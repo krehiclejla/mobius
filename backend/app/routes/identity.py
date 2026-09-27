@@ -1242,7 +1242,10 @@ async def read_railway_deletion_state(
   )
 
 
-@router.post("/railway/deployments/{instance_id}/confirm-absent")
+@router.post(
+  "/railway/deployments/{instance_id}/confirm-absent",
+  dependencies=[Depends(require_nondelegated_owner_or_app_control)],
+)
 async def confirm_railway_deletion_absent(
   instance_id: str,
   body: RailwayConfirmAbsent,
@@ -1260,7 +1263,10 @@ async def confirm_railway_deletion_absent(
   )
 
 
-@router.post("/railway/deployments/{instance_id}/recovery", status_code=202)
+@router.post(
+  "/railway/deployments/{instance_id}/recovery", status_code=202,
+  dependencies=[Depends(require_nondelegated_owner_or_app_control)],
+)
 async def open_railway_recovery(
   instance_id: str,
   owner: models.Owner = Depends(get_owner_or_app_with_railway_manage),

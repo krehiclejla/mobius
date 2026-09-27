@@ -80,6 +80,7 @@ def test_send_push_loads_delivery_dependency_and_preserves_arguments(monkeypatch
       "vapid_private_key": fake_vapid,
       "vapid_claims": claims,
       "content_encoding": "aes128gcm",
+      "timeout": push._DELIVERY_TIMEOUT_SECONDS,
     }
   ]
 

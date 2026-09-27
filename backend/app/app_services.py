@@ -44,6 +44,10 @@ _FORBIDDEN_HEADERS = frozenset({
   "connection", "content-length", "content-type", "keep-alive", "proxy-authenticate",
   "proxy-authorization", "set-cookie", "te", "trailer",
   "transfer-encoding", "upgrade",
+  # Origin-wide effects a shell-origin response must never carry for an app:
+  # wiping the owner's storage, widening a service-worker scope, or a
+  # header-driven redirect.
+  "clear-site-data", "refresh", "service-worker-allowed",
 })
 _global_slots = {
   "private": asyncio.Semaphore(8),

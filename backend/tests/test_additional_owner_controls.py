@@ -155,9 +155,11 @@ def test_schedule_owner_controls_reject_delegation_but_keep_exact_app(
   assert len(schedules) == 1
 
 
-def test_push_owner_control_rejects_delegation_but_keeps_app_and_owner(
+def test_push_subscriptions_are_owner_controls_not_app_or_delegation(
   client, controls,
 ):
+  # A subscription receives every owner notification, so an app registering
+  # its own endpoint would read the owner's whole notification stream.
   body = {
     "endpoint": "https://push.invalid/owner-controls",
     "keys": {"p256dh": "first", "auth": "first"},
@@ -167,7 +169,11 @@ def test_push_owner_control_rejects_delegation_but_keeps_app_and_owner(
   ).status_code == 403
   assert client.post(
     "/api/push/subscribe", headers=controls["app"], json=body,
-  ).status_code == 201
+  ).status_code == 403
+  assert client.post(
+    "/api/push/subscribe", headers=controls["owner"],
+    json={**body, "endpoint": "http://127.0.0.1:9/internal"},
+  ).status_code == 422
   body["keys"] = {"p256dh": "second", "auth": "second"}
   assert client.post(
     "/api/push/subscribe", headers=controls["top_level"], json=body,
@@ -175,11 +181,12 @@ def test_push_owner_control_rejects_delegation_but_keeps_app_and_owner(
   assert client.post(
     "/api/push/subscribe", headers=controls["owner"], json=body,
   ).status_code == 201
-  assert client.request(
-    "DELETE",
-    "/api/push/subscribe", headers=controls["delegated"],
-    json={"endpoint": body["endpoint"]},
-  ).status_code == 403
+  for denied in ("delegated", "app"):
+    assert client.request(
+      "DELETE",
+      "/api/push/subscribe", headers=controls[denied],
+      json={"endpoint": body["endpoint"]},
+    ).status_code == 403
   assert client.request(
     "DELETE",
     "/api/push/subscribe", headers=controls["owner"],
@@ -264,3 +271,19 @@ def test_project_owner_mailbox_rejects_delegation_but_agent_mailbox_remains(
     f"/api/projects/{project_id}/agent-messages",
     headers=controls["top_level"], json=body,
   ).status_code == 200
+
+
+@pytest.mark.parametrize(("method", "path"), [
+  ("POST", "/api/auth/provider/claude/disconnect"),
+  ("POST", "/api/auth/provider/mobius/login"),
+  ("POST", "/api/identity/railway/deployments/instance-1/confirm-absent"),
+  ("POST", "/api/identity/railway/deployments/instance-1/recovery"),
+])
+def test_account_link_and_deployment_mutations_reject_delegation(
+  client, controls, method, path,
+):
+  response = client.request(
+    method, path, headers=controls["delegated"],
+    json={"confirmed_absent": True},
+  )
+  assert response.status_code == 403

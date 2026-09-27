@@ -1039,7 +1039,7 @@ async def _consume_mobius_pending(state: str) -> dict:
 @_limiter.limit("3/minute")
 async def mobius_login_start(
   request: Request,
-  owner: models.Owner = Depends(get_current_owner),
+  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
 ):
   """Start public-client PKCE linking; no central secret enters the runtime."""
   identity = await _mobius_broker_request("GET", "/identity")
@@ -1621,7 +1621,7 @@ async def codex_login_status_view(
 )
 async def provider_disconnect(
   provider_id: str,
-  _: models.Owner = Depends(get_current_owner),
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
 ):
   """Sign out locally; never remove chats, provider settings, or other accounts."""
   from app.providers import disconnect_provider

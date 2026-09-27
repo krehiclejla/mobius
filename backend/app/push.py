@@ -105,6 +105,9 @@ def get_vapid_claims() -> dict:
   return {"sub": f"mailto:admin@{settings.domain}"}
 
 
+_DELIVERY_TIMEOUT_SECONDS = 10
+
+
 def send_push(subscription_info: dict, payload: dict) -> bool:
   """Send a Web Push notification. Returns True on success, False on gone."""
   if _vapid is None:
@@ -122,6 +125,9 @@ def send_push(subscription_info: dict, payload: dict) -> bool:
       vapid_private_key=_vapid,
       vapid_claims=get_vapid_claims(),
       content_encoding="aes128gcm",
+      # pywebpush defaults to no timeout; one unresponsive push service
+      # would otherwise hold a worker thread indefinitely.
+      timeout=_DELIVERY_TIMEOUT_SECONDS,
     )
     return True
   except WebPushException as e:

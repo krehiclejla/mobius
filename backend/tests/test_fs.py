@@ -313,3 +313,22 @@ def test_contribution_runtime_is_denied_to_privileged_filesystem_api(
       headers={**headers, "Content-Type": "text/plain"},
     ).status_code == 403
     assert not (private_file.parent / "new-receipt.json").exists()
+
+
+@pytest.mark.parametrize("rel", [
+  "push/private_key.pem",
+  "shared/connect/outbound/config.json",
+  "agent-browser-profiles/profile/Cookies",
+])
+def test_credential_stores_are_denied(client, auth, fsroot, rel):
+  root, _, made = fsroot
+  secret = root / rel
+  existed = secret.parent.exists()
+  secret.parent.mkdir(parents=True, exist_ok=True)
+  if not secret.exists():
+    secret.write_text("secret")
+    made.append(secret)
+  if not existed:
+    made.append(secret.parent)
+  r = client.get("/api/fs/read", params={"path": rel}, headers=auth)
+  assert r.status_code == 403

@@ -223,9 +223,10 @@ def serve_upload(
   if not file_path.exists():
     raise HTTPException(status_code=404, detail="File not found.")
 
-  # Detect MIME from the stored metadata if available; fall back to
-  # letting FileResponse infer it. Force attachment for non-image types
-  # to prevent a stored-XSS vector if a malicious file slips through.
+  # Serve exactly the recorded upload type: an allowlisted image inline,
+  # anything else as an octet-stream attachment. Never let FileResponse infer
+  # a type from the filename — `page.html` uploaded as `image/png` would
+  # otherwise render as a document on the shell origin.
   #
   # Lookup intentionally bypasses get_active_chat_or_404 — a missing
   # or soft-deleted chat here degrades to "no stored MIME" instead of
@@ -242,11 +243,12 @@ def serve_upload(
         stored_mime = entry.get("mime_type")
         break
 
+  inline = stored_mime in _INLINE_MIME_TYPES
   headers = {}
-  if stored_mime not in _INLINE_MIME_TYPES:
+  if not inline:
     headers["Content-Disposition"] = f'attachment; filename="{filename}"'
 
-  if preview and stored_mime in _INLINE_MIME_TYPES:
+  if preview and inline:
     preview_path = display_image_preview(file_path, upload_dir)
     if preview_path is not None:
       return FileResponse(
@@ -255,4 +257,8 @@ def serve_upload(
         headers={"Cache-Control": "private, max-age=86400"},
       )
 
-  return FileResponse(str(file_path), headers=headers)
+  return FileResponse(
+    str(file_path),
+    media_type=stored_mime if inline else "application/octet-stream",
+    headers=headers,
+  )

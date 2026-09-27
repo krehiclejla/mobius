@@ -460,6 +460,20 @@ _APP_FRAME_PATH = re.compile(r"^/api/apps/[^/]+/frame$")
 _ARTIFACT_OUTPUT_PATH = re.compile(
   r"^/api/projects/[^/]+/artifacts/[^/]+/output/"
 )
+# Stored bytes whose content an app, a chat participant, or a third-party site
+# controls. They are served as subresources, never as shell documents, so a
+# direct navigation to one (a popup that escaped an app sandbox, a link, or a
+# cached proxy response) must not execute on the shell origin, where the owner
+# credential lives.
+_INERT_CONTENT_PATH = re.compile(
+  r"^(?:/app-assets/"
+  r"|/api/proxy(?:/|$)"
+  r"|/api/chats/[^/]+/uploads/"
+  r"|/api/community/publications/github/preview/assets/)"
+)
+# App service responses are app-authored documents. They keep scripts, like a
+# published site, but only inside an opaque origin.
+_APP_SERVICE_PATH = re.compile(r"^/api/(?:app-)?services/")
 
 # This isolation boundary must always be enforced, never Report-Only: browsers
 # ignore the CSP sandbox directive in a Report-Only policy. The sandbox omits
@@ -583,6 +597,14 @@ _ARTIFACT_OUTPUT_CSP = (
   "frame-ancestors 'self'"
 )
 
+# A sandbox without allow-scripts or allow-same-origin: images, media, and
+# plain documents still display when opened directly, but nothing runs and the
+# document cannot act as the shell origin. Must be enforcing, never Report-Only.
+_INERT_CONTENT_CSP = (
+  "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; "
+  "style-src 'unsafe-inline'; frame-ancestors 'self'"
+)
+
 
 def _is_public_service_surface(scope) -> bool:
   """Whether the gateway host may frame this registered service route."""
@@ -638,6 +660,10 @@ class _SecurityHeadersMiddleware:
         csp = _app_frame_csp_for_scope(scope)
       elif artifact_output:
         csp = _ARTIFACT_OUTPUT_CSP
+      elif _INERT_CONTENT_PATH.match(path):
+        csp = _INERT_CONTENT_CSP
+      elif _APP_SERVICE_PATH.match(path):
+        csp = _PUBLISHED_SITE_CSP
       else:
         csp = _SHELL_CSP
       response_headers.append((

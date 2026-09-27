@@ -781,6 +781,15 @@ class PushSubscribeRequest(BaseModel):
   endpoint: str
   keys: PushKeys
 
+  @field_validator("endpoint")
+  @classmethod
+  def _https_push_service(cls, value: str) -> str:
+    """Browser push services are always HTTPS URLs."""
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+      raise ValueError("Push endpoint must be an https URL.")
+    return value
+
 
 class PushUnsubscribeRequest(BaseModel):
   endpoint: str

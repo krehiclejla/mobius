@@ -390,6 +390,16 @@ def test_service_cannot_set_transport_or_credential_headers(client, auth, db):
   assert "set-cookie" not in response.headers
 
 
+@pytest.mark.parametrize(
+  "name", ["Clear-Site-Data", "Refresh", "Service-Worker-Allowed"],
+)
+def test_service_cannot_set_origin_wide_headers(name):
+  # A service answers on the shell origin, so these would act on the owner's
+  # whole session rather than on the app's own response.
+  with pytest.raises(ValueError):
+    app_services._response_headers({name: "*"})
+
+
 def test_service_rejects_nonstandard_json_constants(client, auth, db):
   app = _service_app(db, slug="constant-service")
   accepted = runtime_parent(app.id) / ("a" * 64)

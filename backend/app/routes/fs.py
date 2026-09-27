@@ -101,6 +101,14 @@ _DENY_RELPATHS = (
   "db/ultimate.db",
   ".storage-meta",
   ".contribution-runtime",
+  # Credential stores: the Web Push signing key, encrypted app secrets, the
+  # identity broker, the agent's signed-in browser sessions, and Connect
+  # runner tokens / pairing codes.
+  "push/private_key.pem",
+  "app-secrets",
+  "identity-broker",
+  "agent-browser-profiles",
+  "shared/connect",
 )
 # Defense in depth: a secret-shaped filename anywhere in the tree is denied,
 # in case one is copied outside its canonical home. The two `.recovery-*`

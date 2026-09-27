@@ -7,6 +7,7 @@ Only GET and POST are supported. Requests are authenticated by the
 owner or an app-scoped token.
 """
 
+import asyncio
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -160,7 +161,9 @@ async def _read_external_get(
   """
   current_url = url
   for hop in range(_FAVICON_MAX_REDIRECTS + 1):
-    pinned_url, host_header, sni_host = validate_url_safe(current_url)
+    pinned_url, host_header, sni_host = await asyncio.to_thread(
+      validate_url_safe, current_url,
+    )
     req = client.build_request(
       "GET",
       pinned_url,
@@ -343,7 +346,9 @@ async def proxy_get(
   the SSRF allow/deny checks below, so the mutation-oriented CSRF dependency is
   intentionally not applied here. The POST proxy remains guarded.
   """
-  pinned_url, host_header, sni_host = validate_url_safe(url)
+  pinned_url, host_header, sni_host = await asyncio.to_thread(
+    validate_url_safe, url,
+  )
   async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
     req = client.build_request("GET", pinned_url)
     req.headers["host"] = host_header
@@ -362,7 +367,9 @@ async def proxy_post(
   """Posts to a URL and returns the raw response body."""
   if body.body and len(body.body.encode()) > _MAX_BODY:
     raise HTTPException(413, "Request body too large (max 512 KB)")
-  pinned_url, host_header, sni_host = validate_url_safe(body.url)
+  pinned_url, host_header, sni_host = await asyncio.to_thread(
+    validate_url_safe, body.url,
+  )
   async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
     req = client.build_request(
       "POST", pinned_url,

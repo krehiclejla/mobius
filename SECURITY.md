@@ -125,7 +125,11 @@ ancestor problem). `/app-embeds/by-id/` is also frameable, but every response in
 that namespace carries CSP `sandbox` without `allow-same-origin`; the namespace
 exposes only public packaged assets, while protected API access from null
 origins still requires the scoped principal. Ordinary `/app-assets/` remains
-frame-denied. A configured shared service-gateway hostname is reserved to
+frame-denied. It, `/api/proxy`, chat uploads and Store preview artwork are
+subresources that also carry an inert CSP `sandbox` (no scripts, opaque
+origin), and app-service responses carry the published-site sandbox, so a
+direct navigation to app- or third-party-controlled bytes never runs as the
+shell. A configured shared service-gateway hostname is reserved to
 explicitly enabled `/services/<slug>` prefixes and frames only through each
 direct, same-origin-readable adapter; shell/API and non-enabled
 service paths return 404 there. The gateway isolates its owner-trusted service

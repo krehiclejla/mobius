@@ -245,7 +245,9 @@ async def fetch_public_url(
   if not _target_allowed(url, rules):
     raise HTTPException(status_code=403, detail="URL is not allowed for this public app.")
 
-  pinned_url, host_header, sni_host = validate_url_safe(url)
+  pinned_url, host_header, sni_host = await asyncio.to_thread(
+    validate_url_safe, url,
+  )
   started = time.monotonic()
   try:
     async with _fetch_clients.lease(host_header, sni_host) as client:

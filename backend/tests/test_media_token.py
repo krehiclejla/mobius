@@ -290,3 +290,27 @@ def test_serve_media_rejects_media_token_for_wrong_chat(client, auth, chat, db):
     params={"token": media_token},
   )
   assert r.status_code == 403
+
+
+def test_upload_named_like_a_document_is_served_as_its_recorded_image_type(
+  client, auth, chat,
+):
+  name = _upload_file(
+    client, auth, chat, content=b"<script>alert(1)</script>", name="page.html",
+  )
+  r = client.get(f"/api/chats/{chat.id}/uploads/{name}", headers=auth)
+  assert r.status_code == 200
+  assert r.headers["content-type"] == "image/png"
+  assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_non_image_upload_downloads_as_opaque_bytes(client, auth, chat):
+  r = client.post(
+    f"/api/chats/{chat.id}/uploads",
+    files=[("files", ("page.html", io.BytesIO(b"<p>x</p>"), "text/html"))],
+    headers=auth,
+  )
+  name = r.json()[0]["name"]
+  served = client.get(f"/api/chats/{chat.id}/uploads/{name}", headers=auth)
+  assert served.headers["content-type"] == "application/octet-stream"
+  assert served.headers["content-disposition"].startswith("attachment;")

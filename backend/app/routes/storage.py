@@ -83,15 +83,28 @@ _GIT_BLOB_READ_MAX = 8 * 1024 * 1024
 _LEVELS = {"none": 0, "read": 1, "write": 2}
 
 
-def _require_shared_memory_read(
+# Platform-owned state under /data/shared that holds credentials (Connect
+# pairing codes and remote-runner tokens). Only the owner may read it.
+_SHARED_OWNER_ONLY_ROOTS = frozenset({"connect"})
+
+
+def _require_shared_read(
   path: str,
   principal: Principal,
   db: Session,
 ) -> None:
-  """Gate the optional Memory app's shared graph by its live contract."""
-  if path != "memory" and not path.startswith("memory/"):
-    return
+  """Gate app reads of owner-only and capability-scoped shared subtrees.
+
+  Decide on the normalized first segment, the same one ``_resolve`` serves:
+  ``./memory/x`` and ``memory/x`` name the same file.
+  """
   if principal.app_id is None:
+    return
+  parts = Path(path).parts
+  top = parts[0] if parts else ""
+  if top in _SHARED_OWNER_ONLY_ROOTS:
+    raise HTTPException(status_code=403, detail="Owner-only shared data.")
+  if top != "memory":
     return
   app = (
     db.query(models.App)
@@ -933,7 +946,7 @@ def read_shared_git_file(
   reachable from ``refs/heads/main``; symlinks, submodules, replacement refs,
   hooks and external Git configuration are never consulted.
   """
-  _require_shared_memory_read(f"{repo}/{file}", principal, db)
+  _require_shared_read(f"{repo}/{file}", principal, db)
   if not _GIT_COMMIT_RE.fullmatch(revision):
     raise HTTPException(status_code=400, detail="Invalid Git revision.")
   if (
@@ -1013,7 +1026,7 @@ def read_shared_file(
   db: Session = Depends(get_db),
 ):
   """Returns a file from the shared data directory."""
-  _require_shared_memory_read(path, principal, db)
+  _require_shared_read(path, principal, db)
   base = Path(get_settings().data_dir) / "shared"
   file_path = _resolve(base, path)
   # is_file() so a directory path 404s instead of 500-ing in _serve_file
@@ -1211,7 +1224,7 @@ def list_shared_dir(
   listing rather than 404, matching `apps-list` (enumerating a not-yet-
   created directory is a normal call).
   """
-  _require_shared_memory_read(path, principal, db)
+  _require_shared_read(path, principal, db)
   base = Path(get_settings().data_dir) / "shared"
   dir_path = base if path == "" else _resolve(base, path)
   if not dir_path.is_dir():

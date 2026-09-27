@@ -15,6 +15,7 @@ import {
   appCodeStoreAction,
   entriesToTrim,
   isAppCodeRoute,
+  isCacheableProxyRequest,
   isCacheableAppAssetResponse,
   hasOpaqueEmbedSandbox,
   isCacheableOpaqueEmbedDocument,
@@ -381,4 +382,17 @@ test('scoped chat row reads never enter the offline shell-list cache', async () 
   const scoped = 'https://mobius.test/api/chats?ids=a&ids=b'
   assert.equal(isShellListUrl(new URL(scoped)), false)
   assert.equal(requiresLiveShellList(new Request(scoped, { cache: 'no-store' })), false)
+})
+
+test('proxied third-party assets are cached for subresources but never answer a navigation', () => {
+  const origin = 'https://mobius.example'
+  const svg = new URL(`${origin}/api/proxy?url=${encodeURIComponent('https://evil.example/x.svg')}`)
+  const favicon = new URL(`${origin}/api/proxy/favicon?url=https%3A%2F%2Fevil.example%2F`)
+  const json = new URL(`${origin}/api/proxy?url=${encodeURIComponent('https://api.example/data')}`)
+  assert.equal(isCacheableProxyRequest(svg, { mode: 'no-cors' }, origin), true)
+  assert.equal(isCacheableProxyRequest(favicon, { mode: 'cors' }, origin), true)
+  assert.equal(isCacheableProxyRequest(json, { mode: 'cors' }, origin), false)
+  assert.equal(isCacheableProxyRequest(svg, { mode: 'navigate' }, origin), false)
+  assert.equal(isCacheableProxyRequest(favicon, { mode: 'navigate' }, origin), false)
+  assert.equal(isCacheableProxyRequest(svg, { mode: 'no-cors' }, 'https://other.example'), false)
 })

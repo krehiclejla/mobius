@@ -188,6 +188,13 @@ def test_shared_memory_reads_require_live_declared_contract(
   assert client.get(
     "/api/storage/shared-list/memory", headers=app_auth,
   ).status_code == 403
+  # A dot segment names the same directory and must meet the same gate.
+  assert client.get(
+    "/api/storage/shared/%2E/memory/.ready", headers=app_auth,
+  ).status_code == 403
+  assert client.get(
+    "/api/storage/shared-list/.%2Fmemory", headers=app_auth,
+  ).status_code == 403
   # Other longstanding shared resources retain their existing app-readable
   # behavior; the new gate is scoped to the optional graph namespace.
   client.put(
@@ -1740,3 +1747,26 @@ def test_app_storage_if_none_match_create_if_absent(client, auth, owner_token):
   second = client.put(path, json={"v": 2}, headers={**auth, "If-None-Match": "*"})
   assert second.status_code == 412
   assert client.get(path, headers=auth).json() == {"v": 1}
+
+
+def test_shared_connect_credentials_are_owner_only(client, auth, owner_token):
+  app_id = _make_app(client, owner_token)
+  token = client.post(
+    "/api/auth/app-token",
+    json={"app_id": app_id},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  ).json()["token"]
+  app_auth = {"Authorization": f"Bearer {token}"}
+  runner = Path(get_settings().data_dir) / "shared" / "connect" / "outbound"
+  runner.mkdir(parents=True, exist_ok=True)
+  (runner / "config.json").write_text('{"token":"x"}', encoding="utf-8")
+
+  for path in (
+    "/api/storage/shared/connect/outbound/config.json",
+    "/api/storage/shared/%2E/connect/outbound/config.json",
+    "/api/storage/shared-list/connect/outbound",
+  ):
+    assert client.get(path, headers=app_auth).status_code == 403
+  assert client.get(
+    "/api/storage/shared/connect/outbound/config.json", headers=auth,
+  ).status_code == 200

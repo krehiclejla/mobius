@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.main import (
-  _PUBLISHED_SITE_CSP, _SHELL_CSP, _STATIC_EMBED_CSP, _CHAT_EMBED_CSP, app,
+  _INERT_CONTENT_CSP, _PUBLISHED_SITE_CSP, _SHELL_CSP, _STATIC_EMBED_CSP,
+  _CHAT_EMBED_CSP, app,
 )
 from app.response_policy import chat_embed_csp, app_frame_csp
 
@@ -430,3 +431,32 @@ def test_chat_embed_loopback_delivery_is_exact_and_not_host_header_trusted():
   assert client.get("/shell/embed/chat", headers={"Host": "evil.example"}).headers["content-security-policy"] == _CHAT_EMBED_CSP
   remote = TestClient(app, base_url="http://127.0.0.1:8000", client=("203.0.113.4", 50000))
   assert remote.get("/shell/embed/chat").headers["content-security-policy"] == _CHAT_EMBED_CSP
+
+
+def test_untrusted_stored_bytes_never_execute_as_shell_documents():
+  # App static files, proxied third-party bytes, chat uploads, and Store
+  # preview artwork are subresources. Opened directly, they must not run on
+  # the shell origin where the owner credential lives.
+  for path in (
+    "/app-assets/some-app/x.html",
+    "/app-assets/by-id/1/x.svg",
+    "/api/proxy",
+    "/api/proxy/favicon",
+    "/api/chats/c1/uploads/page.html",
+    "/api/community/publications/github/preview/assets/1/abc/x.svg",
+  ):
+    policy = _headers(path).get("content-security-policy")
+    assert policy == _INERT_CONTENT_CSP, path
+  assert _INERT_CONTENT_CSP.startswith("sandbox;")
+  assert "allow-scripts" not in _INERT_CONTENT_CSP
+  assert "allow-same-origin" not in _INERT_CONTENT_CSP
+
+
+def test_app_service_documents_run_only_at_an_opaque_origin():
+  for path in ("/api/app-services/svc/page", "/api/services/svc/page"):
+    assert _headers(path).get("content-security-policy") == _PUBLISHED_SITE_CSP
+
+
+def test_untrusted_namespaces_do_not_capture_neighbouring_shell_routes():
+  for path in ("/api/proxyish", "/api/chats/c1/media/x.png", "/api/apps/"):
+    assert _headers(path).get("content-security-policy") == _SHELL_CSP, path
