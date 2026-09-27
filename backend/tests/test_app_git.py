@@ -736,6 +736,76 @@ def test_fetch_upstream_rejects_non_fast_forward_trusted_related_origin(
   assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == new_head
 
 
+def _release_proof(fixture, parent, branch):
+  """Model a Store release: a same-tree child of ``parent`` on a side branch."""
+  env = app_git._git_env(fixture)
+  tree = subprocess.run(
+    ["git", "-C", str(fixture), "rev-parse", f"{parent}^{{tree}}"],
+    check=True, capture_output=True, text=True, env=env,
+  ).stdout.strip()
+  proof = subprocess.run(
+    ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+     "-C", str(fixture), "commit-tree", tree, "-p", parent,
+     "-m", "Möbius App Store release proof"],
+    check=True, capture_output=True, text=True, env=env,
+  ).stdout.strip()
+  subprocess.run(
+    ["git", "-C", str(fixture), "branch", "-f", branch, proof],
+    check=True, env=env,
+  )
+  return proof
+
+
+def _store_release_fixture(tmp_path):
+  fixture = tmp_path / "fixture"
+  bare = tmp_path / "fixture.git"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(fixture)], check=True)
+  (fixture / "index.jsx").write_text("export default () => 'v1'\n")
+  v1 = _commit_all(fixture, "v1")
+  proof_v1 = _release_proof(fixture, v1, "release-v1")
+  (fixture / "index.jsx").write_text("export default () => 'v2'\n")
+  v2 = _commit_all(fixture, "v2")
+  proof_v2 = _release_proof(fixture, v2, "release-v2")
+  subprocess.run(
+    ["git", "clone", "-q", "--bare", str(fixture), str(bare)], check=True,
+    env=app_git._git_env(fixture),
+  )
+  return bare, proof_v1, proof_v2
+
+
+def test_fetch_upstream_follows_store_release_proofs_forward(tmp_path):
+  """Each Store release pins a side-branch proof commit, so the next release
+  never descends from the installed proof — only from its parent. That
+  content-free leaf must not make an ordinary update look unrelated."""
+  bare, proof_v1, proof_v2 = _store_release_fixture(tmp_path)
+  source_dir = tmp_path / "source"
+  source_dir.mkdir()
+  app_git.clone_upstream(source_dir, bare.as_uri(), "release-v1")
+  app_git.align_local_to_upstream(source_dir)
+  assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == proof_v1
+
+  fetched = app_git.fetch_upstream(source_dir, proof_v2)
+
+  assert fetched.sha == proof_v2
+  assert fetched.allow_unrelated_histories is False
+  assert app_git.read_ref_tree(source_dir, app_git.UPSTREAM_BRANCH)[
+    "index.jsx"
+  ] == b"export default () => 'v2'\n"
+
+
+def test_fetch_upstream_rejects_store_release_proof_rollback(tmp_path):
+  """Seeing through a proof leaf never admits moving to an older release."""
+  bare, proof_v1, proof_v2 = _store_release_fixture(tmp_path)
+  source_dir = tmp_path / "source"
+  source_dir.mkdir()
+  app_git.clone_upstream(source_dir, bare.as_uri(), "release-v2")
+  app_git.align_local_to_upstream(source_dir)
+
+  with pytest.raises(RuntimeError, match="unrelated to recorded upstream"):
+    app_git.fetch_upstream(source_dir, proof_v1)
+  assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == proof_v2
+
+
 def test_fetch_upstream_rejects_unrelated_origin_without_moving_ref(tmp_path):
   """A synthetic app that accidentally has an origin remote must not have its
   installer-owned upstream branch moved onto unrelated real-repo history."""

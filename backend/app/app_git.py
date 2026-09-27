@@ -2610,6 +2610,33 @@ def fetch_upstream(
   )
 
 
+def _release_continues(repo: Path, previous: str, fetched: str) -> bool:
+  """Whether ``fetched`` moves the recorded upstream forward, never back.
+
+  Store releases are pinned to content-free proof commits: each one has a
+  single parent on the publisher's history and that parent's exact tree, on
+  its own side branch. The next release descends from the old proof's parent,
+  never from the proof itself. Such a leaf carries no bytes of its own, so its
+  parent stands in for it; a rollback or unrelated history still fails
+  because the parent is not an ancestor of the new release.
+  """
+  if _run(
+    repo, "merge-base", "--is-ancestor", previous, fetched, check=False,
+  ).returncode == 0:
+    return True
+  shape = _run(
+    repo, "rev-list", "--parents", "-n", "1", previous, check=False,
+  ).stdout.split()
+  if len(shape) != 2:
+    return False
+  parent = shape[1]
+  if not ref_trees_equal(repo, previous, parent):
+    return False
+  return _run(
+    repo, "merge-base", "--is-ancestor", parent, fetched, check=False,
+  ).returncode == 0
+
+
 def promote_upstream(
   source_dir: str | Path,
   commit: str,
@@ -2634,12 +2661,8 @@ def promote_upstream(
     and ref_trees_equal(repo, LOCAL_BRANCH, fetched_ref)
   )
   if previous_sha and previous_sha != fetched_ref:
-    related = _run(
-      repo, "merge-base", "--is-ancestor", previous_sha, fetched_ref,
-      check=False,
-    )
     if (
-      related.returncode != 0
+      not _release_continues(repo, previous_sha, fetched_ref)
       and not equal_local_adoption
     ):
       raise RuntimeError(
