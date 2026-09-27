@@ -2,25 +2,14 @@
 
 from tests.goal_fixtures import goal_run as make_goal_run
 
-from datetime import timedelta
-import importlib.util
 import hashlib
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
 from app import auth as auth_mod, models
 from app import broadcast as broadcast_mod
 from app.runner_registry import RunnerKind, registry
-
-
-def _goal_plan_script():
-  path = Path(__file__).resolve().parents[1] / "scripts" / "goal_plan.py"
-  spec = importlib.util.spec_from_file_location("goal_plan_script", path)
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-  return module
 
 
 def _active_goal(client, owner_token, db):
@@ -51,6 +40,14 @@ def _agent_run_auth(db, chat_id, run_id):
     expires_delta=timedelta(minutes=5),
   )
   return {"Authorization": f"Bearer {token}"}
+
+
+def _update(client, db, chat_id, body, run_id="goal-root"):
+  """Drive the single agent-facing Goal operation with an agent-run token."""
+  return client.post(
+    f"/api/chats/{chat_id}/goal/update", json=body,
+    headers=_agent_run_auth(db, chat_id, run_id),
+  )
 
 
 def test_terminal_goal_history_projects_onto_final_assistant_message(
@@ -330,12 +327,9 @@ def test_current_turn_promotes_atomically_without_a_goal_message(
     )
     assert conflict.status_code == 409
 
-    plan = client.put(
-      f"/api/chats/{chat_id}/goal-plan",
-      json={
-        "expected_revision": 0,
-        "tasks": [{"id": "repair", "title": "Repair every defect"}],
-      },
+    plan = client.post(
+      f"/api/chats/{chat_id}/goal/update",
+      json={"tasks": [{"id": "repair", "title": "Repair every defect"}]},
       headers=agent_auth,
     )
     assert plan.status_code == 200, plan.text
@@ -370,26 +364,26 @@ def test_resuming_goal_publishes_activation_only_for_attachment_transition(
 
   broadcast = broadcast_mod.create_broadcast(chat_id)
   try:
-    auth = _agent_run_auth(db, chat_id, "active-run")
-    resumed = client.post(
-      f"/api/chats/{chat_id}/goal/resume",
-      json={"goal_id": "active-goal"},
-      headers=auth,
+    # A write attaches this ordinary turn to the presented Goal, publishing the
+    # activation exactly once for that transition.
+    attached = _update(
+      client, db, chat_id,
+      {"tasks": [{"id": "finish", "title": "Finish the work"}]},
+      run_id="active-run",
     )
+    assert attached.status_code == 200, attached.text
+    assert attached.json()["goal"]["id"] == "active-goal"
+    activations = [e for e in broadcast.event_log if e["type"] == "goal_activated"]
+    assert len(activations) == 1
 
-    assert resumed.status_code == 200, resumed.text
-    assert resumed.json()["state"] == "promoted"
-    assert [event["type"] for event in broadcast.event_log] == ["goal_activated"]
-
-    already_active = client.post(
-      f"/api/chats/{chat_id}/goal/resume",
-      json={"goal_id": "active-goal"},
-      headers=auth,
+    already_active = _update(
+      client, db, chat_id,
+      {"tasks": [{"id": "finish", "status": "running"}]},
+      run_id="active-run",
     )
-
     assert already_active.status_code == 200, already_active.text
-    assert already_active.json()["state"] == "active"
-    assert [event["type"] for event in broadcast.event_log] == ["goal_activated"]
+    activations = [e for e in broadcast.event_log if e["type"] == "goal_activated"]
+    assert len(activations) == 1
   finally:
     broadcast_mod.remove_broadcast(chat_id)
 
@@ -538,107 +532,35 @@ def test_completed_plan_clear_dismisses_without_interrupting_final_response(
   assert persisted_run.ended_at is None
 
 
-def test_goal_wait_ownership_excludes_a_later_ordinary_turn(db, chat):
+def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
+  """Who moves next is chat state the client already has, not Goal state.
+
+  An open card, an armed Wait, or a running helper must not change how the
+  Goal itself presents: idle unfinished work is simply paused.
+  """
   from app.chat_waits import declare_wait
   from app.goal_plans import presented_goal
 
-  started_at = datetime.now(UTC)
   goal_run = make_goal_run(db,
-    id="waiting-goal-run", root_run_id="waiting-goal-run", chat_id=chat.id,
-    status="parked", provider="codex", goal_objective="Wait precisely",
-    goal_id="waiting-goal-id", started_at=started_at,
-  )
-  ordinary_run = make_goal_run(db,
-    id="later-ordinary-run", root_run_id="later-ordinary-run",
-    chat_id=chat.id, status="running", provider="codex",
-    started_at=started_at + timedelta(seconds=1),
-  )
-  db.add_all([goal_run, ordinary_run])
-  chat.pending_question_id = "ordinary-question"
-  db.commit()
-  ordinary_wait = declare_wait(
-    db,
-    chat_id=chat.id,
-    description="ordinary wait",
-    kind="timer",
-    delay_secs=60,
-    created_by_run_id=ordinary_run.id,
-  )
-
-  assert "wait_kind" not in presented_goal(db, chat.id)
-
-  ordinary_run.status = "completed"
-  ordinary_wait.status = "cancelled"
-  chat.pending_question_id = "goal-question"
-  db.commit()
-  assert presented_goal(db, chat.id)["wait_kind"] == "owner_question"
-
-  chat.pending_question_id = None
-  declare_wait(
-    db,
-    chat_id=chat.id,
-    description="goal wait",
-    kind="timer",
-    delay_secs=60,
-    created_by_run_id=goal_run.id,
-  )
-  assert presented_goal(db, chat.id)["wait_kind"] == "monitor"
-
-
-def test_settled_continuation_card_keeps_goal_waiting_for_owner(db, chat):
-  from app.goal_plans import presented_goal
-
-  run = make_goal_run(db,
-    id="settled-card-run", root_run_id="settled-card-run", chat_id=chat.id,
-    status="completed", provider="codex", goal_objective="Await approval",
-    goal_id="settled-card-goal", started_at=datetime.now(UTC),
-  )
-  db.add(run)
-  chat.pending_question_id = "settled-card"
-  chat.messages = [{
-    "id": run.id, "role": "assistant", "content": "", "blocks": [{
-      "type": "question", "question_id": "settled-card",
-      "response_mode": "continuation", "questions": [],
-    }], "ts": 1,
-  }]
-  db.commit()
-
-  goal = presented_goal(db, chat.id)
-  assert goal["status"] == "paused"
-  assert goal["wait_kind"] == "owner_question"
-
-
-def test_goal_wait_ownership_includes_only_its_waking_helpers(
-  db, chat, monkeypatch,
-):
-  from app.goal_plans import presented_goal
-
-  goal_run = make_goal_run(db,
-    id="helper-goal-run", root_run_id="helper-goal-run", chat_id=chat.id,
-    status="completed", provider="codex", goal_objective="Wait on helper",
-    goal_id="helper-goal-id", started_at=datetime.now(UTC),
+    id="idle-goal-run", root_run_id="idle-goal-run", chat_id=chat.id,
+    status="completed", provider="codex", goal_objective="Ship it",
+    goal_id="idle-goal-id", started_at=datetime.now(UTC),
   )
   db.add(goal_run)
   db.commit()
+  expected = {
+    "id": "idle-goal-id", "objective": "Ship it", "status": "paused",
+    "resumable": True,
+  }
+  assert presented_goal(db, chat.id) == expected
 
-  monkeypatch.setattr(
-    "app.delegations.background_helper_goal_ids",
-    lambda _db, _chat_id: {"different-goal"},
+  chat.pending_question_id = "any-card"
+  declare_wait(
+    db, chat_id=chat.id, description="goal wait", kind="timer",
+    delay_secs=60, created_by_run_id=goal_run.id,
   )
-  unrelated = presented_goal(db, chat.id)
-  assert unrelated["status"] == "paused"
-  assert "wait_kind" not in unrelated
-  assert unrelated["resumable"] is True
-  assert "wait_kind" not in unrelated
-
-  monkeypatch.setattr(
-    "app.delegations.background_helper_goal_ids",
-    lambda _db, _chat_id: {"helper-goal-id"},
-  )
-  owned = presented_goal(db, chat.id)
-  assert owned["status"] == "paused"
-  assert owned["resumable"] is True
-  assert owned["wait_kind"] == "monitor"
+  db.commit()
+  assert presented_goal(db, chat.id) == expected
 
 
 def test_legacy_queued_goal_clear_is_retired_without_opening_a_turn(db, chat):
@@ -789,13 +711,9 @@ def test_delegated_execution_bearer_cannot_mutate_or_clear_any_goal(
       f"/api/chats/{target_id}/goal",
       json={"objective": "Delegated Goal"}, headers=auth,
     )
-    replaced = client.put(
-      f"/api/chats/{target_id}/goal-plan",
-      json={"expected_revision": 0, "tasks": []}, headers=auth,
-    )
-    patched = client.patch(
-      f"/api/chats/{target_id}/goal-plan/tasks/anything",
-      json={"expected_revision": 0, "status": "completed"}, headers=auth,
+    updated = client.post(
+      f"/api/chats/{target_id}/goal/update",
+      json={"tasks": [{"id": "ship", "title": "Ship"}]}, headers=auth,
     )
     cleared = client.request(
       "DELETE", f"/api/chats/{target_id}/goal",
@@ -803,8 +721,7 @@ def test_delegated_execution_bearer_cannot_mutate_or_clear_any_goal(
     )
 
     assert promoted.status_code == 403, promoted.text
-    assert replaced.status_code == 403, replaced.text
-    assert patched.status_code == 403, patched.text
+    assert updated.status_code == 403, updated.text
     assert cleared.status_code == 403, cleared.text
 
   db.expire_all()
@@ -970,16 +887,12 @@ def test_goal_promotion_commit_failure_is_loud_and_atomic(
 def test_parallel_roots_release_dependent_task_only_after_all_complete(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  tasks = [
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [
     {"id": "a", "title": "Run A", "depends_on": []},
     {"id": "b", "title": "Run B", "depends_on": []},
     {"id": "c", "title": "Run C", "depends_on": ["a", "b"]},
-  ]
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": tasks}, headers=auth,
-  )
+  ]})
   assert created.status_code == 200, created.text
   plan = created.json()["plan"]
   assert plan["revision"] == 1
@@ -992,33 +905,22 @@ def test_parallel_roots_release_dependent_task_only_after_all_complete(
     "completion_blockers": ["a", "b", "c"],
   }
 
-  a_running = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/a",
-    json={"expected_revision": 1, "status": "running"}, headers=auth,
-  )
+  a_running = _update(client, db, chat_id, {"tasks": [{"id": "a", "status": "running"}]})
   assert a_running.status_code == 200, a_running.text
   assert a_running.json()["plan"]["summary"]["running"] == ["a"]
 
-  premature = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/c",
-    json={"expected_revision": 2, "status": "running"}, headers=auth,
-  )
+  premature = _update(client, db, chat_id, {"tasks": [{"id": "c", "status": "running"}]})
   assert premature.status_code == 422
   assert "dependencies complete" in premature.json()["detail"]["message"]
 
-  revision = 2
   for task_id, status in (
     ("a", "completed"),
     ("b", "running"),
     ("b", "completed"),
     ("c", "running"),
   ):
-    response = client.patch(
-      f"/api/chats/{chat_id}/goal-plan/tasks/{task_id}",
-      json={"expected_revision": revision, "status": status}, headers=auth,
-    )
+    response = _update(client, db, chat_id, {"tasks": [{"id": task_id, "status": status}]})
     assert response.status_code == 200, response.text
-    revision += 1
   final = response.json()["plan"]
   assert final["summary"]["running"] == ["c"]
   assert final["summary"]["completed"] == 2
@@ -1029,85 +931,72 @@ def test_parallel_roots_release_dependent_task_only_after_all_complete(
 def test_identical_plan_write_is_a_cas_noop_and_stale_writer_conflicts(
   client, owner_token, db,
 ):
-  """Rewriting the same plan cannot mint a new Goal rollover allowance."""
-  auth, chat_id = _active_goal(client, owner_token, db)
+  """Rewriting the same plan cannot mint a new Goal rollover allowance.
+
+  ``update_goal`` never carries a caller revision, so CAS/no-op semantics are
+  exercised directly against ``replace_plan``, their sole owner.
+  """
+  from app.goal_plans import GoalPlanConflict, replace_plan
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  run = db.get(models.ChatRun, "goal-root")
+  goal = db.get(models.ChatGoal, "goal-1")
   tasks = [{"id": "audit", "title": "Run the audit", "status": "running"}]
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": tasks}, headers=auth,
-  )
-  assert created.status_code == 200, created.text
-  assert created.json()["plan"]["revision"] == 1
 
-  identical = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 1, "tasks": tasks}, headers=auth,
-  )
-  assert identical.status_code == 200, identical.text
-  assert identical.json()["plan"]["revision"] == 1
+  created = replace_plan(db, physical=run, root=goal, expected_revision=0, tasks=tasks)
+  assert created["revision"] == 1
 
-  stale_identical = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": tasks}, headers=auth,
-  )
-  assert stale_identical.status_code == 409, stale_identical.text
+  identical = replace_plan(db, physical=run, root=goal, expected_revision=1, tasks=tasks)
+  assert identical["revision"] == 1
+
+  with pytest.raises(GoalPlanConflict):
+    replace_plan(db, physical=run, root=goal, expected_revision=0, tasks=tasks)
 
 
 def test_unreadable_plan_is_reported_and_replaced_at_the_goal_revision(
   client, owner_token, db,
 ):
+  from app.goal_plans import replace_plan
+
   auth, chat_id = _active_goal(client, owner_token, db)
   tasks = [{"id": "audit", "title": "Run the audit", "status": "running"}]
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": tasks}, headers=auth,
-  )
-  assert created.status_code == 200, created.text
+  run = db.get(models.ChatRun, "goal-root")
   goal = db.query(models.ChatGoal).filter(models.ChatGoal.id == "goal-1").one()
+  replace_plan(db, physical=run, root=goal, expected_revision=0, tasks=tasks)
   goal.plan_json = {"version": 1, "tasks": [{"id": "broken"}]}
   db.commit()
 
   damaged = client.get(f"/api/chats/{chat_id}/goal-plan", headers=auth).json()
   assert damaged["plan"] is None and damaged["plan_unreadable"] is True
-  repaired = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": damaged["goal"]["revision"], "tasks": tasks},
-    headers=auth,
+  db.refresh(goal)
+  repaired = replace_plan(
+    db, physical=run, root=goal,
+    expected_revision=damaged["goal"]["revision"], tasks=tasks,
   )
-  assert repaired.status_code == 200, repaired.text
+  assert repaired["revision"] == 2
   after = client.get(f"/api/chats/{chat_id}/goal-plan", headers=auth).json()
   assert after["plan"]["revision"] == 2 and after["plan_unreadable"] is False
 
 def test_repeated_task_needs_full_progress_and_stale_revision_cannot_overwrite(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={
-      "expected_revision": 0,
-      "tasks": [{
-        "id": "repeat",
-        "title": "Run the audit three times",
-        "status": "running",
-        "depends_on": [],
-        "progress": {"current": 0, "total": 3},
-      }],
-    },
-    headers=auth,
-  )
+  from app.goal_plans import GoalPlanConflict, replace_plan
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [{
+    "id": "repeat",
+    "title": "Run the audit three times",
+    "status": "running",
+    "depends_on": [],
+    "progress": {"current": 0, "total": 3},
+  }]})
   assert created.status_code == 200, created.text
 
-  partial = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/repeat",
-    json={"expected_revision": 1, "progress": {"current": 2, "total": 3}},
-    headers=auth,
-  )
+  partial = _update(client, db, chat_id, {
+    "tasks": [{"id": "repeat", "progress": {"current": 2, "total": 3}}]})
   assert partial.status_code == 200, partial.text
-  not_done = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/repeat",
-    json={"expected_revision": 2, "status": "completed"}, headers=auth,
-  )
+  not_done = _update(client, db, chat_id, {
+    "tasks": [{"id": "repeat", "status": "completed"}]})
   assert not_done.status_code == 422
   # A typed refusal: the client names its own one-call fix from the facts.
   assert not_done.json()["detail"] == {
@@ -1115,18 +1004,18 @@ def test_repeated_task_needs_full_progress_and_stale_revision_cannot_overwrite(
     "total": 3, "message": "repeat cannot complete at 2/3 progress",
   }
 
-  stale = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/repeat",
-    json={"expected_revision": 1, "note": "stale writer"}, headers=auth,
-  )
-  assert stale.status_code == 409
+  # A stale writer cannot overwrite a newer revision; CAS lives in replace_plan.
+  run = db.get(models.ChatRun, "goal-root")
+  goal = db.get(models.ChatGoal, "goal-1")
+  db.refresh(goal)
+  with pytest.raises(GoalPlanConflict):
+    replace_plan(db, physical=run, root=goal, expected_revision=1, tasks=[{
+      "id": "repeat", "title": "Stale", "status": "running",
+      "progress": {"current": 1, "total": 3},
+    }])
 
-  completed = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/repeat",
-    json={"expected_revision": 2, "progress": {"current": 3, "total": 3},
-          "status": "completed"},
-    headers=auth,
-  )
+  completed = _update(client, db, chat_id, {"tasks": [{
+    "id": "repeat", "progress": {"current": 3, "total": 3}, "status": "completed"}]})
   assert completed.status_code == 200, completed.text
   assert completed.json()["plan"]["summary"]["completed"] == 1
   assert completed.json()["plan"]["summary"]["can_complete"] is True
@@ -1136,18 +1025,11 @@ def test_repeated_task_needs_full_progress_and_stale_revision_cannot_overwrite(
 def test_cancelled_work_is_removed_from_the_completion_route(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={
-      "expected_revision": 0,
-      "tasks": [
-        {"id": "done", "title": "Required work", "status": "completed"},
-        {"id": "removed", "title": "No longer needed", "status": "cancelled"},
-      ],
-    },
-    headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [
+    {"id": "done", "title": "Required work", "status": "completed"},
+    {"id": "removed", "title": "No longer needed", "status": "cancelled"},
+  ]})
   assert created.status_code == 200, created.text
   summary = created.json()["plan"]["summary"]
   assert summary["can_complete"] is True
@@ -1157,35 +1039,24 @@ def test_cancelled_work_is_removed_from_the_completion_route(
 def test_nested_children_settle_before_parent_becomes_ready_to_verify(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [
-      {"id": "b", "title": "Deliver B", "status": "running"},
-      {"id": "x", "title": "Do X", "parent_id": "b"},
-      {"id": "y", "title": "Do Y", "parent_id": "b"},
-    ]}, headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [
+    {"id": "b", "title": "Deliver B", "status": "running"},
+    {"id": "x", "title": "Do X", "parent_id": "b"},
+    {"id": "y", "title": "Do Y", "parent_id": "b"},
+  ]})
   assert created.status_code == 200, created.text
-  revision = 1
-  for task_id, status in (("x", "completed"), ("y", "completed")):
-    response = client.patch(
-      f"/api/chats/{chat_id}/goal-plan/tasks/{task_id}",
-      json={"expected_revision": revision, "status": status}, headers=auth,
-    )
+  for task_id in ("x", "y"):
+    response = _update(client, db, chat_id, {"tasks": [{"id": task_id, "status": "completed"}]})
     assert response.status_code == 200, response.text
-    revision += 1
   tasks = {task["id"]: task for task in response.json()["plan"]["tasks"]}
   assert tasks["b"]["children"] == ["x", "y"]
   assert tasks["b"]["ready_to_verify"] is True
 
-  incomplete_parent = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": revision, "tasks": [
-      {"id": "b", "title": "Deliver B", "status": "completed"},
-      {"id": "x", "title": "Do X", "parent_id": "b"},
-    ]}, headers=auth,
-  )
+  incomplete_parent = _update(client, db, chat_id, {"tasks": [
+    {"id": "b", "status": "completed"},
+    {"id": "x", "status": "pending"},
+  ]})
   assert incomplete_parent.status_code == 422
   assert "children settle" in incomplete_parent.json()["detail"]["message"]
 
@@ -1193,15 +1064,12 @@ def test_nested_children_settle_before_parent_becomes_ready_to_verify(
 def test_nested_plan_exposes_ready_sibling_leaves_not_their_parent(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [
-      {"id": "parent", "title": "Coordinate the work"},
-      {"id": "left", "title": "Independent left", "parent_id": "parent"},
-      {"id": "right", "title": "Independent right", "parent_id": "parent"},
-    ]}, headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [
+    {"id": "parent", "title": "Coordinate the work"},
+    {"id": "left", "title": "Independent left", "parent_id": "parent"},
+    {"id": "right", "title": "Independent right", "parent_id": "parent"},
+  ]})
   assert created.status_code == 200, created.text
   plan = created.json()["plan"]
   tasks = {task["id"]: task for task in plan["tasks"]}
@@ -1213,35 +1081,26 @@ def test_nested_plan_exposes_ready_sibling_leaves_not_their_parent(
 def test_parent_dependency_gates_every_descendant_leaf(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [
-      {"id": "first", "title": "Establish the input"},
-      {
-        "id": "parent", "title": "Coordinate dependent work",
-        "depends_on": ["first"],
-      },
-      {"id": "child", "title": "Use the input", "parent_id": "parent"},
-    ]}, headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [
+    {"id": "first", "title": "Establish the input"},
+    {
+      "id": "parent", "title": "Coordinate dependent work",
+      "depends_on": ["first"],
+    },
+    {"id": "child", "title": "Use the input", "parent_id": "parent"},
+  ]})
   assert created.status_code == 200, created.text
   plan = created.json()["plan"]
   child = next(task for task in plan["tasks"] if task["id"] == "child")
   assert plan["summary"]["ready"] == ["first"]
   assert child["waiting_on"] == ["first"]
 
-  premature = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/child",
-    json={"expected_revision": 1, "status": "running"}, headers=auth,
-  )
+  premature = _update(client, db, chat_id, {"tasks": [{"id": "child", "status": "running"}]})
   assert premature.status_code == 422
   assert "dependencies complete" in premature.json()["detail"]["message"]
 
-  completed = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/first",
-    json={"expected_revision": 1, "status": "completed"}, headers=auth,
-  )
+  completed = _update(client, db, chat_id, {"tasks": [{"id": "first", "status": "completed"}]})
   assert completed.status_code == 200, completed.text
   assert completed.json()["plan"]["summary"]["ready"] == ["child"]
 
@@ -1249,38 +1108,29 @@ def test_parent_dependency_gates_every_descendant_leaf(
 def test_cancelled_dependency_releases_downstream_work(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [
-      {"id": "removed", "title": "No longer needed", "status": "cancelled"},
-      {"id": "next", "title": "Continue", "depends_on": ["removed"]},
-    ]}, headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  created = _update(client, db, chat_id, {"tasks": [
+    {"id": "removed", "title": "No longer needed", "status": "cancelled"},
+    {"id": "next", "title": "Continue", "depends_on": ["removed"]},
+  ]})
   assert created.status_code == 200, created.text
   assert created.json()["plan"]["summary"]["ready"] == ["next"]
 
-  running = client.patch(
-    f"/api/chats/{chat_id}/goal-plan/tasks/next",
-    json={"expected_revision": 1, "status": "running"}, headers=auth,
-  )
+  running = _update(client, db, chat_id, {"tasks": [{"id": "next", "status": "running"}]})
   assert running.status_code == 200, running.text
 
 
 def test_mixed_parent_dependency_cycle_is_rejected_before_it_can_deadlock(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  response = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [
-      {"id": "parent", "title": "Parent", "status": "running"},
-      {
-        "id": "child", "title": "Child", "parent_id": "parent",
-        "depends_on": ["parent"],
-      },
-    ]}, headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  response = _update(client, db, chat_id, {"tasks": [
+    {"id": "parent", "title": "Parent", "status": "running"},
+    {
+      "id": "child", "title": "Child", "parent_id": "parent",
+      "depends_on": ["parent"],
+    },
+  ]})
   assert response.status_code == 422
   assert "completion cycle" in response.json()["detail"]["message"]
 
@@ -1288,17 +1138,14 @@ def test_mixed_parent_dependency_cycle_is_rejected_before_it_can_deadlock(
 def test_failed_parent_never_masquerades_as_ready_to_verify(
   client, owner_token, db,
 ):
-  auth, chat_id = _active_goal(client, owner_token, db)
-  response = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [
-      {"id": "parent", "title": "Parent", "status": "failed"},
-      {
-        "id": "child", "title": "Child", "parent_id": "parent",
-        "status": "completed",
-      },
-    ]}, headers=auth,
-  )
+  _, chat_id = _active_goal(client, owner_token, db)
+  response = _update(client, db, chat_id, {"tasks": [
+    {"id": "parent", "title": "Parent", "status": "failed"},
+    {
+      "id": "child", "title": "Child", "parent_id": "parent",
+      "status": "completed",
+    },
+  ]})
   assert response.status_code == 200, response.text
   tasks = {task["id"]: task for task in response.json()["plan"]["tasks"]}
   assert tasks["parent"]["ready_to_verify"] is False
@@ -1308,11 +1155,7 @@ def test_plan_follows_stable_goal_identity_across_a_new_logical_run(
   client, owner_token, db,
 ):
   auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [{"id": "a", "title": "A"}]},
-    headers=auth,
-  )
+  created = _update(client, db, chat_id, {"tasks": [{"id": "a", "title": "A"}]})
   assert created.status_code == 200, created.text
   db.query(models.ChatRun).filter(models.ChatRun.id == "goal-root").update({
     models.ChatRun.status: "interrupted",
@@ -1333,13 +1176,9 @@ def test_plan_projects_recursive_delegation_ownership_without_transcripts(
   client, owner_token, db,
 ):
   auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [{
-      "id": "b", "title": "Do B", "status": "completed",
-    }]},
-    headers=auth,
-  )
+  created = _update(client, db, chat_id, {"tasks": [{
+    "id": "b", "title": "Do B", "status": "completed",
+  }]})
   assert created.status_code == 200, created.text
   app = models.App(
     slug="goal-tree-subagents", source_dir="/tmp/goal-tree-subagents",
@@ -1363,8 +1202,8 @@ def test_plan_projects_recursive_delegation_ownership_without_transcripts(
   db.add_all([
     models.Delegation(
       id="delegation-b", parent_chat_id=chat_id,
-      parent_root_run_id="goal-root", task_key="b", child_chat_id="child-b",
-      **common,
+      parent_root_run_id="goal-root", task_key="review-b", goal_task_id="b",
+      child_chat_id="child-b", **common,
     ),
     models.Delegation(
       id="delegation-x", parent_chat_id="child-b",
@@ -1383,28 +1222,27 @@ def test_plan_projects_recursive_delegation_ownership_without_transcripts(
   db.commit()
 
   plan = client.get(f"/api/chats/{chat_id}/goal-plan", headers=auth).json()["plan"]
+  # The helper is filed under task b by its recorded plan_task, not its name;
+  # while it works, b does not count as complete.
   assert plan["delegations"] == [{
-    "id": "delegation-b", "task_key": "b", "provider": "codex",
-    "status": "running", "children": [{
-      "id": "delegation-x", "task_key": "x", "provider": "codex",
-      "status": "running", "children": [],
+    "id": "delegation-b", "task_key": "review-b", "plan_task": "b",
+    "provider": "codex", "status": "running", "children": [{
+      "id": "delegation-x", "task_key": "x", "plan_task": None,
+      "provider": "codex", "status": "running", "children": [],
     }],
   }]
   assert plan["summary"]["completed"] == 0
   assert plan["summary"]["can_complete"] is False
-  assert plan["summary"]["completion_blockers"] == ["b", "x"]
+  assert plan["summary"]["completion_blockers"] == ["review-b", "x"]
 
 
 def test_resumed_goal_projects_only_latest_delegation_attempt_per_task(
   client, owner_token, db,
 ):
   auth, chat_id = _active_goal(client, owner_token, db)
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [{
-      "id": "audit", "title": "Audit", "status": "completed",
-    }]}, headers=auth,
-  )
+  created = _update(client, db, chat_id, {"tasks": [{
+    "id": "audit", "title": "Audit", "status": "completed",
+  }]})
   assert created.status_code == 200, created.text
   app = models.App(
     slug="goal-retry-subagents", source_dir="/tmp/goal-retry-subagents",
@@ -1434,13 +1272,13 @@ def test_resumed_goal_projects_only_latest_delegation_attempt_per_task(
     ),
     models.Delegation(
       id="old-attempt", parent_chat_id=chat_id,
-      parent_root_run_id="goal-root", task_key="audit",
+      parent_root_run_id="goal-root", task_key="audit", goal_task_id="audit",
       child_chat_id=old_child.id, created_at=now - timedelta(minutes=1),
       **common,
     ),
     models.Delegation(
       id="new-attempt", parent_chat_id=chat_id,
-      parent_root_run_id="resumed-goal-run", task_key="audit",
+      parent_root_run_id="resumed-goal-run", task_key="audit", goal_task_id="audit",
       child_chat_id=new_child.id, created_at=now,
       **common,
     ),
@@ -1461,256 +1299,23 @@ def test_resumed_goal_projects_only_latest_delegation_attempt_per_task(
   assert plan["summary"]["completion_blockers"] == ["audit"]
 
 
-def test_completion_preflight_names_only_unfinished_required_work():
-  helper = _goal_plan_script()
-  plan = {
-    "tasks": [
-      {"id": "done", "title": "Finished", "status": "completed"},
-      {"id": "removed", "title": "Removed", "status": "cancelled"},
-      {"id": "next", "title": "Run final audit", "status": "pending"},
-      {"id": "blocked", "title": "Resolve blocker", "status": "blocked"},
-    ],
-  }
-  assert helper._completion_blockers(None) == []
-  assert helper._completion_blockers(plan) == [
-    "Run final audit", "Resolve blocker",
-  ]
-  plan["summary"] = {"completion_blockers": ["next", "live-child"]}
-  assert helper._completion_blockers(plan) == [
-    "Run final audit", "live-child",
-  ]
-
-
-def test_goal_plan_write_attaches_presented_goal_and_refetches_revision(
-  monkeypatch, capsys,
-):
-  helper = _goal_plan_script()
-  calls = []
-
-  def request(method, path, body=None):
-    calls.append((method, path, body))
-    if len(calls) == 1:
-      return {
-        "goal": {"id": "goal-1", "revision": 4, "status": "open"},
-        "plan": {"revision": 4},
-      }
-    if len(calls) == 2:
-      return {"state": "promoted"}
-    if len(calls) == 3:
-      return {
-        "goal": {"id": "goal-1", "revision": 5, "status": "open"},
-        "plan": {"revision": 5},
-      }
-    return {
-      "plan": {
-        "revision": 6,
-        "summary": {"completed": 0, "total": 1},
-      },
-    }
-
-  monkeypatch.setattr(helper, "_request", request)
-  monkeypatch.setenv("API_BASE_URL", "http://mobius.test")
-  monkeypatch.setenv("AGENT_TOKEN", "agent-token")
-  monkeypatch.setenv("CHAT_ID", "chat-1")
-  monkeypatch.setattr(
-    helper.sys, "argv",
-    ["goal-plan", "update", "review", "--status", "running"],
-  )
-
-  assert helper.main() == 0
-  assert calls == [
-    ("GET", "/api/chats/chat-1/goal-plan", None),
-    ("POST", "/api/chats/chat-1/goal/resume", {"goal_id": "goal-1"}),
-    ("GET", "/api/chats/chat-1/goal-plan", None),
-    (
-      "PATCH", "/api/chats/chat-1/goal-plan/tasks/review",
-      {"status": "running", "expected_revision": 5},
-    ),
-  ]
-  assert "Goal plan revision 6" in capsys.readouterr().out
-
-
-def test_goal_checkpoint_attaches_presented_goal_and_uses_refetched_revision(
-  monkeypatch,
-):
-  helper = _goal_plan_script()
-  calls = []
-
-  def request(method, path, body=None):
-    calls.append((method, path, body))
-    if len(calls) == 1:
-      return {
-        "goal": {"id": "goal-1", "revision": 4, "status": "open"},
-        "plan": {"revision": 4},
-      }
-    if len(calls) == 2:
-      return {"state": "promoted"}
-    if len(calls) == 3:
-      return {
-        "goal": {"id": "goal-1", "revision": 5, "status": "open"},
-        "plan": {"revision": 5},
-      }
-    return {"goal": {"id": "goal-1", "revision": 6, "status": "open"}}
-
-  monkeypatch.setattr(helper, "_request", request)
-  monkeypatch.setenv("API_BASE_URL", "http://mobius.test")
-  monkeypatch.setenv("AGENT_TOKEN", "agent-token")
-  monkeypatch.setenv("CHAT_ID", "chat-1")
-  monkeypatch.setattr(
-    helper.sys, "argv",
-    [
-      "goal-plan", "checkpoint", "--summary", "Reviewed current state",
-      "--next-action", "Run verification",
-    ],
-  )
-
-  assert helper.main() == 0
-  assert calls == [
-    ("GET", "/api/chats/chat-1/goal-plan", None),
-    ("POST", "/api/chats/chat-1/goal/resume", {"goal_id": "goal-1"}),
-    ("GET", "/api/chats/chat-1/goal-plan", None),
-    (
-      "PATCH", "/api/chats/chat-1/goal",
-      {
-        "goal_id": "goal-1", "expected_revision": 5,
-        "checkpoint": "Reviewed current state",
-        "next_action": "Run verification",
-      },
-    ),
-  ]
-
-
-def test_goal_plan_read_does_not_attach_presented_goal(monkeypatch, capsys):
-  helper = _goal_plan_script()
-  calls = []
-
-  def request(method, path, body=None):
-    calls.append((method, path, body))
-    return {
-      "goal": {"id": "goal-1", "revision": 4, "status": "open"},
-      "plan": {"revision": 4, "tasks": []},
-    }
-
-  monkeypatch.setattr(helper, "_request", request)
-  monkeypatch.setenv("API_BASE_URL", "http://mobius.test")
-  monkeypatch.setenv("AGENT_TOKEN", "agent-token")
-  monkeypatch.setenv("CHAT_ID", "chat-1")
-  monkeypatch.setattr(helper.sys, "argv", ["goal-plan", "show"])
-
-  assert helper.main() == 0
-  assert calls == [("GET", "/api/chats/chat-1/goal-plan", None)]
-  assert '"revision": 4' in capsys.readouterr().out
-
-
-def test_goal_plan_write_aborts_when_presented_goal_changes(monkeypatch):
-  helper = _goal_plan_script()
-  calls = []
-
-  def request(method, path, body=None):
-    calls.append((method, path, body))
-    if len(calls) == 1:
-      return {
-        "goal": {"id": "goal-1", "revision": 4, "status": "open"},
-        "plan": {"revision": 4},
-      }
-    if len(calls) == 2:
-      return {"state": "promoted"}
-    return {
-      "goal": {"id": "goal-2", "revision": 1, "status": "open"},
-      "plan": {"revision": 1},
-    }
-
-  monkeypatch.setattr(helper, "_request", request)
-  monkeypatch.setenv("API_BASE_URL", "http://mobius.test")
-  monkeypatch.setenv("AGENT_TOKEN", "agent-token")
-  monkeypatch.setenv("CHAT_ID", "chat-1")
-  monkeypatch.setattr(
-    helper.sys, "argv",
-    ["goal-plan", "update", "review", "--status", "running"],
-  )
-
-  with pytest.raises(
-    SystemExit,
-    match="The presented Goal changed while this attempt attached to it.",
-  ):
-    helper.main()
-  assert calls == [
-    ("GET", "/api/chats/chat-1/goal-plan", None),
-    ("POST", "/api/chats/chat-1/goal/resume", {"goal_id": "goal-1"}),
-    ("GET", "/api/chats/chat-1/goal-plan", None),
-  ]
-
-
-@pytest.mark.parametrize("task_status", ["pending", "completed"])
-def test_cli_completion_validates_and_records_outcome_without_preflight(
-  client, owner_token, db, monkeypatch, capsys, task_status,
-):
-  import sys
-
-  auth, chat_id = _active_goal(client, owner_token, db)
-  saved = client.put(
-    f"/api/chats/{chat_id}/goal-plan", headers=auth,
-    json={"expected_revision": 0, "tasks": [
-      {"id": "verify", "title": "Verify release", "status": task_status},
-    ]},
-  )
-  assert saved.status_code == 200, saved.text
-  agent_auth = _agent_run_auth(db, chat_id, "goal-root")
-  helper = _goal_plan_script()
-
-  def request(method, path, body=None):
-    response = client.request(method, path, json=body, headers=agent_auth)
-    if response.status_code >= 400:
-      raise SystemExit(response.json()["detail"])
-    return response.json()
-
-  monkeypatch.setattr(helper, "_request", request)
-  monkeypatch.setattr(helper, "_settings", lambda: ("unused", "unused", chat_id))
-  monkeypatch.setattr(sys, "argv", ["goal_plan.py", "complete", "--result", "Verified release"])
-  if task_status == "pending":
-    with pytest.raises(SystemExit, match="unfinished tasks"):
-      helper.main()
-  else:
-    assert helper.main() == 0
-    assert '"status": "completed"' in capsys.readouterr().out
-  db.expire_all()
-  goal = db.get(models.ChatGoal, "goal-1")
-  assert goal.status == ("completed" if task_status == "completed" else "open")
-  assert goal.result == ("Verified release" if task_status == "completed" else None)
-
-
-def test_plan_rejects_cycles_missing_dependencies_and_non_goal_runs(
+def test_plan_rejects_cycles_missing_dependencies_and_settled_attempt_writes(
   client, owner_token, db,
 ):
   auth, chat_id = _active_goal(client, owner_token, db)
-  cycle = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={
-      "expected_revision": 0,
-      "tasks": [
-        {"id": "a", "title": "A", "depends_on": ["b"]},
-        {"id": "b", "title": "B", "depends_on": ["a"]},
-      ],
-    }, headers=auth,
-  )
+  cycle = _update(client, db, chat_id, {"tasks": [
+    {"id": "a", "title": "A", "depends_on": ["b"]},
+    {"id": "b", "title": "B", "depends_on": ["a"]},
+  ]})
   assert cycle.status_code == 422
   assert "cycle" in cycle.json()["detail"]["message"]
 
-  missing = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={
-      "expected_revision": 0,
-      "tasks": [{"id": "a", "title": "A", "depends_on": ["gone"]}],
-    }, headers=auth,
-  )
+  missing = _update(client, db, chat_id, {"tasks": [
+    {"id": "a", "title": "A", "depends_on": ["gone"]}]})
   assert missing.status_code == 422
   assert "missing task" in missing.json()["detail"]["message"]
 
-  created = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [{"id": "a", "title": "A"}]},
-    headers=auth,
-  )
+  created = _update(client, db, chat_id, {"tasks": [{"id": "a", "title": "A"}]})
   assert created.status_code == 200
 
   db.query(models.ChatRun).filter(models.ChatRun.id == "goal-root").update({
@@ -1720,9 +1325,86 @@ def test_plan_rejects_cycles_missing_dependencies_and_non_goal_runs(
   inactive = client.get(f"/api/chats/{chat_id}/goal-plan", headers=auth)
   assert inactive.status_code == 200
   assert inactive.json()["plan"]["summary"]["can_complete"] is False
-  rejected = client.put(
-    f"/api/chats/{chat_id}/goal-plan",
-    json={"expected_revision": 0, "tasks": [{"id": "a", "title": "A"}]},
-    headers=auth,
-  )
-  assert rejected.status_code == 409
+  # The saved attempt's token is now inert: it can no longer write the plan.
+  rejected = _update(client, db, chat_id, {"tasks": [{"id": "a", "title": "A"}]})
+  assert rejected.status_code == 401
+  assert "no longer active" in rejected.json()["detail"]
+
+
+def _plan_with(client, db, chat_id, tasks):
+  created = _update(client, db, chat_id, {"tasks": tasks})
+  assert created.status_code == 200, created.text
+
+
+def test_new_helper_files_under_the_single_running_task_not_by_name(
+  client, owner_token, db,
+):
+  """A helper joins the plan's current focus whatever it is named."""
+  from app.goal_plans import helper_plan_task
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  _plan_with(client, db, chat_id, [
+    {"id": "r1", "title": "Round one", "status": "completed"},
+    {"id": "r2", "title": "Round two", "status": "running", "depends_on": ["r1"]},
+    {"id": "report", "title": "Report", "depends_on": ["r2"]},
+  ])
+  db.expire_all()
+  assert helper_plan_task(db, chat_id, None) == "r2"
+  assert helper_plan_task(db, chat_id, "report") == "report"
+
+
+def test_helper_plan_task_refusal_lists_the_real_task_ids(client, owner_token, db):
+  from app.goal_plans import GoalPlanError, helper_plan_task
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  _plan_with(client, db, chat_id, [{"id": "r2", "title": "Round two"}])
+  db.expire_all()
+  with pytest.raises(GoalPlanError, match="plan tasks: r2"):
+    helper_plan_task(db, chat_id, "round-2")
+
+
+def test_helper_stays_unfiled_when_several_leaves_are_running(
+  client, owner_token, db,
+):
+  """With parallel focus the platform does not guess; plan_task decides."""
+  from app.goal_plans import helper_plan_task
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  _plan_with(client, db, chat_id, [
+    {"id": "a", "title": "A", "status": "running"},
+    {"id": "b", "title": "B", "status": "running"},
+    {"id": "p", "title": "Parent", "status": "running"},
+    {"id": "p1", "title": "Child", "status": "running", "parent_id": "p"},
+  ])
+  db.expire_all()
+  assert helper_plan_task(db, chat_id, None) is None
+
+
+def test_running_parent_defers_to_its_running_child_leaf(client, owner_token, db):
+  from app.goal_plans import helper_plan_task
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  _plan_with(client, db, chat_id, [
+    {"id": "p", "title": "Parent", "status": "running"},
+    {"id": "p1", "title": "Child", "status": "running", "parent_id": "p"},
+  ])
+  db.expire_all()
+  assert helper_plan_task(db, chat_id, None) == "p1"
+
+
+def test_helper_without_a_goal_is_unfiled_and_cannot_name_a_task(db):
+  from app.goal_plans import GoalPlanError, helper_plan_task
+
+  db.add(models.Chat(id="plain-chat", title="Plain", messages=[]))
+  db.commit()
+  assert helper_plan_task(db, "plain-chat", None) is None
+  with pytest.raises(GoalPlanError, match="no active Goal plan"):
+    helper_plan_task(db, "plain-chat", "r2")
+
+
+def test_a_task_note_may_run_to_a_thousand_characters():
+  from app.goal_plans import GoalPlanError, normalize_tasks
+
+  assert normalize_tasks([{"id": "a", "title": "A", "note": "n" * 1000}])[0]["note"] == "n" * 1000
+  with pytest.raises(GoalPlanError, match="at most 1000 characters"):
+    normalize_tasks([{"id": "a", "title": "A", "note": "n" * 1001}])

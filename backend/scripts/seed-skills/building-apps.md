@@ -222,8 +222,7 @@ imports `index.jsx`):
 ### Deleting an app — reversible for 7 days
 
 ```bash
-python "$SCRIPTS_DIR/list_apps.py" --name "<exact display name>"
-python "$SCRIPTS_DIR/delete_app.py" <id> --confirm
+python "$SCRIPTS_DIR/delete_app.py" <id> --confirm   # id from list_apps name: "<exact display name>"
 ```
 
 Delete is a **soft delete**: the app is tombstoned and its saved data is kept for
@@ -264,6 +263,15 @@ manifest, layered by how always-on they are:
   always-relevant default the agent should carry without being asked, and keep
   it tight — it costs tokens on every session. Memory ships `memory-core.md`;
   Pages ships `pages-core.md`. Max 256 KB.
+- **Agent tools (callable by every agent run, while installed).** `"tools"`:
+  up to 16 entries of exactly `name` (`^[a-z][a-z0-9_]{0,39}$`),
+  `description`, and `input_schema` (a JSON Schema `object`). Requires a
+  `service`: agents see `<app slug>_<name>`, and each call reaches the service
+  as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
+  app's own authority (`backend/app/app_tools.py`). Helpers get the tools too:
+  the request's `actor` has `delegated: true` for a helper and
+  `access: "read"` for a read-only one, so refuse any change for a read-only
+  caller. Keep tools few.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then
@@ -299,10 +307,15 @@ MOBIUS_APP_ACTIVITY_V1:{"activity_id":"lookup","status":"succeeded","label":"Fou
 `status` is `succeeded`, `empty`, or `failed`; `label` is required. `detail`,
 `warning`, and up to 128 `resources` are optional. A resource needs `label` and
 may add `summary` plus an app-owned `intent`; the shell opens that intent only
-inside the authenticated declaring app. Extra receipt fields remain ordinary
-command output for the agent and are ignored by the shell, so a retrieval app
-can carry its own cursors, page metadata, and protocol without teaching the
-platform any of those concepts. Keep the receipt bounded and print it last.
+inside the authenticated declaring app. An app that pages one operation across
+several calls (to fit a provider's tool-output limit) gives each page's receipt
+the same optional `operation_key` (up to 160 letters, digits, `.`, `_`, `:` or
+`-`). The chat folds that app's receipts sharing a key within one answer into
+the first call's row, showing the latest status and wording with every page's
+resources. Other receipt fields remain ordinary command output for the agent
+and are ignored by the shell, so a retrieval app can carry its own cursors,
+page metadata, and protocol without teaching the platform any of those
+concepts. Keep the receipt bounded and print it last.
 
 ---
 

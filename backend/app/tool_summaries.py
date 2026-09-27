@@ -13,6 +13,11 @@ def summarize_tool_input(tool: str, inp: dict[str, Any]) -> str:
   """Returns a short human-readable summary of a tool's input."""
   if not isinstance(inp, dict):
     return str(inp)[:200] if inp else ""
+  helper_tool = _mobius_helper_tool(tool)
+  if helper_tool == "spawn_agent":
+    return str(inp.get("name") or "")[:120]
+  if helper_tool is not None:
+    return str(inp.get("helper") or "")[:120]
   if tool == "Bash":
     return inp.get("command", "")
   if tool == "shell":
@@ -64,7 +69,25 @@ def summarize_tool_input(tool: str, inp: dict[str, Any]) -> str:
       return f"{len(plan)} step(s)"
     return ""
   if inp:
+    # Each value is clipped visibly so a reader (and the shell's row title)
+    # never mistakes a cut value for the whole one.
     return ", ".join(
-      f"{k}={str(v)[:40]}" for k, v in inp.items()
+      f"{k}={_clip(str(v), 60)}" for k, v in inp.items()
     )[:200]
   return ""
+
+
+def _clip(text: str, limit: int) -> str:
+  return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+_HELPER_TOOLS = frozenset({"spawn_agent", "message_agent", "stop_agent", "list_agents"})
+
+
+def _mobius_helper_tool(tool: str) -> str | None:
+  """The bare Möbius helper tool name, as Claude or Codex reports it."""
+  for prefix in ("mcp__mobius_control__", "mobius_control:"):
+    if isinstance(tool, str) and tool.startswith(prefix):
+      bare = tool[len(prefix):]
+      return bare if bare in _HELPER_TOOLS else None
+  return None

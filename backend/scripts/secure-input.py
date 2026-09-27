@@ -106,7 +106,9 @@ def _submit_saved(args) -> int:
     values.clear()
 
 
-def _request_saved(spec: dict, command: list[str], action: str) -> dict:
+def _request_saved(
+  spec: dict, command: list[str], action: str, cwd: str | None = None,
+) -> dict:
   """Commit a sealed request, without retaining a waiting helper or values."""
   base = os.environ.get("API_BASE_URL", "").rstrip("/")
   token = os.environ.get("AGENT_TOKEN", "")
@@ -117,7 +119,7 @@ def _request_saved(spec: dict, command: list[str], action: str) -> dict:
     raise RuntimeError("A sealed consumer command is required.")
   status, receipt = _post(
     f"{base}/api/secure-inputs/{chat_id}/saved",
-    {**spec, "command": command, "cwd": os.getcwd(), "action": action}, token,
+    {**spec, "command": command, "cwd": cwd or os.getcwd(), "action": action}, token,
   )
   if status >= 300:
     raise RuntimeError("Could not save secure input; no values were requested. Retry the identical request.")
@@ -192,6 +194,23 @@ def _owner_credentials_consumer() -> list[str]:
   ]
 
 
+# The sign-in change card; the request_secret control tool offers the same one.
+OWNER_CREDENTIALS_SPEC = {
+  "mode": "sealed",
+  "title": "Update sign-in",
+  "description": (
+    "Values go directly to a local credential updater and are not sent to "
+    "the AI provider."
+  ),
+  "fields": [
+    {"name": "current_password", "type": "password", "label": "Current password", "autocomplete": "current-password"},
+    {"name": "new_username", "type": "text", "label": "New username", "autocomplete": "username"},
+    {"name": "new_password", "type": "password", "label": "New password", "autocomplete": "new-password"},
+    {"name": "confirm_password", "type": "password", "label": "Confirm new password", "autocomplete": "new-password"},
+  ],
+}
+
+
 def main() -> int:
   parser = argparse.ArgumentParser(
     description="Request secure input without adding values to model context.",
@@ -199,21 +218,7 @@ def main() -> int:
   sub = parser.add_subparsers(dest="action", required=True)
 
   owner = sub.add_parser("owner-credentials")
-  owner.set_defaults(
-    mode="sealed",
-    title="Update sign-in",
-    description=(
-      "Values go directly to a local credential updater and are not sent to "
-      "the AI provider."
-    ),
-    fields=[
-      {"name": "current_password", "type": "password", "label": "Current password", "autocomplete": "current-password"},
-      {"name": "new_username", "type": "text", "label": "New username", "autocomplete": "username"},
-      {"name": "new_password", "type": "password", "label": "New password", "autocomplete": "new-password"},
-      {"name": "confirm_password", "type": "password", "label": "Confirm new password", "autocomplete": "new-password"},
-    ],
-    command=_owner_credentials_consumer(),
-  )
+  owner.set_defaults(**OWNER_CREDENTIALS_SPEC, command=_owner_credentials_consumer())
 
   run = sub.add_parser("run")
   run.add_argument("--title", required=True)

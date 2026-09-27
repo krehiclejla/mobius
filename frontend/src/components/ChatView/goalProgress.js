@@ -76,20 +76,17 @@ function isContinue(text) {
 const GOAL_PRESENTATION_STATUSES = new Set([
   'active', 'paused', 'completed', 'failed',
 ])
-const GOAL_WAIT_KINDS = new Set(['owner_question', 'monitor'])
 
 /** Normalize the durable Goal presentation shared by detail/runtime reads. */
 export function normalizeGoalPresentation(goal) {
   if (!goal || typeof goal !== 'object') return null
   const objective = compactGoalObjective(goal.objective)
   if (!objective || !GOAL_PRESENTATION_STATUSES.has(goal.status)) return null
-  const waitKind = GOAL_WAIT_KINDS.has(goal.wait_kind) ? goal.wait_kind : null
   return {
     id: goal.id == null ? null : String(goal.id),
     objective,
     status: goal.status,
     resumable: goal.status === 'paused',
-    ...(waitKind ? { wait_kind: waitKind } : {}),
   }
 }
 
@@ -205,16 +202,16 @@ function progressLabel(task) {
   return task?.title || ''
 }
 
-/** Present the live execution owner rather than a stale optimistic task state. */
-export function goalTaskDisplayStatus(task, execution) {
-  if (!execution || execution.status === 'completed') return task?.status
-  if (['starting', 'running', 'resuming', 'paused'].includes(execution.status)) {
-    return 'running'
-  }
-  if (['failed', 'needs_review', 'interrupted'].includes(execution.status)) {
-    return 'failed'
-  }
-  return execution.status
+/**
+ * A task with a helper still working shows as running, whatever it was marked;
+ * otherwise the task's own status stands. A failed helper shows on its own row
+ * beneath the task, since another helper may already have redone its work.
+ */
+export function goalTaskDisplayStatus(task, helpers = []) {
+  const active = ['starting', 'running', 'resuming', 'paused']
+  return helpers.some(helper => active.includes(helper?.status))
+    ? 'running'
+    : task?.status
 }
 
 function deepestPlanTasks(tasks, candidates) {
@@ -280,22 +277,17 @@ export function progressRailViewModel(
     const planned = Number.isInteger(completed) && Number.isInteger(total)
     const activeTasks = visibleGoalTasks(goalPlan)
     const activeLabels = activeTasks.map(progressLabel).filter(Boolean)
-    // The Goal lifecycle tells us whether the outcome is active; the chat
-    // interaction tells us who owns the next move. Keep that distinction in
-    // one existing rail instead of inventing a second persistent status card.
+    // The Goal lifecycle says only whether a turn is working on it. Who moves
+    // next comes from the chat itself: an open card, or a Wait/helper that
+    // will resume it. Anything else idle is simply the owner's turn.
     const ownerActionRequired = waitState?.ownerActionRequired === true
-    const monitoring = !ownerActionRequired && waitState?.monitoring === true
-    const displayStatus = ownerActionRequired
-      ? 'waiting for you'
-      : monitoring
-        ? 'monitoring'
-        : actionable.status
+    const waiting = !ownerActionRequired && waitState?.monitoring === true
     const statusLabel = ownerActionRequired
-      ? 'Waiting for you'
-      : monitoring
-        ? 'Monitoring'
+      ? 'Needs your answer'
+      : waiting
+        ? 'Waiting'
         : {
-            paused: 'Paused',
+            paused: 'Your turn',
             completed: 'Completed',
             failed: 'Needs attention',
           }[actionable.status]
@@ -311,7 +303,7 @@ export function progressRailViewModel(
       tone: actionable.status,
       ...(goalPlan ? {
         title: `Goal: ${goalObjective}`,
-        ariaLabel: `Goal ${displayStatus} for ${goalObjective}; ${completed} of ${total} complete`,
+        ariaLabel: `Goal: ${goalObjective}. ${statusLabel || 'Working'}; ${completed} of ${total} complete`,
       } : {}),
     })
   }

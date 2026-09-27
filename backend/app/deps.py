@@ -763,6 +763,32 @@ def get_current_owner_for_lifecycle_control(
   return owner
 
 
+def get_owner_or_delegated_owner_for_app_token(
+  principal: Principal = Depends(get_principal),
+) -> Principal:
+  """Resolve a top-level OR delegated owner bearer for app-frame token minting.
+
+  Minting a mini-app frame token is NOT an owner-confirmed lifecycle control:
+  the returned token is strictly NARROWER than the owner bearer the caller
+  already presents (scoped to one app), and a delegated helper can already read
+  that app's frame/module/storage with its owner-scoped bearer. So a delegated
+  child is admitted here — unlike ``get_current_owner_for_lifecycle_control`` —
+  but the caller MUST forward ``principal.delegation_id``/``principal.chat_id``
+  into ``auth.create_app_token`` so the down-scoped token stays a delegated
+  bearer. Without that lineage a child could launder its inherited access into a
+  CLEAN app credential and bypass the delegation boundary that
+  ``require_nondelegated_owner_or_app_control`` enforces at secrets/connectors
+  (see routes/auth.py module docstring). App-scoped and embed bearers are still
+  refused here: only an owner (delegated or not) may mint.
+  """
+  if principal.scope != "owner" or principal.app_id is not None:
+    raise HTTPException(
+      status_code=403,
+      detail="Only an owner token can mint an app token.",
+    )
+  return principal
+
+
 def is_owner_input_principal(principal: Principal) -> bool:
   """Whether this principal represents direct human/browser owner input."""
   if principal.scope == "chat_embed" and principal.delegation_id is None:

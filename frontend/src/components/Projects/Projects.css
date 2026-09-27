@@ -1366,7 +1366,7 @@ button.project-finder__change:hover { color: var(--text); background: var(--surf
 .project-finder__view-switch { display: flex; flex: 0 0 auto; gap: 4px; padding: 4px 10px; border-bottom: 1px solid var(--border-light); }
 .project-finder__view-switch button { min-height: 36px; padding: 6px 12px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }
 .project-finder__view-switch button:hover { color: var(--text); background: var(--surface); }
-.project-finder__view-switch button[aria-pressed="true"] { color: var(--text); background: var(--surface2); }
+.project-finder__view-switch button[aria-pressed="true"] { color: var(--text); background: var(--surface-2); }
 .project-file-diff { flex: 1; min-width: 0; overflow: auto; padding: 12px; }
 .project-file-diff > p { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .project-artifacts__app-icon { width: 32px; height: 32px; border-radius: 8px; font-size: 13px; }

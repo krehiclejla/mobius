@@ -160,25 +160,6 @@ def test_deleted_follower_cannot_suppress_live_follower_notification(db):
   assert finished.interested_chat_ids == [live.id]
 
 
-def test_exact_action_claim_never_masquerades_as_whole_goal_handoff(db):
-  from app.goal_plans import goal_handoff_owner_kind
-
-  owner, first, second = _fixture(db)
-  first.pending_question_id = "approval-card"
-  db.commit()
-  key = "github:mobius-os/mobius:pr:1079:3134e050:merge"
-  claim_work(
-    db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first",
-    work_key=key, summary="Merge the reviewed PR",
-  )
-  claim_work(
-    db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
-    work_key=key, summary="Merge the same reviewed PR",
-  )
-
-  assert goal_handoff_owner_kind(db, second.id, "claim-goal-second") is None
-
-
 def test_deleting_owner_releases_only_unfinished_exact_action(db):
   owner, first, second = _fixture(db)
   key = "github:mobius-os/mobius:pr:1079:3134e050:merge"

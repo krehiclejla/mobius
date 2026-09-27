@@ -911,7 +911,6 @@ def test_update_pending_message_preserves_identity_order_and_attachments(
   assert edited == {
     "role": "user", "content": "after", "ts": 100, "cid": "c-edit",
     "position": 1, "attachments": [{"name": "notes.txt"}],
-    "_owner_authored": True,
   }
 
   db.refresh(c)

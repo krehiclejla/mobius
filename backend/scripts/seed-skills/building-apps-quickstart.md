@@ -55,12 +55,8 @@ improve the requested experience after the first apply.
 Read the compact live app list once and update an existing app with the same
 purpose instead of duplicating it:
 
-```bash
-python "$SCRIPTS_DIR/list_apps.py"
-```
-
-Use this helper instead of rebuilding a `curl | python` quoting pipeline or
-printing the full capability payload.
+Call the `list_apps` tool. It returns compact identities; do not rebuild a
+`curl | python` pipeline or print the full capability payload.
 
 Do not search GitHub or the App Store for a uniquely named personal app.
 Search the wider ecosystem only when the partner asked for something
@@ -165,21 +161,14 @@ collection membership, use `storage.listWithStatus()` and treat
 
 ### 3. Apply once early, then after each coherent revision
 
-As soon as the first slice compiles and contains one real feature:
-
-```bash
-python "$SCRIPTS_DIR/apply_app.py" /data/apps/<slug>
-```
+As soon as the first slice compiles and contains one real feature, call the
+`apply_app` tool with `source_dir: /data/apps/<slug>`.
 
 For a Store-installed app, ordinary apply deliberately accepts local UI source
 while preserving the Store-reviewed manifest, skills, permissions, schedules,
 and project templates. If—and only if—the partner explicitly chose to make the
-local package manifest authoritative for this revision, use the deliberate
-variant:
-
-```bash
-python "$SCRIPTS_DIR/apply_app.py" --accept-local-package /data/apps/<slug>
-```
+local package manifest authoritative for this revision, pass
+`accept_local_package: true`.
 
 This keeps the app's Store provenance while accepting the validated local
 runtime declarations, permissions, project templates, skills and schedules,
@@ -188,9 +177,9 @@ receipt warns that a future reviewed Store update may replace the accepted
 declarations. Never use it merely to make an ordinary source edit take effect
 or to work around a manifest/permission guard.
 
-The helper validates the manifest and complete source tree, compiles and
-commits that exact revision, returns a compact receipt with `app_id`,
-`preview_path`, and `open_path`, and emits one live-preview action tied to this
+It validates the manifest and complete source tree, compiles and commits that
+exact revision, returns a compact receipt with `app_id` and `open_path`, and
+emits one live-preview action tied to this
 building chat. That action keeps the partner's focused pane untouched. On a
 phone it leaves Standard/Builder mode and the visible screen unchanged, parking
 the app until the partner taps the preview CTA. On a larger screen it opens the
@@ -200,7 +189,7 @@ Reuse that numeric ID for preview, storage, notifications, and later actions;
 do not list apps again after a successful apply. Do not send a separate
 `open_item`.
 
-Afterward, edit source files normally and run the same command once the change
+Afterward, edit source files normally and apply again once the change
 is coherent enough to preview. Each successful apply live-swaps the already
 open app, so the partner can watch and try the build as it gains layers. For a
 material build, the first apply is a beginning rather than the closeout: keep
@@ -301,7 +290,7 @@ Run validation once:
 python "$SCRIPTS_DIR/validate-app.py" /data/apps/<slug>
 ```
 
-Do not run `git add` or `git commit`. `apply_app.py` owns every accepted source
+Do not run `git add` or `git commit`. `apply_app` owns every accepted source
 commit and leaves later edits as an unpublished draft until the next apply.
 Repository status is diagnostic: a clean tree confirms the applied revision,
 while a dirty tree means an edit still awaits apply.

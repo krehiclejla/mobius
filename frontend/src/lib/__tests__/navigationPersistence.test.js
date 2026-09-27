@@ -39,8 +39,26 @@ test('deep links preserve slug, numeric identity, and intent', () => {
   assert.deepEqual(parseShellDeepLink({
     pathname: '/shell/', search: '?chat=chat-1&focus=question',
   }), { view: 'chat', chatId: 'chat-1', intent: null, focusQuestion: true })
-  assert.equal(parseShellDeepLink({ pathname: '/app/42', search: '' }), null)
-  assert.equal(parseShellDeepLink({ pathname: '/chat/c-1', search: '' }), null)
+})
+
+test('legacy path deep links translate /app, /chat, and /settings', () => {
+  // The backend serves the shell for these bare paths (agent-screenshot.sh
+  // documents /app/<id>; the AI-provider OAuth callback redirects to /settings),
+  // so parseShellDeepLink must translate them into a boot destination in the
+  // same shape as the /shell/?app=/?chat= forms. #1119 dropped these and made
+  // /app/<id> and /settings land on the home screen.
+  assert.deepEqual(parseShellDeepLink({ pathname: '/app/118', search: '' }),
+    { view: 'canvas', app: '118', appId: 118, intent: null })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/app/pages/', search: '' }),
+    { view: 'canvas', app: 'pages', appId: null, intent: null })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/chat/c-1', search: '' }),
+    { view: 'chat', chatId: 'c-1', intent: null, focusQuestion: false })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/settings', search: '?section=ai-providers' }),
+    { view: 'settings' })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/settings/', search: '' }),
+    { view: 'settings' })
+  // A non-legacy single segment is still an ordinary empty destination.
+  assert.equal(parseShellDeepLink({ pathname: '/app', search: '' }), null)
 })
 
 test('deep links can open the Projects directory or one project', () => {

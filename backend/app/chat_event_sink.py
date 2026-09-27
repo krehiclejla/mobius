@@ -53,7 +53,9 @@ from app.agent_activity import (
   EMPTY_AGENT_ACTIVITY_BINDING,
   MAX_RESULT_SCAN_CHARS,
   AgentActivityBinding,
+  activity_from_app_tool,
   activity_from_command,
+  app_tool_result_text,
   activity_from_result,
   activity_from_task_output,
   activity_without_receipt,
@@ -398,8 +400,6 @@ class ChatEventSink:
     # the next snapshot (or the terminal finalize) appends the continuation as
     # a fresh assistant message.
     self._steering = False
-    # Fresh owner input authorizes one return to unfinished Goal work.
-    self.owner_steer_committed = False
     self._lifecycle_writes: list[tuple[RecordAgentLifecycle, object]] = []
     # Some providers stream command output but omit the final aggregate. Keep
     # only the bounded raw tail needed by protocol receipts; presentation
@@ -589,6 +589,13 @@ class ChatEventSink:
   ) -> None:
     """Attach one generic app-owned activity across the tool lifecycle."""
     if event.get("type") in ("tool_start", "tool_input"):
+      if event.get("type") == "tool_start":
+        activity = activity_from_app_tool(
+          event.get("tool"), self._agent_activity_binding,
+        )
+        if activity is not None:
+          event["app_activity"] = activity
+          return
       if event.get("type") == "tool_start" and event.get("tool") != "Bash":
         return
       # Both a tool_start AND a tool_input can arrive for one tool call on the
@@ -607,7 +614,7 @@ class ChatEventSink:
       return
     pending = self._app_activity_for_tool(event.get("tool_use_id"))
     if event.get("output_complete") and pending is not None:
-      content = (
+      content = app_tool_result_text(
         event.get("content")
         if result_content is None
         else result_content
@@ -1061,6 +1068,11 @@ class ChatEventSink:
     # live transcript surface.
     if event_type in ("tool_start", "tool_input"):
       self._stash_full_edit_diff(event)
+    if event_type in ("tool_start", "tool_input"):
+      # A helper's parent shows what the helper is doing right now. Claude
+      # names the tool on tool_start and sends its text on tool_input.
+      from app.delegations import note_helper_activity
+      note_helper_activity(self.chat_id, event.get("tool"), event.get("input"))
 
     # Contract rule 6: reduce a large tool_output to a bounded excerpt and stash
     # its full text BEFORE process_event (which copies content onto the block)
@@ -1426,9 +1438,6 @@ class ChatEventSink:
       user_msgs, consume_pending_cids,
     )
     stored_messages = stored_result["stored_messages"]
-    self.owner_steer_committed |= bool(
-      stored_result.get("owner_steer_committed", False)
-    )
     try:
       self.bc.publish(steered_into_turn_event(
         stored_messages,
@@ -1593,21 +1602,6 @@ class ChatEventSink:
       block.get("type") == "question"
       and block.get("question_id") == question_id
       and block.get("response_mode") == "continuation"
-      for block in self.assistant_blocks
-    )
-
-  def has_open_continuation_card(self) -> bool:
-    """Whether this turn already handed its next move to the owner.
-
-    QuestionCommit saves the card through the writer's session; terminal Goal
-    settlement may still hold an older Chat in its own identity map. Read the
-    same-turn handoff from its owning sink instead of that cached transcript.
-    A failed save scrubs the card before returning to the caller.
-    """
-    return any(
-      block.get("type") == "question"
-      and block.get("response_mode") == "continuation"
-      and not block.get("answers")
       for block in self.assistant_blocks
     )
 

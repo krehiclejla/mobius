@@ -1,13 +1,16 @@
-#!/usr/bin/env python3
 """Save an owner-input card and return its receipt, never wait for an answer.
 
 The saved card ends the turn: the response is cut at the card, so say
-everything before running this. See app/questions.py for the card lifecycle.
+everything before calling it. See app/questions.py for the card lifecycle.
+
+Agents call this through the Möbius control tools. When a provider cannot
+surface those tools, the one command-line fallback for every control is
+`python3 /data/platform/backend/scripts/mobius_control_mcp.py call <tool>
+--args-json '<json>'` (or `--args-json -` to read the JSON from stdin).
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from urllib.error import HTTPError, URLError
@@ -127,48 +130,3 @@ def save_card(kind: str, body: dict) -> dict:
       "Invalid owner-input card receipt; no answer or approval was granted."
     )
   return payload
-
-
-def main() -> None:
-  parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("question", nargs="?")
-  parser.add_argument(
-    "--questions-json",
-    help=(
-      "JSON array for a saved ordinary question card; question is required "
-      "and card-only id, header, and options fields have safe defaults"
-    ),
-  )
-  parser.add_argument(
-    "--restart", action="store_true",
-    help="save a platform-owned card for the exact pending server restart",
-  )
-  parser.add_argument("--option", action="append", nargs=2,
-                      metavar=("LABEL", "DESCRIPTION"))
-  parser.add_argument(
-    "--work-key", help="required stable identity for the action awaiting approval",
-  )
-  args = parser.parse_args()
-  if args.restart:
-    if args.question or args.questions_json is not None or args.option or args.work_key:
-      parser.error("--restart does not accept approval or question arguments")
-    print(json.dumps(request_restart()))
-  elif args.questions_json is not None:
-    if args.question or args.option or args.work_key:
-      parser.error("use either --questions-json or an approval question with --option")
-    try:
-      questions = json.loads(args.questions_json)
-    except ValueError:
-      parser.error("--questions-json must be a JSON array")
-    print(json.dumps(request_question(questions)))
-  else:
-    if not args.question or not args.option or not args.work_key:
-      parser.error("approval needs a question, --work-key, and --option choices")
-    print(json.dumps(request_approval(args.question, [
-      {"label": label, "description": description}
-      for label, description in args.option
-    ], work_key=args.work_key)))
-
-
-if __name__ == "__main__":
-  main()

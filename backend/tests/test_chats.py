@@ -562,6 +562,47 @@ def test_create_chat_returns_canonical_owner_drawer_summary(client, auth):
   assert body["detail"] == detail_body
 
 
+def test_chat_list_ids_refresh_returns_only_those_visible_rows(
+  client, auth, db,
+):
+  """A run event refreshes its own rows, identical to the full list's rows.
+
+  Deleted and drawer-hidden chats are absent, which tells the caller to drop
+  them; chats that were not asked for are never returned.
+  """
+  made = [
+    client.post("/api/chats", json={"title": f"Row {n}"}, headers=auth).json()["id"]
+    for n in range(4)
+  ]
+  kept, other, hidden, deleted = made
+  hidden_row = db.get(models.Chat, hidden)
+  hidden_row.agent_settings_json = {"drawer_hidden": True}
+  db.commit()
+  assert client.delete(f"/api/chats/{deleted}", headers=auth).status_code == 204
+
+  scoped = client.get(
+    "/api/chats",
+    params=[("ids", kept), ("ids", hidden), ("ids", deleted), ("ids", "missing")],
+    headers=auth,
+  )
+  assert scoped.status_code == 200
+  full = {row["id"]: row for row in client.get("/api/chats", headers=auth).json()}
+  assert scoped.json() == [full[kept]]
+  assert other in full
+
+
+def test_chat_list_ids_refresh_is_bounded(client, auth):
+  def scoped(count):
+    return client.get(
+      "/api/chats",
+      params=[("ids", f"chat-{n}") for n in range(count)],
+      headers=auth,
+    )
+
+  assert scoped(200).status_code == 200
+  assert scoped(201).status_code == 422
+
+
 def test_chat_failure_attention_is_listed_and_acknowledged_by_version(
   client, auth, db,
 ):

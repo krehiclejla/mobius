@@ -681,6 +681,53 @@ def test_run_chat_passes_merged_settings_into_claude_sdk(
   settings = captured["agent_settings"]
   assert settings["model"] == "claude-opus-4-5"
   assert settings["effort"] == "medium"
+  # spawn_agent defaults helpers to this provider, so it must be the id the
+  # Subagents app knows ("claude"), never the display name ("Claude Code").
+  assert captured["base_env"]["MOBIUS_AGENT_PROVIDER"] == "claude"
+
+
+def test_claude_receives_an_owner_goal_command_as_a_plain_request(
+  client, auth, chat, db,
+):
+  """Claude's CLI has its own /goal. Möbius owns the command, so the agent's
+  copy must never start with it: the CLI would echo the hidden context Möbius
+  appends as a visible "Goal set:" reply and arm a second goal loop."""
+  from app import chat as chat_mod, schemas
+
+  captured = {}
+
+  async def fake_runner(**kwargs):
+    captured.update(kwargs)
+    return {"session_id": "fake-session-id", "cost_usd": 0.0, "error": None}
+
+  async def _scenario():
+    from app.broadcast import create_broadcast
+
+    create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat)
+    await chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content="/goal ship the fix")],
+      chat_id=chat.id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=chat_mod.current_run_generation(chat.id),
+      run_token=run_token,
+    )
+
+  with patch(
+         "app.claude_sdk_runner.run_claude_sdk_turn",
+         side_effect=fake_runner,
+       ), \
+       patch(
+         "app.providers.ClaudeProvider.check_auth",
+         return_value=None,
+       ):
+    asyncio.run(_scenario())
+
+  prompt = captured["user_message"]
+  assert prompt.startswith("[Context — current time:")
+  assert "Goal: ship the fix" in prompt
+  assert not any(line.startswith("/goal") for line in prompt.splitlines())
 
 
 def test_patch_model_only_with_cross_provider_model_switches_provider(

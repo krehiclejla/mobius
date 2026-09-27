@@ -539,16 +539,10 @@ def test_seed_guidance_uses_literal_payload_boundaries():
   notifications = (seed / "notifications.md").read_text(encoding="utf-8")
   theming = (seed / "theming.md").read_text(encoding="utf-8")
 
-  assert "--data-binary @- <<JSON" in notifications
-  assert "--data-binary @- <<'JSON'" in notifications
-  assert "real JSON encoder" in notifications
-  assert "'\"$CHAT_ID\"'" not in notifications
-  examples = re.findall(
-    r"<<'?JSON'?\n(.*?)\nJSON", notifications, flags=re.DOTALL,
-  )
-  assert len(examples) == 3
-  for example in examples:
-    assert isinstance(json.loads(example.replace("$CHAT_ID", "chat-123")), dict)
+  # Notifications are sent through typed tools, so the skill carries no
+  # hand-built JSON whose quoting could drift.
+  assert "mapi -X POST /api/notifications/send" not in notifications
+  assert "`notify_owner`" in notifications
 
   assert "Content-Type: text/css" in theming
   assert "--data-binary @- <<'CSS'" in theming

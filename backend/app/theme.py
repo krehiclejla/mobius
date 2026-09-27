@@ -23,11 +23,16 @@ _IMPORT_RE = re.compile(
   r"""@import\s+url\(\s*['"]([^'"]+)['"]\s*\)\s*;[^\S\n]*\n?""",
 )
 
+# The secondary-surface token was renamed --surface2 -> --surface-2 with no
+# compatibility alias. `migrate_theme_surface2_token` rewrites a saved theme once
+# at boot; the lookahead matches only the exact legacy token, never a longer name.
+_LEGACY_SURFACE2_RE = re.compile(r"--surface2(?![\w-])")
+
 DEFAULT_THEME = """\
 :root {
   /* Opaque fill colors — set by many shell components as solid
      backgrounds (.shell paints --bg across the viewport, chat
-     bubbles + drawer + banners paint --surface / --surface2,
+     bubbles + drawer + banners paint --surface / --surface-2,
      borders are 1px lines on top of those surfaces). Keep these
      SOLID — making them rgba(..., <1) lets whatever sits behind
      bleed through and makes text unreadable.
@@ -37,14 +42,14 @@ DEFAULT_THEME = """\
      mode reads as a true charcoal stack rather than blue-grey. */
   --bg: #0d0d0d;
   --surface: #171717;
-  --surface2: #212121;
+  --surface-2: #212121;
   --border: #2a2a2a;
   --border-light: #1f1f1f;
 
   /* Text colors — paint on top of the opaque fills above.
        2026-05-26: --muted #6b6b76 (~3.8:1 vs --bg, failed AA)
          → #9b9b9b (~6.4:1)
-       2026-05-27: --muted #9b9b9b → #a8a8a8 (~6.1:1 on --surface2
+       2026-05-27: --muted #9b9b9b → #a8a8a8 (~6.1:1 on --surface-2
          #212121, was ~5.2:1 — comfortable AA on raised surfaces
          for the small text used in section labels and provider
          status indicators). */
@@ -241,6 +246,40 @@ def _prune_theme_snapshots(shared_dir: Path) -> None:
       pass
 
 
+def migrate_theme_surface2_token(data_dir: str) -> bool:
+  """One-time, idempotent in-place rewrite of a saved theme.css's legacy
+  --surface2 token to the standard --surface-2.
+
+  The secondary-surface token was renamed --surface2 -> --surface-2 with no
+  compatibility alias, so a theme.css saved before the rename would keep the
+  owner's custom value under a name the shell no longer reads. Boot runs this
+  before anything is served (see startup.py), so the owner's value survives.
+
+  Reads theme.css, rewrites the token word-boundary-safely
+  (`_LEGACY_SURFACE2_RE`), and — only when something
+  actually changed — snapshots the prior file first (the same recovery trail
+  the storage write path keeps) and writes the result atomically. Returns True
+  when it rewrote the file, False when there was nothing to do: missing file,
+  empty file, or already migrated. Every other byte is preserved, and it is
+  safe to run repeatedly.
+  """
+  path = Path(data_dir) / "shared" / "theme.css"
+  try:
+    content = path.read_text(encoding="utf-8")
+  except OSError:
+    # Missing file (fresh install using DEFAULT_THEME) or unreadable — nothing
+    # to migrate. Never a hard failure: the served theme is already canonical.
+    return False
+  migrated = _LEGACY_SURFACE2_RE.sub("--surface-2", content)
+  if migrated == content:
+    return False
+  from app.storage_io import atomic_write
+
+  snapshot_theme_if_present(data_dir)
+  atomic_write(path, migrated)
+  return True
+
+
 def reset_theme_override(data_dir: str) -> dict:
   """Moves /data/shared/theme.css aside so DEFAULT_THEME paints again.
 
@@ -313,7 +352,7 @@ def _is_safe_import_url(url: str) -> bool:
 #
 # Variables augmented when missing (full list lives in
 # `_CORE_VARS`):
-#   --bg, --surface, --surface2, --text, --muted,
+#   --bg, --surface, --surface-2, --text, --muted,
 #   --accent, --accent-hover, --accent-dim, --accent-fg,
 #   --border, --border-light, --danger, --green,
 #   --font, --mono
@@ -328,7 +367,7 @@ _CORE_VARS = {
   # we inject the default value so the shell never falls back to an
   # invisible-on-dark-mode hardcoded literal (e.g. `var(--fg, #111)`
   # where --fg doesn't exist).
-  "--bg", "--surface", "--surface2", "--text", "--muted",
+  "--bg", "--surface", "--surface-2", "--text", "--muted",
   "--accent", "--accent-hover", "--accent-dim", "--accent-fg",
   "--border", "--border-light", "--danger", "--green",
   "--font", "--mono",
@@ -338,7 +377,7 @@ _CORE_VARS = {
 # Light-mode defaults for the structural + status vars whose correct
 # value DEPENDS on mode. DEFAULT_THEME is the DARK palette, so filling a
 # partial LIGHT theme.css from it injected dark surfaces/borders
-# (--surface2:#212121, --border-light:#1f1f1f) appended in a cascade-
+# (--surface-2:#212121, --border-light:#1f1f1f) appended in a cascade-
 # winning :root block — "dark surfaces in light mode". These values
 # mirror the frontend LIGHT_COLORS in frontend/src/theme.js so the
 # server-augmented light theme matches what a client-side toggle
@@ -348,7 +387,7 @@ _CORE_VARS = {
 _LIGHT_DEFAULTS = {
   "--bg": "#f0eeeb",
   "--surface": "#ffffff",
-  "--surface2": "#e8e6e2",
+  "--surface-2": "#e8e6e2",
   "--border": "#d4d1cc",
   "--border-light": "#e2dfdb",
   "--text": "#1c1b1a",

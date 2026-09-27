@@ -283,7 +283,7 @@
 }
 
 .global-search__result--selected {
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface2));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-2));
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
@@ -294,8 +294,8 @@
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .global-search__result:hover { background: var(--surface2); }
-  .global-search__close:hover { background: var(--surface2); }
+  .global-search__result:hover { background: var(--surface-2); }
+  .global-search__close:hover { background: var(--surface-2); }
 }
 
 .global-search__result-icon {
@@ -309,7 +309,7 @@
 .global-search__result-icon:not(.app-icon) {
   display: grid;
   place-items: center;
-  background: var(--surface2);
+  background: var(--surface-2);
   color: var(--muted);
 }
 

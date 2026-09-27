@@ -90,6 +90,31 @@ def _prepared_review_publication_unavailable(monkeypatch):
   )
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_repos_answer_the_canonical_diff(monkeypatch):
+  """Send hashes the byte-exact diff; fake repos still answer through ``_git``.
+
+  Real repositories keep the production path. Synthetic ones have no Git head
+  and script Git through a patched ``_git``, so route the one canonical diff
+  command there instead of spawning Git against an empty directory.
+  """
+  from app import github_contribution_git as git_ops
+  real = app_git._canonical_diff
+
+  def canonical(repo, base_sha, head_sha, *, read_only=False):
+    marker = Path(repo) / ".git"
+    if marker.is_file() or (marker / "HEAD").exists():
+      return real(repo, base_sha, head_sha, read_only=read_only)
+    proc = git_ops._git(
+      Path(repo), "-c", "core.quotePath=false", "diff", "--no-ext-diff",
+      "--no-color", "--binary", "--full-index", "--src-prefix=a/",
+      "--dst-prefix=b/", f"{base_sha}..{head_sha}", check=False,
+    )
+    return proc.stdout.encode("utf-8") if proc.returncode == 0 else None
+
+  monkeypatch.setattr(app_git, "_canonical_diff", canonical)
+
+
 def _set_client_id(monkeypatch, value):
   """Sets GITHUB_OAUTH_CLIENT_ID and drops the lru_cache so the next
   get_settings() reflects it. None means "device flow disabled", which is
@@ -6716,6 +6741,17 @@ def test_cleanup_terminal_staging_checkout_only_removes_disposable_clone():
     }
     assert _cleanup_terminal_staging_checkout(record) is True
     assert not candidate.exists()
+    # The emptied per-record folder goes with its checkout.
+    assert not candidate.parent.exists()
+
+  # Anything else in the record folder is left for a person to judge.
+  kept = data_dir / "contrib" / "terminal-cleanup-kept" / "repo"
+  (kept / ".git").mkdir(parents=True)
+  (kept.parent / "notes.md").write_text("owner notes")
+  record = {"status": "merged", "plan": {"repo_path": str(kept)}}
+  assert _cleanup_terminal_staging_checkout(record) is True
+  assert not kept.exists()
+  assert (kept.parent / "notes.md").read_text() == "owner notes"
 
   live_repo = data_dir / "apps" / "terminal-cleanup-live"
   (live_repo / ".git").mkdir(parents=True)
@@ -6972,12 +7008,14 @@ def test_standalone_app_review_persists_equivalence_in_installed_repo():
   assert app_git.ref_exists(live, landed)
 
 
-def test_cleanup_terminal_staging_checkout_unlocks_and_unregisters_linked_worktree():
+@pytest.mark.parametrize("owner_root", ["contrib", "worktrees"])
+def test_cleanup_terminal_staging_checkout_unlocks_and_unregisters_linked_worktree(owner_root):
   from app.routes.github import _cleanup_terminal_staging_checkout
 
   data_dir = Path(get_settings().data_dir)
-  owner = data_dir / "contrib" / "terminal-cleanup-owner"
-  checkout = data_dir / "contrib" / "terminal-cleanup-linked" / "worktree"
+  # "worktrees" is the GitHub adapter's working source for ordinary projects.
+  owner = data_dir / owner_root / "terminal-cleanup-owner"
+  checkout = data_dir / "contrib" / f"terminal-cleanup-linked-{owner_root}" / "worktree"
   owner.mkdir(parents=True)
   subprocess.run(["git", "init", "-q", str(owner)], check=True)
   subprocess.run(["git", "-C", str(owner), "config", "user.name", "Test"], check=True)

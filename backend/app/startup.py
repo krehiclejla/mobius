@@ -214,6 +214,20 @@ def _configure_claude_settings_defaults(context: StartupContext) -> None:
     context.logger.info("set Claude settings defaults: %s", ", ".join(added))
 
 
+def _migrate_theme_surface_token(context: StartupContext) -> None:
+  """Rewrite a saved theme.css's legacy --surface2 token to --surface-2.
+
+  Fix-forward for the secondary-surface token rename (no alias). This is the
+  only code that knows the legacy name, so it must run before the theme is
+  served or an owner's saved value is lost. Idempotent and missing-file-safe;
+  runs before the database phase because it only touches shared/theme.css.
+  """
+  from app.theme import migrate_theme_surface2_token
+
+  if migrate_theme_surface2_token(context.settings.data_dir):
+    context.logger.info("migrated saved theme.css --surface2 -> --surface-2")
+
+
 _SKILL_RECONCILER = Path(__file__).resolve().parents[1] / "scripts" / "init_skills.py"
 
 
@@ -361,21 +375,43 @@ def _freeze_legacy_app_runtimes(context: StartupContext) -> None:
 
 
 async def _complete_platform_swap(context: StartupContext) -> None:
-  """Merge back edits made on the previous source after an update swap.
+  """Finish what boot left of an update swap before chats resume.
 
-  Runs before chats are reconciled and resumed. A conflict is parked on a
-  frozen copy and handed to one resolver chat; resumes wait until it is done.
+  Boot normally merged the late edits back before this process imported
+  anything. A conflict is parked on a frozen copy and handed to one resolver
+  chat; resumes wait until it is done.
   """
   import asyncio
 
   from app import platform_update
 
-  outcome = await asyncio.to_thread(platform_update.complete_platform_swap)
+  try:
+    outcome = await asyncio.to_thread(platform_update.complete_platform_swap)
+  except platform_update.BootTransactionError:
+    raise  # This task's failure reason: never resume on an unplaced checkout.
+  except Exception:
+    # Anything else stays best effort, as before: resumes remain held while
+    # the swap's late edits are not loaded (``late_edits_pending``).
+    context.logger.exception("platform update swap could not be finished")
+    return
   if outcome:
     context.logger.info("platform update swap: %s", outcome)
   if outcome == "conflict":
     with SessionLocal() as db:
       await platform_update.create_platform_conflict_resolver_chat(db)
+
+
+def _confirm_platform_swap_loaded(context: StartupContext) -> None:
+  """Confirm an update this started server settles by itself, or start the
+  bounded check that waits for its container replacement's confirmation."""
+  from app import deployment_control, platform_update
+
+  if platform_update.confirm_platform_swap_loaded():
+    context.logger.info("platform update swap: confirmed loaded")
+    return
+  record = platform_update.read_prepared_update()
+  if record and record["operation"]:
+    deployment_control.schedule_settle_image_update_after_boot()
 
 
 def _reconcile_startup_chats(context: StartupContext) -> None:
@@ -607,6 +643,7 @@ PROCESS_STARTUP_TASKS = (
     _configure_claude_settings_defaults,
   ),
   StartupTask("reconcile platform skills", _reconcile_platform_skills),
+  StartupTask("migrate theme surface token", _migrate_theme_surface_token),
   StartupTask(
     "initialize database",
     _initialize_database,
@@ -633,7 +670,13 @@ DATABASE_STARTUP_TASKS = (
   StartupTask("backfill session links", _backfill_session_links),
   StartupTask("backfill prompt snapshots", _backfill_prompt_snapshots),
   StartupTask("fix forward chat media", _fix_forward_chat_media),
-  StartupTask("complete platform update swap", _complete_platform_swap),
+  # A checkout that cannot be placed relative to its update must not resume
+  # work (images without the boot transaction reach this path).
+  StartupTask(
+    "complete platform update swap",
+    _complete_platform_swap,
+    database_failure_reason="platform_update_swap_unplaced",
+  ),
   StartupTask("read restart authorization", _read_restart_authorization),
   StartupTask("freeze legacy app runtimes", _freeze_legacy_app_runtimes),
   StartupTask(
@@ -678,4 +721,7 @@ DATABASE_STARTUP_TASKS = (
     _route_diagnostics_to_chat_log,
     checkpoint="startup_app_source_ready",
   ),
+  # Last, after every fallible startup step: this server loaded the late
+  # edits merged back at boot, so the swap no longer needs its rollback.
+  StartupTask("confirm platform update swap", _confirm_platform_swap_loaded),
 )

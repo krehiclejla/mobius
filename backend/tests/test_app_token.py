@@ -35,6 +35,71 @@ def test_create_app_token(client, owner_token):
   assert claims["app_nonce"]
 
 
+def test_delegated_helper_mints_app_token_but_keeps_delegation_boundary(
+  client, owner_token, db,
+):
+  """A delegated helper's owner-scoped bearer can mint the app-frame token its
+  shell needs to MOUNT an owner app it can already read.
+
+  Regression: this endpoint used to refuse any bearer carrying a delegation id
+  (get_current_owner_for_lifecycle_control), so a delegated helper's AppCanvas
+  never obtained a token and the app iframe never mounted — while '/' and the
+  same app under the top-level chat's token worked. The mint is admitted now,
+  but the delegation lineage is FORWARDED into the down-scoped token so it stays
+  a delegated bearer and is still refused at delegated-blocked app controls.
+  """
+  from app import models
+
+  owner = db.query(models.Owner).one()
+  app_id = create_local_app(
+    client, {"Authorization": f"Bearer {owner_token}"}, name="delegated-mount",
+  )["id"]
+
+  child_chat = "delegated-mount-child"
+  delegated = token_auth.create_agent_token(
+    child_chat, owner.username, owner.token_epoch,
+    delegation_id="delegated-mount-delegation", delegation_chat=child_chat,
+  )
+  delegated_auth = {"Authorization": f"Bearer {delegated}"}
+
+  r = client.post(
+    "/api/auth/app-token", json={"app_id": app_id}, headers=delegated_auth,
+  )
+  assert r.status_code == 200, r.text
+  app_token = r.json()["token"]
+  claims = token_auth.decode_access_token(app_token)
+  assert claims["scope"] == "app"
+  assert claims["app_id"] == app_id
+  # Lineage preserved: the narrower token is still a delegated bearer.
+  assert claims["delegation_id"] == "delegated-mount-delegation"
+  assert claims["delegation_chat"] == child_chat
+
+  app_token_auth = {"Authorization": f"Bearer {app_token}"}
+  # It mounts: the frame's own-app storage reads/writes work with this token.
+  assert client.put(
+    f"/api/storage/apps/{app_id}/state.json", json={"content": "{}"},
+    headers=app_token_auth,
+  ).status_code == 204
+  assert client.get(
+    f"/api/storage/apps/{app_id}/state.json", headers=app_token_auth,
+  ).status_code == 200
+
+  # Boundary preserved: a clean owner-minted app token may write a secret, but
+  # the delegated app token is still refused by the delegated-blocked control.
+  clean_app_token = client.post(
+    "/api/auth/app-token", json={"app_id": app_id},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  ).json()["token"]
+  assert client.put(
+    f"/api/apps/{app_id}/secrets/API_KEY", json={"value": "s3cr3t"},
+    headers={"Authorization": f"Bearer {clean_app_token}"},
+  ).status_code == 204
+  assert client.put(
+    f"/api/apps/{app_id}/secrets/API_KEY", json={"value": "s3cr3t"},
+    headers=app_token_auth,
+  ).status_code == 403
+
+
 def test_app_token_cannot_access_settings(client, owner_token):
   app_id = create_local_app(
     client, {"Authorization": f"Bearer {owner_token}"}, name="test-app",

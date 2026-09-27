@@ -539,21 +539,16 @@ def _build_resumed_context(chat_row) -> str | None:
   )
 
 
-# The CLI slash commands Möbius keeps at character 0. Named rather than
-# inlined below because it is half of a cross-language contract: the composer's
-# "/" menu (frontend/src/components/ChatView/slashCommands.js) offers exactly
-# this set, and `test_slash_command_registry_parity` reads both to pin them
-# together. Without that pin the menu could offer a command this dispatch check
-# does not know, and picking it would degrade into ordinary prose with no error
-# shown anywhere.
-CLI_SLASH_COMMANDS = frozenset({"/goal"})
-
-# Commands the platform itself owns rather than forwarding to the provider CLI.
-# `/compact` rewrites the chat's live context and resets the provider session
-# (routes/chats.py ``/compact``); it must never reach a model as prose. Kept
-# beside CLI_SLASH_COMMANDS so the composer menu and both dispatch sets stay
-# pinned together by test_slash_command_registry_parity.
-MOBIUS_SLASH_COMMANDS = frozenset({"/compact"})
+# The slash commands Möbius owns; none is forwarded to a provider CLI. `/goal`
+# creates the Möbius Goal, and the agent receives its objective as a plain
+# request (goal_commands.goal_request_for_agent), so Claude's own `/goal` never
+# runs. `/compact` rewrites the chat's live context and resets the provider
+# session (routes/chats.py ``/compact``); it never reaches a model as prose.
+# This is half of a cross-language contract: the composer's "/" menu
+# (frontend/src/components/ChatView/slashCommands.js) offers exactly this set,
+# and `test_slash_command_registry_parity` pins the two together so a menu entry
+# can never silently degrade into prose.
+MOBIUS_SLASH_COMMANDS = frozenset({"/goal", "/compact"})
 
 
 def _chat_has_goal_intent(messages: list[schemas.ChatMessage]) -> bool:
@@ -563,16 +558,3 @@ def _chat_has_goal_intent(messages: list[schemas.ChatMessage]) -> bool:
     and _is_goal_command(message.content or "")
     for message in messages
   )
-
-
-def _is_cli_slash_command(text: str) -> bool:
-  """True when `text` starts with a supported Claude CLI slash command.
-
-  The Claude CLI only dispatches slash commands when the message starts
-  with the command at position 0. Möbius appends its own hidden context
-  below known commands so `/goal` keeps its owner-authored command shape
-  without turning path-like prose such as `/data/apps/x is broken` into
-  a command-shaped prompt.
-  """
-  words = (text or "").lstrip("\n").split(None, 1)
-  return bool(words) and words[0].strip() in CLI_SLASH_COMMANDS

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -26,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app import (
   app_git,
+  contribution_staging,
   fs_locks,
   github_auth,
   github_contribution_git as _git_ops,
@@ -63,6 +65,9 @@ _PERSONAL_PUBLIC_INPUT_FIELDS = (
   "head_repository", "publication_stage", "submission_mode", "submitter",
   "plan", "quality_review",
 )
+
+log = logging.getLogger(__name__)
+
 _PREPARED_PR_ACTIONS = frozenset(("pr", "pr_update"))
 
 
@@ -151,6 +156,9 @@ def _require_all_clear_review(record: dict) -> None:
     not canonical
     or review.get("state") != "all_clear"
     or reviewed_head_sha != head_sha
+    # A verdict recorded through Contribute's review call also names the diff
+    # it covered, so the same head over a different base cannot inherit it.
+    or review.get("reviewed_diff_sha256") not in (None, plan.get("diff_sha256"))
   ):
     raise HTTPException(
       status_code=409,
@@ -879,6 +887,33 @@ def _merged_upstream_sha(record: dict, repo: Path) -> str | None:
   return candidate if _GIT_SHA.fullmatch(candidate) else None
 
 
+def _mark_superseded_draft(
+  record: dict, repo: Path, upstream_sha: str | None,
+) -> str | None:
+  """Hand the updater the live draft a merged, revised contribution replaces.
+
+  Staging records ``source_sync.draft`` only while the live source holds an
+  earlier version than the one reviewed (``diverged``); the merge commit then
+  supersedes that exact draft.
+  """
+  sync = record.get("source_sync") if isinstance(record.get("source_sync"), dict) else {}
+  draft = sync.get("draft") if sync.get("state") == "diverged" else None
+  if not isinstance(draft, dict) or not upstream_sha:
+    return None
+  try:
+    return app_git.mark_draft_superseded(
+      repo,
+      contribution_id=str(record.get("id") or ""),
+      base_sha=str(draft.get("base_sha") or ""),
+      head_sha=str(draft.get("head_sha") or ""),
+      upstream_sha=upstream_sha,
+      draft_ref=draft.get("ref"),
+    )
+  except (OSError, subprocess.SubprocessError, RuntimeError):
+    log.warning("could not record a superseded draft", exc_info=True)
+    return None
+
+
 def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | None:
   """Promote or discard the pending witness when GitHub settles the PR."""
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
@@ -888,6 +923,7 @@ def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | 
   repo, _review_repo = repos
   digest = str(plan.get("diff_sha256") or "")
   if record.get("status") == "merged":
+    _mark_superseded_draft(record, repo, upstream_sha)
     equivalent = app_git.mark_equivalent_change_landed(
       repo, digest, upstream_sha=upstream_sha,
     )
@@ -898,6 +934,9 @@ def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | 
     return equivalent
   if record.get("status") == "closed":
     app_git.discard_pending_equivalent_change(repo, digest)
+  if record.get("status") in ("closed", "abandoned"):
+    # A draft that never merged has nothing for an update to retire.
+    contribution_staging.unpin_draft(repo, str(record.get("id") or ""))
   return None
 
 
@@ -917,8 +956,19 @@ def _cleanup_terminal_staging_checkout(record: dict) -> bool:
   roots = (data_dir / "contrib", data_dir / "contributions")
   if not any(repo.is_relative_to(root) for root in roots):
     return False
-  if not repo.exists():
-    return True
+  cleaned = not repo.exists() or _remove_staging_checkout(repo, data_dir)
+  if cleaned and repo.parent.parent in roots:
+    # The per-record folder holds only this checkout by convention. Remove it
+    # once empty; anything else left there is for a person to judge.
+    try:
+      repo.parent.rmdir()
+    except OSError:
+      pass
+  return cleaned
+
+
+def _remove_staging_checkout(repo: Path, data_dir: Path) -> bool:
+  """Remove one validated staging checkout through its owning Git shape."""
   marker = repo / ".git"
   if not marker.exists() or marker.is_symlink():
     return False
@@ -982,11 +1032,14 @@ def _cleanup_terminal_staging_checkout(record: dict) -> bool:
       common_dir = common_dir.resolve()
     except (OSError, RuntimeError):
       return False
+    # /data/worktrees holds the owner's clones of ordinary GitHub projects,
+    # which the GitHub adapter uses as a review worktree's primary checkout.
     common_roots = (
       data_dir / "platform",
       data_dir / "apps",
       data_dir / "contrib",
       data_dir / "contributions",
+      data_dir / "worktrees",
     )
     if not any(common_dir.is_relative_to(root) for root in common_roots):
       return False

@@ -82,7 +82,7 @@ test('Settings omits historical container diagnostics but keeps current action e
   assert.doesNotMatch(updates, /The source is installed\./)
   assert.match(updates, /update\.error && <Alert/)
   assert.match(updates, /platformUpdateRepairReason/)
-  assert.match(updates, /rebuildProgressMessage\(rebuild\)/)
+  assert.match(updates, /rebuildStatusLine\(rebuild\)/)
   assert.doesNotMatch(updates + requests, /rebuildInitiatedHereRef|rebuildReviewedUpdateRef/)
   assert.match(requests, /if \(!reconnect\) return/)
 })

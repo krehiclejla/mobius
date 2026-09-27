@@ -113,7 +113,7 @@ function makeQueryClient(seedCache) {
 const DARK_CSS = `:root {
   --bg: #0d0f14;
   --surface: #151820;
-  --surface2: #1c2028;
+  --surface-2: #1c2028;
   --border: #2a2f3a;
   --border-light: #1e2330;
   --text: #d8d8dc;
@@ -332,7 +332,7 @@ test('REGRESSION — toggling an accent-stripped theme restores the missing toke
   const STRIPPED_LIGHT = `:root {
   --bg: #f0eeeb;
   --surface: #ffffff;
-  --surface2: #e8e6e2;
+  --surface-2: #e8e6e2;
   --border: #d4d1cc;
   --border-light: #e2dfdb;
   --text: #1c1b1a;

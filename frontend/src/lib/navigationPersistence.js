@@ -46,6 +46,19 @@ export function parseShellDeepLink(location = globalThis.location) {
     } catch { /* malformed query is an ordinary empty destination */ }
     return null
   }
+  // Legacy path-form deep links still arrive on a fresh page load (the
+  // screenshot helper's /app/<id>, the AI-provider OAuth return to /settings).
+  // Return the same shapes as the /shell/?app= and ?chat= forms above so the
+  // ordinary boot and slug resolution run.
+  const appMatch = path.match(/^\/app\/([^/]+)\/?$/)
+  if (appMatch) {
+    const app = appMatch[1]
+    const appId = /^\d+$/.test(app) ? Number.parseInt(app, 10) : null
+    return { view: 'canvas', app, appId, intent: null }
+  }
+  const chatMatch = path.match(/^\/chat\/([^/]+)\/?$/)
+  if (chatMatch) return { view: 'chat', chatId: chatMatch[1], intent: null, focusQuestion: false }
+  if (/^\/settings\/?$/.test(path)) return { view: 'settings' }
   return null
 }
 

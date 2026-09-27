@@ -363,7 +363,7 @@ Static container cards drop the `button` pseudo-states + chevron. State
 .ma-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
 .ma-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .ma-btn-primary:hover { filter: brightness(1.06); }
-.ma-btn-secondary { background: var(--surface2, var(--surface)); }
+.ma-btn-secondary { background: var(--surface-2, var(--surface)); }
 .ma-btn-secondary:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .ma-btn-ghost { background: transparent; border-color: transparent; color: var(--accent); }
 .ma-btn-ghost:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
@@ -422,7 +422,7 @@ A full-width form-submit adds `width: 100%` via a `.ma-btn-block` modifier.
 /* mobius-ui:Segmented — app-owned (no sync owed). */
 .ma-seg {
   display: inline-flex; gap: 2px; height: 44px;
-  background: var(--surface2, var(--surface)); border: 0; border-radius: 10px;
+  background: var(--surface-2, var(--surface)); border: 0; border-radius: 10px;
   box-shadow: inset 0 0 0 1px var(--border);
 }
 .ma-seg-btn {

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import UTC, datetime
 import re
 from typing import Any
@@ -23,24 +22,8 @@ SETTLED_TASK_STATUSES = frozenset({"completed", "cancelled"})
 MAX_TASKS = 64
 MAX_DEPENDENCIES = 16
 MAX_TITLE = 160
-MAX_NOTE = 500
+MAX_NOTE = 1000
 MAX_RESULT = 1000
-
-
-def goal_plan_is_unfinished(
-  db: Session, chat_id: str, goal_id: str,
-) -> bool:
-  """Whether the durable obligation is still open, even without a plan."""
-  goal = db.get(models.ChatGoal, goal_id)
-  return goal is not None and goal.chat_id == chat_id and goal.status == "open"
-
-
-def goal_plan_revision(db: Session, chat_id: str, goal_id: str) -> int:
-  """Return the exact durable plan revision for one stable Goal."""
-  goal = db.get(models.ChatGoal, goal_id)
-  if goal is None or goal.chat_id != chat_id:
-    return 0
-  return int(goal.revision or 0)
 
 
 class GoalPlanError(ValueError):
@@ -293,6 +276,35 @@ def active_goal_rows(
   return _goal_rows_for_physical(db, physical) if physical is not None else None
 
 
+def helper_plan_task(
+  db: Session, chat_id: str, requested: str | None,
+) -> str | None:
+  """Choose the plan task a new helper of ``chat_id`` works on.
+
+  An explicit task must exist in the chat's active Goal plan. Otherwise the
+  helper joins the plan's current focus: the one running leaf task. With no
+  Goal, no plan, or several running leaves the helper stays unfiled rather
+  than guessing among them.
+  """
+  rows = active_goal_rows(db, chat_id)
+  tasks = list(((rows[1].plan_json or {}) if rows else {}).get("tasks") or [])
+  if requested is not None:
+    ids = [str(task.get("id")) for task in tasks]
+    if requested not in ids:
+      known = ", ".join(ids) if ids else "none (no active Goal plan)"
+      raise GoalPlanError(
+        f"plan_task {requested!r} is not a task of this chat's Goal plan; "
+        f"plan tasks: {known}"
+      )
+    return requested
+  running = {
+    str(task.get("id")): task for task in tasks if task.get("status") == "running"
+  }
+  parents = {str(task.get("parent_id")) for task in running.values()}
+  leaves = [task_id for task_id in running if task_id not in parents]
+  return leaves[0] if len(leaves) == 1 else None
+
+
 def presented_goal_rows(
   db: Session, chat_id: str,
 ) -> tuple[models.ChatRun, models.ChatGoal] | None:
@@ -376,6 +388,7 @@ def _delegation_tree(
     return {
       "id": row.id,
       "task_key": row.task_key,
+      "plan_task": row.goal_task_id,
       "provider": row.provider,
       "status": status,
       "children": [project(child, seen | {row.id}) for child in children],
@@ -412,6 +425,32 @@ def publish_plan_for_delegation(
     broadcast.publish({"type": "goal_plan_updated", "plan": plan})
 
 
+def _active_helper_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  """Delegation-tree nodes, at any depth, whose execution has not settled."""
+  from app.delegations import TERMINAL_DELEGATION_STATUSES
+
+  active: list[dict[str, Any]] = []
+  for node in nodes:
+    if node.get("status") not in TERMINAL_DELEGATION_STATUSES:
+      active.append(node)
+    active.extend(_active_helper_nodes(node.get("children") or []))
+  return active
+
+
+def _helper_key(node: dict[str, Any]) -> str:
+  return str(node.get("task_key") or node["id"])
+
+
+def active_goal_helpers(
+  db: Session, physical: models.ChatRun, root: models.ChatGoal,
+) -> list[str]:
+  """Task keys of this Goal's helpers still working, with or without a plan."""
+  return [
+    _helper_key(node)
+    for node in _active_helper_nodes(_delegation_tree(db, physical, root))
+  ]
+
+
 def serialize_plan(
   db: Session, physical: models.ChatRun, root: models.ChatGoal,
 ) -> dict[str, Any] | None:
@@ -443,20 +482,15 @@ def serialize_plan(
       if by_id.get(dependency, {}).get("status") not in SETTLED_TASK_STATUSES
     ]
   delegations = _delegation_tree(db, physical, root)
-  from app.delegations import TERMINAL_DELEGATION_STATUSES
-
-  active_execution_keys: list[str] = []
-
-  def collect_active_execution(nodes: list[dict[str, Any]]) -> None:
-    for node in nodes:
-      if node.get("status") not in TERMINAL_DELEGATION_STATUSES:
-        active_execution_keys.append(str(node.get("task_key") or node["id"]))
-      collect_active_execution(node.get("children") or [])
-
-  collect_active_execution(delegations)
-  active_execution = set(active_execution_keys)
+  active_helpers = _active_helper_nodes(delegations)
+  active_execution_keys = [_helper_key(node) for node in active_helpers]
+  # Plan tasks with a helper still working: such a task is not counted complete
+  # even if it was marked so, because its execution has not settled.
+  tasks_with_active_helpers = {
+    str(node["plan_task"]) for node in active_helpers if node.get("plan_task")
+  }
   completed = sum(
-    task.get("status") == "completed" and task["id"] not in active_execution
+    task.get("status") == "completed" and task["id"] not in tasks_with_active_helpers
     for task in tasks
   )
   running = [task["id"] for task in tasks if task.get("status") == "running"]
@@ -505,203 +539,6 @@ def serialize_plan(
   }
 
 
-def goal_handoff_owner_kind(
-  db: Session,
-  chat_id: str,
-  goal_id: str,
-  *,
-  excluding_question_id: str | None = None,
-  include_queued_execution: bool = False,
-  excluding_automatic_continuations: bool = False,
-) -> str | None:
-  """Name the durable actor that owns this exact Goal's next move.
-
-  Goal presentation and turn settlement must agree on ownership. Keeping the
-  identity check here prevents an unrelated question, Wait, or helper in the
-  same chat from making unfinished Goal work look safely handed off.
-  """
-  # Goal presentation is also read by the small runtime route and once per
-  # historical Goal. Do not decode the entire transcript for an absent card.
-  # An actual continuation card still lazily reads messages to prove its exact
-  # author; a detail read's already-loaded Chat is reused by the identity map.
-  projected = [models.Chat.pending_question_id]
-  if include_queued_execution:
-    projected.append(models.Chat.pending_messages)
-  chat = db.query(models.Chat).options(load_only(*projected)).filter(
-    models.Chat.id == chat_id,
-  ).first()
-  pending_question_id = chat.pending_question_id if chat is not None else None
-  if pending_question_id is not None and pending_question_id != excluding_question_id:
-    from app.questions import continuation_question_owner_run_id
-    owner_run_id = continuation_question_owner_run_id(chat, pending_question_id)
-    if owner_run_id is not None:
-      question_owner = db.get(models.ChatRun, owner_run_id)
-    else:
-      # Compatibility for pre-message-identity fixtures and legacy cards.
-      question_owner = (
-        db.query(models.ChatRun)
-        .filter(
-          models.ChatRun.chat_id == chat_id,
-          models.ChatRun.status.in_(models.NONTERMINAL_RUN_STATUSES),
-        )
-        .order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc())
-        .first()
-      )
-    if (
-      question_owner is not None
-      and (
-        question_owner.goal_id
-        or question_owner.root_run_id
-        or question_owner.id
-      ) == goal_id
-    ):
-      return "owner_question"
-
-  # A queued continuation is durable execution ownership, not owner speech.
-  # Resolve its exact Goal so an unrelated continuation cannot make this Goal
-  # look safely handed off.
-  if include_queued_execution and chat is not None:
-    from app.continuations import continuation_reason, is_continuation_message
-    from app.run_state import GOAL_HANDOFF_REASON, goal_identity_for_run_start
-
-    for pending in chat.pending_messages or []:
-      if not isinstance(pending, dict) or not is_continuation_message(pending):
-        continue
-      if (
-        excluding_automatic_continuations
-        and continuation_reason(pending) == GOAL_HANDOFF_REASON
-      ):
-        continue
-      _objective, pending_goal_id = goal_identity_for_run_start(
-        db, chat_id, pending,
-      )
-      if pending_goal_id == goal_id:
-        return "executor"
-
-  from app.delegations import background_helper_goal_ids
-  if goal_id in background_helper_goal_ids(db, chat_id):
-    return "monitor"
-
-  from app.chat_waits import wait_owns_goal
-  if wait_owns_goal(db, chat_id, goal_id):
-    return "monitor"
-  return None
-
-
-def _has_runnable_work(plan: dict[str, Any] | None) -> bool:
-  """Whether a successor could start, verify, or complete something."""
-  return plan is None or plan["summary"]["can_complete"] or any(
-    task["ready"] or task["ready_to_verify"] or task.get("status") == "running"
-    for task in plan["tasks"]
-  )
-
-
-@dataclass(frozen=True)
-class GoalTerminalHandoff:
-  """An ownerless unfinished Goal and its plan-owned next move."""
-
-  goal_id: str
-  automatic_allowed: bool
-  plan_revision: int
-
-
-def goal_terminal_handoff(
-  db: Session, chat_id: str, ending_run_token: str,
-) -> GoalTerminalHandoff | None:
-  """Describe an unfinished Goal whose clean terminal has no next owner.
-
-  The physical provider turn is still ``running`` while the writer performs
-  this check. It is deliberately not an owner of its own future: only a saved
-  question, durable monitor/helper, or queued exact continuation may let it
-  close without creating the next executor.
-
-  A provider turn cannot authorize its own successor merely because the Goal
-  remains unfinished. Another turn is automatic only after the durable plan
-  advances beyond the exact revision captured at admission and leaves a task
-  a successor could run; recording a blocker alone is not progress. Otherwise
-  the terminal path saves an owner question instead of starting an unbounded
-  chain of clean, no-progress turns.
-  """
-  if not ending_run_token:
-    return None
-  run = db.query(models.ChatRun).filter(
-    models.ChatRun.id == ending_run_token,
-    models.ChatRun.chat_id == chat_id,
-    models.ChatRun.status == "running",
-    models.ChatRun.goal_objective.isnot(None),
-    models.ChatRun.goal_id.isnot(None),
-  ).first()
-  if run is None:
-    return None
-  goal = db.get(models.ChatGoal, run.goal_id)
-  if goal is None or goal.status != "open" or goal_handoff_owner_kind(
-    db, chat_id, run.goal_id, include_queued_execution=True,
-  ) is not None:
-    return None
-  current_revision = goal_plan_revision(db, chat_id, run.goal_id)
-  admitted_revision = run.goal_plan_revision_at_admission
-  plan = serialize_plan(db, run, goal) if goal.plan_json is not None else None
-  plan_corrupt = goal.plan_json is not None and plan is None
-  return GoalTerminalHandoff(
-    goal_id=run.goal_id,
-    automatic_allowed=(
-      not plan_corrupt
-      and _has_runnable_work(plan)
-      and isinstance(admitted_revision, int)
-      and current_revision > admitted_revision
-    ),
-    plan_revision=current_revision,
-  )
-
-
-def require_quiet_answer_handoff(db: Session, chat, question_id: str) -> None:
-  """Closing a card cannot remove the sole next owner of unfinished work.
-
-  This checks the card's exact Goal, not the currently presented Goal or an
-  unrelated follow-up. It also keeps a typed approval from silently abandoning
-  the exact active work claim it admitted. It neither changes the plan nor
-  creates a continuation.
-  """
-  from app.questions import (
-    AnswerConflict, saved_question, saved_question_owner_run_id,
-  )
-  from app.run_state import goal_identity_for_run_start, _recoverable_result_goal
-
-  card = saved_question(chat, question_id)
-  action_key = card.get("action_key") if isinstance(card, dict) else None
-  if isinstance(action_key, str) and action_key:
-    active_claim = db.query(models.AgentWorkClaim).filter(
-      models.AgentWorkClaim.work_key == action_key,
-      models.AgentWorkClaim.owner_chat_id == chat.id,
-      models.AgentWorkClaim.completed_at.is_(None),
-      models.AgentWorkClaim.released_at.is_(None),
-    ).first()
-    if active_claim is not None:
-      raise AnswerConflict(
-        "This question still owns an active work claim. "
-        "Choose a reply option so the agent can release or complete the "
-        "claim before closing it without a reply."
-      )
-
-  owner_id = saved_question_owner_run_id(chat, question_id)
-  owner = db.get(models.ChatRun, owner_id) if owner_id else None
-  if owner is None or not owner.goal_objective:
-    return
-  physical, root = _goal_rows_for_physical(db, owner)
-  goal_id = physical.goal_id or root.id
-  if _recoverable_result_goal(db, chat.id, owner)[0] is None:
-    return  # The durable obligation owns completion/Stop, not its author attempt.
-  if goal_handoff_owner_kind(db, chat.id, goal_id, excluding_question_id=question_id):
-    return
-  for pending in chat.pending_messages or []:
-    if isinstance(pending, dict) and goal_identity_for_run_start(db, chat.id, pending)[1] == goal_id:
-      return
-  raise AnswerConflict(
-    "This question is the only next step for an unfinished Goal. "
-    "Choose a reply option or Stop the Goal before closing it without a reply."
-  )
-
-
 def serialize_goal(
   db: Session,
   physical: models.ChatRun,
@@ -718,10 +555,13 @@ def _goal_presentation(
   root: models.ChatGoal,
   plan: dict[str, Any] | None,
 ) -> dict[str, Any]:
-  """Use the same plan snapshot for completion and the historical plan card."""
-  wait_kind = goal_handoff_owner_kind(
-    db, physical.chat_id, physical.goal_id or root.id,
-  )
+  """Project only the Goal's own lifecycle: active, paused, or completed.
+
+  "Paused" means unfinished with no turn running. Who moves next is chat
+  state the client already has (an open card, armed Waits, running helpers),
+  so it is not re-derived per Goal here; an idle Goal is simply the owner's
+  turn.
+  """
   if root.status == "completed":
     status = "completed"
   elif root.status in {"stopped", "dismissed"}:
@@ -735,7 +575,6 @@ def _goal_presentation(
     "objective": root.objective,
     "status": status,
     "resumable": status == "paused",
-    **({"wait_kind": wait_kind} if wait_kind is not None else {}),
   }
 
 
@@ -947,29 +786,44 @@ def replace_plan(
   return plan
 
 
-def update_task(
+TASK_EDIT_FIELDS = frozenset({
+  "title", "status", "depends_on", "parent_id", "completion_condition",
+  "note", "result", "progress",
+})
+
+
+def edit_plan(
   db: Session,
   *,
   physical: models.ChatRun,
   root: models.ChatGoal,
-  expected_revision: int,
-  task_id: str,
-  changes: dict[str, Any],
+  edits: list[dict[str, Any]],
 ) -> dict[str, Any]:
-  existing = serialize_plan(db, physical, root)
-  if existing is None:
-    raise GoalPlanError("this Goal does not have a plan yet")
-  tasks = existing["tasks"]
-  target = next((task for task in tasks if task["id"] == task_id), None)
-  if target is None:
-    raise GoalPlanError(f"unknown task id: {task_id}")
-  for key, value in changes.items():
-    if value is not None:
-      target[key] = value
+  """Apply several task edits as one validated plan revision.
+
+  An edit naming an existing id changes only the fields it carries; a new id
+  adds a task (its title is then required). The whole result is validated
+  once, so finishing one task and starting its dependant is a single edit
+  regardless of the order they are listed in.
+  """
+  saved = root.plan_json.get("tasks") if isinstance(root.plan_json, dict) else None
+  tasks = [dict(task) for task in saved if isinstance(task, dict)] if isinstance(saved, list) else []
+  by_id = {task.get("id"): task for task in tasks}
+  for position, edit in enumerate(edits):
+    if not isinstance(edit, dict) or not isinstance(edit.get("id"), str):
+      raise GoalPlanError(f"task edit {position + 1} needs a string id")
+    unknown = set(edit) - TASK_EDIT_FIELDS - {"id"}
+    if unknown:
+      raise GoalPlanError(
+        f"unknown fields for {edit['id']}: {', '.join(sorted(unknown))}"
+      )
+    target = by_id.get(edit["id"])
+    if target is None:
+      target = {"id": edit["id"]}
+      tasks.append(target)
+      by_id[edit["id"]] = target
+    target.update({key: value for key, value in edit.items() if key != "id"})
   return replace_plan(
-    db,
-    physical=physical,
-    root=root,
-    expected_revision=expected_revision,
-    tasks=tasks,
+    db, physical=physical, root=root,
+    expected_revision=root.revision, tasks=tasks,
   )

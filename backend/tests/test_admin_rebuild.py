@@ -75,6 +75,45 @@ def test_rebuild_status_is_read_only(client, auth, monkeypatch):
   assert response.json()["state"] == "verifying"
 
 
+def test_withdraw_request_requires_owner(client):
+  assert client.delete("/api/admin/rebuild/request").status_code == 401
+
+
+def test_withdraw_request_rejects_cross_site(client, auth):
+  response = client.delete(
+    "/api/admin/rebuild/request",
+    headers={**auth, "Origin": "null", "Sec-Fetch-Site": "cross-site"},
+  )
+
+  assert response.status_code == 403
+
+
+def test_withdraw_request_returns_the_fresh_status(client, auth, monkeypatch):
+  async def withdraw():
+    return _status(state="idle", operation_id=None, expected_sha=None)
+
+  monkeypatch.setattr(dc, "withdraw_unclaimed_host_request", withdraw)
+
+  response = client.delete("/api/admin/rebuild/request", headers=auth)
+
+  assert response.status_code == 200
+  assert response.json()["state"] == "idle"
+
+
+def test_withdraw_request_preserves_stable_error_code(client, auth, monkeypatch):
+  async def withdraw():
+    raise dc.DeploymentControlError(
+      "not_supported", "Railway manages this.", status_code=409,
+    )
+
+  monkeypatch.setattr(dc, "withdraw_unclaimed_host_request", withdraw)
+
+  response = client.delete("/api/admin/rebuild/request", headers=auth)
+
+  assert response.status_code == 409
+  assert response.json()["detail"]["code"] == "not_supported"
+
+
 def test_host_prepare_drains_only_the_matching_operation(
   client, auth, tmp_path, monkeypatch,
 ):

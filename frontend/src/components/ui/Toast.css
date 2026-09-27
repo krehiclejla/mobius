@@ -36,7 +36,7 @@
 }
 
 .toast--info {
-  background: var(--surface2, #212121);
+  background: var(--surface-2, #212121);
   color: var(--text, #ececec);
   border: 1px solid var(--border, #2a2a2a);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);

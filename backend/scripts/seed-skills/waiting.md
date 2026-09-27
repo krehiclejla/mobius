@@ -40,7 +40,7 @@ just to discover that nothing changed. Use a timer when elapsed time is the
 condition or no safe read-only check is available.
 
 Use the first-class `declare_wait` tool from Möbius control (and `cancel_wait`
-to disarm). The `chat_wait.py` helper below is resilience, not an equivalent
+to disarm). The command-line form below is resilience, not an equivalent
 convenience path: use it only when the tool is absent or an attempted tool call
 returns a failure. Both arm the same wait.
 
@@ -89,18 +89,19 @@ observation window", "delay_secs": 1800}`.
 The partner sees each armed wait as a "Waiting…" chip in the chat and can
 cancel it too.
 
-Fallback helper, only when the tool is absent or failed (same arguments as
-flags; `list` shows this chat's armed waits and `cancel <id>` disarms one):
+Fallback, only when the tool is absent or failed: the same arguments as JSON.
+A quoted heredoc carries the check command literally:
 
 ```bash
-python3 /data/platform/backend/scripts/chat_wait.py declare \
-  'the new deploy answering its health check' \
-  --owner "the hosting provider's deploy" \
-  --command 'test "$(curl -s -o /dev/null -w "%{http_code}" https://app.example.com/health)" = 200' \
-  --interval 120 --deadline 1800
-python3 /data/platform/backend/scripts/chat_wait.py declare \
-  'review the agreed 30-minute observation window' --in 1800
+python3 /data/platform/backend/scripts/mobius_control_mcp.py call declare_wait --args-json - <<'JSON'
+{"description": "the new deploy answering its health check",
+ "condition_owner": "the hosting provider's deploy",
+ "command": "test \"$(curl -s -o /dev/null -w '%{http_code}' https://app.example.com/health)\" = 200",
+ "interval_secs": 120, "deadline_secs": 1800}
+JSON
 ```
+
+`call cancel_wait --args-json '{"wait_id":"..."}'` disarms one.
 
 ## What happens on resume
 

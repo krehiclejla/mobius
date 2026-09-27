@@ -713,6 +713,11 @@ export const api = {
   },
   chats: {
     list: (options = {}) => apiFetch('/chats', options),
+    // The drawer rows for just these chats: same projection as `list`.
+    rows: (ids, options = {}) => apiFetch(
+      `/chats?${ids.map(id => `ids=${encodeURIComponent(id)}`).join('&')}`,
+      options,
+    ),
     search: (query, options = {}) => apiFetch(
       `/chats/search?q=${encodeURIComponent(query)}`,
       { timeoutMs: 10000, ...options },
@@ -1376,6 +1381,8 @@ export const api = {
   admin: {
     restart: () => apiFetch('/admin/restart', { method: 'POST' }),
     rebuildStatus: () => apiFetch('/admin/rebuild'),
+    // Drop an unclaimed host request so a stalled self-hosted update can retry.
+    withdrawRebuildRequest: () => apiFetch('/admin/rebuild/request', { method: 'DELETE' }),
   },
   platform: {
     status: () => apiFetch('/platform/status'),
@@ -1392,6 +1399,7 @@ export const api = {
       body: JSON.stringify(plan),
     }),
     cancelUnfinishedUpdate: () => apiFetch('/platform/unfinished-update', { method: 'DELETE' }),
+    keepSettlingUpdate: () => apiFetch('/platform/unfinished-update/keep', { method: 'POST' }),
     parkForAgent: (plan) => apiFetch('/platform/park-for-agent', {
       method: 'POST',
       body: JSON.stringify(plan),

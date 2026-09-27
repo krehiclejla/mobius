@@ -106,6 +106,12 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
       "restarting."
     ) from exc
   if completed.returncode == 0:
+    # The next boot also refuses source that needs a newer image's packages.
+    from app.platform_update import release_packages_missing_from_image
+
+    reason = release_packages_missing_from_image(platform_root)
+    if reason:
+      raise RestartSourceInvalid(f"Restart stopped: {reason}")
     return
   detail = (completed.stderr or completed.stdout or "").strip()
   if len(detail) > 1200:

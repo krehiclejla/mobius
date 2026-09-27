@@ -42,7 +42,7 @@
   background:
     linear-gradient(
       145deg,
-      color-mix(in srgb, var(--surface2) 24%, transparent),
+      color-mix(in srgb, var(--surface-2) 24%, transparent),
       transparent 38%
     ),
     var(--surface);
@@ -94,7 +94,7 @@
   height: 34px;
   display: grid;
   place-items: center;
-  background: color-mix(in srgb, var(--surface2) 62%, transparent);
+  background: color-mix(in srgb, var(--surface-2) 62%, transparent);
   border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
   color: var(--muted);
   font-size: 22px;
@@ -107,7 +107,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .mmm__close:hover {
-    background: var(--surface2);
+    background: var(--surface-2);
     border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
     color: var(--text);
   }
@@ -246,7 +246,7 @@
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .mmm-row:hover { background: var(--surface2); }
+  .mmm-row:hover { background: var(--surface-2); }
 }
 
 .mmm-row--hidden .mmm-row__title,
@@ -289,7 +289,7 @@
   accent-color: var(--accent);
   border-radius: 999px;
   border: 1px solid var(--border);
-  background: var(--surface2);
+  background: var(--surface-2);
   cursor: pointer;
   position: relative;
   transition: background 0.15s, border-color 0.15s;
@@ -327,7 +327,7 @@
 .mmm__skeleton-row {
   height: 56px;
   border-radius: 8px;
-  background: var(--surface2);
+  background: var(--surface-2);
   opacity: 0.5;
   animation: mmm-skeleton-pulse 1.6s ease-in-out infinite;
 }
@@ -416,7 +416,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .mmm__btn--outline:not(:disabled):hover {
-    background: var(--surface2);
+    background: var(--surface-2);
   }
 }
 
@@ -428,7 +428,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .mmm__btn--ghost:not(:disabled):hover {
-    background: var(--surface2);
+    background: var(--surface-2);
     border-color: color-mix(in srgb, var(--text) 20%, var(--border));
   }
 }

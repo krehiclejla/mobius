@@ -34,7 +34,7 @@ export const DIFF_VIEWER_STYLES = `
   display: grid;
   grid-template-columns: 8ch minmax(0, 1fr);
   min-width: 0;
-  background: var(--surface2, #212121);
+  background: var(--surface-2, #212121);
   color: var(--muted, #a8a8a8);
 }
 
@@ -82,7 +82,7 @@ export const DIFF_VIEWER_STYLES = `
   color: var(--muted, #a8a8a8);
   background: color-mix(
     in srgb,
-    var(--surface2, #212121) 58%,
+    var(--surface-2, #212121) 58%,
     transparent
   );
   border-right: 1px solid var(--border, #2a2a2a);
@@ -174,7 +174,7 @@ export const DIFF_VIEWER_STYLES = `
   .file-diff-list__more:hover {
     background: color-mix(
       in srgb,
-      var(--surface2, #212121) 72%,
+      var(--surface-2, #212121) 72%,
       transparent
     );
   }
@@ -259,7 +259,7 @@ export const DIFF_VIEWER_STYLES = `
   border-radius: 5px;
   background: color-mix(
     in srgb,
-    var(--surface2, #212121) 80%,
+    var(--surface-2, #212121) 80%,
     transparent
   );
   color: var(--muted, #a8a8a8);
@@ -296,7 +296,7 @@ export const DIFF_VIEWER_STYLES = `
   overflow-x: hidden;
   overflow-y: auto;
   border-top: 1px solid var(--border, #2a2a2a);
-  background: var(--surface2, #212121);
+  background: var(--surface-2, #212121);
 }
 
 .file-diff-list__message,

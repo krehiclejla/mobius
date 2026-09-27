@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   HISTORY_PREFETCH_VIEWPORTS,
-  olderHistoryRetryShown,
+  olderHistoryRetryDelayMs,
   olderHistoryShouldLoad,
   paginationViewportCompensationAllowed,
 } from '../scroll/policy.js'
@@ -42,8 +42,10 @@ test('pagination compensation preserves the same reader generation under touch',
   }), false)
 })
 
-test('failed pagination exposes retry only while older pages remain', () => {
-  assert.equal(olderHistoryRetryShown(true, 20), true)
-  assert.equal(olderHistoryRetryShown(false, 20), false)
-  assert.equal(olderHistoryRetryShown(true, 0), false)
+test('failed pagination retries quietly with a capped backoff instead of a retry control', () => {
+  assert.equal(olderHistoryRetryDelayMs(0), 1000)
+  assert.ok(olderHistoryRetryDelayMs(1) > olderHistoryRetryDelayMs(0))
+  assert.equal(olderHistoryRetryDelayMs(4), 30000)
+  assert.equal(olderHistoryRetryDelayMs(50), 30000,
+    'a reader waiting at the top keeps getting a steady, bounded retry cadence')
 })

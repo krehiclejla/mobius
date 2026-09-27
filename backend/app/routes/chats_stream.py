@@ -284,7 +284,6 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
 async def _append_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
   *, initiated_by_app_id: int | None = None,
-  owner_authored: bool = False,
   front: bool = False,
   require_answer_match: bool = False,
 ) -> dict:
@@ -311,7 +310,6 @@ async def _append_to_pending(
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       selected_options=body.selected_options, question_id=body.question_id,
       initiated_by_app_id=initiated_by_app_id,
-      owner_authored=owner_authored,
       front=front, require_answer_match=require_answer_match,
     ),
   )
@@ -321,7 +319,6 @@ async def _append_to_pending(
 async def _append_restart_feedback_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
   *, initiated_by_app_id: int | None = None,
-  owner_authored: bool = False,
 ) -> dict:
   """Settle a Restart card and queue its written response as one command."""
   return await _submit_pending_message(
@@ -329,7 +326,6 @@ async def _append_restart_feedback_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       question_id=body.question_id, initiated_by_app_id=initiated_by_app_id,
-      owner_authored=owner_authored,
     ),
   )
 
@@ -618,10 +614,8 @@ def _selected_force_steer_pending(
 def _user_messages_from_pending(
   selected_pending: list[dict],
   fallback_user_msg: dict,
-  *,
-  owner_authored: bool,
 ) -> list[dict]:
-  """Build force-steered rows under the current actor's authority."""
+  """Build durable transcript rows for a force-steered pending batch."""
   user_msgs: list[dict] = []
   for pending in selected_pending:
     msg = dict(pending)
@@ -637,24 +631,8 @@ def _user_messages_from_pending(
       derived = cid_of(pending)
       if derived is not None:
         msg["cid"] = derived
-    user_msgs.append(_message_for_steer_actor(
-      msg, owner_authored=owner_authored,
-    ))
+    user_msgs.append(msg)
   return user_msgs or [fallback_user_msg]
-
-
-def _message_for_steer_actor(
-  message: dict,
-  *,
-  owner_authored: bool,
-) -> dict:
-  """Copy a steer row and bind authority to the actor choosing it now."""
-  result = dict(message)
-  if owner_authored:
-    result["_owner_authored"] = True
-  else:
-    result.pop("_owner_authored", None)
-  return result
 
 
 @router.post(
@@ -731,7 +709,6 @@ async def send_message(
           try:
             append_result = await _append_restart_feedback_to_pending(
               chat, body, db, initiated_by_app_id=principal.app_id,
-              owner_authored=is_owner_input_principal(principal),
             )
             stored = append_result["stored"]
             duplicate = append_result.get("duplicate") is True
@@ -1045,7 +1022,6 @@ async def send_message(
         # wake, so neither a second runner nor a polling task is needed.
         stored = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
-          owner_authored=is_owner_input_principal(principal),
           front=True, require_answer_match=True,
         )
         from app.chat_event_sink import get_active_sink
@@ -1180,7 +1156,6 @@ async def send_message(
           body,
           db,
           initiated_by_app_id=principal.app_id,
-          owner_authored=is_owner_input_principal(principal),
           front=True,
           require_answer_match=True,
         )
@@ -1375,7 +1350,6 @@ async def _send_message_locked(
   if is_draining():
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
-      owner_authored=is_owner_input_principal(principal),
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1387,7 +1361,6 @@ async def _send_message_locked(
   if activation_barrier_wait_id(db, chat_id) is not None:
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
-      owner_authored=is_owner_input_principal(principal),
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1405,7 +1378,6 @@ async def _send_message_locked(
   ):
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
-      owner_authored=is_owner_input_principal(principal),
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1455,9 +1427,7 @@ async def _send_message_locked(
       user_msg = _user_message_from_body(chat, body)
       if body.force_steer:
         user_msgs = _user_messages_from_pending(
-          selected_force_pending or [],
-          user_msg,
-          owner_authored=is_owner_input_principal(principal),
+          selected_force_pending or [], user_msg,
         )
         consume_cids = list(body.consume_pending_cids or [])
         steer_content = user_msg["content"]
@@ -1465,14 +1435,10 @@ async def _send_message_locked(
       else:
         reserved = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
-          owner_authored=is_owner_input_principal(principal),
         )
         db.expire(chat)
         reserved_cid = cid_of(reserved)
-        user_msgs = [_message_for_steer_actor(
-          reserved,
-          owner_authored=is_owner_input_principal(principal),
-        )]
+        user_msgs = [reserved]
         consume_cids = [reserved_cid] if reserved_cid is not None else []
         steer_content = reserved.get("content", "")
       if questions.is_waiting(chat_id):
@@ -1519,7 +1485,6 @@ async def _send_message_locked(
 
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
-      owner_authored=is_owner_input_principal(principal),
     )
     started_message = None
 
@@ -1600,7 +1565,6 @@ async def _send_message_locked(
       })
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
-      owner_authored=is_owner_input_principal(principal),
     )
     return _queued_response(new_msg, len(chat.pending_messages))
 
@@ -1826,7 +1790,6 @@ async def update_pending_message(
       run_token="",
       cid=cid,
       content=content,
-      owner_authored=is_owner_input_principal(principal),
     )
   )
   result = await await_ack(ack)

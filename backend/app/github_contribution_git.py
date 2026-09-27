@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
 
-from app import github_auth
+from app import app_git, github_auth
 from app.contribution_errors import ContributionSubmitError
 from app.github_contribution_contract import (
   BRANCH_NAME as _BRANCH_NAME,
@@ -648,16 +648,21 @@ def _assert_pr_checks_green(
     )
 
 
-def _assert_merges_with_upstream(
-  repo: Path, upstream_repo: str, branch: str,
-) -> dict:
-  upstream_branch = _upstream_default_branch(repo, upstream_repo)
+def fetch_upstream_head(
+  repo: Path, upstream_repo: str, upstream_branch: str,
+) -> str:
+  """Fetch one upstream branch tip into ``repo``'s objects and return its sha.
+
+  The tip is fetched through a unique temporary ref that is removed again, so
+  concurrent callers never race on a shared remote-tracking ref. Transient
+  transport failures get one fresh attempt; failures carry
+  ``upstream_fetch_unavailable`` (transient) or ``upstream_fetch_failed``.
+  """
   remote_url = f"https://github.com/{upstream_repo}.git"
   ref_key = hashlib.sha256(
-    f"{upstream_repo}\0{branch}\0{time.time_ns()}".encode("utf-8")
+    f"{upstream_repo}\0{upstream_branch}\0{time.time_ns()}".encode("utf-8")
   ).hexdigest()[:24]
   upstream_ref = f"refs/mobius-submit/upstream-{ref_key}"
-  preflight_patch = {"last_submit_upstream_branch": upstream_branch}
   try:
     fetch_detail = ""
     fetched = None
@@ -690,54 +695,74 @@ def _assert_merges_with_upstream(
       if not fetch_was_transient:
         break
       # Starting a fresh git process is the recovery boundary. There is no
-      # sleep here: Send remains bounded, and deterministic rejections never
+      # sleep here: callers remain bounded, and deterministic rejections never
       # consume a second attempt.
       if attempt + 1 >= _FETCH_ATTEMPTS:
         break
     if fetched is None or fetched.returncode != 0:
-      transient = fetch_was_transient
       raise ContributionSubmitError(
-        (
-          "GitHub was temporarily unreachable while Contribute checked "
-          f"upstream {upstream_branch}. Nothing was published. Try Send "
-          "again; leave feedback only if it keeps failing."
-          if transient else
-          f"GitHub could not provide upstream {upstream_branch} while "
-          "Contribute checked mergeability. Nothing was published. Leave "
-          "feedback so your agent can inspect it."
-        ),
-        record_patch=preflight_patch,
+        f"GitHub could not provide upstream {upstream_branch}.",
         code=(
-          "upstream_fetch_unavailable" if transient
+          "upstream_fetch_unavailable" if fetch_was_transient
           else "upstream_fetch_failed"
         ),
         detail=fetch_detail or "Git fetch failed without diagnostic output.",
-      ) from None
+      )
     upstream_sha = _git(
       repo, "rev-parse", "--verify", f"{upstream_ref}^{{commit}}",
     ).stdout.strip()
     if not _GIT_SHA.match(upstream_sha):
       raise ContributionSubmitError(
+        f"Could not resolve upstream {upstream_branch}.",
+        code="upstream_unresolved",
+      )
+    return upstream_sha
+  finally:
+    _git(repo, "update-ref", "-d", upstream_ref, check=False)
+
+
+def _assert_merges_with_upstream(
+  repo: Path, upstream_repo: str, branch: str,
+) -> dict:
+  upstream_branch = _upstream_default_branch(repo, upstream_repo)
+  preflight_patch = {"last_submit_upstream_branch": upstream_branch}
+  try:
+    upstream_sha = fetch_upstream_head(repo, upstream_repo, upstream_branch)
+  except ContributionSubmitError as exc:
+    if exc.code == "upstream_unresolved":
+      raise ContributionSubmitError(
         "Could not resolve the upstream branch for this PR. Leave feedback "
         "so your agent can refresh it.",
         record_patch=preflight_patch,
-      )
-    preflight_patch["last_submit_upstream_sha"] = upstream_sha
-    merged = _git(
-      repo, "merge-tree", "--write-tree", upstream_sha, branch, check=False,
+      ) from None
+    raise ContributionSubmitError(
+      (
+        "GitHub was temporarily unreachable while Contribute checked "
+        f"upstream {upstream_branch}. Nothing was published. Try Send "
+        "again; leave feedback only if it keeps failing."
+        if exc.code == "upstream_fetch_unavailable" else
+        f"GitHub could not provide upstream {upstream_branch} while "
+        "Contribute checked mergeability. Nothing was published. Leave "
+        "feedback so your agent can inspect it."
+      ),
+      record_patch=preflight_patch,
+      code=exc.code,
+      detail=exc.detail,
+    ) from None
+  preflight_patch["last_submit_upstream_sha"] = upstream_sha
+  merged = _git(
+    repo, "merge-tree", "--write-tree", upstream_sha, branch, check=False,
+  )
+  if merged.returncode != 0:
+    raise ContributionSubmitError(
+      (
+        f"This PR no longer merges cleanly with upstream {upstream_branch}. "
+        "Leave feedback so your agent can refresh the branch before it is "
+        "pushed."
+      ),
+      record_patch=preflight_patch,
     )
-    if merged.returncode != 0:
-      raise ContributionSubmitError(
-        (
-          f"This PR no longer merges cleanly with upstream {upstream_branch}. "
-          "Leave feedback so your agent can refresh the branch before it is "
-          "pushed."
-        ),
-        record_patch=preflight_patch,
-      )
-    return preflight_patch
-  finally:
-    _git(repo, "update-ref", "-d", upstream_ref, check=False)
+  return preflight_patch
 
 def _conflicts_with_recorded_upstream(record: dict, repo, branch: str) -> bool:
   """Whether this branch still fails to merge the upstream it last saw.
@@ -804,19 +829,17 @@ def _resolve_reviewed_commit(repo: Path, value: object, label: str) -> str:
 
 
 def _reviewed_branch_diff(repo: Path, base_sha: str, head_sha: str) -> bytes:
-  proc = _git(
-    repo,
-    "-c", "core.quotePath=false",
-    "diff",
-    "--no-ext-diff",
-    "--no-color",
-    "--binary",
-    "--full-index",
-    "--src-prefix=a/",
-    "--dst-prefix=b/",
-    f"{base_sha}..{head_sha}",
-  )
-  return proc.stdout.encode("utf-8")
+  """The byte-exact canonical diff that staging, review status and Send hash.
+
+  One definition only: decoding it as text would rewrite CR line endings and
+  fail on non-UTF-8 source, so Send would refuse a correctly staged record.
+  """
+  diff = app_git._canonical_diff(repo, base_sha, head_sha)
+  if diff is None:
+    raise ContributionSubmitError(
+      "Git could not compute the reviewed branch diff."
+    )
+  return diff
 
 
 def _assert_fresh(

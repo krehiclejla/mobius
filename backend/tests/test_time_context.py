@@ -12,17 +12,16 @@ from types import SimpleNamespace
 
 from app import models, schemas
 from app.chat_context import (
-  CLI_SLASH_COMMANDS,
   MOBIUS_SLASH_COMMANDS,
   _build_time_context,
   _chat_has_goal_intent,
   _goal_clear_requested,
   _goal_objective,
   _human_elapsed,
-  _is_cli_slash_command,
   _last_user_message_elapsed,
 )
 from app.database import SessionLocal
+from app.goal_commands import goal_request_for_agent
 
 
 def _frontend_slash_command_names(source: str) -> set[str]:
@@ -118,14 +117,24 @@ def test_elapsed_ignores_automatic_continuation_marker(monkeypatch):
     db.close()
 
 
-def test_goal_slash_command_is_detected_without_matching_paths():
-  assert _is_cli_slash_command("/goal say PONG")
-  assert _is_cli_slash_command("\n/goal clear")
-  assert not _is_cli_slash_command("")
-  assert not _is_cli_slash_command("\n\n")
-  assert not _is_cli_slash_command("/")
-  assert not _is_cli_slash_command("/data/apps/x is broken")
-  assert not _is_cli_slash_command("please run /goal later")
+def test_agent_receives_an_owner_goal_command_as_a_plain_request():
+  """Claude's CLI has its own /goal; the agent copy must never start with it."""
+  assert goal_request_for_agent("/goal say PONG") == "Goal: say PONG"
+  assert goal_request_for_agent("\n/goal\n  inspect first") == (
+    "Goal:\n  inspect first"
+  )
+  manifest = (
+    "\n\n[Files in this session:\n"
+    "- image.png → /data/chats/example/uploads/image.png "
+    "(image/png, 257 KB)]"
+  )
+  assert goal_request_for_agent("/goal ship it" + manifest) == (
+    "Goal: ship it" + manifest
+  )
+  # Only a complete owner Goal command is rewritten; other text is untouched.
+  for text in ("/goal", "/data/apps/x is broken", "please run /goal later",
+               " /goal indented is prose", "/goalkeeper tips", ""):
+    assert goal_request_for_agent(text) == text
 
 
 def test_goal_objective_is_extracted_from_clean_persisted_message():
@@ -179,10 +188,11 @@ def test_goal_controls_ignore_the_server_upload_manifest():
 
 
 
-def test_textless_send_is_not_a_slash_command():
-  """An attachment-only send has no text; this used to raise IndexError."""
-  for textless in ("", "   ", "\n\n", None):
-    assert not _is_cli_slash_command(textless)
+def test_textless_send_passes_through_unchanged():
+  """An attachment-only send has no text and must not raise."""
+  for textless in ("", "   ", "\n\n"):
+    assert goal_request_for_agent(textless) == textless
+  assert goal_request_for_agent(None) is None
 
 
 def test_slash_command_registry_parity():
@@ -201,7 +211,7 @@ def test_slash_command_registry_parity():
   offered = _frontend_slash_command_names(source)
 
   assert offered, f"no commands parsed from {registry} — did its shape change?"
-  dispatched = set(CLI_SLASH_COMMANDS) | set(MOBIUS_SLASH_COMMANDS)
+  dispatched = set(MOBIUS_SLASH_COMMANDS)
   assert offered == dispatched, (
     "composer menu and backend dispatch disagree: "
     f"menu={sorted(offered)} backend={sorted(dispatched)}"

@@ -295,7 +295,7 @@ export async function persistTheme(css, mode, api) {
 const STRUCTURAL_KEYS = [
   '--bg',
   '--surface',
-  '--surface2',
+  '--surface-2',
   '--border',
   '--border-light',
   '--text',

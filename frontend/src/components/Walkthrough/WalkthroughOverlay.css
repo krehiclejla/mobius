@@ -80,7 +80,7 @@
   height: 42px;
   margin-bottom: 18px;
   border-radius: 14px;
-  background: color-mix(in srgb, var(--accent, #8b6cf7) 16%, var(--surface2, #1a1f28));
+  background: color-mix(in srgb, var(--accent, #8b6cf7) 16%, var(--surface-2, #1a1f28));
 }
 
 .wt__mark::before,
@@ -129,7 +129,7 @@
   align-items: center;
   margin-top: 18px;
   padding: 12px;
-  background: color-mix(in srgb, var(--accent, #8b6cf7) 8%, var(--surface2, #1a1f28));
+  background: color-mix(in srgb, var(--accent, #8b6cf7) 8%, var(--surface-2, #1a1f28));
   border: 1px solid color-mix(in srgb, var(--accent, #8b6cf7) 22%, var(--border, #252b36));
   border-radius: 12px;
 }
@@ -226,7 +226,7 @@
   min-height: 58px;
   padding: 10px 12px;
   color: var(--text, #e4e4e7);
-  background: var(--surface2, #1a1f28);
+  background: var(--surface-2, #1a1f28);
   border: 0;
   border-radius: 0;
   font: inherit;
@@ -236,7 +236,7 @@
 }
 
 .wt__path:hover {
-  background: color-mix(in srgb, var(--accent, #8b6cf7) 11%, var(--surface2, #1a1f28));
+  background: color-mix(in srgb, var(--accent, #8b6cf7) 11%, var(--surface-2, #1a1f28));
 }
 
 .wt__path span {

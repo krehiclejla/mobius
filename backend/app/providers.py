@@ -1410,10 +1410,20 @@ def owner_default_provider(
   return resolve_default_provider(data_dir, configured_provider)
 
 
-def get_provider(provider_id: str | None = None) -> BaseProvider:
-  """Resolve a provider; an explicitly removed app must never fall into Claude."""
-  from app.config import get_settings
-  sync_app_model_providers(get_settings().data_dir)
+def get_provider(
+  provider_id: str | None = None, *, data_dir: str | None = None
+) -> BaseProvider:
+  """Resolve a provider; an explicitly removed app must never fall into Claude.
+
+  The app-model registry sync needs a durable-data root. An out-of-band caller
+  (a scheduled runner given an explicit `data_dir`) passes it here so provider
+  resolution stays off global server settings; only the in-process default path
+  falls back to `get_settings().data_dir`.
+  """
+  if data_dir is None:
+    from app.config import get_settings
+    data_dir = get_settings().data_dir
+  sync_app_model_providers(data_dir)
   selected = provider_id or DEFAULT_PROVIDER
   if selected not in PROVIDERS:
     raise ValueError(f"Provider {selected!r} is not installed.")

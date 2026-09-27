@@ -164,7 +164,7 @@ def test_image_owned_python_dependencies_do_not_probe_the_old_runtime():
 
 def test_only_image_owned_bootstrap_scripts_require_a_rebuild():
   assert activation.classify_activation([
-    "backend/scripts/goal_plan.py",
+    "backend/scripts/describe-tree.py",
   ])["level"] == "live"
   assert activation.classify_activation([
     "backend/scripts/rebuild_shell.sh",

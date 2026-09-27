@@ -1,59 +1,25 @@
-import useDelayedConnectionNotice from '../../hooks/useDelayedConnectionNotice.js'
 import { composerAdjacentActionProps } from './composerAdjacentAction.js'
 
 /**
- * Subtle reconnection indicator shown when the SSE connection is lost,
- * plus a quieter note while a wake/online reattach is in flight.
+ * The chat's one connection notice: shown only once the stream has given up,
+ * with the Retry the owner needs. Reattaching and retrying stay silent here;
+ * the shell's connectivity badge owns "Reconnecting…", "Offline", and
+ * "Restarting…".
  */
-export default function ConnectionStatus({ error, reconnecting, onRetry }) {
-  const transient = reconnecting || error === 'retrying'
-  const showTransient = useDelayedConnectionNotice(transient)
-
-  if (!error) {
-    // `reconnecting` is the healthy sleep/wake reattach window (see
-    // useStreamConnection's armReconnectingNote): the stream is being
-    // replaced, not failing, so it renders as a quiet note without the
-    // error bar or a Retry affordance. Error states below win the slot —
-    // 'retrying' already announces its own reconnect, and 'disconnected'
-    // needs the Retry button front and center.
-    if (!showTransient) return null
-    return (
-      <div
-        className="connection-status connection-status--reattach"
-        role="status"
-        aria-live="polite"
-      >
-        <span className="connection-status__text">Reconnecting…</span>
-      </div>
-    )
-  }
-
-  // Announce a dropped stream to assistive tech: 'alert' (assertive) for the
-  // terminal "connection lost" so a screen-reader user hears it immediately
-  // and can find Retry; 'status' (polite) for the transient reconnecting
-  // state so it doesn't interrupt.
-  const isLost = error !== 'retrying'
-  if (!isLost && !showTransient) return null
+export default function ConnectionStatus({ error, onRetry }) {
+  if (!error || error === 'retrying') return null
+  // 'alert' (assertive) so a screen-reader user hears the lost connection
+  // immediately and can find Retry.
   return (
-    <div
-      className="connection-status"
-      role={isLost ? 'alert' : 'status'}
-      aria-live={isLost ? 'assertive' : 'polite'}
-    >
-      {error === 'retrying' ? (
-        <span className="connection-status__text">Reconnecting...</span>
-      ) : (
-        <>
-          <span className="connection-status__text">Connection lost</span>
-          <button
-            type="button"
-            className="connection-status__retry"
-            {...composerAdjacentActionProps(onRetry)}
-          >
-            Retry
-          </button>
-        </>
-      )}
+    <div className="connection-status" role="alert" aria-live="assertive">
+      <span className="connection-status__text">Connection lost</span>
+      <button
+        type="button"
+        className="connection-status__retry"
+        {...composerAdjacentActionProps(onRetry)}
+      >
+        Retry
+      </button>
     </div>
   )
 }

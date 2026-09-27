@@ -108,6 +108,15 @@ def continuation_reason(message: Mapping[str, Any] | None) -> str:
   return "automatic recovery"
 
 
+def is_retired_goal_handoff(message: Mapping[str, Any] | None) -> bool:
+  """A queued automatic-Goal control the pre-2026-09-27 writer left behind.
+
+  Goals no longer continue themselves. Such a row may still sit behind owner
+  input in a persisted queue; it is retired unrun, never promoted as input.
+  """
+  return continuation_reason(message) == "goal_handoff"
+
+
 def continuation_actor_label(message: Mapping[str, Any] | None) -> str:
   """Return provider/history attribution without treating a marker as speech."""
   reason = continuation_reason(message)

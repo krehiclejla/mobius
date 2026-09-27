@@ -63,3 +63,16 @@ def goal_objective(text: str) -> str | None:
   if objective is None or objective.lower() == "clear":
     return None
   return objective
+
+
+def goal_request_for_agent(text: str) -> str:
+  """The agent's copy of an owner ``/goal <objective>`` message.
+
+  Möbius has already turned the command into its Goal, so the agent receives
+  the objective as a plain request. A provider must never see ``/goal`` as its
+  own slash command: Claude's CLI has a native ``/goal`` that would echo the
+  hidden context Möbius appends and arm a second, parallel goal loop.
+  """
+  if goal_objective(text) is None:
+    return text
+  return re.sub(r"^\n*/goal\b", "Goal:", text, count=1)

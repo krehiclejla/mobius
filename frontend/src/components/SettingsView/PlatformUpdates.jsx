@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert } from '@openai/apps-sdk-ui/components/Alert'
 import { platformUpdateStatusLabel, platformActivationLevel, reviewedUpdateUsesContainerRebuild } from '../../lib/platformUpdateState.js'
-import { rebuildIsActive, rebuildProgressMessage } from '../../lib/containerRebuild.js'
+import { rebuildIsActive, rebuildAwaitingHostHelper, rebuildStatusLine } from '../../lib/containerRebuild.js'
 import { containerVersionIdentity, platformVersionIdentity } from '../../lib/platformVersionIdentity.js'
 import { formatUpstreamCommitDate } from '../../lib/platformProvenance.js'
 import usePlatformUpdates from './usePlatformUpdates.js'
@@ -28,6 +28,9 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
   // A prepared or installed update must finish (restart, or container
   // replacement) before another is offered.
   const unfinished = platform?.unfinished_update?.stage === 'finish' ? platform.unfinished_update : null
+  // A new container is running the update and its replacement is not yet
+  // confirmed; nothing else may start until it is.
+  const settling = platform?.unfinished_update?.stage === 'settling'
   const available = platform?.available || platform?.newer_updates_available
   const unavailable = !platform || platform.status_unavailable
   const activeRebuild = rebuildIsActive(rebuild)
@@ -80,6 +83,8 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
 
   const primary = conflict
     ? { label: platform?.conflict_chat_id ? 'Finish in chat' : 'Finish update', act: update.resolve }
+    : settling
+      ? { label: phase === 'checking' ? 'Checking…' : 'Check again', act: check }
     : unfinished?.action === 'restart'
       ? { label: confirmRestart === 'primary' ? 'Confirm restart' : 'Restart to finish', act: () => pressRestart('primary') }
     : unfinished
@@ -91,7 +96,8 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
         : restartNeeded
           ? { label: confirmRestart === 'primary' ? 'Confirm restart' : 'Restart to finish', act: () => pressRestart('primary') }
           : { label: phase === 'checking' ? 'Checking…' : 'Check for updates', act: check }
-  const status = activeRebuild ? rebuildProgressMessage(rebuild)
+  const status = activeRebuild ? rebuildStatusLine(rebuild)
+    : settling ? 'Confirming the new container…'
     : update.reconnecting ? (update.observingKind === 'apply' ? 'Checking the update…' : 'Restarting Möbius…')
       : !platform ? 'Checking update status…' : platformUpdateStatusLabel(platform)
 
@@ -130,11 +136,28 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
         </button>
       </div>
       {confirmRestart && <p className="platform-updates__description" role="status">Restarting briefly pauses active chats. This page will reconnect automatically. Confirm within 4 seconds, or let this prompt expire.</p>}
+      {settling && !busy && !activeRebuild && (
+        <div className="platform-updates__description">
+          <p>The new container is running this update. Möbius keeps the previous version ready until the replacement is confirmed; other updates wait until then.</p>
+          {rebuild && rebuild.state !== 'succeeded' && (
+            <button type="button" className="settings__btn settings__btn--sm settings__btn--outline" onClick={update.keepSettling}>Keep this version</button>
+          )}
+        </div>
+      )}
       {!busy && !unavailable && !conflict && restartNeeded && (
         <p className="platform-updates__description">Your changes are ready. You can add more updates before restarting once.</p>
       )}
       {activeRebuild && rebuild.status_unavailable && (
         <p className="platform-updates__description">Reconnecting to Möbius. The update is still running.</p>
+      )}
+      {rebuildAwaitingHostHelper(rebuild) && !update.reconnecting && (
+        <div className="platform-updates__description">
+          <p role="status">{rebuild.message}</p>
+          <button type="button" className="settings__btn settings__btn--sm settings__btn--outline"
+            disabled={phase !== 'idle'} onClick={update.withdrawHostRequest}>
+            {phase === 'cancelling' ? 'Withdrawing…' : 'Withdraw request'}
+          </button>
+        </div>
       )}
       {update.reconnecting && (
         <p className="platform-updates__description" role="status">{update.slow

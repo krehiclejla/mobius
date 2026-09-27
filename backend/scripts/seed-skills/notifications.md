@@ -16,22 +16,9 @@ Send push notifications for meaningful events — not routine confirmations. If 
 
 ## `open_item` is live-only — pair it with a push for durability
 
-The `open_item` system event drops an app or chat into the live workspace and is
-never stored. Use it when the partner asks to open an item or when a completed
-item should be visible now:
-
-```bash
-mapi -X POST /api/notify --data-binary @- <<JSON
-{"type":"open_item","itemKind":"app","itemId":"42","sourceKind":"chat","sourceId":"$CHAT_ID","placement":"beside-source","activation":"background"}
-JSON
-```
-
-(`mapi` fills in auth + base URL.) For literal or multiline JSON, pass stdin
-with `--data-binary @-` instead of building a shell-escaped `-d` argument.
-Quote the heredoc delimiter when no variable expansion is needed. The examples
-that expand `$CHAT_ID` leave it unquoted only for that machine-generated ID;
-generate arbitrary or user-authored values with a real JSON encoder instead of
-splicing them into JSON text.
+The `open_item` tool drops an app (numeric id) or chat into the live workspace
+beside this chat and is never stored. Use it when the partner asks to open an
+item or when a completed item should be visible now.
 
 - Default `activation` to `background`; use `foreground` only when the partner
   just asked to open that exact item.
@@ -44,40 +31,19 @@ splicing them into JSON text.
 
 ## Ending a turn with an open question — you fire the push yourself
 
-The platform does NOT auto-notify when you call `AskUserQuestion` or end a turn with a prose clarifying question. You own this explicitly: same `mapi -X POST /api/notifications/send` pattern you use after building an app, with a question-shaped title and body. Firing it from bash means the HTTP response lands in your tool output, so you see success/failure and can react (re-try, fall back to text) on the same turn.
+The platform does NOT auto-notify when you call `AskUserQuestion` or end a turn with a prose clarifying question. You own this explicitly with `notify_owner`, the same tool you use after building an app, with a question-shaped title and body. Its result tells you whether it was sent, so you can react on the same turn.
 
-Title: "Möbius needs your answer". Body: the first ~80 chars of your question. Include `source_id: "$CHAT_ID"` and `target: "/shell/?chat=$CHAT_ID"` so the tap routes back here **inside the PWA** — the bare `/chat/<id>` form escapes the service-worker scope and a cold tap opens a browser tab instead. Skip the notify only when you delivered something useful in the same turn AND that delivery already sent a notification whose **default target is this chat**. An app-targeted completion notification does not cover an open question: its tap lands in the wrong place, so send the chat-targeted question notification too.
+Title: "Möbius needs your answer". Body: the first ~80 chars of your question. The tool's default target already routes the tap back to this chat **inside the PWA** (`/shell/?chat=<id>`); a bare `/chat/<id>` target would escape the service-worker scope and open a browser tab. Skip the notify only when you delivered something useful in the same turn AND that delivery already sent a notification whose **default target is this chat**. An app-targeted completion notification does not cover an open question: its tap lands in the wrong place, so send the chat-targeted question notification too.
 
 ---
 
-## The authenticated JSON forms
+## Sending one
 
-Minimum viable:
+Call `notify_owner` with `title` and `body`. It defaults `target` to this chat;
+pass `/shell/?app=APP_ID` to open an app, and up to two `actions`
+(`{action, title, target}`, e.g. `open_app` and `open_chat`).
 
-```bash
-mapi -X POST /api/notifications/send --data-binary @- <<'JSON'
-{"title":"Task complete","body":"Your expense tracker app is ready."}
-JSON
-```
-
-`source_type` defaults to `"agent"`; `source_id` is optional. Full form when you want a deep link + actions:
-
-```bash
-mapi -X POST /api/notifications/send --data-binary @- <<JSON
-{
-    "title": "Task complete",
-    "body": "Your expense tracker app is ready.",
-    "source_id": "$CHAT_ID",
-    "target": "/shell/?app=APP_ID_HERE",
-    "actions": [
-      {"action": "open_app", "title": "Open App", "target": "/shell/?app=APP_ID_HERE"},
-      {"action": "open_chat", "title": "View Chat", "target": "/shell/?chat=$CHAT_ID"}
-    ]
-}
-JSON
-```
-
-Optional `"tag"` (1-128 chars of `A-Z a-z 0-9 _ . : -`, the same shape as a
+Optional `tag` (1-128 chars of `A-Z a-z 0-9 _ . : -`, the same shape as a
 target `intent`) groups pushes about the same thing: a newer push replaces the
 older one on the device instead of stacking. Using the target's intent as the
 tag (`"target": "/shell/?app=ID&intent=dm:alice.example"`, `"tag":

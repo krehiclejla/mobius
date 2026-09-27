@@ -86,7 +86,7 @@
   padding: 10px 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--surface2);
+  background: var(--surface-2);
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
@@ -159,7 +159,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .settings__btn--outline:hover {
-    background: var(--surface2);
+    background: var(--surface-2);
   }
 }
 
@@ -216,7 +216,7 @@
 
 .settings__appearance-option--active {
   color: var(--text);
-  background: var(--surface2);
+  background: var(--surface-2);
   opacity: 1;
 }
 
@@ -387,7 +387,7 @@
 @media (hover: hover) and (pointer: fine) {
   .settings-bg-row__drag-handle:hover {
     color: var(--text);
-    background: var(--surface2);
+    background: var(--surface-2);
   }
 }
 

@@ -76,46 +76,6 @@ def test_cold_goal_runtime_without_question_never_reads_transcript(
   assert response.status_code == 200, response.text
   assert not _transcript_reads(statements)
   assert not any("chats.live_assistant" in sql for sql in statements)
-  with SessionLocal() as cold, _selects() as handoff_statements:
-    assert goal_plans.goal_handoff_owner_kind(cold, chat_id, "goal") is None
-  assert not _transcript_reads(handoff_statements)
-  assert not any("chats.pending_messages" in sql for sql in handoff_statements)
-
-
-@pytest.mark.parametrize("preload", ["cold", "loaded", "raiseload"])
-def test_settled_question_keeps_exact_author_without_reloading_loaded_history(
-  client, auth, db, preload,
-):
-  chat_id = _new_chat(client, auth, [{
-    "id": "root", "role": "assistant", "content": "Choose", "ts": 1,
-    "blocks": [{
-      "type": "question", "question_id": "card",
-      "response_mode": "continuation", "questions": [],
-    }],
-  }])
-  _run(db, chat_id)
-  _run(
-    db, chat_id, run_id="unrelated", goal_id="another", status="running",
-    start=10, end=15,
-  )
-  row = db.get(models.Chat, chat_id)
-  row.pending_question_id = "card"
-  db.commit()
-  with SessionLocal() as cold:
-    held = None
-    if preload == "loaded":
-      held = cold.get(models.Chat, chat_id)
-      assert held.messages
-    elif preload == "raiseload":
-      held = cold.query(models.Chat).options(
-        load_only(models.Chat.id, raiseload=True),
-      ).one()
-    with _selects() as statements:
-      assert goal_plans.goal_handoff_owner_kind(
-        cold, chat_id, "goal",
-      ) == "owner_question"
-    assert len(_transcript_reads(statements)) == (0 if preload == "loaded" else 1)
-    assert goal_plans.goal_handoff_owner_kind(cold, chat_id, "another") is None
 
 
 @pytest.mark.parametrize("start,end,expected", [
@@ -247,9 +207,10 @@ def test_detail_history_with_many_goals_reads_transcript_only_once(
   assert {call.args[1].goal_id for call in spy.call_args_list} == {"goal-5"}
 
 
-def test_cold_runtime_keeps_settled_continuation_question_owner(
+def test_cold_runtime_with_an_open_card_never_reads_transcript(
   client, auth, db,
 ):
+  """Who moves next is the chat's open card, not a per-Goal author lookup."""
   chat_id = _new_chat(client, auth, [{
     "id": "root", "role": "assistant", "content": "Approval needed", "ts": 1,
     "blocks": [{
@@ -267,5 +228,5 @@ def test_cold_runtime_keeps_settled_continuation_question_owner(
   body = response.json()
   assert body["pending_question_id"] == "card"
   assert body["goal"]["status"] == "paused"
-  assert body["goal"]["wait_kind"] == "owner_question"
-  assert len(_transcript_reads(statements)) == 1
+  assert "wait_kind" not in body["goal"]
+  assert not _transcript_reads(statements)

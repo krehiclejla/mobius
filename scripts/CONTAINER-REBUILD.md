@@ -137,7 +137,12 @@ root-owned `systemd.path` unit starts a one-shot worker; durable status is
 mirrored back into `/data` for polling without a host process or network
 handshake. A boot-time one-shot reconciles any active status left behind by a
 host power loss. The request contains only the expected 40-character upstream
-SHA and is claimed atomically on the same persistent filesystem before use.
+SHA and, from request version 2, an app-generated nonce that the helper echoes
+as `request_nonce` in its status, so the app can tell its exact replacement's
+outcome from any earlier one. It is claimed atomically on the same persistent
+filesystem before use. The app requires a helper that advertises request
+version 2 (`request_versions`); `deployment/self-hosted-helper.required`
+revision 1 asks older installations to reinstall it.
 
 The worker:
 

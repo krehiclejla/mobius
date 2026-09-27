@@ -48,6 +48,7 @@ from app import (
   app_git,
   contribution_assignments,
   contribution_runtime,
+  contribution_staging,
   contribution_work,
   fs_locks,
   github_auth,
@@ -121,8 +122,8 @@ from app.github_contribution_git import (
   _assert_unprotected_landing_target,
   _assert_pr_checks_green,
   _assert_merges_with_upstream,
+  fetch_upstream_head,
   _resolve_reviewed_commit,
-  _reviewed_branch_diff,
   _assert_fresh,
 )
 from app.storage_io import atomic_write
@@ -177,6 +178,7 @@ from app.github_contributions import (
   _reviewed_pr_labels,
   _apply_reviewed_pr_labels,
   _authoritative_public_reconciliation,
+  _exact_reviewed_pr_text,
   _find_existing_pr,
   _existing_branch_pr,
   _is_transient_push_error,
@@ -804,6 +806,45 @@ class ContributionUpdateBody(BaseModel):
   )
 
 
+class ContributionStageBody(BaseModel):
+  """What an agent supplies to stage a review branch; Git supplies the rest.
+
+  A new record names its review checkout, target repository and the reviewed
+  public text. A restage keeps its checkout and may replace the text of a PR
+  that is not public yet. An open PR's title and description are never staged:
+  an update publishes only its branch, so staging copies the live text.
+  ``base_sha`` overrides the accepted base (normally the merge base with the
+  target's freshly fetched default branch; a stack layer uses its parent).
+  ``chat_id`` names the source conversation the work belongs to when a helper
+  stages it; it defaults to the calling chat.
+  """
+
+  chat_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9-]{1,64}$")
+  # An Autopilot round restages its open PR in place: the record stays public
+  # and the round's own ``/autopilot/update`` pushes the derived head.
+  autopilot_run_id: str | None = None
+  repo_path: str | None = None
+  repo: str | None = None
+  source_repo_path: str | None = None
+  base_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+  title: str | None = None
+  body_draft: str | None = None
+  summary: str | None = None
+  labels: list[str] | None = None
+  prior_work: dict | None = None
+  coauthor_trailer: Literal[False] | None = None
+
+
+class ContributionReviewBody(BaseModel):
+  """A review verdict for the exact staged head and diff the reviewer read."""
+
+  head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+  diff_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+  state: Literal["reviewing", "changes_needed", "all_clear"]
+  summary: str = Field(min_length=1, max_length=4000)
+  scope: list[str] | None = None
+
+
 class ContributionSourceContinuityBody(BaseModel):
   """Exact source/review identity an active agent has just re-read.
 
@@ -866,8 +907,8 @@ class AutopilotRespondBody(BaseModel):
 
 class AutopilotUpdateBody(BaseModel):
   run_id: str
-  # The head + reviewed-diff hash the agent recomputed and wrote to the record
-  # (CAS) before calling; the endpoint re-verifies both against the branch.
+  # The head + diff hash the round's in-place stage call derived onto the
+  # record; the endpoint re-verifies both against the branch.
   head_sha: str
   diff_sha256: str
   summary: str = ""
@@ -1590,6 +1631,422 @@ async def attest_contribution_source_continuity(
     "record_id": record_id,
     "reviewed_through_sha": body.reviewed_through_sha,
   }
+
+
+_STAGEABLE_STATUSES = frozenset(("prepared", "open", "draft"))
+_SOURCE_SYNC_RESERVE = 1024
+_STAGE_CLEARED_FIELDS = (
+  "last_submit_error", "last_submit_error_code", "last_submit_error_detail",
+)
+
+
+def _stage_error(exc: ContributionSubmitError) -> HTTPException:
+  return HTTPException(
+    status_code=exc.status_code,
+    detail={
+      "message": exc.message,
+      **({"code": exc.code} if exc.code else {}),
+      **({"detail": exc.detail} if exc.detail else {}),
+    },
+  )
+
+
+def _stage_inputs(
+  previous: dict | None, body: ContributionStageBody, parent_head: str,
+) -> dict:
+  """Validate one staging request and read the remote facts it depends on.
+
+  Runs before any lock is taken: it may fetch the target's default branch and
+  read an open PR from GitHub.
+  """
+  if previous is None:
+    missing = [
+      name for name in ("repo_path", "repo", "title", "body_draft", "summary")
+      if not getattr(body, name)
+    ]
+    if missing:
+      raise ContributionSubmitError(
+        "A new contribution needs " + ", ".join(missing) + ".",
+        status_code=422, code="stage_incomplete",
+      )
+    plan: dict = {}
+    repo_path = _safe_repo_path(body.repo_path)
+    repo_slug = _validate_repo_slug(body.repo)
+    action = "pr"
+  else:
+    plan = previous.get("plan") if isinstance(previous.get("plan"), dict) else {}
+    if (
+      previous.get("type") != "pr"
+      or previous.get("status") not in _STAGEABLE_STATUSES
+    ):
+      raise ContributionSubmitError(
+        "Only a prepared or open pull request can be staged.",
+        code="not_stageable",
+      )
+    if body.repo_path and body.repo_path != plan.get("repo_path"):
+      raise ContributionSubmitError(
+        "A contribution keeps its review checkout. Stage a new record for a "
+        "different checkout.",
+        code="checkout_changed",
+      )
+    repo_path = _safe_repo_path(plan.get("repo_path"))
+    repo_slug = _validate_repo_slug(plan.get("repo") or previous.get("repo"))
+    if body.repo and body.repo != repo_slug:
+      raise ContributionSubmitError(
+        "A contribution keeps its target repository.", code="target_changed",
+      )
+    action = (
+      "pr_update"
+      if previous.get("status") in ("open", "draft")
+      or plan.get("action") == "pr_update"
+      else "pr"
+    )
+  in_place = bool(body.autopilot_run_id)
+  if in_place:
+    if previous is None or previous.get("status") not in ("open", "draft"):
+      raise ContributionSubmitError(
+        "An Autopilot round restages only its open pull request.",
+        code="not_stageable",
+      )
+    # Whatever action first published it, a public PR is now updated in place.
+    action = "pr_update"
+  if action == "pr_update" and (
+    body.title is not None or body.body_draft is not None
+  ):
+    raise ContributionSubmitError(
+      "An open pull request's title and description are edited on GitHub "
+      "directly; staging its update copies the live text.",
+      status_code=422, code="stage_public_text",
+    )
+  if not (repo_path / ".git").exists():
+    raise ContributionSubmitError(
+      "The review checkout is missing.", code="missing_checkout",
+    )
+  branch = contribution_staging.checkout_branch(repo_path)
+  recorded_branch = plan.get("branch") or (previous or {}).get("branch")
+  if recorded_branch and branch != recorded_branch:
+    raise ContributionSubmitError(
+      f"The review checkout is on {branch}, but this contribution publishes "
+      f"{recorded_branch}.",
+      code="branch_mismatch",
+    )
+  _validate_branch(branch)
+  live = None
+  if action == "pr_update":
+    live = _autopilot_live_target(*_prepared_existing_pr_target(previous))
+    if live.get("error"):
+      raise ContributionSubmitError(
+        "The open pull request could not be read, so nothing was staged.",
+        code="pr_unavailable", detail=str(live["error"]),
+      )
+  base_ref = body.base_sha or parent_head
+  if not base_ref:
+    upstream_sha = fetch_upstream_head(
+      repo_path, repo_slug, _upstream_default_branch(repo_path, repo_slug),
+    )
+    base_ref = _git(repo_path, "merge-base", upstream_sha, branch).stdout.strip()
+  source_repo = _safe_equivalence_source_path(
+    body.source_repo_path
+    or plan.get("source_repo_path")
+    or str(app_git.primary_worktree_path(repo_path) or "")
+  )
+  return {
+    "repo_path": repo_path, "repo": repo_slug, "branch": branch,
+    "action": action, "live": live, "base_ref": base_ref,
+    "source_repo": source_repo, "in_place": in_place,
+  }
+
+
+def _source_contains(record: dict) -> bool:
+  """Whether the owner's live source provably contains this reviewed change."""
+  try:
+    _assert_pending_equivalence_preflight(record)
+  except (
+    ContributionSubmitError, OSError, subprocess.SubprocessError,
+    RuntimeError, ValueError,
+  ):
+    return False
+  return True
+
+
+def _stage_record(
+  record_id: str,
+  previous: dict | None,
+  body: ContributionStageBody,
+  inputs: dict,
+  principal: Principal,
+) -> tuple[dict, contribution_staging.StagedCandidate]:
+  """Build the staged record from Git; the caller holds every lock."""
+  repo_path = inputs["repo_path"]
+  candidate = contribution_staging.derive_candidate(
+    repo_path, inputs["branch"], inputs["base_ref"],
+  )
+  live = inputs["live"]
+  if live is not None:
+    _assert_reviewed_update_contains_live_head(
+      repo_path, str(live.get("head_sha") or ""), candidate.head_sha,
+    )
+  now = _now_iso()
+  source_chat = body.chat_id or principal.chat_id
+  record = json.loads(json.dumps(previous)) if previous else {
+    "id": record_id, "type": "pr", "repo": inputs["repo"],
+    "chat_id": source_chat, "chat_ids": [source_chat],
+    "created_at": now,
+  }
+  plan = dict(record.get("plan") or {})
+  for field in ("title", "body_draft", "labels", "prior_work", "coauthor_trailer"):
+    value = getattr(body, field)
+    if value is not None:
+      plan[field] = value
+  if live is not None:
+    plan["title"], plan["body_draft"] = live["title"], live["body"]
+    plan["pr_metadata"] = {"old_title": live["title"], "old_body": live["body"]}
+  source_repo = inputs["source_repo"]
+  plan.update({
+    "action": inputs["action"],
+    "repo": inputs["repo"],
+    "branch": inputs["branch"],
+    "repo_path": str(repo_path),
+    "base_sha": candidate.base_sha,
+    "head_sha": candidate.head_sha,
+    "diff_sha256": candidate.diff_sha256,
+    "diff_stat": candidate.diff_stat,
+    "files": list(candidate.files),
+    "source_repo_path": str(source_repo),
+    "source_sha": app_git.head_sha(source_repo, "HEAD"),
+  })
+  record.update({
+    "status": previous["status"] if inputs["in_place"] else "prepared",
+    "title": plan["title"],
+    "branch": inputs["branch"],
+    "updated_at": now,
+    "plan": plan,
+  })
+  if body.summary:
+    record["summary"] = body.summary
+  chat_ids = [
+    value for value in record.get("chat_ids") or []
+    if isinstance(value, str) and value
+  ]
+  if source_chat not in chat_ids:
+    record["chat_ids"] = [*chat_ids, source_chat]
+  for field in _STAGE_CLEARED_FIELDS:
+    record.pop(field, None)
+  _exact_reviewed_pr_text(record)
+  _reviewed_pr_labels(plan)
+  message = _git(repo_path, "log", "-1", "--format=%B", candidate.head_sha).stdout
+  if coauthor_trailer_required(record) and _COAUTHOR_TRAILER not in message:
+    raise ContributionSubmitError(
+      "The staged commit is missing its required co-author trailer.",
+      code="missing_coauthor",
+    )
+  verdict = contribution_staging.restaged_verdict(previous, record)
+  if verdict is None:
+    record.pop("quality_review", None)
+  else:
+    record["quality_review"] = verdict
+  # Refuse an oversized record before the live source can be changed: the
+  # live-source result below adds at most the reserved bytes.
+  encoded = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
+  if len(encoded.encode("utf-8")) + _SOURCE_SYNC_RESERVE > MAX_RECORD_BYTES:
+    raise ContributionSubmitError(
+      "The staged record is too large.", status_code=422,
+      code="record_too_large",
+    )
+  record["source_sync"] = _track_live_source(previous, record, source_repo)
+  return record, candidate
+
+
+def _track_live_source(previous: dict | None, record: dict, source: Path) -> dict:
+  """Keep the live source on the reviewed version, or name the draft it holds.
+
+  When the live source held the previous staged version, the review revision
+  is committed onto it, so a later update recognizes the published change
+  instead of replaying the superseded draft. When that is not possible, the
+  result keeps the exact draft delta the live source still holds (carried
+  across later revisions) so the updater can retire it once the PR merges.
+  """
+  plan = record["plan"]
+  if _source_contains(record):
+    return contribution_staging.source_sync("in_source", plan["source_sha"])
+  old = (previous or {}).get("plan")
+  old_sync = (previous or {}).get("source_sync")
+  draft = (
+    old_sync.get("draft")
+    if isinstance(old_sync, dict) and old_sync.get("state") == "diverged"
+    and isinstance(old_sync.get("draft"), dict)
+    else None
+  )
+  if draft and not contribution_staging.source_holds(
+    source, str(draft.get("base_sha")), str(draft.get("head_sha")),
+  ):
+    draft = None
+  detail = "The live source does not contain this reviewed version."
+  if isinstance(old, dict) and contribution_staging.source_holds(
+    source, str(old.get("base_sha")), str(old.get("head_sha")),
+  ):
+    draft = contribution_staging.pin_draft(
+      source, record["id"], str(old.get("base_sha")), str(old.get("head_sha")),
+    )
+    detail = "Installed app source changes only through its own apply flow."
+    if contribution_staging.adopts_reviewed_revisions(source):
+      try:
+        adopted = contribution_staging.adopt_reviewed_revision(
+          source,
+          previous=(draft["base_sha"], draft["head_sha"]),
+          current=(plan["base_sha"], plan["head_sha"]),
+          message=f"Adopt reviewed revision: {plan['title']}",
+        )
+      except contribution_staging.AdoptionRefused as exc:
+        detail = exc.detail
+      else:
+        plan["source_sha"] = adopted
+        if _source_contains(record):
+          contribution_staging.unpin_draft(source, record["id"])
+          return contribution_staging.source_sync("adopted", adopted)
+        detail = "The adopted revision does not reproduce the reviewed change."
+  return contribution_staging.source_sync(
+    "diverged", plan["source_sha"], detail, draft=draft,
+  )
+
+
+@router.post(
+  "/contributions/{app_id}/{record_id}/stage",
+  dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("30/minute")
+async def stage_contribution(
+  request: Request,
+  app_id: int,
+  record_id: str,
+  body: ContributionStageBody,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_agent_run_principal),
+):
+  """Stage (or restage) one PR candidate from its committed review branch.
+
+  Private preparation only: nothing is pushed. Git, not the caller, supplies
+  the reviewed base, head, canonical diff and files, and an open PR becomes a
+  ``pr_update`` carrying its live public text. A verdict survives only a
+  byte-identical change. The response's ``source_sync`` says whether the live
+  source contains the staged version.
+  """
+  _validate_submit_app(app_id, principal, db)
+  if not _CONTRIBUTION_ID.fullmatch(record_id):
+    raise HTTPException(status_code=422, detail="Invalid contribution id.")
+  if body.autopilot_run_id is not None:
+    from app import contribution_autopilot as autopilot
+    _require_autopilot_agent(principal)
+    if not autopilot.verify_claim(
+      autopilot.get_row(db, app_id, record_id), body.autopilot_run_id,
+    ):
+      raise HTTPException(status_code=409, detail="No live round with this run_id.")
+  db.close()
+  record_path, diff_path = _record_paths(app_id, record_id)
+
+  async def snapshot() -> tuple[dict | None, str]:
+    previous = _read_record(record_path) if record_path.exists() else None
+    stack = ((previous or {}).get("plan") or {}).get("stack")
+    parent_id = str(stack.get("parent_record_id") or "") if isinstance(stack, dict) else ""
+    parent_head = ""
+    if parent_id:
+      parent_path, _ = _record_paths(app_id, parent_id)
+      parent_head = str((_read_record(parent_path).get("plan") or {}).get("head_sha") or "")
+    return previous, parent_head
+
+  async with fs_locks.app_storage_lock(app_id):
+    previous, parent_head = await snapshot()
+  try:
+    inputs = await asyncio.to_thread(_stage_inputs, previous, body, parent_head)
+  except ContributionSubmitError as exc:
+    raise _stage_error(exc) from exc
+
+  async with fs_locks.app_storage_lock(app_id):
+    if await snapshot() != (previous, parent_head):
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "message": "This contribution changed while it was being staged. Stage it again.",
+          "code": "record_changed",
+        },
+      )
+    async with AsyncExitStack() as source_locks:
+      for lock_path in sorted({str(inputs["repo_path"]), str(inputs["source_repo"])}):
+        await source_locks.enter_async_context(fs_locks.source_dir_lock(lock_path))
+      try:
+        record, candidate = await asyncio.to_thread(
+          _stage_record, record_id, previous, body, inputs, principal,
+        )
+      except ContributionSubmitError as exc:
+        raise _stage_error(exc) from exc
+      atomic_write(diff_path, candidate.diff)
+      _write_record(record_path, record)
+  return {"record": record, "source_sync": record["source_sync"]}
+
+
+@router.post(
+  "/contributions/{app_id}/{record_id}/review",
+  dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("30/minute")
+async def record_contribution_review(
+  request: Request,
+  app_id: int,
+  record_id: str,
+  body: ContributionReviewBody,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_agent_run_principal),
+):
+  """Record one private review verdict for the exact staged candidate.
+
+  The verdict names the head and diff the reviewer read; a moved candidate is
+  refused rather than inheriting it. ``all_clear`` additionally requires the
+  same local freshness proof the review card shows, so a verdict never marks
+  a checkout that Send would refuse.
+  """
+  _validate_submit_app(app_id, principal, db)
+  if not _CONTRIBUTION_ID.fullmatch(record_id):
+    raise HTTPException(status_code=422, detail="Invalid contribution id.")
+  db.close()
+  record_path, diff_path = _record_paths(app_id, record_id)
+  github_state = github_auth.read_state() or {}
+  async with fs_locks.app_storage_lock(app_id):
+    record = _read_record(record_path)
+    plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    if (
+      record.get("type") != "pr"
+      or record.get("status") != "prepared"
+      or plan.get("action") not in _PREPARED_PR_ACTIONS
+    ):
+      raise HTTPException(
+        status_code=409,
+        detail={"message": "Only a staged pull request can be reviewed.", "code": "not_staged"},
+      )
+    if (
+      plan.get("head_sha") != body.head_sha
+      or plan.get("diff_sha256") != body.diff_sha256
+    ):
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "message": "The staged change moved after it was read. Review the current head.",
+          "code": "review_target_changed",
+        },
+      )
+    if body.state == "all_clear":
+      status = await _inspect_prepared_review_locked(record, diff_path, github_state)
+      if status["state"] != "ready":
+        raise HTTPException(
+          status_code=409,
+          detail={"message": status["message"], "code": status["code"]},
+        )
+    record["quality_review"] = contribution_staging.review_verdict(
+      record, state=body.state, summary=body.summary, scope=body.scope,
+      chat_id=principal.chat_id,
+    )
+    record["updated_at"] = _now_iso()
+    _write_record(record_path, record)
+  return {"record": record}
 
 
 # Paths touched by a stored diff, for the chat card's "what am I sending" list.
@@ -6045,9 +6502,10 @@ async def autopilot_update(
 ):
   """Push a validated follow-up commit to this PR's branch (agent-called).
 
-  The single write path the follow-up agent has. The agent commits its fix on
-  the topic branch in the staging worktree and writes the new head + reviewed
-  diff hash onto the record (CAS) before calling. This endpoint binds the call
+  The single push path the follow-up agent has. The agent commits its fix on
+  the topic branch in the staging worktree and restages the open record in
+  place (``/stage`` with its ``autopilot_run_id``) before calling, so Git, not
+  the agent, derived the new head + diff hash. This endpoint binds the call
   to that reviewed state (``head_sha``/``diff_sha256`` must match the record's
   plan), enforces the source-only allowlist (contributing.md Hard stop #2), then
   reuses the full submit push path — same freshness, co-author trailer, and

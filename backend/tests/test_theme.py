@@ -58,7 +58,7 @@ def test_ensure_core_vars_skips_when_all_present():
 :root {
   --bg: #000;
   --surface: #111;
-  --surface2: #222;
+  --surface-2: #222;
   --text: #fff;
   --muted: #999;
   --accent: #f0f;
@@ -86,7 +86,7 @@ def test_ensure_core_vars_leaves_creative_css_alone():
 :root {
   --bg: #082015;
   --surface: rgba(20, 60, 38, 0.78);
-  --surface2: rgba(28, 78, 50, 0.88);
+  --surface-2: rgba(28, 78, 50, 0.88);
   --text: #f0e6c8;
   --muted: #9bb3a3;
   --accent: #d4a437;
@@ -166,7 +166,7 @@ def test_get_theme_css_augments_accent_stripped_override(tmp_path):
   shared.mkdir()
   (shared / "theme.css").write_text(
     ":root {\n"
-    "  --bg: #f0eeeb;\n  --surface: #ffffff;\n  --surface2: #e8e6e2;\n"
+    "  --bg: #f0eeeb;\n  --surface: #ffffff;\n  --surface-2: #e8e6e2;\n"
     "  --border: #d4d1cc;\n  --border-light: #e2dfdb;\n"
     "  --text: #1c1b1a;\n  --muted: #6b6864;\n"
     "  color-scheme: light;\n}\n"
@@ -184,7 +184,7 @@ def test_ensure_core_vars_fills_light_theme_with_light_defaults():
   tokens) must be gap-filled with LIGHT defaults, not the DARK palette
   from DEFAULT_THEME. The bug: _ensure_core_vars sourced every default
   from DEFAULT_THEME (dark), so a hand-written / toggle-stripped light
-  theme got --surface2:#212121 + --border-light:#1f1f1f injected in a
+  theme got --surface-2:#212121 + --border-light:#1f1f1f injected in a
   cascade-winning :root block — dark surfaces in light mode."""
   # Light --bg + --text only; every other structural token is missing
   # and must be filled from the LIGHT palette.
@@ -192,12 +192,12 @@ def test_ensure_core_vars_fills_light_theme_with_light_defaults():
   out = _ensure_core_vars(css)
   # Mode-dependent structural defaults must be the LIGHT values.
   assert "--surface: #ffffff" in out
-  assert "--surface2: #e8e6e2" in out
+  assert "--surface-2: #e8e6e2" in out
   assert "--border: #d4d1cc" in out
   assert "--border-light: #e2dfdb" in out
   assert "--muted: #6b6864" in out
   # The DARK structural literals must NOT leak in.
-  assert "#212121" not in out  # dark --surface2
+  assert "#212121" not in out  # dark --surface-2
   assert "#1f1f1f" not in out  # dark --border-light
   assert "#171717" not in out  # dark --surface
   # Mode-agnostic brand accent stays the shared purple in either mode.
@@ -211,14 +211,14 @@ def test_ensure_core_vars_dark_theme_unchanged_by_mode_awareness():
   css = ":root {\n  --bg: #0d0d0d;\n  --text: #ececec;\n}\n"
   out = _ensure_core_vars(css)
   assert "--surface: #171717" in out
-  assert "--surface2: #212121" in out
+  assert "--surface-2: #212121" in out
   assert "--border-light: #1f1f1f" in out
   # No light-mode value leaked into a dark theme.
   # Assert the LIGHT --surface value specifically, not a bare "#ffffff"
   # substring: --accent-fg is legitimately #ffffff in both modes (white on
   # the purple accent fill), so the loose form fails for the wrong reason.
   assert "--surface: #ffffff" not in out
-  assert "#e8e6e2" not in out  # light --surface2
+  assert "#e8e6e2" not in out  # light --surface-2
 
 
 def test_ensure_core_vars_light_4digit_rgba_bg():
@@ -231,9 +231,9 @@ def test_ensure_core_vars_light_4digit_rgba_bg():
   out = _ensure_core_vars(css)
   # LIGHT structural defaults must be injected.
   assert "--surface: #ffffff" in out
-  assert "--surface2: #e8e6e2" in out
+  assert "--surface-2: #e8e6e2" in out
   # The DARK structural literals must NOT leak in.
-  assert "#212121" not in out  # dark --surface2
+  assert "#212121" not in out  # dark --surface-2
   assert "#171717" not in out  # dark --surface
 
 
@@ -244,8 +244,8 @@ def test_ensure_core_vars_light_8digit_rrggbbaa_bg():
   css = ":root {\n  --bg: #ffffffff;\n  --text: #1c1b1a;\n}\n"
   out = _ensure_core_vars(css)
   assert "--surface: #ffffff" in out
-  assert "--surface2: #e8e6e2" in out
-  assert "#212121" not in out  # dark --surface2
+  assert "--surface-2: #e8e6e2" in out
+  assert "#212121" not in out  # dark --surface-2
   assert "#171717" not in out  # dark --surface
 
 
@@ -255,13 +255,13 @@ def test_ensure_core_vars_dark_4digit_rgba_bg():
   css = ":root {\n  --bg: #000f;\n  --text: #ececec;\n}\n"
   out = _ensure_core_vars(css)
   assert "--surface: #171717" in out
-  assert "--surface2: #212121" in out
+  assert "--surface-2: #212121" in out
   # No light-mode value leaked into a dark theme.
   # Assert the LIGHT --surface value specifically, not a bare "#ffffff"
   # substring: --accent-fg is legitimately #ffffff in both modes (white on
   # the purple accent fill), so the loose form fails for the wrong reason.
   assert "--surface: #ffffff" not in out
-  assert "#e8e6e2" not in out  # light --surface2
+  assert "#e8e6e2" not in out  # light --surface-2
 
 
 def test_ensure_core_vars_missing_bg_defaults_to_dark():
@@ -270,7 +270,7 @@ def test_ensure_core_vars_missing_bg_defaults_to_dark():
   unaffected."""
   css = ":root {\n  --accent: #ff00aa;\n}\n"
   out = _ensure_core_vars(css)
-  assert "--surface2: #212121" in out  # dark default
+  assert "--surface-2: #212121" in out  # dark default
   assert "--bg: #0d0d0d" in out
 
 
@@ -599,3 +599,111 @@ def test_theme_that_declares_accent_fg_is_left_alone():
   css = ":root { --bg: #fff; --fg: #111; --accent: #ffffff; --accent-fg: #123456; }"
   assert _ensure_core_vars(css).count("--accent-fg") == 1
   assert "#123456" in _ensure_core_vars(css)
+
+
+# ---------------------------------------------------------------------------
+# --surface2 -> --surface-2 rename migration (fix-forward, no alias)
+# ---------------------------------------------------------------------------
+
+
+def _write_theme(tmp_path, css):
+  shared = tmp_path / "shared"
+  shared.mkdir(exist_ok=True)
+  (shared / "theme.css").write_text(css, encoding="utf-8")
+  return shared / "theme.css"
+
+
+def test_migrate_theme_surface2_rewrites_custom_value(tmp_path):
+  """A saved theme.css's custom --surface2 value is rewritten to --surface-2
+  in place, keeping the owner's value and every other byte."""
+  from app.theme import migrate_theme_surface2_token
+
+  path = _write_theme(
+    tmp_path,
+    ":root {\n"
+    "  --bg: #101014;\n"
+    "  --surface: #1b1b22;\n"
+    "  --surface2: #2b2b33;\n"  # owner's custom value
+    "  --text: #eeeeee;\n"
+    "}\n"
+    ".panel { background: var(--surface2); }\n",
+  )
+  assert migrate_theme_surface2_token(str(tmp_path)) is True
+  out = path.read_text(encoding="utf-8")
+  # Declaration and var() use both renamed, value preserved.
+  assert "--surface-2: #2b2b33;" in out
+  assert "var(--surface-2)" in out
+  assert "--surface2" not in out
+  # Untouched bytes stay exactly as written.
+  assert "--bg: #101014;" in out
+  assert "--surface: #1b1b22;" in out
+
+
+def test_migrate_theme_surface2_is_noop_when_already_migrated(tmp_path):
+  """An already-migrated theme.css is left byte-for-byte unchanged and the
+  migration reports it did nothing."""
+  from app.theme import migrate_theme_surface2_token
+
+  css = ":root {\n  --surface-2: #2b2b33;\n}\n.x { background: var(--surface-2); }\n"
+  path = _write_theme(tmp_path, css)
+  assert migrate_theme_surface2_token(str(tmp_path)) is False
+  assert path.read_text(encoding="utf-8") == css
+  # No snapshot is created when nothing changed.
+  assert list((tmp_path / "shared").glob("theme.css.bak-*")) == []
+
+
+def test_migrate_theme_surface2_missing_file_is_fine(tmp_path):
+  """No theme.css (fresh install on DEFAULT_THEME) is a safe no-op."""
+  from app.theme import migrate_theme_surface2_token
+
+  (tmp_path / "shared").mkdir()
+  assert migrate_theme_surface2_token(str(tmp_path)) is False
+
+
+def test_migrate_theme_surface2_snapshots_before_rewrite(tmp_path):
+  """The prior theme.css is snapshotted before the in-place rewrite, so the
+  change is recoverable — mirroring the storage write path."""
+  from app.theme import migrate_theme_surface2_token
+
+  original = ":root {\n  --surface2: #2b2b33;\n}\n"
+  _write_theme(tmp_path, original)
+  assert migrate_theme_surface2_token(str(tmp_path)) is True
+  backups = list((tmp_path / "shared").glob("theme.css.bak-*"))
+  assert len(backups) == 1
+  assert backups[0].read_text(encoding="utf-8") == original
+
+
+def test_migrate_theme_surface2_leaves_longer_names_untouched(tmp_path):
+  """Word-boundary safety: a token that merely starts with the same letters
+  is not corrupted by the rename."""
+  from app.theme import migrate_theme_surface2_token
+
+  css = ":root {\n  --surface2x: #111;\n  --surface2-alt: #222;\n}\n"
+  path = _write_theme(tmp_path, css)
+  assert migrate_theme_surface2_token(str(tmp_path)) is False
+  assert path.read_text(encoding="utf-8") == css
+
+
+def test_served_theme_uses_surface_2_and_custom_value_wins(tmp_path):
+  """After the boot migration, the augmented theme served to the shell and
+  frames contains --surface-2 and never --surface2, and the owner's saved value
+  wins over the injected default."""
+  from app.theme import migrate_theme_surface2_token
+
+  shared = tmp_path / "shared"
+  shared.mkdir()
+  # Legacy token on disk (pre-migration), with a custom dark value that differs
+  # from the DEFAULT_THEME --surface-2 (#212121).
+  (shared / "theme.css").write_text(
+    ":root {\n  --bg: #0d0d0d;\n  --text: #ececec;\n  --surface2: #333333;\n}\n",
+    encoding="utf-8",
+  )
+  assert migrate_theme_surface2_token(str(tmp_path)) is True
+  css = get_theme_css(str(tmp_path))
+  assert "--surface2" not in css
+  assert "--surface-2: #333333" in css  # owner's value wins, not #212121
+  assert "#212121" not in css  # the default was NOT injected on top
+  # theme_data (the shell + frame handoff) carries the same effective CSS.
+  bundle = theme_data(str(tmp_path))
+  assert "--surface2" not in bundle["css"]
+  assert "--surface-2: #333333" in bundle["css"]

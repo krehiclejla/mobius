@@ -17,8 +17,14 @@ export const FOLLOW_STICK_BAND_PX = 70
 export const HISTORY_PREFETCH_MIN_PX = 240
 export const HISTORY_PREFETCH_VIEWPORTS = 4
 
-export function olderHistoryRetryShown(error, offset) {
-  return Boolean(error) && Number(offset) > 0
+const HISTORY_RETRY_DELAYS_MS = [1000, 3000, 8000, 15000, 30000]
+
+/** Delay before quietly re-requesting a failed older-history page. There is no
+ * retry control: the page is requested again while the reader still waits at
+ * the top for it, backing off to a steady cap. */
+export function olderHistoryRetryDelayMs(attempt) {
+  const index = Math.min(Math.max(0, attempt), HISTORY_RETRY_DELAYS_MS.length - 1)
+  return HISTORY_RETRY_DELAYS_MS[index]
 }
 
 export function olderHistoryShouldLoad(scrollEl, { userDriven = false } = {}) {

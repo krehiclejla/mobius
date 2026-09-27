@@ -264,29 +264,16 @@ _platform_import_probe() {
   _platform_import_probe_dir /data/platform/backend
 }
 
-# A checked platform update is swapped in at shutdown and its previous state
-# (previous version plus edits made meanwhile) saved as one commit. If the
-# swapped-in version still fails its startup check, return to that commit so
-# the owner keeps a working Möbius; the server then reports the update failed.
-_platform_revert_swap() {
-  _swap_record=/data/.platform-prepared-update.json
-  [ -f "$_swap_record" ] || return 1
-  _swap_late="$(python3 -P -c 'import json, sys
-r = json.load(open(sys.argv[1]))
-print(r.get("late") or "" if r.get("state") == "swapped" else "")' "$_swap_record" 2>/dev/null)" || return 1
-  case "$_swap_late" in *[!0-9a-f]*|"") return 1 ;; esac
-  [ "${#_swap_late}" -eq 40 ] || return 1
-  echo "PLATFORM LAYER WARNING: the updated version failed its startup check; returning to the previous version." >&2
-  su -s /bin/sh mobius -c "git -C /data/platform reset -q --hard $_swap_late" || return 1
-  python3 -P -c 'import json, os, sys
-path = sys.argv[1]
-record = json.load(open(path))
-record["state"] = "reverted"
-temp = path + ".tmp"
-with open(temp, "w") as handle:
-  handle.write(json.dumps(record, sort_keys=True))
-os.replace(temp, path)' "$_swap_record" || return 1
-  chown mobius:mobius "$_swap_record" 2>/dev/null || true
+# The image's boot transaction for the served checkout (app/platform_boot.py).
+# It runs from this image's own baked checkout, never from /data/platform: the
+# image owns the Python packages, so the image, not the candidate source,
+# decides what may run on it. `activate` swaps in an update prepared for this
+# exact image (or reverts one swapped in for another image) and merges late
+# edits back; `revert` returns a swapped-in update that failed its probe to
+# its saved previous state; `guard` is the fail-closed clean-tree check.
+_platform_boot() {
+  su -s /bin/sh mobius -c \
+    "cd /app/platform-baked/backend && $_env_scrub PYTHONDONTWRITEBYTECODE=1 timeout 900 python3 -m app.platform_boot $1"
 }
 
 _platform_clear_empty_target() {
@@ -510,6 +497,10 @@ _platform_use_baked() {
   _restore_baked_dir_if_symlink /app/scripts "$_baked_scripts"
 }
 
+# `_platform_boot activate` publishes this marker (its protocol) only once
+# this boot's transaction succeeded; never trust one from an earlier boot.
+rm -f /tmp/platform-boot-transaction
+
 if [ "${MOBIUS_TEST_RUNTIME:-0}" = "1" ]; then
   _platform_seed_test_checkout || exit 1
 elif [ -n "${MOBIUS_TEST_PLATFORM_SOURCE:-}" ]; then
@@ -519,59 +510,62 @@ fi
 
 chown -R mobius:mobius /data/platform 2>/dev/null || true
 
-if [ ! -d "$_platform_app" ]; then
-  if _platform_bootstrap && _platform_git_valid && _platform_import_probe; then
-    _platform_use_direct
-  else
-    echo "PLATFORM LAYER WARNING: bootstrap did not produce an importable repo." >&2
-    _platform_use_baked
+# One boot transaction, in this order, so the probe and uvicorn see the same
+# bytes, and no served code runs before the probe: the image settles the source
+# it may run (and its activation bookkeeping and trusted hooks), the fail-closed
+# guard, then the decisive probe. A probe failure returns a swapped-in update
+# to its saved previous state and checks that tree the same way. A fresh seed
+# takes the same path, so every served boot publishes the transaction.
+_platform_serve_checkout() {
+  if ! _platform_boot activate 2>&1; then
+    echo "Platform layer: this image could not establish a platform state it may run; refusing to start." >&2
+    exit 1
   fi
-else
-  if _platform_git_valid; then
-    if _platform_import_probe; then
-      echo "Platform layer: import probe OK; serving /data/platform/backend."
-      _platform_use_direct
-    elif _platform_revert_swap && _platform_import_probe; then
-      echo "Platform layer: returned to the previous version; serving /data/platform/backend."
-      _platform_use_direct
-    else
-      echo "PLATFORM LAYER WARNING: import probe failed for /data/platform." >&2
-      _platform_use_baked
-    fi
-  else
-    echo "PLATFORM LAYER WARNING: /data/platform/.git missing or invalid." >&2
-    _platform_use_baked
-  fi
-fi
-
-if [ "$_use_platform" -eq 1 ] && [ "${MOBIUS_TEST_RUNTIME:-0}" != "1" ]; then
-  _platform_reconciler_backend=/data/platform/backend
-  # Startup runs installed source only. Recover an interrupted explicit update,
-  # retire completed activation, and refresh trusted local hooks; never fetch
-  # or select a release. The Python entrypoint name is shared with deployed
-  # images. Keep the separate fail-closed guard for interrupted preparation.
-  echo "Platform layer: preparing the installed /data/platform source..." >&2
-  su -s /bin/sh mobius -c \
-    "cd '$_platform_reconciler_backend' && $_env_scrub timeout 900 python3 -c \
-     'from app import platform_update; print(platform_update.reconcile_clone_sync())'" \
-    2>&1 || true
-  # Reconcile itself is best-effort, but the post-reconcile guard is the final
-  # safety boundary: if it cannot prove/reset the tree to a clean committed
-  # state, do not import that tree. Exiting lets container policy retry instead
-  # of serving possibly half-applied code.
-  if ! su -s /bin/sh mobius -c \
-    "cd '$_platform_reconciler_backend' && $_env_scrub python3 -c \
-     'from app import platform_update; print(platform_update.boot_guard_sync())'" \
-    2>&1; then
+  if ! _platform_boot guard 2>&1; then
     echo "Platform layer: boot guard failed; refusing to serve the platform tree." >&2
     exit 1
   fi
-  # Recovery may have restored an interrupted update. Report persistent HEAD.
-  if [ "$_use_platform" -eq 1 ]; then
-    _served_sha=$(su -s /bin/sh mobius -c \
-      'git -C /data/platform rev-parse HEAD' 2>/dev/null || echo "$_served_sha")
+  if _platform_import_probe; then
+    echo "Platform layer: import probe OK; serving /data/platform/backend."
+    _platform_use_direct
+  elif _platform_boot revert 2>&1 && _platform_boot guard 2>&1 &&
+       _platform_import_probe; then
+    echo "Platform layer: returned to the previous version; serving /data/platform/backend."
+    _platform_use_direct
+  else
+    echo "PLATFORM LAYER WARNING: import probe failed for /data/platform." >&2
+    _platform_use_baked
   fi
+}
+
+if [ ! -d "$_platform_app" ]; then
+  if _platform_bootstrap && _platform_git_valid; then
+    _platform_serve_checkout
+  else
+    echo "PLATFORM LAYER WARNING: bootstrap did not produce a valid repo." >&2
+    _platform_use_baked
+  fi
+elif ! _platform_git_valid; then
+  echo "PLATFORM LAYER WARNING: /data/platform/.git missing or invalid." >&2
+  _platform_use_baked
+elif [ "${MOBIUS_TEST_RUNTIME:-0}" = "1" ]; then
+  # The disposable test checkout was just seeded; there is no update to settle.
+  if _platform_import_probe; then
+    _platform_use_direct
+  else
+    echo "PLATFORM LAYER WARNING: import probe failed for /data/platform." >&2
+    _platform_use_baked
+  fi
+else
+  _platform_serve_checkout
 fi
+
+# Boot-time writers above (update revert, recovery, late-edit merge-back) run
+# as mobius through su, whose login policy grants group write to user-private
+# groups. A served module writable by group or other fails validation below and
+# forces the baked floor on every boot, so keep the served tree owner-writable
+# only before anything validates or serves it.
+chmod -R go-w /data/platform 2>/dev/null || true
 
 # Privileged served source belongs to the same boot choice as the FastAPI
 # process. Validate it before publishing the source marker: an invalid broker

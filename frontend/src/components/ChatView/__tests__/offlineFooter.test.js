@@ -77,7 +77,6 @@ test('the shell is the one persistent connection owner while send failures stay 
   assert.match(shell, /connectionStatusState === 'offline' \? 'Offline'/)
   assert.match(shell, /connectionStatusState === 'reconnecting' \? 'Reconnecting…'/)
   assert.match(shell, /useDelayedConnectionNotice\([\s\S]*?!deliveryReady/)
-  assert.match(connectionStatus, /useDelayedConnectionNotice\(transient\)/)
   assert.match(shell, /\{connectionStatusLabel && \([\s\S]*?className="shell__connection-status"[\s\S]*?data-state=\{connectionStatusState\}[\s\S]*?tabIndex=\{0\}[\s\S]*?shell__sr-only">\{connectionStatusLabel\}/)
   assert.match(
     shellCss,
@@ -195,6 +194,34 @@ test('credential expiry preserves principal-bound intent while explicit logout w
     /await clearExplicitOwnerSession\(/,
     'owner-invoked logout must use the explicit session owner that performs the full outbox wipe',
   )
+})
+
+test('the chat footer stays quiet through transient trouble and shows only an actionable lost connection', () => {
+  // Reattaching, retrying, a failed older page, and a failed or preparing
+  // activation recover without a footer note.
+  assert.match(connectionStatus, /if \(!error \|\| error === 'retrying'\) return null/,
+    'a retrying stream never shows a chat-level Reconnecting note; the shell badge owns it')
+  assert.doesNotMatch(connectionStatus, />\s*Reconnecting|connection-status--reattach|\{ error, reconnecting/,
+    'the chat has no separate reattach note')
+  assert.match(connectionStatus, /Connection lost[\s\S]*?connection-status__retry/,
+    'a stream the chat gave up on keeps its Retry')
+  assert.doesNotMatch(streamConnection, /armReconnectingNote|reconnecting:/,
+    'the stream hook no longer carries note-only reconnect state')
+  for (const retiredNote of [
+    /Earlier messages didn’t load/,
+    /chat__history-retry/,
+    /chat__activation-retry/,
+    /Chat activation (?:still )?needs a retry/,
+    /Preparing this chat…/,
+  ]) {
+    assert.doesNotMatch(chatView, retiredNote, `retired footer note ${retiredNote} must not return`)
+  }
+  assert.match(chatView,
+    /\.catch\(\(\) => \{[\s\S]{0,500}retry\.timer = setTimeout\([\s\S]{0,300}olderHistoryShouldLoad\(scrollEl, \{ userDriven: true \}\)[\s\S]{0,120}loadOlderMessages\(before, \{ readerDriven \}\)[\s\S]{0,80}olderHistoryRetryDelayMs\(retry\.attempts\)/,
+    'a failed older page retries quietly while the reader still waits near the top')
+  assert.match(chatView,
+    /function loadOlderMessages\([^)]*\) \{[\s\S]{0,300}if \(olderHistoryRetryRef\.current\.timer\) return/,
+    'while a quiet retry is pending, scroll and resize triggers cannot storm a failing page (#833)')
 })
 
 test('connection failure preserves the local queue and disables composer steering', () => {

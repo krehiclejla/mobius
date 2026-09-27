@@ -204,30 +204,31 @@ def open_continuation_question(chat, question_id: str | None) -> dict | None:
   return None
 
 
-def continuation_question_owner_run_id(
-  chat, question_id: str | None,
-) -> str | None:
-  """Return the run identity that durably authored an open continuation card."""
-  if not question_id or chat.pending_question_id != question_id:
-    return None
-  return saved_question_owner_run_id(chat, question_id)
+def require_quiet_close_holds_no_claim(db, chat, question_id: str) -> None:
+  """A card that claimed an exact action cannot be closed without a reply.
 
+  ``request_approval`` claims its action under the card's ``action_key``. Only
+  a reply reaches the agent that can complete or release that claim, so a
+  quiet close would strand it with no one left to settle it.
+  """
+  from app import models
 
-def saved_question_owner_run_id(chat, question_id: str | None) -> str | None:
-  """Resolve the exact author even after its card has been stopped or closed."""
-  if not question_id:
-    return None
-  for message in reversed(chat.messages or []):
-    if not isinstance(message, dict):
-      continue
-    for block in message.get("blocks") or []:
-      if (block.get("type") == "question"
-          and block.get("question_id") == question_id
-          and block.get("response_mode") == "continuation"
-          and not block.get("answers")):
-        owner = message.get("id")
-        return owner if isinstance(owner, str) and owner else None
-  return None
+  card = saved_question(chat, question_id)
+  action_key = card.get("action_key") if isinstance(card, dict) else None
+  if not isinstance(action_key, str) or not action_key:
+    return
+  active_claim = db.query(models.AgentWorkClaim.id).filter(
+    models.AgentWorkClaim.work_key == action_key,
+    models.AgentWorkClaim.owner_chat_id == chat.id,
+    models.AgentWorkClaim.completed_at.is_(None),
+    models.AgentWorkClaim.released_at.is_(None),
+  ).first()
+  if active_claim is not None:
+    raise AnswerConflict(
+      "This question still owns an active work claim. "
+      "Choose a reply option so the agent can release or complete the "
+      "claim before closing it without a reply."
+    )
 
 
 def is_secure_question(chat, question_id: str | None) -> bool:

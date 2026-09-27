@@ -3,14 +3,14 @@
 // Palette neutralized 2026-05: dropped the slight blue tint so the
 // dark stack reads as true charcoal. --muted bumped twice:
 //   2026-05-26: #6b6b76 (~3.8:1, failed WCAG AA) → #9b9b9b (~6.4:1)
-//   2026-05-27: #9b9b9b → #a8a8a8 (~6.1:1 on --surface2 #212121, was
+//   2026-05-27: #9b9b9b → #a8a8a8 (~6.1:1 on --surface-2 #212121, was
 //     ~5.2:1 — comfortable AA on raised surfaces for the small text
 //     used in section labels and provider status indicators).
 // Must stay in sync with backend/app/theme.py DEFAULT_THEME.
 export const DARK_COLORS = {
   '--bg': '#0d0d0d',
   '--surface': '#171717',
-  '--surface2': '#212121',
+  '--surface-2': '#212121',
   '--border': '#2a2a2a',
   '--border-light': '#1f1f1f',
   '--text': '#ececec',
@@ -31,7 +31,7 @@ export const DARK_COLORS = {
 export const LIGHT_COLORS = {
   '--bg': '#f0eeeb',
   '--surface': '#ffffff',
-  '--surface2': '#e8e6e2',
+  '--surface-2': '#e8e6e2',
   '--border': '#d4d1cc',
   '--border-light': '#e2dfdb',
   '--text': '#1c1b1a',

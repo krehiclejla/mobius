@@ -168,7 +168,7 @@
   outline-offset: 2px;
 }
 .qcard__opt:hover:not(.qcard__opt--static) {
-  background: var(--surface2, rgba(128,128,128,.1));
+  background: var(--surface-2, rgba(128,128,128,.1));
 }
 .qcard__opt--on {
   background: color-mix(in srgb, var(--accent) 12%, var(--surface));
@@ -249,7 +249,7 @@
   padding: 10px 11px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: var(--surface2, rgba(128,128,128,.1));
+  background: var(--surface-2, rgba(128,128,128,.1));
   color: var(--text);
   font-size: 13px;
   font-family: inherit;

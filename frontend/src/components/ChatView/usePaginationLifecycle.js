@@ -15,6 +15,7 @@ export default function usePaginationLifecycle({
   searchRevealId,
   loadingOlderRef,
   followupRafRef,
+  retryRef,
 }) {
   const lifecycleRef = useRef(0)
 
@@ -27,6 +28,8 @@ export default function usePaginationLifecycle({
       const followupRaf = followupRafRef.current
       if (followupRaf) cancelAnimationFrame(followupRaf)
       followupRafRef.current = 0
+      clearTimeout(retryRef.current.timer)
+      retryRef.current = { timer: 0, attempts: 0 }
       loadingOlderRef.current = false
     }
   }, [
@@ -38,6 +41,7 @@ export default function usePaginationLifecycle({
     searchRevealId,
     loadingOlderRef,
     followupRafRef,
+    retryRef,
   ])
 
   return lifecycleRef

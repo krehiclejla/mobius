@@ -74,23 +74,25 @@ def test_descendant_growth_does_not_grow_root_injection():
   assert project_goal(large, "leaf-199")["task"]["note"] == "long detail "*30
 
 
-def test_scoped_route_is_read_only_and_keeps_full_plan_available(client, auth, db, chat):
+def test_scoped_projection_is_read_only_and_keeps_full_plan_available(client, auth, db, chat):
   from app import models
+  from app.goals import scoped_goal_context
   from tests.goal_fixtures import goal_run
   tasks = [task("root"), task("child", "root", note="CHILD_DETAILS")]
   db.add(goal_run(db, id="context-run", chat_id=chat.id, status="running",
                   goal_id="context-goal", goal_objective="Entire outcome",
                   goal_plan_json={"tasks":tasks}, goal_plan_revision=5))
   db.commit()
-  base = f"/api/chats/{chat.id}"
-  overview = client.get(base+"/goal-context", headers=auth)
-  assert overview.status_code == 200
-  assert "CHILD_DETAILS" not in overview.text
-  branch = client.get(base+"/goal-context?task=child", headers=auth)
-  assert branch.json()["context"]["task"]["note"] == "CHILD_DETAILS"
-  assert client.get(base+"/goal-context?task=missing", headers=auth).status_code == 404
-  assert client.get(base+"/goal-context?goal_id=missing", headers=auth).status_code == 404
-  full = client.get(base+"/goal-plan", headers=auth).json()["plan"]
+  goal = db.get(models.ChatGoal, "context-goal")
+  overview = scoped_goal_context(db, goal)
+  assert "CHILD_DETAILS" not in json.dumps(overview)
+  branch = scoped_goal_context(db, goal, "child")
+  assert branch["task"]["note"] == "CHILD_DETAILS"
+  with pytest.raises(ValueError):
+    scoped_goal_context(db, goal, "missing")
+  # The scoped projection never touches the saved plan; the full plan endpoint
+  # still serves every task.
+  full = client.get(f"/api/chats/{chat.id}/goal-plan", headers=auth).json()["plan"]
   assert full["revision"] == 5 and len(full["tasks"]) == 2
   db.expire_all()
   assert db.get(models.ChatGoal, "context-goal").plan_json == {"tasks":tasks}

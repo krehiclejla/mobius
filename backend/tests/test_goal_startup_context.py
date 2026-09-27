@@ -63,9 +63,9 @@ def test_goal_receives_startup_context_only_through_system_prompt(
     run_gen=chat_mod.current_run_generation(chat_id),
   ))
 
-  assert captured["user_message"].startswith(
-    "/goal keep the objective clean"
-  )
+  # Möbius owns /goal: the agent gets a plain request, never a CLI command.
+  assert captured["user_message"].endswith("Goal: keep the objective clean")
+  assert not captured["user_message"].startswith("/goal")
   assert digest not in captured["user_message"]
   assert skills not in captured["user_message"]
   assert digest in captured["skill_text"]

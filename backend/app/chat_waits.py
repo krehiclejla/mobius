@@ -1114,28 +1114,6 @@ _FIRED_UNDELIVERED = (
 )
 
 
-def wait_owns_goal(db: Session, chat_id: str, goal_id: str) -> bool:
-  """Whether one Goal is owned through observation or result admission.
-
-  Check settlement is not delivery. Between those transitions (including a
-  restart), the Wait supervisor still owns the next move; Goal settlement
-  must not manufacture another executor. Keep this projection small rather
-  than hydrating commands, transcripts or activation manifests per Goal.
-  """
-  return _goal_waits(db, chat_id, goal_id).filter(
-    (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-  ).with_entities(models.ChatWait.id).first() is not None
-
-
-def armed_goal_waits(
-  db: Session, chat_id: str, goal_id: str,
-) -> list[models.ChatWait]:
-  """Waits still watching for this Goal; only their owner may cancel them."""
-  return _goal_waits(db, chat_id, goal_id).filter(
-    models.ChatWait.status == "armed",
-  ).order_by(models.ChatWait.created_at).all()
-
-
 def stage_consume_fired_goal_waits(
   db: Session, chat_id: str, goal_id: str,
 ) -> int:

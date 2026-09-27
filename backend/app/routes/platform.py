@@ -74,6 +74,17 @@ _PLAN_ERROR_MESSAGES = {
     "This update needs a system replacement. Return to the review and use "
     "its update action so Möbius can keep the source and running system together."
   ),
+  "update_operation_bound": (
+    "A container replacement for this update is still under way. Wait for it "
+    "to finish before cancelling."
+  ),
+  "replay_conflict_must_finish": (
+    "Finish merging your recent edits into this update; dropping them now "
+    "would lose the way back to the previous version."
+  ),
+  "update_not_settling": (
+    "This update is no longer waiting for confirmation. Refresh Settings."
+  ),
   "platform_update_in_progress": (
     "Möbius is finishing another update task. Wait a moment, then review again."
   ),
@@ -334,9 +345,33 @@ async def cancel_unfinished_platform_update(
 ) -> None:
   """Drop an update that has not been swapped in; the live checkout never changed."""
   try:
+    # A replacement that already ended must not keep the update bound.
+    await deployment_control.release_ended_binding()
     await asyncio.to_thread(platform_update.cancel_unfinished_update)
+  except deployment_control.DeploymentControlError as exc:
+    raise HTTPException(
+      status_code=exc.status_code, detail={"code": exc.code, "message": exc.message},
+    ) from exc
   except PlatformUpdateError as exc:
     raise HTTPException(status_code=409, detail=_plan_error_detail(exc)) from exc
+
+
+@router.post(
+  "/unfinished-update/keep",
+  dependencies=[Depends(reject_cross_site)],
+  status_code=204,
+)
+async def keep_settling_platform_update(
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+) -> None:
+  """Keep a settling update whose container replacement can no longer be
+  confirmed: the owner's explicit decision when the controller is unavailable."""
+  try:
+    await deployment_control.keep_settling_update()
+  except deployment_control.DeploymentControlError as exc:
+    raise HTTPException(
+      status_code=exc.status_code, detail={"code": exc.code, "message": exc.message},
+    ) from exc
 
 
 @router.post("/conflict-resolver-chat", dependencies=[Depends(reject_cross_site)])

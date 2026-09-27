@@ -103,7 +103,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .pa__btn--sm:hover:not(:disabled) {
-    background: var(--surface2, #1a1f28);
+    background: var(--surface-2, #1a1f28);
   }
 }
 
@@ -647,7 +647,7 @@
    pill against the surface-colored provider row. Earlier outline
    + transparent background was too faint to scan. */
 .provider-row__action {
-  background: var(--surface2);
+  background: var(--surface-2);
   border: 1px solid var(--border-light);
   color: var(--text);
   min-height: 32px;
@@ -664,7 +664,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .provider-row__action:hover {
-    background: color-mix(in srgb, var(--accent) 14%, var(--surface2));
+    background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
     border-color: color-mix(in srgb, var(--accent) 60%, var(--border-light));
     color: var(--text);
   }

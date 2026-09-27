@@ -128,6 +128,27 @@ _PREPARED_REF = "refs/mobius/update-prepared"
 # The live state saved at the swap: the previous version plus late edits. The
 # boot script returns to it if the swapped-in version fails its startup check.
 _LATE_REF = "refs/mobius/update-late"
+# Edits made on an image-requiring update before its image was rolled back.
+# The boot transaction keeps them here instead of discarding them; they may
+# need the rolled-back image's packages, so they are never merged back
+# automatically.
+_SET_ASIDE_PREFIX = "refs/mobius/platform-set-aside"
+_SET_ASIDE_KEEP = 5
+# Written by the image entrypoint once this boot's own boot transaction
+# (``app.platform_boot``) succeeded; it holds that transaction's protocol.
+BOOT_TRANSACTION_MARKER = Path("/tmp/platform-boot-transaction")
+# The prepared-update record and boot-transaction semantics an image's boot
+# understands. An image may be asked to activate or revert a record written by
+# newer served code (it is the rollback image), so served code prepares an
+# image-requiring update only for a running image with its own protocol, and
+# the boot refuses a record from a newer protocol. The number lives in an
+# image-owned file, so a release that advances it needs a new image and only an
+# image that understands it can ever swap it in. Advance it with any change an
+# older image's boot would misread.
+BOOT_PROTOCOL = int(
+  (Path(__file__).resolve().parents[1] / "runtime" / "boot-protocol")
+  .read_text(encoding="utf-8").strip()
+)
 # Container-local: survives a server restart but never claims a replacement
 # image inherited packages installed in the previous container.
 DEPENDENCY_RECEIPT_PATH = Path("/tmp/mobius-dependency-inputs.json")
@@ -232,12 +253,15 @@ class UnfinishedUpdate(TypedDict):
   ``finish``: it installed, and its container replacement is still owed, so
   its source would otherwise keep running on the old image. A pending
   restart alone does not count: several updates may share one restart.
+  ``settling``: its new image is running it, and the controller has not yet
+  confirmed that replacement, which it can still roll back.
   """
 
   target_sha: str
-  stage: Literal["resolve", "finish"]
+  stage: Literal["resolve", "finish", "settling"]
   # What finishing takes: a container replacement, or just a restart.
-  action: Literal["replace", "restart"]
+  # ``settling`` takes nothing: its replacement is being confirmed.
+  action: Literal["replace", "restart", "none"]
   # Prepared but not yet in place: dropping it changes nothing live.
   cancellable: bool
 
@@ -602,7 +626,9 @@ def _validate_update_plan(
   if resolved != target_sha:
     raise PlatformUpdateError("update_plan_target_missing")
   pending = unfinished_update(repo)
-  if pending and pending["target_sha"] != target_sha:
+  if pending and (
+    pending["target_sha"] != target_sha or pending["stage"] == "settling"
+  ):
     raise PlatformUpdateError("finish_update_first")
 
 
@@ -1668,6 +1694,33 @@ def _build_info() -> dict:
   return data if isinstance(data, dict) else {}
 
 
+def frozen_image_sha() -> str | None:
+  """The running image's own source commit, from its frozen build record.
+
+  Never settings or the environment: a deployment can override those, and
+  this identity decides which image may swap in an image-requiring update.
+  """
+  sha = str(_build_info().get("sha") or "").strip().lower()
+  return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def image_activates_updates() -> bool:
+  """Whether this boot's image ran its own boot transaction.
+
+  Such an image swaps in an update that needs it only when it boots as that
+  update's target, and reverts it when booted as any other image, so the
+  running server can leave that swap to the new image and allow updates that
+  change Python packages. Images without the transaction swapped these
+  updates at the old container's cutover instead; remove this gate once no
+  supported image predates the transaction.
+  """
+  try:
+    marker = BOOT_TRANSACTION_MARKER.read_text(encoding="utf-8").strip()
+  except OSError:
+    return False
+  return marker == str(BOOT_PROTOCOL)
+
+
 def image_input_drift(repo: Path = PLATFORM_REPO) -> list[str] | None:
   """Image inputs whose served source no longer matches the running image.
 
@@ -2436,13 +2489,16 @@ def _final_tree_merge(repo: Path, source: str, target: str) -> app_git.MergeResu
 
   Reviewed contribution provenance may supply a newer shared base that removes
   duplicate-change conflicts; otherwise it is Git's ordinary three-way merge.
-  Review, Apply and the agent handoff all call this, so the conflict Review
-  predicts is the conflict Apply would park. It writes Git objects only; no
-  ref, index or working tree moves.
+  A local draft of a contribution the release merged in revised form is set
+  aside first, so the merged version arrives instead of a draft-vs-final
+  conflict. Review, Apply and the agent handoff all call this, so the conflict
+  Review predicts is the conflict Apply would park. It writes Git objects only;
+  no ref, index or working tree moves.
   """
+  local = app_git.without_superseded_drafts(repo, source, target)
   return (
-    app_git.merge_with_equivalent_changes(repo, source, target)
-    or app_git.merge_refs(repo, source, target)
+    app_git.merge_with_equivalent_changes(repo, local, target)
+    or app_git.merge_refs(repo, local, target)
   )
 
 
@@ -2614,6 +2670,24 @@ class PreparedUpdate(TypedDict):
   requires_image: bool
   late: str | None  # live state saved at the swap, in-progress edits on top
   late_committed: str | None  # its committed part
+  # The late edits merged back before the server imported anything; the
+  # record stays swapped until it is confirmed, so a merged tree that cannot
+  # start is still returned to ``late`` by the boot transaction.
+  replayed: str | None
+  # The container replacement whose success confirms an image-requiring
+  # update: ``{"controller": "railway" | "host", "id": ...}``. Only that exact
+  # operation retires the record (``reconcile_bound_operation``). None means
+  # the started server confirms it: a restart-only update, or one whose image
+  # was already running.
+  operation: dict | None
+  # ``BOOT_PROTOCOL`` of the code that wrote the record (0 before it existed).
+  protocol: int
+  # Bookkeeping the swap replaced, restored exactly if the swap is reverted:
+  # ``{"upstream": sha | None, "activation": marker text | None}``.
+  restore: dict | None
+  # The complete working tree (in-progress edits included) the merge-back
+  # left, so a revert sets aside only work made after it.
+  booted_tree: str | None
 
 
 def read_prepared_update() -> PreparedUpdate | None:
@@ -2634,7 +2708,23 @@ def read_prepared_update() -> PreparedUpdate | None:
     requires_image=bool(record.get("requires_image")),
     late=record.get("late") or None,
     late_committed=record.get("late_committed") or None,
+    replayed=record.get("replayed") or None,
+    operation=_valid_operation(record.get("operation")),
+    protocol=record.get("protocol") if isinstance(record.get("protocol"), int) else 0,
+    restore=record.get("restore") if isinstance(record.get("restore"), dict) else None,
+    booted_tree=record.get("booted_tree") or None,
   )
+
+
+def _valid_operation(value: object) -> dict | None:
+  if not isinstance(value, dict):
+    return None
+  controller, ident = value.get("controller"), value.get("id")
+  if controller not in {"railway", "host"} or not isinstance(ident, str):
+    return None
+  if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", ident):
+    return None
+  return {"controller": controller, "id": ident}
 
 
 def _write_prepared_update(record: PreparedUpdate) -> None:
@@ -2659,8 +2749,12 @@ def _prepare(
   """
   from app.restart_util import RestartSourceInvalid, validate_restart_source
 
-  if _changes_python_dependencies(repo, snapshot, prepared):
-    # The running image cannot check source that imports new packages.
+  if (
+    _changes_python_dependencies(repo, snapshot, prepared)
+    and not image_activates_updates()
+  ):
+    # Only an image whose own boot swaps in, probes, and can revert the update
+    # may prepare source that imports packages this image does not have.
     raise PlatformUpdateError("image_rebuild_required")
   # The image is owed for this release's changes and for any activation the
   # running image still owes (a Finish after the source already contains the
@@ -2684,15 +2778,19 @@ def _prepare(
         "The official image would drop these local image-owned changes: "
         + ", ".join(kept)
       )
-  try:
-    validate_restart_source(checkout)
-  except RestartSourceInvalid as exc:
-    raise PlatformUpdateError(str(exc)) from exc
+  # This image's import verdict decides source it will run. Source for
+  # another image is judged by that image's own boot probe, which reverts it.
+  if not (requires_image and image_activates_updates()):
+    try:
+      validate_restart_source(checkout)
+    except RestartSourceInvalid as exc:
+      raise PlatformUpdateError(str(exc)) from exc
   _git("update-ref", _PREPARED_REF, prepared, repo=repo)
   record = PreparedUpdate(
     state="prepared", snapshot=snapshot, prepared=prepared, target=target,
     image_digest=image_digest, requires_image=requires_image, late=None,
-    late_committed=None,
+    late_committed=None, replayed=None, operation=None,
+    protocol=BOOT_PROTOCOL, restore=None, booted_tree=None,
   )
   _write_prepared_update(record)
   _set_update_progress(
@@ -2774,19 +2872,80 @@ async def prepare_platform_update(
   )
 
 
+class BootTransactionError(PlatformUpdateError):
+  """The boot transaction could not establish a state this image may serve."""
+
+
+def _swap_in(repo: Path, record: PreparedUpdate) -> PreparedUpdate:
+  """Point the live checkout at a prepared update; the caller holds the lock.
+
+  Everything live (commits and in-progress edits) is saved as one commit
+  under ``_LATE_REF`` first. The record is written ``swapped`` before the
+  branch moves, so a process that dies in between leaves a record the boot
+  transaction finishes (``_settle_swap``). A failure raises with the live
+  source and the prepared record restored.
+  """
+  local = _local_branch(repo)
+  _reattach_detached_head(repo, local)
+  restore = {
+    "upstream": recorded_upstream_sha(repo),
+    "activation": (
+      RESTART_NEEDED_FLAG.read_text(encoding="utf-8")
+      if RESTART_NEEDED_FLAG.exists() else None
+    ),
+  }
+  carried = _carry_working_edits(repo, local)
+  late = carried.pre
+  swapped = PreparedUpdate(**{
+    **record, "state": "swapped", "late": late,
+    "late_committed": carried.served, "replayed": None, "restore": restore,
+    "booted_tree": None,
+  })
+  try:
+    _git("update-ref", _LATE_REF, late, repo=repo)
+    _write_prepared_update(swapped)
+    _activate_candidate(repo, local, late, record["prepared"])
+  except Exception:
+    _write_prepared_update(record)
+    _restore_working_edits(repo, local)
+    raise
+  _clear_reconcile_pre()
+  _finish_swap(repo, swapped)
+  return swapped
+
+
+def _finish_swap(repo: Path, record: PreparedUpdate) -> None:
+  """Bookkeeping after the checkout reached the prepared update. Idempotent:
+  the boot transaction repeats it after a crash between the two. A revert
+  restores what it replaces (``record["restore"]``); contribution provenance
+  moves only once the swap is confirmed (``_retire_swap``)."""
+  # The update's one linear commit replaces the local commit chain, as in
+  # Apply: keep the replaced chain (late commits included) reachable for undo.
+  _git("update-ref", _PRE_UPDATE_REF, record["late_committed"], repo=repo)
+  _set_upstream(repo, record["target"])
+  ROLLED_BACK_FLAG.unlink(missing_ok=True)
+  _record_update_activation(repo, record["prepared"], record["target"])
+
+
 def swap_in_prepared_update(
   *, cutover: bool, repo: Path = PLATFORM_REPO,
 ) -> bool:
-  """At shutdown, after every chat is paused, point the live checkout at the
-  checked update. Everything live (commits and in-progress edits) is saved as
-  one commit under ``_LATE_REF`` first. An update that needs a new image
-  swaps only at its container cutover, never at an unrelated restart.
-  Returns whether the swap happened; failures leave the live source intact.
+  """At shutdown, after every chat is paused, swap in a prepared update that
+  this image can run: a restart-only update.
+
+  An update that needs a new image is swapped in by that image's own boot
+  (``settle_prepared_update_for_this_image``), never by the outgoing
+  container. Only an image without that boot transaction still swaps it at
+  its container cutover. Returns whether the swap happened; failures leave the
+  live source intact.
   """
   def swappable(record: PreparedUpdate | None) -> bool:
     return (
       record is not None and record["state"] == "prepared"
-      and (cutover or not record["requires_image"])
+      and (
+        not record["requires_image"]
+        or (cutover and not image_activates_updates())
+      )
     )
 
   # Check once without the lock so an ordinary restart never waits on it, then
@@ -2797,38 +2956,25 @@ def swap_in_prepared_update(
     record = read_prepared_update()
     if not swappable(record):
       return False
-    local = _local_branch(repo)
-    _reattach_detached_head(repo, local)
-    carried = _carry_working_edits(repo, local)
-    late = carried.pre
     try:
-      _git("update-ref", _LATE_REF, late, repo=repo)
-      # Record the swap first: if the process dies before the checkout moves,
-      # or boot's guard restores ``late``, boot sees an unswapped checkout and
-      # returns the update to prepared instead of losing the late edits.
-      _write_prepared_update({
-        **record, "state": "swapped", "late": late,
-        "late_committed": carried.served,
-      })
-      _activate_candidate(repo, local, late, record["prepared"])
+      _swap_in(repo, record)
     except Exception:
       log.exception("platform: could not swap in the prepared update")
-      _write_prepared_update(record)
-      _restore_working_edits(repo, local)
       return False
-    _clear_reconcile_pre()
-    # The update's one linear commit replaces the local commit chain, as in
-    # Apply: keep the replaced chain (late commits included) reachable for undo.
-    _git("update-ref", _PRE_UPDATE_REF, carried.served, repo=repo)
-    try:
-      app_git.carry_equivalent_change_sources(repo, carried.served, record["prepared"])
-      app_git.retire_landed_equivalent_changes(repo, record["target"])
-    except Exception:
-      log.warning("platform: could not update contribution provenance", exc_info=True)
-    _set_upstream(repo, record["target"])
-    ROLLED_BACK_FLAG.unlink(missing_ok=True)
-    _record_update_activation(repo, record["prepared"], record["target"])
     return True
+
+
+def _retire_swap(repo: Path, record: PreparedUpdate) -> None:
+  """The swap is confirmed: move contribution provenance onto the update and
+  drop the record, so nothing can return to the previous state any more."""
+  try:
+    app_git.carry_equivalent_change_sources(
+      repo, record["late_committed"], record["prepared"],
+    )
+    app_git.retire_landed_equivalent_changes(repo, record["target"])
+  except Exception:
+    log.warning("platform: could not update contribution provenance", exc_info=True)
+  _clear_prepared_update(repo)
 
 
 def cancel_unfinished_update(repo: Path = PLATFORM_REPO) -> None:
@@ -2845,9 +2991,41 @@ def cancel_unfinished_update(repo: Path = PLATFORM_REPO) -> None:
       return
     if not pending["cancellable"]:
       raise PlatformUpdateError("prepared_update_swapped")
+    record = read_prepared_update()
+    if record is not None and record["operation"] is not None:
+      # Its replacement may still start; the controller releases it first.
+      raise PlatformUpdateError("update_operation_bound")
     if CONFLICT_FLAG.exists():
       _drop_parked_resolution(repo)
     _clear_prepared_update(repo)
+
+
+def bind_update_operation(
+  target_sha: str, operation: dict, repo: Path = PLATFORM_REPO,
+  *, replacing: dict | None = None,
+) -> None:
+  """Bind the container replacement that is to confirm a prepared update.
+
+  Called before the replacement can start, so no other operation's success
+  (an earlier attempt at the same release included) can retire the record.
+  Compare-and-set: the record must be unbound, already bound to exactly this
+  operation, or bound to ``replacing``, a binding the caller observed after
+  the controller proved no replacement was running. A concurrent Finish that
+  bound first therefore wins, and the other is refused before it publishes.
+  """
+  bound = _valid_operation(operation)
+  if bound is None:
+    raise PlatformUpdateError("update_operation_invalid")
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if (
+      record is None or record["state"] != "prepared"
+      or record["target"] != target_sha or not record["requires_image"]
+    ):
+      raise PlatformUpdateError("update_plan_stale")
+    if record["operation"] not in (None, bound, _valid_operation(replacing)):
+      raise PlatformUpdateError("update_operation_bound")
+    _write_prepared_update(PreparedUpdate(**{**record, "operation": bound}))
 
 
 def late_edits_pending() -> bool:
@@ -2857,81 +3035,572 @@ def late_edits_pending() -> bool:
   that is missing its own recent edits.
   """
   record = read_prepared_update()
-  return record is not None and record["state"] == "swapped"
+  return (
+    record is not None and record["state"] == "swapped"
+    and not _serves_replayed(record)
+  )
+
+
+def _serves_replayed(record: PreparedUpdate, repo: Path = PLATFORM_REPO) -> bool:
+  """Whether this server imported the merged-back late edits (or newer)."""
+  served = _served_platform_sha()
+  return bool(record["replayed"] and served and (
+    served == record["replayed"]
+    or _is_ancestor(repo, record["replayed"], served)
+  ))
+
+
+def _swap_position(repo: Path, record: PreparedUpdate, head: str) -> str:
+  """Where the checkout stands after a swap: the booted update awaiting its
+  late edits (``pending``), those edits merged back (``replayed``), the saved
+  previous state (``not_swapped``), or something else."""
+  if head == record["prepared"]:
+    return "pending"
+  if record["replayed"]:
+    if head == record["replayed"] or _is_ancestor(repo, record["replayed"], head):
+      return "replayed"
+  elif _is_ancestor(repo, record["prepared"], head):
+    # Nothing but the merge-back moves the checkout between the swap and the
+    # first started server, so a descendant of the update is its result even
+    # if the process died before recording it.
+    return "replayed"
+  if head in {record["late"], record["late_committed"]}:
+    return "not_swapped"
+  return "unknown"
+
+
+def _replay_parked(record: PreparedUpdate) -> bool:
+  return record["state"] == "swapped" and bool(
+    ((_read_conflict_flag() or {}).get("overlay") or {}).get("replay")
+  )
+
+
+def _replay_late_edits(repo: Path, record: PreparedUpdate) -> str:
+  """Merge late edits onto the booted update, or park them; the caller holds
+  the reconcile lock and has checked the checkout is exactly the update."""
+  local = _local_branch(repo)
+  head = record["prepared"]
+  # Late edits are local work and the booted update is the incoming
+  # release: the same merge Apply uses, so in-progress edits come back
+  # uncommitted and a conflict parks for a resolver on a frozen copy.
+  late_committed = record["late_committed"] or record["late"]
+  carried = _Carried(
+    served=late_committed, pre=record["late"],
+    working=record["late"] if record["late"] != late_committed else None,
+  )
+  outcome = _merged_candidate(
+    repo, carried, head,
+    app_git.merge_refs(repo, late_committed, head, merge_base=record["snapshot"]),
+    right=head, base=record["snapshot"],
+    reconciliation=app_git.ReconciliationReceipt(),
+  )
+  if isinstance(outcome, ReconcileResult):
+    flag = _read_conflict_flag() or {}
+    _write_conflict_flag(
+      head, list(flag.get("paths") or []),
+      overlay={**(flag.get("overlay") or {}), "replay": True, "live": head},
+    )
+    return "conflict"
+  if outcome.tip != head:
+    _activate_candidate(repo, local, head, outcome.tip)
+    _clear_reconcile_pre()
+    _restore_working_edits(repo, local)
+  replayed = _rev(repo, local)
+  _write_prepared_update(PreparedUpdate(**{
+    **record, "replayed": replayed,
+    "booted_tree": _working_tree_oid(repo, replayed),
+  }))
+  return "replayed"
+
+
+# --- The boot transaction ---------------------------------------------------
+#
+# ``app.platform_boot`` runs these from the image's own baked checkout, before
+# the entrypoint's guard and import probe, so the image that owns the Python
+# packages decides whether served source may run on it. Served code never
+# makes that decision for itself.
+
+
+def settle_prepared_update_for_this_image(repo: Path = PLATFORM_REPO) -> str:
+  """Boot, before anything imports the served tree: establish the source this
+  image may run.
+
+  An update that needs this exact image is swapped in now; one swapped in for
+  another image is returned to its own saved previous state; an interrupted
+  swap or merge-back is finished. Late edits merge back here, so the probe
+  and the server both see the final tree. Activation bookkeeping and trusted
+  hooks follow, and source needing a newer image's packages is refused.
+  Returns the update's outcome (``none``, ``waiting``, ``replayed``,
+  ``conflict`` or ``reverted``); raises ``BootTransactionError`` when no
+  valid state can be established. Safe to repeat after a crash at any
+  point.
+  """
+  image = frozen_image_sha()
+  with _reconcile_flock():
+    recovery = boot_guard_clean_served_tree(repo)
+    outcome = _settle_update_record(repo, image)
+    _refuse_source_newer_than_image_packages(repo, image)
+    _normalize_activation_marker()
+    _complete_boot_activation(repo)
+    hooks = _refresh_trusted_hooks(repo)
+  log.info("platform boot: %s%s", recovery, f" hooks={hooks}" if hooks else "")
+  return outcome
+
+
+def _settle_update_record(repo: Path, image: str | None) -> str:
+  record = read_prepared_update()
+  if record is None:
+    return "none"
+  if record["protocol"] > BOOT_PROTOCOL:
+    raise BootTransactionError(
+      f"the update was prepared for boot protocol {record['protocol']}; "
+      f"this image understands {BOOT_PROTOCOL}",
+    )
+  if record["state"] == "reverted":
+    record = _settle_reverted(
+      repo, record, set_aside=None, reason=_FAILED_STARTUP_CHECK,
+    )
+  if record["requires_image"] and image is None:
+    raise BootTransactionError("this image does not record its own revision")
+  on_image = not record["requires_image"] or image == record["target"]
+  if record["state"] == "prepared":
+    if record["requires_image"] and on_image:
+      return activate_prepared_update_for_this_image(repo, record)
+    return "waiting"
+  if not on_image:
+    _revert_swap(repo, record, reason=_REPLACEMENT_NOT_KEPT)
+    return "reverted"
+  return _settle_swap(repo, record)
+
+
+def release_packages_missing_from_image(
+  repo: Path = PLATFORM_REPO, image: str | None = None,
+) -> str | None:
+  """Why this image must not serve the checkout, or None.
+
+  Running an older image under source from a newer release (historical
+  image-only rollback) is unsupported: that source declares Python packages
+  the image does not have. The checkout is refused when any package input is
+  exactly its release's yet differs from this image's, and this image is not
+  provably that release or newer. A live update record is settled before
+  this runs; image-first moves (an image newer than the source) and local
+  package declarations stay allowed.
+  """
+  baked = _build_info().get("image_inputs")
+  if not isinstance(baked, dict) or not baked:
+    return None
+  image = image or frozen_image_sha()
+  release = recorded_upstream_sha(repo)
+  if not release:
+    return None
+  # Each input counts on its own: a local declaration exempts only its own
+  # path, never a release's input that the image provably lacks.
+  differs = False
+  for path in _PYTHON_DEPENDENCY_INPUTS:
+    try:
+      served = (repo / path).read_bytes()
+    except OSError:
+      continue
+    if hashlib.sha256(served).hexdigest() == baked.get(path):
+      continue
+    if _blob_bytes(repo, release, path) == served:
+      differs = True
+  if not differs:
+    return None
+  if image and release and (image == release or _is_ancestor(repo, release, image)):
+    return None
+  return (
+    "the platform source declares Python packages from a newer release than "
+    "this container image; starting an older image under newer source is not "
+    "supported. Replace the container with the release's image."
+  )
+
+
+def _blob_bytes(repo: Path, commit: str, path: str) -> bytes | None:
+  try:
+    shown = subprocess.run(
+      ["git", "-C", str(repo), "show", f"{commit}:{path}"],
+      capture_output=True, check=False, timeout=_GIT_TIMEOUT,
+      env=_scrubbed_git_env(repo),
+    )
+  except (OSError, subprocess.SubprocessError):
+    return None
+  return shown.stdout if shown.returncode == 0 else None
+
+
+def _refuse_source_newer_than_image_packages(repo: Path, image: str | None) -> None:
+  reason = release_packages_missing_from_image(repo, image)
+  if reason:
+    raise BootTransactionError(reason)
+
+
+def _refresh_trusted_hooks(repo: Path) -> str | None:
+  """Install local Git hooks from the recorded upstream release only; returns
+  None when nothing needed refreshing, ``refreshed``, or the error."""
+  source = recorded_upstream_sha(repo)
+  if source and not _is_ancestor(repo, source, "HEAD"):
+    source = None  # Recovery may leave provenance unprovable; do not guess hook authority.
+  error = _refresh_git_hooks(repo, source)
+  if error == "":
+    return "refreshed"
+  return f"error:{error}" if error else None
+
+
+def activate_prepared_update_for_this_image(
+  repo: Path, record: PreparedUpdate,
+) -> str:
+  """Swap in an update that needs this image, from this image's own boot, and
+  merge the late edits back. The caller holds the reconcile lock."""
+  if not (
+    record["state"] == "prepared" and record["requires_image"]
+    and frozen_image_sha() == record["target"]
+  ):
+    raise BootTransactionError("this image is not the update's target")
+  try:
+    swapped = _swap_in(repo, record)
+  except Exception as exc:
+    raise BootTransactionError(f"could not swap in the update: {exc}") from exc
+  return _replay_late_edits(repo, swapped)
+
+
+def _settle_swap(repo: Path, record: PreparedUpdate) -> str:
+  """Finish a swap on the image it belongs to, wherever a crash left it."""
+  if _replay_parked(record):
+    return "conflict"
+  local = _local_branch(repo)
+  position = _swap_position(repo, record, _rev(repo, local))
+  if position == "not_swapped":
+    # Died after recording the swap, before the checkout moved (the guard
+    # has already unwound any carried edits): swap in again from here.
+    prepared = PreparedUpdate(**{
+      **record, "state": "prepared", "late": None, "late_committed": None,
+      "replayed": None,
+    })
+    try:
+      record = _swap_in(repo, prepared)
+    except Exception as exc:
+      raise BootTransactionError(f"could not swap in the update: {exc}") from exc
+    return _replay_late_edits(repo, record)
+  if position == "pending":
+    _finish_swap(repo, record)
+    return _replay_late_edits(repo, record)
+  if position == "replayed":
+    head = _rev(repo, local)
+    if record["replayed"] != head or not record["booted_tree"]:
+      # Died after the merge-back moved the checkout, before recording it.
+      _write_prepared_update(PreparedUpdate(**{
+        **record, "replayed": head,
+        "booted_tree": record["booted_tree"] or _working_tree_oid(repo, head),
+      }))
+    return "replayed"
+  raise BootTransactionError(
+    f"the checkout at {_short(_rev(repo, local))} is neither the update, "
+    "its merge-back, nor the saved previous state",
+  )
+
+
+_FAILED_STARTUP_CHECK = (
+  "The updated version failed its startup check, so Möbius returned to the "
+  "previous version with your recent edits."
+)
+_REPLACEMENT_NOT_KEPT = (
+  "The new container was not kept, so Möbius returned to the previous "
+  "version with your recent edits."
+)
+
+
+def revert_failed_update(repo: Path = PLATFORM_REPO) -> bool:
+  """Boot, after the swapped-in update failed its import probe: return to the
+  swap's own saved previous state. Returns whether anything was reverted."""
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if record is None or record["state"] != "swapped" or not record["late"]:
+      return False
+    _revert_swap(repo, record, reason=_FAILED_STARTUP_CHECK)
+    return True
+
+
+def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
+  """Reset to the swap's saved ``late`` state and keep the update prepared.
+
+  Anything made on the update since it booted is set aside first, never
+  discarded. The reset precedes the record write, so a crash leaves a still
+  swapped record the next boot reverts again.
+  """
+  local = _local_branch(repo)
+  resolver_work = None
+  if _replay_parked(record):
+    # Keep the resolver's answer, then drop its merge while the record still
+    # says swapped: a crash from here on repeats this revert, and a settled
+    # record never sits beside a stale late-edit conflict.
+    resolver_work = _set_aside_resolver_work(repo)
+    flag = _read_conflict_flag() or {}
+    worktree = Path(str(
+      (flag.get("overlay") or {}).get("worktree") or _overlay_candidate_path(repo)
+    ))
+    app_git.remove_overlay_worktree(repo, worktree)
+    CONFLICT_FLAG.unlink(missing_ok=True)
+  _abort_interrupted(repo)
+  set_aside = _set_aside_unsaved_update_work(repo, local, record)
+  _reset_hard_to(repo, local, record["late"])
+  _clear_reconcile_pre()
+  _settle_reverted(
+    repo, record, reason=reason,
+    set_aside=" and ".join(ref for ref in (set_aside, resolver_work) if ref) or None,
+  )
+
+
+def _set_aside_unsaved_update_work(
+  repo: Path, local: str, record: PreparedUpdate,
+) -> str | None:
+  """Keep the checkout's commits and working tree under a durable ref when
+  they hold anything the saved previous state does not."""
+  head = _rev(repo, local) or _rev(repo, "HEAD")
+  if not head or not record["late"]:
+    return None
+  tree = _working_tree_oid(repo, head)
+  # The saved previous state and the tree the update booted with are already
+  # kept; set aside only what was made after that boot.
+  if tree in {_commit_tree_oid(repo, record["late"]), record["booted_tree"]}:
+    return None
+  commit = app_git._run(
+    repo, "commit-tree", tree, "-p", head, "-m",
+    "platform: work set aside when an update's image was not kept",
+  ).stdout.strip()
+  return _keep_set_aside(repo, commit)
+
+
+def _set_aside_resolver_work(repo: Path) -> str | None:
+  """Keep a resolver's in-progress answer to a late-edit conflict (its whole
+  working tree) under the set-aside refs before its merge is dropped."""
+  worktree = Path(str(
+    ((_read_conflict_flag() or {}).get("overlay") or {}).get("worktree")
+    or _overlay_candidate_path(repo)
+  ))
+  head = _rev(worktree, "HEAD") if (worktree / ".git").exists() else ""
+  if not head:
+    return None
+  tree = _working_tree_oid(worktree, head)
+  commit = app_git._run(
+    repo, "commit-tree", tree, "-p", head, "-m",
+    "platform: late-edit resolution set aside when an update's image was not kept",
+  ).stdout.strip()
+  return _keep_set_aside(repo, commit)
+
+
+def _keep_set_aside(repo: Path, commit: str) -> str:
+  stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+  ref = f"{_SET_ASIDE_PREFIX}/{stamp}"
+  _git("update-ref", ref, commit, repo=repo)
+  kept = _git(
+    "for-each-ref", "--sort=-refname", "--format=%(refname)", _SET_ASIDE_PREFIX,
+    repo=repo, check=False,
+  ).stdout.split()
+  for old in kept[_SET_ASIDE_KEEP:]:
+    _git("update-ref", "-d", old, repo=repo, check=False)
+  return ref
+
+
+def _settle_reverted(
+  repo: Path, record: PreparedUpdate, *, set_aside: str | None, reason: str,
+) -> PreparedUpdate:
+  """The previous version is back: keep the update prepared, so the owner can
+  retry Finish or cancel it, and say what happened."""
+  _restore_working_edits(repo, _local_branch(repo))
+  restore = record["restore"]
+  if restore is not None:
+    # The previous version's own bookkeeping, not the update's.
+    if restore.get("upstream"):
+      _set_upstream(repo, str(restore["upstream"]))
+    else:
+      _clear_upstream(repo)
+    if restore.get("activation") is not None:
+      _atomic_write_text(RESTART_NEEDED_FLAG, str(restore["activation"]))
+    else:
+      RESTART_NEEDED_FLAG.unlink(missing_ok=True)
+  prepared = PreparedUpdate(**{
+    **record, "state": "prepared", "late": None, "late_committed": None,
+    "replayed": None, "operation": None, "restore": None, "booted_tree": None,
+  })
+  _write_prepared_update(prepared)
+  if set_aside:
+    reason += f" Work made on the new version is kept at {set_aside}."
+  _write_rolled_back_flag(record["target"], reason)
+  return prepared
 
 
 def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
-  """At boot, finish a swap: merge late edits back or park them.
+  """Startup, before chats resume: finish what boot left of a swap.
 
-  Returns ``replayed``, ``conflict`` (parked for the resolver), ``reverted``
-  (the boot script returned to the previous version), or None.
+  The boot transaction normally left nothing. This covers an image that ran
+  none: its shell revert (``reverted``), or a swap it served without merging
+  the late edits back first. Returns ``replayed``, ``conflict`` (parked for
+  the resolver), ``reverted``, ``not_swapped``, ``unknown``, or None.
   """
-  record = read_prepared_update()
-  if record is None:
-    return None
-  local = _local_branch(repo)
-  unswapped = PreparedUpdate(
-    **{**record, "state": "prepared", "late": None, "late_committed": None},
-  )
-  if record["state"] == "reverted":
-    # The previous version is back with its recent edits. The update stays
-    # prepared, so the owner can retry Finish (often an interrupted cutover)
-    # or cancel it.
-    _write_rolled_back_flag(
-      record["target"],
-      "The updated version failed its startup check, so Möbius returned to "
-      "the previous version with your recent edits.",
-    )
-    _restore_working_edits(repo, local)
-    _write_prepared_update(unswapped)
-    return "reverted"
-  if record["state"] != "swapped" or not record["late"]:
-    return None
+  if read_prepared_update() is None:
+    return None  # Nothing to finish; no lock, as on most boots.
   with _reconcile_flock():
+    record = read_prepared_update()
+    if record is None:
+      return None
+    local = _local_branch(repo)
+    if record["state"] == "reverted":
+      _settle_reverted(repo, record, set_aside=None, reason=_FAILED_STARTUP_CHECK)
+      return "reverted"
+    if record["state"] != "swapped" or not record["late"]:
+      return None
     head = _rev(repo, local)
-    if head != record["prepared"]:
+    position = "parked" if _replay_parked(record) else _swap_position(
+      repo, record, head,
+    )
+    if position == "not_swapped":
       # The checkout never moved (the swap failed or boot restored it), so
       # there is nothing to merge back: the update is still just prepared.
       _restore_working_edits(repo, local)
-      _write_prepared_update(unswapped)
+      _write_prepared_update(PreparedUpdate(**{
+        **record, "state": "prepared", "late": None, "late_committed": None,
+        "replayed": None,
+      }))
       return "not_swapped"
+    if position == "unknown":
+      # As in the boot transaction: never resume work on a checkout that
+      # cannot be placed relative to its update.
+      raise BootTransactionError(
+        f"the checkout at {_short(head)} is neither the swapped update, its "
+        "merge-back, nor the saved previous state",
+      )
+    outcome = "conflict" if position == "parked" else "replayed"
+    if position == "pending":
+      # This process imported the update before its late edits merged back,
+      # so it cannot have loaded them: merge now and record the restart that
+      # loads them. The record stays, so the next boot can still return a
+      # tree that cannot start to the saved previous state.
+      outcome = _replay_late_edits(repo, record)
+      if outcome == "replayed":
+        _record_update_activation(
+          repo, _rev(repo, local), recorded_upstream_sha(repo),
+        )
+    elif position == "replayed" and record["replayed"] != head:
+      _write_prepared_update(PreparedUpdate(**{**record, "replayed": head}))
     # The source moved while the server was down: install a changed
-    # dependency lock now; the shell is rebuilt once late edits are back.
-    moved = _activation_paths_between(repo, record["late"], head)
+    # dependency lock, then drop the stamp so the watcher's startup check
+    # rebuilds the shell against it.
+    moved = _activation_paths_between(repo, record["late"], _rev(repo, local))
     if any(path in _FRONTEND_DEPENDENCY_INPUTS for path in moved):
       installed, error = _sync_frontend_dependencies(repo)
       if not installed:
         log.error("platform: frontend dependencies for the update failed: %s", error)
-    # Late edits are local work and the booted update is the incoming
-    # release: the same merge Apply uses, so in-progress edits come back
-    # uncommitted and a conflict parks for a resolver on a frozen copy.
-    late_committed = record["late_committed"] or record["late"]
-    carried = _Carried(
-      served=late_committed, pre=record["late"],
-      working=record["late"] if record["late"] != late_committed else None,
-    )
-    outcome = _merged_candidate(
-      repo, carried, head,
-      app_git.merge_refs(repo, late_committed, head, merge_base=record["snapshot"]),
-      right=head, base=record["snapshot"],
-      reconciliation=app_git.ReconciliationReceipt(),
-    )
-    if isinstance(outcome, ReconcileResult):
-      flag = _read_conflict_flag() or {}
-      _write_conflict_flag(
-        head, list(flag.get("paths") or []),
-        overlay={**(flag.get("overlay") or {}), "replay": True, "live": head},
-      )
-      _invalidate_frontend_build_stamp(repo)
-      return "conflict"
-    if outcome.tip != head:
-      _activate_candidate(repo, local, head, outcome.tip)
-      _clear_reconcile_pre()
-      _restore_working_edits(repo, local)
-    # Dropping the stamp makes the watcher's startup check rebuild the shell.
     _invalidate_frontend_build_stamp(repo)
-    _clear_prepared_update(repo)
-    return "replayed"
+    return outcome
+
+
+def confirm_platform_swap_loaded(repo: Path = PLATFORM_REPO) -> bool:
+  """End of startup: this server is running the merged-back late edits.
+
+  That confirms an update no controller replacement is verifying, so the boot
+  no longer needs to be able to return to the previous state. An update bound
+  to a replacement waits for that exact operation instead
+  (``finalize_confirmed_update``): the controller can still roll the image
+  back. A server started from other source (the baked floor) leaves the record
+  for the next platform boot.
+  """
+  if read_prepared_update() is None:
+    return False
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if (
+      record is None or record["state"] != "swapped"
+      or record["operation"] is not None
+      or not _serves_replayed(record, repo)
+    ):
+      return False
+    _retire_swap(repo, record)
+    return True
+
+
+def _serving_settled_update(record: PreparedUpdate, repo: Path) -> bool:
+  """Whether this process is the update's target image serving its merged
+  platform tree: the local half of every retirement."""
+  return (
+    record["state"] == "swapped" and record["requires_image"]
+    and bool(record["replayed"])
+    and frozen_image_sha() == record["target"]
+    and _serves_replayed(record, repo)
+  )
+
+
+def status_reports_bound_operation(status: dict, record: PreparedUpdate) -> bool:
+  """Whether a controller status is about exactly the record's bound
+  replacement: its operation or nonce, its release, and on Railway its image."""
+  operation = record["operation"]
+  if operation is None or status.get("expected_sha") != record["target"]:
+    return False
+  if operation["controller"] == "railway":
+    return status.get("operation_id") == operation["id"] and (
+      not record["image_digest"]
+      or status.get("image_digest") == record["image_digest"]
+    )
+  return status.get("request_nonce") == operation["id"]
+
+
+def reconcile_bound_operation(status: dict, repo: Path = PLATFORM_REPO) -> str | None:
+  """Apply the bound replacement's reported outcome to the update record.
+
+  ``status`` is the controller's current report, read outside the lock. Only
+  a report about exactly the bound operation counts. Its success retires the
+  update, and only while this process is the update's target image serving
+  its merged platform tree. A replacement that ended without booting the
+  target (it failed, found nothing to change, or was rolled back before the
+  swap) releases the binding so Finish can try again. Returns ``retired``,
+  ``unbound``, or None. Idempotent.
+  """
+  # Settings polls this; skip the lock unless a binding could be affected.
+  unlocked = read_prepared_update()
+  if unlocked is None or not status_reports_bound_operation(status, unlocked):
+    return None
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if record is None or not status_reports_bound_operation(status, record):
+      return None
+    state = status.get("state")
+    if state == "succeeded" and _serving_settled_update(record, repo):
+      _retire_swap(repo, record)
+      return "retired"
+    if record["state"] == "prepared" and state in {
+      "no_change", "failed", "rolled_back",
+    }:
+      _write_prepared_update(PreparedUpdate(**{**record, "operation": None}))
+      return "unbound"
+    return None
+
+
+def unbind_update_operation(
+  target_sha: str, operation: dict, repo: Path = PLATFORM_REPO,
+) -> None:
+  """Release a binding whose replacement definitively never started. Only
+  that exact binding on a still-prepared update is released."""
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if (
+      record is not None and record["state"] == "prepared"
+      and record["target"] == target_sha
+      and record["operation"] == _valid_operation(operation)
+    ):
+      _write_prepared_update(PreparedUpdate(**{**record, "operation": None}))
+
+
+def keep_settling_update(repo: Path = PLATFORM_REPO) -> None:
+  """The owner's decision to keep an update whose replacement can no longer be
+  confirmed (the controller is unavailable). Only the update's target image,
+  serving its merged platform tree, may keep it."""
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if (
+      record is None or record["operation"] is None
+      or not _serving_settled_update(record, repo)
+    ):
+      raise PlatformUpdateError("update_not_settling")
+    _retire_swap(repo, record)
 
 
 def _net_overlay_commit(repo: Path, target: str, tree: str, source: str) -> str:
@@ -3079,14 +3748,27 @@ def continue_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
         # A late-edit merge replaces no local chain; the swap recorded it.
         overlay=None if parked.get("replay") else outcome.overlay,
       )
-      if result.status == "updated":
-        if parked.get("replay"):
-          _clear_prepared_update(repo)
-        else:
-          _record_update_activation(repo, result.new_sha, target)
-      return result.status
     finally:
       _restore_working_edits(repo, local)
+    if result.status != "updated":
+      return result.status
+    # Record what the checkout holds once transient edit commits are unwound.
+    head = _rev(repo, local)
+    if not parked.get("replay"):
+      _record_update_activation(repo, head, target)
+      return result.status
+    # The server booted before these edits returned, so it still owes the
+    # restart that loads them.
+    _record_update_activation(repo, head, recorded_upstream_sha(repo))
+    record = read_prepared_update()
+    if record is not None and record["operation"] is not None:
+      # Its replacement still confirms it; the restart loads this.
+      _write_prepared_update(PreparedUpdate(**{
+        **record, "replayed": head, "booted_tree": _working_tree_oid(repo, head),
+      }))
+    elif record is not None:
+      _retire_swap(repo, record)
+    return result.status
 
 
 def _resolved_tree(parked: dict, worktree: Path, source: str) -> str:
@@ -3133,6 +3815,11 @@ def _resolved_tree(parked: dict, worktree: Path, source: str) -> str:
 def abandon_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
   """Drop a parked tree merge and keep serving the pre-update tree."""
   with _reconcile_flock():
+    record = read_prepared_update()
+    if record is not None and record["operation"] is not None and _replay_parked(record):
+      # Dropping it would clear the record that can still return this image
+      # update to its previous state; the late edits must be resolved.
+      raise PlatformUpdateError("replay_conflict_must_finish")
     _drop_parked_resolution(repo)
     return "abandoned"
 
@@ -3250,27 +3937,29 @@ def _last_fetch_timestamp(repo: Path) -> str | None:
 def reconcile_clone_sync() -> str:
   """Prepare installed source locally before uvicorn imports it.
 
-  The name is the entrypoint contract baked into deployed images. It no longer
+  Only images from before the boot transaction call this; newer images run
+  ``settle_prepared_update_for_this_image`` from their own baked checkout,
+  which includes this work. The name is the entrypoint contract baked into
+  those images. It no longer
   reconciles a remote release: restarting must never become an update. Recovery
   restores interrupted work before completing activation or selecting trusted
   hooks. The shell's separate boot guard remains fail-closed if preparation
   fails or is interrupted.
   """
+  # Boot writes the served tree through ``su``, whose login umask can leave
+  # rewritten files group-writable, and the served-runtime check then falls
+  # back to the baked platform. Files written here keep the image's mode.
+  os.umask(0o022)
   try:
     with _reconcile_flock():
       recovery = boot_guard_clean_served_tree(PLATFORM_REPO)
       _normalize_activation_marker()
       _complete_boot_activation(PLATFORM_REPO)
-      source = recorded_upstream_sha(PLATFORM_REPO)
-      if source and not _is_ancestor(PLATFORM_REPO, source, "HEAD"):
-        source = None  # Recovery may leave provenance unprovable; do not guess hook authority.
-      hook_refresh = _refresh_git_hooks(PLATFORM_REPO, source)
-      summary = f"startup[installed] head={_short(_rev(PLATFORM_REPO, 'HEAD'))} {recovery}"
-      if hook_refresh == "":
-        summary += " hooks=refreshed"
-      elif hook_refresh:
-        summary += f" hooks=error:{hook_refresh}"
-      return summary
+      hooks = _refresh_trusted_hooks(PLATFORM_REPO)
+    summary = f"startup[installed] head={_short(_rev(PLATFORM_REPO, 'HEAD'))} {recovery}"
+    if hooks:
+      summary += f" hooks={hooks}"
+    return summary
   except Exception as exc:
     return f"startup[error] {exc!r}"
 
@@ -3293,6 +3982,7 @@ def boot_guard_sync() -> str:
   guard is the final proof that the served tree is clean. Booting after a guard
   error would silently bypass the safety boundary it exists to enforce.
   """
+  os.umask(0o022)  # As in reconcile_clone_sync: never a group-writable tree.
   with _reconcile_flock():
     return boot_guard_clean_served_tree(PLATFORM_REPO)
 
@@ -3313,10 +4003,21 @@ def unfinished_update(repo: Path = PLATFORM_REPO) -> UnfinishedUpdate | None:
       stage="resolve", action="replace",
       cancellable=prepared is None or prepared["state"] == "prepared",
     )
+  if prepared and prepared["state"] == "swapped" and prepared["operation"]:
+    return UnfinishedUpdate(
+      target_sha=prepared["target"], stage="settling", action="none",
+      cancellable=False,
+    )
   if prepared and prepared["state"] in {"prepared", "swapped"}:
+    # Once the target image is running, only its own boot is still owed:
+    # another replacement would find nothing to change.
+    replace = (
+      prepared["requires_image"]
+      and frozen_image_sha() != prepared["target"]
+    )
     return UnfinishedUpdate(
       target_sha=prepared["target"], stage="finish",
-      action="replace" if prepared["requires_image"] else "restart",
+      action="replace" if replace else "restart",
       cancellable=prepared["state"] == "prepared",
     )
   marker = _read_activation_marker()

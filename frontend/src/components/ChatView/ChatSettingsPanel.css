@@ -163,7 +163,7 @@
 .csp-row__icon--claude { color: #d97757; }
 
 .csp-row--selected .csp-row__icon {
-  background: var(--surface2);
+  background: var(--surface-2);
 }
 
 .csp-row__main {
@@ -429,7 +429,7 @@
 .csp__confirm-btn--ghost {
   color: var(--text);
   border-color: color-mix(in srgb, var(--text) 18%, var(--border));
-  background: var(--surface2);
+  background: var(--surface-2);
 }
 
 @media (hover: hover) and (pointer: fine) {

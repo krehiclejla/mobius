@@ -30,10 +30,15 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   inbox.mkdir(parents=True)
   state.mkdir()
   (control / "status.json").write_text(
-    '{"state":"idle","handoff":"external-cutover-v1"}', encoding="utf-8",
+    '{"state":"idle","handoff":"external-cutover-v1","request_versions":[1,2]}', encoding="utf-8",
   )
   monkeypatch.setattr(dc, "_control_dir", lambda: control)
   monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  bound = []
+  monkeypatch.setattr(
+    dc.platform_update, "bind_update_operation",
+    lambda target, operation, **_kw: bound.append(operation),
+  )
 
   target = "c" * 40
   outcome = await dc._request_self_hosted_rebuild(
@@ -84,3 +89,6 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   status = json.loads((control / "status.json").read_text(encoding="utf-8"))
   assert status["state"] == "succeeded"
   assert status["expected_sha"] == target
+  # The helper echoes the exact request the app bound to the update.
+  assert bound == [{"controller": "host", "id": status["request_nonce"]}]
+  assert outcome["request_nonce"] == status["request_nonce"]

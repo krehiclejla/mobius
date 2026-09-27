@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -346,7 +347,9 @@ def test_failed_request_claim_is_terminal_and_retryable(tmp_path, monkeypatch):
 
   assert host.run() == 1
   assert statuses[-1]["state"] == "failed"
-  assert not request.exists()
+  # It was never claimed, so it may be another request by now: it stays for
+  # the owner to withdraw instead of being deleted unverified.
+  assert request.exists()
 
 
 
@@ -538,3 +541,171 @@ def test_drain_requires_root_open_prepare_accept_order(tmp_path, monkeypatch):
 
   assert result is None
   assert order == ["open-cutover", "prepare", "accept-cutover"]
+
+
+def test_the_helper_accepts_both_request_versions_and_echoes_only_the_nonce():
+  assert host.parse_request({"version": 1, "expected_sha": "a" * 40}) == ("a" * 40, None)
+  assert host.parse_request({
+    "version": 2, "expected_sha": "a" * 40, "nonce": "b" * 32,
+  }) == ("a" * 40, "b" * 32)
+  for invalid in (
+    {"version": 1, "expected_sha": "a" * 40, "nonce": "b" * 32},
+    {"version": 2, "expected_sha": "a" * 40},
+    {"version": 2, "expected_sha": "a" * 40, "nonce": "not-a-nonce"},
+    {"version": 3, "expected_sha": "a" * 40},
+  ):
+    with pytest.raises(ValueError):
+      host.parse_request(invalid)
+
+
+def test_the_helper_advertises_the_request_versions_it_accepts(tmp_path, monkeypatch):
+  monkeypatch.setattr(host, "STATE_DIR", tmp_path / "state")
+  monkeypatch.setattr(host, "STATUS", tmp_path / "state" / "status.json")
+  control = tmp_path / "control"
+  control.mkdir()
+
+  status = host.write_status({"control_dir": control}, state="idle")
+
+  assert status["request_versions"] == [1, 2]
+
+
+def test_the_helper_names_a_request_in_its_status_before_claiming_it(
+  tmp_path, monkeypatch,
+):
+  """The app treats a request gone from the inbox and absent from the status
+  as never claimed, so the helper must publish its nonce first."""
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  nonce = "a" * 32
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "3" * 40, "nonce": nonce,
+  }), encoding="utf-8")
+  order = []
+  real_replace = host.os.replace
+
+  def record_replace(source, target):
+    if Path(source) == request:
+      order.append("claim")
+    return real_replace(source, target)
+
+  def record_status(_config, **fields):
+    if fields.get("request_nonce") == nonce and fields.get("state") == "queued":
+      order.append("named")
+    return fields
+
+  monkeypatch.setattr(host.os, "replace", record_replace)
+  monkeypatch.setattr(host, "write_status", record_status)
+  monkeypatch.setattr(
+    host, "app_container",
+    lambda _config: (_ for _ in ()).throw(RuntimeError("stop after the claim")),
+  )
+
+  host.run()
+
+  assert order[:2] == ["named", "claim"]
+
+
+def _requeue(request: Path, content: str) -> None:
+  """What the app's withdraw-then-Finish does: a new file at the same path."""
+  temp = request.with_name(".app-request.tmp")
+  temp.write_text(content, encoding="utf-8")
+  os.replace(temp, request)
+
+
+def test_a_newer_request_that_replaced_the_one_read_stays_queued(
+  tmp_path, monkeypatch,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  nonce = "b" * 32
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": nonce,
+  }), encoding="utf-8")
+  newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+  statuses = []
+
+  def status(_config, **fields):
+    statuses.append(fields)
+    if fields.get("state") == "queued":
+      _requeue(request, newer)  # withdrawn and re-queued before the claim
+    return fields
+
+  monkeypatch.setattr(host, "write_status", status)
+
+  assert host.run() == 1
+  assert (statuses[-1]["state"], statuses[-1]["code"]) == ("failed", "withdrawn")
+  assert statuses[-1]["request_nonce"] == nonce
+  assert request.read_text(encoding="utf-8") == newer
+  assert not list(_config["control_dir"].glob(".request-*"))
+
+
+def test_a_request_queued_after_a_withdrawal_survives_the_failed_claim(
+  tmp_path, monkeypatch,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": "b" * 32,
+  }), encoding="utf-8")
+  newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def status(_config, **fields):
+    if fields.get("state") == "queued":
+      request.unlink()  # withdrawn before the claim
+    elif fields.get("code") == "withdrawn":
+      _requeue(request, newer)  # a newer Finish before the worker cleans up
+    return fields
+
+  monkeypatch.setattr(host, "write_status", status)
+
+  assert host.run() == 1
+  assert request.read_text(encoding="utf-8") == newer
+
+
+def test_a_request_rewritten_in_place_is_returned_not_run(tmp_path, monkeypatch):
+  """Same inode, different bytes: the file claimed is not the request read."""
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": "b" * 32,
+  }), encoding="utf-8")
+  rewritten = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def status(_config, **fields):
+    if fields.get("state") == "queued":
+      with open(request, "w", encoding="utf-8") as handle:  # same inode
+        handle.write(rewritten)
+    return fields
+
+  monkeypatch.setattr(host, "write_status", status)
+  monkeypatch.setattr(
+    host, "app_container",
+    lambda _config: (_ for _ in ()).throw(AssertionError("must not run")),
+  )
+
+  assert host.run() == 1
+  assert request.read_text(encoding="utf-8") == rewritten
+
+
+def test_an_unverified_claim_that_cannot_be_returned_is_kept(tmp_path, monkeypatch):
+  config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": "b" * 32,
+  }), encoding="utf-8")
+  newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def status(_config, **fields):
+    if fields.get("state") == "queued":
+      _requeue(request, newer)
+    return fields
+
+  def no_link(*_args):
+    raise PermissionError("link refused")
+
+  monkeypatch.setattr(host, "write_status", status)
+  monkeypatch.setattr(host.os, "link", no_link)
+
+  assert host.run() == 1
+  kept = list(config["control_dir"].glob(".unreturned-*"))
+  assert [path.read_text(encoding="utf-8") for path in kept] == [newer]

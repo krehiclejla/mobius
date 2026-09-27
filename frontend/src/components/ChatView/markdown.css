@@ -78,7 +78,7 @@
 
 @media (hover: hover) and (pointer: fine) {
   .md-code-copy:hover {
-    background: var(--surface2);
+    background: var(--surface-2);
     color: var(--text);
   }
   .md-code-copy--copied:hover { color: var(--accent); }
@@ -105,7 +105,7 @@
 }
 
 .md-inline-code {
-  background: var(--surface2);
+  background: var(--surface-2);
   border: 1px solid var(--border-light);
   border-radius: 5px;
   padding: 2px 6px;
@@ -463,14 +463,14 @@ ol.md-list ol.md-list ol.md-list { list-style: lower-roman; }
   border-bottom: 1px solid var(--border);
   background:
     radial-gradient(circle at 55% 38%, color-mix(in srgb, var(--accent) 23%, transparent), transparent 46%),
-    var(--surface2);
+    var(--surface-2);
   isolation: isolate;
 }
 .md-app-card__visual--mapbook,
 .md-app-card__visual--maps {
   background:
     radial-gradient(circle at 55% 38%, color-mix(in srgb, var(--green) 24%, transparent), transparent 48%),
-    var(--surface2);
+    var(--surface-2);
 }
 .md-app-card__preview-fallback {
   position: absolute;

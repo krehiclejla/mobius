@@ -3,12 +3,11 @@
 /**
  * The composer's "/" menu.
  *
- * DISPATCH AUTHORITY LIVES IN THE BACKEND. A message only reaches a real
- * command when `_is_cli_slash_command` (backend/app/chat.py) recognises it —
- * that function is what keeps the command at character 0 by appending Möbius's
- * hidden context blocks BELOW the message instead of prepending them, which is
- * the only arrangement the Claude CLI dispatches on. This registry is the
- * PRESENTATION half of that same fact.
+ * DISPATCH AUTHORITY LIVES IN THE BACKEND. Möbius owns every command here;
+ * none is forwarded to a provider CLI. `/goal` creates the Möbius Goal and the
+ * agent receives its objective as a plain request, so Claude's own `/goal`
+ * never runs. The backend's MOBIUS_SLASH_COMMANDS (backend/app/chat_context.py)
+ * is the dispatch half of this list; this registry is the PRESENTATION half.
  *
  * Listing a command here that the backend does not dispatch is the failure
  * worth guarding: the menu would offer it, the user would pick it, and it
@@ -44,8 +43,8 @@ export const SLASH_COMMANDS = [
 /**
  * Commands Möbius handles itself instead of handing to the model.
  *
- * `/goal` is dispatched by the CLI (the backend keeps the token at position 0
- * so Claude/Codex see it). `/compact` is not a prompt at all — it is a chat
+ * `/goal` is sent as a message; the backend turns it into the Goal and hands
+ * the agent a plain request. `/compact` is not a prompt at all — it is a chat
  * action: the platform rewrites the chat's live context and resets the provider
  * session. It is dispatched to the backend's compaction endpoint, never sent as
  * prose. Both lists are still pinned to the backend by

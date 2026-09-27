@@ -49,9 +49,7 @@ def goal_identity_for_run_start(db, chat_id, message):
   reason = continuation_reason(message)
   kind = message.get("kind")
   exact_goal_id = None
-  if reason == GOAL_HANDOFF_REASON:
-    exact_goal_id = message.get("goal_id")
-  elif kind == DELEGATION_RESULT_MESSAGE_KIND:
+  if kind == DELEGATION_RESULT_MESSAGE_KIND:
     exact_goal_id = message.get("source_work_id")
   elif kind in {WAIT_RESULT_MESSAGE_KIND, PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND,
                 PEER_MESSAGE_WAKE_KIND}:
@@ -63,7 +61,7 @@ def goal_identity_for_run_start(db, chat_id, message):
     if goal is not None and goal.chat_id == chat_id and goal.status == "open":
       return goal.objective, goal.id
     return None, None
-  if kind in {DELEGATION_RESULT_MESSAGE_KIND} or reason == GOAL_HANDOFF_REASON:
+  if kind == DELEGATION_RESULT_MESSAGE_KIND:
     return None, None
 
   manual = reason == "manual"
@@ -136,11 +134,6 @@ def product_result_continuation_root(
     models.ChatRun.id == root_run_id,
   ).first()
   return root_run_id if exists is not None else None
-
-
-# Durable hidden continuations use this reason to retain the exact Goal across
-# physical turns. Older transcripts use the same value and remain recoverable.
-GOAL_HANDOFF_REASON = "goal_handoff"
 
 
 def latest_run(db: Session, chat_id: str) -> models.ChatRun | None:

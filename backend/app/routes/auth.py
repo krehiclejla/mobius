@@ -2,7 +2,9 @@
 
 Owner-authorized credential minting and provider-link mutations reject delegated
 execution bearers; otherwise a child could exchange inherited tool access for a
-new unrestricted owner or app credential and bypass its delegation boundary.
+new unrestricted owner or app credential and bypass its delegation boundary. The
+app-frame token is the one exception: it is narrower than the bearer presented
+and carries the same delegation lineage, so it stays a delegated credential.
 """
 
 import asyncio
@@ -37,7 +39,8 @@ from app.deps import (
   get_chat_view_principal,
   get_current_owner, get_current_owner_for_lifecycle_control,
   get_current_owner_or_app,
-  get_owner_app_or_chat_embed_for_models, reject_cross_site,
+  get_owner_app_or_chat_embed_for_models,
+  get_owner_or_delegated_owner_for_app_token, reject_cross_site,
   require_chat_embed_operation,
   require_nondelegated_owner_control,
 )
@@ -510,10 +513,19 @@ def login(
 @router.post("/app-token", dependencies=[Depends(reject_cross_site)])
 def create_app_token_endpoint(
   body: schemas.AppTokenRequest,
-  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  principal: Principal = Depends(get_owner_or_delegated_owner_for_app_token),
   db: Session = Depends(get_db),
 ):
-  """Returns a short-lived JWT scoped to a specific mini-app."""
+  """Returns a short-lived JWT scoped to a specific mini-app.
+
+  Admits a delegated helper (an owner-scoped bearer that carries a delegation
+  id) so its shell can mount an owner app it can already read — the returned
+  app token is strictly NARROWER than the bearer it presents. The delegation
+  lineage is forwarded into the minted token so it stays a delegated bearer and
+  cannot be laundered into a clean app credential that would bypass the
+  delegation boundary (see get_owner_or_delegated_owner_for_app_token and
+  require_nondelegated_owner_or_app_control).
+  """
   # A tombstoned (soft-deleted) app must not be granted fresh authority — no new
   # token for an uninstalled app. Revive (reinstall/recover) makes it mintable
   # again. See feature 110.
@@ -524,11 +536,19 @@ def create_app_token_endpoint(
   )
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
+  owner = principal.owner
+  # Preserve the delegation lineage on the down-scoped token. create_agent_token
+  # keeps agent_chat == delegation_chat, so principal.chat_id is the child chat
+  # a delegated bearer must carry; a plain owner has neither claim.
+  delegation_id = principal.delegation_id
+  delegation_chat = principal.chat_id if delegation_id is not None else None
   token = auth.create_app_token(
     body.app_id,
     owner.username,
     owner.token_epoch,
     app_nonce=app.token_nonce,
+    delegation_id=delegation_id,
+    delegation_chat=delegation_chat,
   )
   return {"token": token}
 

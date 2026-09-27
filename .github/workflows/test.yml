@@ -269,15 +269,28 @@ jobs:
         # The SDK is pinned and installed only in the production image. Run its
         # focused, offline contract tests there so slim host CI cannot silently
         # skip the exact provider surface Mobius serves.
+        # The container is disposable, so its database is too; say so, or
+        # app.database refuses to create an engine in a test process. Settings
+        # also need a key; a throwaway one fits a container that serves nothing.
         run: >-
           docker run --rm
           --entrypoint python
+          -e MOBIUS_TEST_DATABASE_ISOLATED=1
+          -e DATABASE_URL=sqlite:////tmp/codex-contract.db
+          -e SECRET_KEY=codex-contract-throwaway-key-0123456789abcdef
           -v "$PWD/backend/tests/test_codex_sdk_contract.py:/app/test_codex_sdk_contract.py:ro"
           mobius-test:ci
           -m pytest -q /app/test_codex_sdk_contract.py
 
       - name: Verify timed Docker probe cleanup
         run: scripts/test-docker-probe.sh
+
+      - name: Verify the production boot transaction
+        # The e2e container below runs the disposable test runtime, which
+        # skips the image's boot transaction. Boot the production path on real
+        # restarts once per run so a broken transaction cannot reach main.
+        if: matrix.shard == 1
+        run: scripts/test-boot-transaction.sh mobius-test:ci
 
       - name: Start test container
         run: |

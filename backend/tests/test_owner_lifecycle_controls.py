@@ -309,89 +309,6 @@ def test_delegated_bearer_cannot_send_edit_or_cancel_owner_messages(
     assert pending[0]["cid"] == f"pending-{target}"
 
 
-def test_top_level_agent_sends_and_edits_do_not_gain_owner_authority(
-  client, owner_token, db, monkeypatch,
-):
-  from app.routes import chats_stream
-
-  chat_ids, _delegated_auth, top_level_auth = _delegated_and_top_level_auth(
-    client, owner_token, db,
-  )
-  monkeypatch.setattr(chats_stream, "is_draining", lambda: True)
-
-  for target in ("top-level", "foreign"):
-    response = client.post(
-      f"/api/chats/{chat_ids[target]}/messages",
-      json={"content": f"agent-{target}", "cid": f"agent-{target}"},
-      headers=top_level_auth,
-    )
-    assert response.status_code == 202, response.text
-
-  owner_auth = {"Authorization": f"Bearer {owner_token}"}
-  owner_response = client.post(
-    f"/api/chats/{chat_ids['foreign']}/messages",
-    json={"content": "owner", "cid": "owner"},
-    headers=owner_auth,
-  )
-  assert owner_response.status_code == 202, owner_response.text
-  db.expire_all()
-  queued_owner = next(
-    row for row in db.get(models.Chat, chat_ids["foreign"]).pending_messages
-    if row["cid"] == "owner"
-  )
-  assert queued_owner["_owner_authored"] is True
-  edited = client.patch(
-    f"/api/chats/{chat_ids['foreign']}/pending/owner",
-    json={"content": "agent rewrite"},
-    headers=top_level_auth,
-  )
-  assert edited.status_code == 200, edited.text
-  assert edited.json()["updated"] is True
-
-  db.expire_all()
-  for target in ("top-level", "foreign"):
-    pending = db.get(models.Chat, chat_ids[target]).pending_messages
-    agent_row = next(row for row in pending if row["cid"] == f"agent-{target}")
-    assert "_owner_authored" not in agent_row
-  owner_row = next(
-    row for row in db.get(models.Chat, chat_ids["foreign"]).pending_messages
-    if row["cid"] == "owner"
-  )
-  assert owner_row["content"] == "agent rewrite"
-  assert "_owner_authored" not in owner_row
-
-  from app.chat_writer import AppendSteeredUserMessage, get_writer
-  committed = get_writer().submit(AppendSteeredUserMessage(
-    chat_id=chat_ids["foreign"],
-    run_token="",
-    user_msgs=[owner_row],
-    consume_pending_cids=["owner"],
-  )).result(timeout=30)
-  assert committed["owner_steer_committed"] is False
-
-  restored = client.patch(
-    f"/api/chats/{chat_ids['foreign']}/pending/agent-foreign",
-    json={"content": "owner rewrite"},
-    headers=owner_auth,
-  )
-  assert restored.status_code == 200, restored.text
-  assert restored.json()["updated"] is True
-  db.expire_all()
-  owner_rewrite = next(
-    row for row in db.get(models.Chat, chat_ids["foreign"]).pending_messages
-    if row["cid"] == "agent-foreign"
-  )
-  assert owner_rewrite["content"] == "owner rewrite"
-  assert owner_rewrite["_owner_authored"] is True
-  committed = get_writer().submit(AppendSteeredUserMessage(
-    chat_id=chat_ids["foreign"],
-    run_token="",
-    user_msgs=[owner_rewrite],
-    consume_pending_cids=["agent-foreign"],
-  )).result(timeout=30)
-  assert committed["owner_steer_committed"] is True
-
-
 def test_delegated_bearer_cannot_enter_host_or_platform_lifecycle(
   client, owner_token, db, monkeypatch, tmp_path,
 ):
@@ -472,10 +389,6 @@ def test_delegated_bearer_cannot_enter_host_or_platform_lifecycle(
       headers=delegated_auth,
     ),
     client.post(
-      "/api/auth/app-token", json={"app_id": app_id},
-      headers=delegated_auth,
-    ),
-    client.post(
       "/api/auth/app-job-token", json={"app_id": app_id},
       headers=delegated_auth,
     ),
@@ -495,6 +408,17 @@ def test_delegated_bearer_cannot_enter_host_or_platform_lifecycle(
   assert calls == []
   db.expire_all()
   assert db.query(models.Owner).one().token_epoch == 0
+
+  # The one credential a delegated bearer may mint is the app-frame token its
+  # shell needs to mount an app it can already read, and only because that
+  # narrower token keeps the delegation lineage: it stays refused wherever a
+  # delegated bearer is (see test_app_token).
+  minted = client.post(
+    "/api/auth/app-token", json={"app_id": app_id}, headers=delegated_auth,
+  )
+  assert minted.status_code == 200, minted.text
+  claims = auth_mod.decode_access_token(minted.json()["token"])
+  assert claims["scope"] == "app" and claims["delegation_id"]
 
 
 def test_owner_restart_routes_refuse_source_that_would_boot_to_recovery(

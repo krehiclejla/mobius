@@ -521,7 +521,10 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   purge_app_bundles(deleted_app_id)
   await asyncio.to_thread(_rmtree_strict, storage_dir)
   await asyncio.to_thread(_rmtree_strict, secrets_dir)
+  from app import service_preload
   from app.applied_app_runtime import runtime_parent
+  # A preloaded service host runs from, and pins, the tree removed next.
+  service_preload.retire(deleted_app_id)
   await asyncio.to_thread(_rmtree_strict, runtime_parent(deleted_app_id))
 
   # Storage is gone; only now free the row and its reusable id. A partial

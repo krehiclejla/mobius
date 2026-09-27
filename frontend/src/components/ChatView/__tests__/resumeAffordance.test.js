@@ -143,8 +143,8 @@ test('restart recovery waits for a durable run identity instead of showing a fal
     'the interrupted-turn card explains the short restart handoff')
   assert.match(msgContent, /resumeState\?\.pending \|\| resumeState\?\.unavailable/,
     'the recovery action cannot be invoked before its identity is durable')
-  assert.match(chatView, /resumeState\.unavailable \? 'Reconnecting…' : 'Resume'/,
-    'the Goal rail follows the same unavailable-recovery contract')
+  assert.doesNotMatch(chatView, /actionKind: 'resume'/,
+    'only the interrupted-turn card resumes; an idle Goal is simply your turn')
 })
 
 test('MsgContent memo compares onResume so a stable ref skips re-render', () => {
@@ -207,7 +207,6 @@ test('ChatView routes both offscreen attention nudges through the controller', (
 
 test('floating composer controls share the keyboard-safe activation contract', () => {
   const controls = [
-    ['chat__history-retry', /loadOlderMessages\(offset, \{ readerDriven: true \}\)/],
     ['chat__question-nudge', /revealPendingQuestion\(pendingQuestionEl\)/],
     ['chat__resume-nudge', /revealConversationTail/],
     ['chat__jump-latest', /followLatest/],

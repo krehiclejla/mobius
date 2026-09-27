@@ -11,27 +11,20 @@ Prepare the narrow local consumer, explain what it will do, and finish all
 other work and closeout **before** invoking the helper. The card is the final
 action of the turn, exactly like Möbius's saved Q&A and approval cards.
 
-```bash
-python3 /data/platform/backend/scripts/secure-input.py owner-credentials
-```
-
-This requests the current password, new username, new password and confirmation.
-The helper saves the safe request and returns a receipt immediately. It does
+Call `request_secret` with `preset: "owner_credentials"`. This requests the
+current password, new username, new password and confirmation. The tool saves
+the safe request and returns a receipt immediately. It does
 **not** wait for an answer or receive values. On a confirmed receipt, end the
 turn with **no further text or tools**. Do not append “I'll wait,” poll, or run
 a background consumer. No answer and no permission may be inferred from the
 receipt. The saved card blocks further work until it is submitted or cancelled.
 
-For another local consumer:
-
-```bash
-python3 /data/platform/backend/scripts/secure-input.py run \
-  --title "Connect service" \
-  --description "Credentials go directly to the local connector." \
-  --field username:text:"Username" \
-  --field api_key:password:"API key" \
-  -- python3 /data/path/to/safe-consumer.py
-```
+For another local consumer, call `request_secret` with a `title`, optional
+`description`, `fields` such as `[{"name":"api_key","type":"password","label":"API key"}]`,
+the consumer `command` as an argv list (`["python3", "/data/path/to/safe-consumer.py"]`),
+and an absolute `cwd` when it is not `/data`. The same card is available from
+`python3 /data/platform/backend/scripts/secure-input.py run` for shells without
+the tool.
 
 Möbius persists only the prompts, pre-authored command, working directory and
 safe lifecycle status. Unsubmitted cards survive agent completion and server

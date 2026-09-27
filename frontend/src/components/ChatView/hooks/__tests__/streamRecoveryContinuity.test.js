@@ -469,7 +469,7 @@ test('a successful attachment announcing network recovery must not cancel itself
   assert.equal(requests[0].aborted, false)
 })
 
-test('a redundant online signal cannot show Reconnecting after catchup settled', async t => {
+test('a redundant online signal after catchup settled neither replaces the stream nor raises an error', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const settled = deferred()
   await setup({ onCatchUpSettled: () => settled.resolve() })
@@ -486,5 +486,5 @@ test('a redundant online signal cannot show Reconnecting after catchup settled',
   window.dispatchEvent(new Event('online'))
   t.mock.timers.tick(1600)
   assert.equal(requests, 1)
-  assert.equal(hook.result.current.reconnecting, false)
+  assert.equal(hook.result.current.connectionError, null)
 })

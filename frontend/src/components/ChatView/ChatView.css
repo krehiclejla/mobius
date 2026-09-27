@@ -87,7 +87,7 @@
    ╚════════════════════════════════════════════════════════════╝ */
 
 /* CONTRACT: .chat paints `var(--bg)` as its own solid background.
-   Message bubbles below paint `var(--surface)` / `var(--surface2)`
+   Message bubbles below paint `var(--surface)` / `var(--surface-2)`
    on top of this — so both `--bg` and `--surface*` must read as
    OPAQUE FILL variables. Translucent values let the page background
    bleed through bubbles.
@@ -334,7 +334,7 @@
   min-height: 36px;             /* coarse pointers use the 44px override below */
 }
 .chat__quick-action-chip:hover {
-  background: var(--surface2, var(--surface));
+  background: var(--surface-2, var(--surface));
   border-color: var(--accent-dim, var(--accent));
 }
 .chat__quick-action-chip:focus-visible {
@@ -480,7 +480,7 @@
 }
 @media (hover: hover) and (pointer: fine) {
   .chat__msg-copy:hover {
-    background: var(--surface2); /* CONTRACT: secondary opaque fill */
+    background: var(--surface-2); /* CONTRACT: secondary opaque fill */
     color: var(--text);
   }
 }
@@ -532,7 +532,7 @@
   font-size: 24px;
   line-height: 1;
 }
-.chat-summary__close:active { background: var(--surface2); }
+.chat-summary__close:active { background: var(--surface-2); }
 .chat-summary__body { min-height: 0; overflow-y: auto; }
 .chat-summary__state {
   margin: 0;
@@ -756,7 +756,7 @@
 }
 .chat__recovery-action--quiet:hover:not(:disabled) {
   border-color: var(--border-light);
-  background: color-mix(in srgb, var(--surface2) 72%, transparent);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
   color: var(--text);
 }
 .chat__recovery-action:disabled {
@@ -778,7 +778,7 @@
   --switch-thumb-size: 16px;
   --switch-thumb-offset: 2px;
   --switch-track-color: var(--border);
-  --switch-track-color-hover: var(--surface2);
+  --switch-track-color-hover: var(--surface-2);
   --switch-track-color-checked: var(--accent);
   --switch-track-color-disabled: var(--surface);
   --switch-track-color-checked-disabled: var(--accent-dim);
@@ -875,7 +875,7 @@
 }
 
 .connection-status__retry:hover {
-  background: var(--surface2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
+  background: var(--surface-2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
 }
 
 .connection-status__retry:focus-visible {
@@ -1404,7 +1404,7 @@
   min-height: 30px;
   padding: 4px 8px;
   border-bottom: 1px solid var(--border-light);
-  background: var(--surface2);
+  background: var(--surface-2);
 }
 
 .chat__tool-diff-head code {
@@ -1537,7 +1537,7 @@
   padding: 4px 9px 4px 5px;
   border-radius: 999px;
   color: var(--text); /* CONTRACT: readable source text on opaque fill */
-  background: color-mix(in srgb, var(--surface2) 58%, var(--surface));
+  background: color-mix(in srgb, var(--surface-2) 58%, var(--surface));
   border: 1px solid var(--border-light);
   text-decoration: none;
   transition: background-color 120ms ease, border-color 120ms ease;
@@ -1550,7 +1550,7 @@
 
 @media (hover: hover) {
   .chat__source-chip:hover {
-    background: color-mix(in srgb, var(--accent-dim) 42%, var(--surface2));
+    background: color-mix(in srgb, var(--accent-dim) 42%, var(--surface-2));
     border-color: color-mix(in srgb, var(--accent) 42%, var(--border-light));
   }
 }
@@ -1660,7 +1660,7 @@
 @media (hover: hover) {
   .chat__sources-toggle:hover {
     color: var(--text);
-    background: color-mix(in srgb, var(--surface2) 54%, transparent);
+    background: color-mix(in srgb, var(--surface-2) 54%, transparent);
   }
 }
 
@@ -2346,7 +2346,6 @@
 .chat__foot .queued,
 .chat__foot .connection-status,
 .chat__foot .chat__attach-tray,
-.chat__foot .chat__history-retry,
 .chat__foot .chat__question-nudge,
 .chat__foot .chat__resume-nudge,
 .chat__foot .chat__jump-latest,
@@ -2420,19 +2419,6 @@
   color: var(--danger, #b42318);
   background: color-mix(in srgb, var(--danger, #b42318) 7%, var(--surface));
   text-align: center;
-}
-
-.chat__activation-retry {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  border-radius: 12px;
-}
-
-.chat__activation-retry .chat__empty-action {
-  flex: 0 0 auto;
-  margin-top: 0;
-  padding-block: 5px;
 }
 
 /* The pill: TRANSLUCENT surface with backdrop-blur — chat content
@@ -2731,26 +2717,12 @@
   transition: background 0.15s, color 0.15s, transform 0.08s;
 }
 .chat__question-nudge:hover,
-.chat__resume-nudge:hover,
-.chat__history-retry:hover {
+.chat__resume-nudge:hover {
   background: var(--accent); /* CONTRACT: vivid opaque accent fill */
   color: #fff;
 }
 .chat__question-nudge:active,
-.chat__resume-nudge:active,
-.chat__history-retry:active { transform: scale(0.96); }
-
-.chat__history-retry {
-  min-height: 36px;
-  margin: 0 auto;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text);
-  font: 600 12px/1.2 var(--font);
-  cursor: pointer;
-}
+.chat__resume-nudge:active { transform: scale(0.96); }
 
 .chat__offscreen-nudges > button + button { margin-top: 8px; }
 
@@ -2932,7 +2904,7 @@
 }
 
 .chat__plus:hover {
-  background: color-mix(in srgb, var(--surface2) 70%, transparent);
+  background: color-mix(in srgb, var(--surface-2) 70%, transparent);
   color: var(--text); /* CONTRACT: high-contrast text on opaque fill */
 }
 
@@ -2970,7 +2942,7 @@
 .chat__brain-usage:focus { outline: none; }
 .chat__brain-usage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .chat__plus.chat__brain-usage.chat__plus--active {
-  background-color: color-mix(in srgb, var(--surface2) 82%, transparent) !important;
+  background-color: color-mix(in srgb, var(--surface-2) 82%, transparent) !important;
   border-color: var(--accent);
   color: var(--text);
 }
@@ -3078,13 +3050,13 @@
   transition: background 0.12s ease;
 }
 
-.composer-popover__row:hover { background: var(--surface2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */ }
+.composer-popover__row:hover { background: var(--surface-2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */ }
 
 .composer-popover__row-icon {
   width: 30px;
   height: 30px;
   border-radius: 8px;
-  background: var(--surface2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
+  background: var(--surface-2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
   border: 1px solid rgba(255, 255, 255, 0.07);
   display: grid;
   place-items: center;
@@ -3270,7 +3242,7 @@
   justify-content: flex-start;
   gap: 6px;
   padding: clamp(4px, calc(var(--composer-attach-card, var(--attach-card)) * 0.1), 10px);
-  background: var(--surface2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
+  background: var(--surface-2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
   border: 1px solid var(--border-light); /* CONTRACT: subtle 1px hairline on opaque fill */
   border-radius: 14px;
   width: var(--composer-attach-card, var(--attach-card, 96px));
@@ -3285,7 +3257,7 @@
   padding: 0;
   border-radius: 14px;
   overflow: hidden;
-  background: var(--surface2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
+  background: var(--surface-2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
   border: 1px solid var(--border-light); /* CONTRACT: subtle 1px hairline on opaque fill */
 }
 
@@ -3454,7 +3426,7 @@
   width: var(--attach-card, 96px);
   height: var(--attach-card, 96px);
   border-radius: 14px;
-  background: var(--surface2);
+  background: var(--surface-2);
 }
 
 .chat__attach-thumb-button {
@@ -3540,7 +3512,7 @@
 }
 
 .chat__attach-file:hover {
-  background: var(--surface2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
+  background: var(--surface-2); /* CONTRACT: opaque hover/raised fill, slightly above --surface */
 }
 
 .chat__attach-file-name {
@@ -4013,6 +3985,8 @@
 .chat__wait-history { --lifecycle-tone: var(--accent); }
 .chat__wait-history--attention { --lifecycle-tone: var(--warning, #d8922f); }
 .chat__wait-history--stopped { --lifecycle-tone: var(--muted); }
+/* A wake cause opens the answer it started, so its gap sits below it. */
+.chat__wait-history--lead { margin-top: 0; margin-bottom: 10px; }
 
 /* What started an answer sits above its first line. */
 .chat__answer-cause {
@@ -4210,7 +4184,7 @@
 }
 
 .queued__hdr:hover {
-  background: var(--surface2); /* CONTRACT: secondary opaque fill */
+  background: var(--surface-2); /* CONTRACT: secondary opaque fill */
 }
 
 .queued__hdr:focus-visible {
@@ -4396,7 +4370,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--surface2); /* CONTRACT: neutral compact well on opaque fill */
+  background: var(--surface-2); /* CONTRACT: neutral compact well on opaque fill */
   border: 1px solid var(--border-light); /* CONTRACT: subtle hairline around the well */
   border-radius: 8px;
   color: var(--muted); /* CONTRACT: low-contrast icon on opaque fill */
@@ -4488,6 +4462,16 @@
 .chat__peer-delivery { margin: 0; color: var(--muted); font-size: 12px; }
 .chat__peer-links { display: flex; flex-wrap: wrap; gap: 8px; }
 .chat__peer-links a { color: var(--accent); text-underline-offset: 3px; overflow-wrap: anywhere; }
+.chat__peer-link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent); /* CONTRACT: link-coloured action beside the chat link */
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
 
 /* A rejected outbox row keeps its original content and a visible next action. */
 .queued__rejection {

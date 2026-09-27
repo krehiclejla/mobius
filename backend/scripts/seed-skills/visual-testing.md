@@ -9,21 +9,16 @@ and visible evidence.
 
 `agent-browser` is a CLI wrapping a headless Chromium with a persistent session — your visual testing tool. Seeing the app as it renders beats trusting the code for anything visual.
 
-**To screenshot any Möbius page, use the authenticated helper — never `agent-browser open` it directly.** Your browser starts with an empty `localStorage`, so opening a Möbius URL lands on the login wall and every screenshot is the password form, not the page you meant to capture. The helper writes your scoped token into `localStorage` first, then navigates:
+**To screenshot any Möbius page, call the `screenshot` tool — never `agent-browser open` it directly.** Your browser starts with an empty `localStorage`, so opening a Möbius URL lands on the login wall and every screenshot is the password form. The tool runs the authenticated helper at the owner's viewport, saves the image in this chat's served media, and returns the image to you plus the exact embed line for the owner. Routes: `/` the shell, `/shell/?chat=<id>`, `/shell/?app=<id>` (a mini-app in the shell, numeric id), `/apps/<slug>/` (its standalone page); `content_only: true` hides product overlays. It needs write access.
 
-```bash
-bash "$SCRIPTS_DIR/agent-screenshot.sh" <route> <out.png>
-# /                → the shell      /chat/<id>     → a chat
-# /app/<id>        → a mini-app in the shell (numeric id)
-# /apps/<slug>/    → a mini-app's standalone PWA page (by slug)
-```
+For an already-open page (`--current-page`) or a specific output path, use the
+helper itself: `bash "$SCRIPTS_DIR/agent-screenshot.sh" [--current-page] <route> <out.png>`.
 
 `preview_app.sh <id>` and `preview_shell.sh [chat_id]` are thin wrappers over it
 for those two common cases. `preview_app.sh` is readiness-gated and uses
 ephemeral content-only mode: it waits for the real post-render frame-mounted
 state and prevents product-owned walkthrough/install overlays from mounting in
-that isolated browser session without writing onboarding or dismissal state. Use the helper, then
-`Read`/`view_image` the PNG before describing it.
+that isolated browser session without writing onboarding or dismissal state.
 
 Raw `agent-browser open <url>` is for **non-Möbius pages only** (an external site you're scraping or sanity-checking) — it has no auth dance, so it shows the login wall for any Möbius route.
 
@@ -115,7 +110,7 @@ retain the broken result.
 
 Loading a PNG into your vision (`Read` on Claude, `view_image` on Codex) lets YOU inspect it. The partner sees ONLY your text plus any `![caption](/api/chats/$CHAT_ID/media/<name>.png)` embeds you explicitly write. The failure mode: you view it, describe it ("the grid rendered beautifully"), but never embed — so the partner trusts an unverified claim. Pattern:
 
-1. `Bash`: capture with `bash "$SCRIPTS_DIR/agent-screenshot.sh" <route>` — with no output path it lands in the chat's served media dir (`/data/chats/$CHAT_ID/media/shot-*.png`) and prints the path **plus a ready-to-paste `![screenshot](/api/chats/…)` embed line**. For an already-open Möbius state, mint the unique final media path first and use the same helper with `--current-page`; reserve raw `agent-browser screenshot "$OUT"` for non-Möbius pages. For an upload or unavoidable pre-existing tool output, publish the exact file with `publish_chat_image.py`. Only files under `media/` embed in replies; `/tmp` images preview only inside their protected tool activity.
+1. Capture with the `screenshot` tool: the file lands in the chat's served media dir and the result carries the image itself **plus a ready-to-paste `![screenshot](/api/chats/…)` embed line**, so steps 2–3 are already done for it. For an already-open Möbius state, mint the unique final media path first and run `agent-screenshot.sh --current-page` with it; reserve raw `agent-browser screenshot "$OUT"` for non-Möbius pages. For an upload or unavoidable pre-existing tool output, publish the exact file with `publish_chat_image.py`. Only files under `media/` embed in replies; `/tmp` images preview only inside their protected tool activity.
 2. `Bash`: verify the final media file and authenticated response as above.
 3. `Read` / `view_image`: inspect that final media file.
 4. **Text** (same message, BEFORE interpreting): paste the verified embed. The path must carry the resolved chat id; a literal `$CHAT_ID` only expands in Bash, never in markdown. Then add the one-line description.

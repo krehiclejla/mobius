@@ -8,6 +8,13 @@ export function rebuildIsActive(status) {
   return ACTIVE_REBUILD_STATES.has(status?.state)
 }
 
+// The self-hosted helper never claimed the queued request. It stays queued (so
+// nothing starts beside it), and withdrawing it is safe: the helper renames the
+// request out of the inbox before it acts.
+export function rebuildAwaitingHostHelper(status) {
+  return rebuildIsActive(status) && status?.code === 'host_helper_unclaimed'
+}
+
 export function rebuildPollShouldContinue(status) {
   return status === null || rebuildIsActive(status)
 }
@@ -47,4 +54,35 @@ export function rebuildProgressMessage(status) {
     default:
       return ''
   }
+}
+
+// How long the current stage has been running, from the controller's updated_at.
+export function rebuildStartedAgo(status, now = Date.now()) {
+  const started = Date.parse(status?.updated_at || '')
+  if (!Number.isFinite(started)) return ''
+  const minutes = Math.max(0, Math.floor((now - started) / 60000))
+  if (minutes < 1) return 'just entered this stage'
+  if (minutes < 60) return `in this stage for ${minutes} min`
+  const hours = Math.floor(minutes / 60)
+  return `in this stage for about ${hours} ${hours === 1 ? 'hour' : 'hours'}`
+}
+
+// Collapse a controller message to one short, safe status line.
+function shortStatusText(message) {
+  const text = String(message || '').replace(/\s+/g, ' ').trim()
+  return text.length > 160 ? `${text.slice(0, 159)}…` : text
+}
+
+// One honest status line while a replacement is active: the controller's own
+// stage text ("Selecting the verified Möbius image.", "Downloading and checking
+// the official image.", "Railway is replacing the container.") when it sent one,
+// else the fixed phase copy, plus how long the current stage has been running.
+// An unclaimed host request keeps the fixed copy here; its actionable message is
+// shown as the description.
+export function rebuildStatusLine(status, now = Date.now()) {
+  if (!rebuildIsActive(status)) return rebuildProgressMessage(status)
+  const controller = rebuildAwaitingHostHelper(status) ? '' : shortStatusText(status?.message)
+  const base = controller || rebuildProgressMessage(status)
+  const elapsed = rebuildStartedAgo(status, now)
+  return elapsed ? `${base} (${elapsed})` : base
 }

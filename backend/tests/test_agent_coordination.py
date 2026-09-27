@@ -1686,11 +1686,10 @@ def test_goal_completion_wakes_claim_followers_without_a_finish_call(
   _claim_owner_and_follower(db)
   delivered = _record_deliveries(monkeypatch)
 
-  completed = client.patch(
-    "/api/chats/claim-owner/goal",
+  completed = client.post(
+    "/api/chats/claim-owner/goal/update",
     headers=_top_level_auth(db, "claim-owner", "claim-owner-run"),
-    json={"goal_id": "claim-owner-goal", "expected_revision": 0,
-          "result": "Merged as 0b44dc9d; CI green",
+    json={"complete": "Merged as 0b44dc9d; CI green",
           "finished_claims": [CLAIM_KEY]},
   )
 

@@ -453,10 +453,11 @@ def test_test_runtime_seed_precedes_selection_and_skips_reconcile():
   seed_call = '_platform_seed_test_checkout || exit 1'
   selection = 'if [ ! -d "$_platform_app" ]; then'
   assert entrypoint.index(seed_call) < entrypoint.index(selection)
-  assert (
-    'if [ "$_use_platform" -eq 1 ] && '
-    '[ "${MOBIUS_TEST_RUNTIME:-0}" != "1" ]; then'
-  ) in entrypoint
+  # The disposable test checkout is probed directly; no update is settled.
+  test_branch = entrypoint.index('elif [ "${MOBIUS_TEST_RUNTIME:-0}" = "1" ]; then')
+  branch = entrypoint[test_branch:entrypoint.index("\nelse\n", test_branch)]
+  assert "_platform_import_probe" in branch
+  assert "_platform_serve_checkout" not in branch
 
 
 def test_test_runtime_seed_preserves_non_group_writable_source_modes():
@@ -482,10 +483,18 @@ def test_platform_boot_has_one_main_reconcile_path():
 
   assert "MOBIUS_PLATFORM_RELEASE_REF" not in entrypoint
   assert "managed_release" not in entrypoint
-  assert "_platform_reconciler_backend=/data/platform/backend" in entrypoint
-  assert entrypoint.index("platform_update.reconcile_clone_sync()") < entrypoint.index(
-    "platform_update.boot_guard_sync()"
+  # One boot path: the image's own transaction, then its fail-closed guard.
+  activate = "if ! _platform_boot activate 2>&1; then"
+  assert entrypoint.count(activate) == 1
+  assert entrypoint.index(activate) < entrypoint.index(
+    "if ! _platform_boot guard 2>&1; then"
   )
+  assert "reconcile_clone_sync" not in entrypoint
+  # A fresh seed and an existing checkout take the same transaction.
+  selection = entrypoint[entrypoint.index('if [ ! -d "$_platform_app" ]; then'):]
+  bootstrap = selection[:selection.index("elif ! _platform_git_valid; then")]
+  assert "_platform_bootstrap && _platform_git_valid; then\n    _platform_serve_checkout" in bootstrap
+  assert selection.count("_platform_serve_checkout") == 2
 
 
 def test_browser_setup_fails_closed_before_auth_and_never_wipes_chats():

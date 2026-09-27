@@ -4610,7 +4610,10 @@ async def install_from_manifest(
       500, "Install failed due to an unexpected server error.",
     )
 
+  from app import service_preload
   from app.applied_app_runtime import prune_runtime
+  # A preloaded service host pins the runtime it imported.
+  service_preload.retire(app.id, keep_revision=app.runtime_revision)
   try:
     await asyncio.to_thread(prune_runtime, app)
   except OSError:

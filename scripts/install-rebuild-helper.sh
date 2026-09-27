@@ -3,6 +3,9 @@ set -euo pipefail
 
 # Install the root-owned self-host replacement controller from the trusted
 # checkout that owns the live Compose app. No executable code is downloaded.
+#
+# Helper protocol revision: 1 (request version 2 echoes the app's nonce).
+# Keep in step with deployment/self-hosted-helper.required; never decrement.
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run with sudo from the trusted Möbius checkout." >&2

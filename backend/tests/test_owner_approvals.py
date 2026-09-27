@@ -143,7 +143,7 @@ def test_owner_card_receipt_detection_handles_provider_result_shapes():
     "isError": True,
   }) is None
   # The Claude CLI's Bash tool_response, which the card-end hook reads when the
-  # turn saved its card through the owner_approval.py / secure-input helper.
+  # turn saved its card through the mobius_control_mcp.py call / secure-input fallback.
   assert _owner_card_receipt_id({
     "stdout": json.dumps(receipt), "stderr": "", "interrupted": False,
   }) == "saved-1"

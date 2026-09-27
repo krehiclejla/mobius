@@ -87,7 +87,7 @@ test('errors have one alert owner and results focus a live control', () => {
 
 test('Settings keeps current update feedback and reserves technical detail for review', () => {
   assert.doesNotMatch(updates, /Last container update|terminalRebuild|platform-updates__details/)
-  assert.match(updates, /rebuildProgressMessage\(rebuild\)/)
+  assert.match(updates, /rebuildStatusLine\(rebuild\)/)
   assert.match(updates, /update\.error && <Alert/)
   assert.doesNotMatch(updates, /rebuildRequested|rebuildReviewedUpdateRef/)
   assert.match(modal, /<details[^>]*urm__technical/)
@@ -194,4 +194,11 @@ test('replacement rollback copy distinguishes the image from source and data', (
   assert.match(modal, /tries to restore the previous system image/)
   assert.match(modal, /newly installed source stay in place/)
   assert.doesNotMatch(modal, /previous working version/)
+})
+
+test('a settling update offers a check and the owner keep decision, never a new update', () => {
+  assert.match(updates, /stage === 'settling'/)
+  assert.match(updates, /settling\s*\n?\s*\? \{ label: phase === 'checking' \? 'Checking…' : 'Check again', act: check \}/)
+  assert.match(updates, /onClick=\{update\.keepSettling\}>Keep this version</)
+  assert.match(requests, /api\.platform\.keepSettlingUpdate\(\)/)
 })

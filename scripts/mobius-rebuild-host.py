@@ -31,6 +31,9 @@ IMAGE_SOURCE = "https://github.com/mobius-os/mobius"
 ROLLBACK_TAG = f"{IMAGE}:mobius-rebuild-last-good"
 ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 HANDOFF_VERSION = "external-cutover-v1"
+# Version 2 requests carry the app's nonce, echoed as ``request_nonce`` so the
+# app can tell its exact replacement's outcome from any earlier one.
+REQUEST_VERSIONS = [1, 2]
 
 
 def now() -> str:
@@ -147,6 +150,7 @@ def write_status(config_value: dict, **fields) -> dict:
         pass
     current.update(fields)
     current["handoff"] = HANDOFF_VERSION
+    current["request_versions"] = REQUEST_VERSIONS
     current.pop("runtime_overlay", None)
     current["updated_at"] = now()
     _atomic_json(STATUS, current)
@@ -389,6 +393,78 @@ def rollback(config_value: dict, operation: str, expected: str,
     return 1
 
 
+def parse_request(payload: dict) -> tuple[str, str | None]:
+    """The requested target and, for a version 2 request, the app's nonce."""
+    version = payload.get("version")
+    keys = {"version", "expected_sha"} | ({"nonce"} if version == 2 else set())
+    if version not in REQUEST_VERSIONS or set(payload) != keys:
+        raise ValueError("invalid replacement request")
+    expected = str(payload["expected_sha"])
+    if not SHA_RE.fullmatch(expected):
+        raise ValueError("invalid replacement target")
+    nonce = str(payload["nonce"]) if version == 2 else None
+    if nonce is not None and not OPERATION_RE.fullmatch(nonce):
+        raise ValueError("invalid replacement nonce")
+    return expected, nonce
+
+
+def read_request(request: Path) -> tuple[dict | None, tuple[int, int, bytes] | None]:
+    """The queued request's payload (None when unreadable) and the identity of
+    the exact file read (device, inode, bytes), or ``(None, None)`` when
+    nothing is queued."""
+    try:
+        fd = os.open(request, os.O_RDONLY)
+    except FileNotFoundError:
+        return None, None
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        raw = handle.read()
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        value = None
+    payload = value if isinstance(value, dict) else None
+    return payload, (info.st_dev, info.st_ino, raw)
+
+
+def claim_request(
+    request: Path, claimed: Path, identity: tuple[int, int, bytes],
+) -> bool:
+    """Take exactly the request this worker read out of the inbox.
+
+    The app reuses the inbox path and may withdraw a request and queue a newer
+    one at any moment, so a rename alone can take the wrong file. The claimed
+    file counts as this request only when both its inode and its bytes match
+    what was read. Returns False when the request read was withdrawn; any
+    other file taken is put back, or kept beside it, never deleted."""
+    try:
+        os.replace(request, claimed)
+    except FileNotFoundError:
+        return False
+    try:
+        info = os.stat(claimed)
+        verified = (info.st_dev, info.st_ino) == identity[:2] and (
+            claimed.read_bytes() == identity[2]
+        )
+    except OSError:
+        verified = False
+    if verified:
+        return True
+    return_unverified_request(request, claimed)
+    return False
+
+
+def return_unverified_request(request: Path, claimed: Path) -> None:
+    """Put a file this worker did not read back in the inbox without
+    overwriting a newer one; failing that, keep it under a durable name."""
+    try:
+        os.link(claimed, request)
+    except OSError:
+        os.replace(claimed, claimed.with_name(f".unreturned-{claimed.name}"))
+    else:
+        claimed.unlink()
+
+
 def run() -> int:
     config_value = config()
     request = config_value["control_dir"] / "inbox" / "request.json"
@@ -400,7 +476,7 @@ def run() -> int:
     # atomic rename also works when operators place Docker data on a separate
     # mount. Moving out of the app-writable inbox prevents later replacement.
     claimed = config_value["control_dir"] / f".request-{operation}.json"
-    request_claimed = False
+    claim_verified = False
     expected = None
     previous = None
     image_ref = None
@@ -409,20 +485,35 @@ def run() -> int:
     try:
         with LOCK.open("a+") as lock:
             acquire_lock(lock)
+            payload, identity = read_request(request)
+            if identity is None:
+                return 0  # withdrawn before this worker looked
+            try:
+                expected, nonce = parse_request(payload or {})
+            except ValueError:
+                expected = nonce = None
+            if expected:
+                # Publish this operation's nonce before claiming: while the
+                # request is in the inbox the app sees it queued, and once it
+                # is gone the status already names it, so the app never
+                # mistakes a claimed request for one that ended.
+                write_status(config_value, operation_id=operation, state="queued",
+                             expected_sha=expected, request_nonce=nonce, code=None,
+                             message="Container rebuild queued.")
             # Reconciliation uses this same lock when removing abandoned
             # claims. Claim only after ownership is established so a boot-time
             # reconcile can never mistake a live worker's request for debris.
-            os.replace(request, claimed)
-            request_claimed = True
-            payload = read_json(claimed)
-            if set(payload) != {"version", "expected_sha"} or payload["version"] != 1:
+            if not claim_request(request, claimed, identity):
+                # Whatever the rename took is back in the inbox or kept aside.
+                if expected:
+                    write_status(config_value, operation_id=operation, state="failed",
+                                 expected_sha=expected, request_nonce=nonce,
+                                 code="withdrawn",
+                                 message="The request was withdrawn before it started.")
+                return 1
+            claim_verified = True
+            if not expected:
                 raise ValueError("invalid replacement request")
-            expected = str(payload["expected_sha"])
-            if not SHA_RE.fullmatch(expected):
-                raise ValueError("invalid replacement target")
-            write_status(config_value, operation_id=operation, state="queued",
-                         expected_sha=expected, code=None,
-                         message="Container rebuild queued.")
             cid, previous = app_container(config_value)
             image_ref = f"{IMAGE}:sha-{expected}"
             require_pull_space(previous)
@@ -525,11 +616,10 @@ def run() -> int:
                      expected_sha=expected, code="replacement_failed", message=detail)
         return 1
     finally:
-        claimed.unlink(missing_ok=True)
-        if not request_claimed:
-            # A malformed path or other claim failure must not leave the path
-            # unit continuously retriggering an unrecoverable request.
-            request.unlink(missing_ok=True)
+        # Only the verified claim is ever removed; whatever is still in the
+        # inbox may be a newer request and stays for the next run or withdrawal.
+        if claim_verified:
+            claimed.unlink(missing_ok=True)
 
 
 def reconcile() -> int:

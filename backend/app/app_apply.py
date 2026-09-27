@@ -22,7 +22,9 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app import app_git, chat_app_artifacts, icon_assets, managed_paths, models, timeutil
+from app import (
+  app_git, chat_app_artifacts, icon_assets, managed_paths, models, service_preload, timeutil,
+)
 from app.app_capabilities import (
   contract_from_app_state,
   contract_from_manifest,
@@ -583,6 +585,7 @@ def _apply_local_manifest_runtime(
     public_access=runtime_fields["public_access"],
     contract_permissions=manifest.get("permissions") or {},
     service=service,
+    tools=list(manifest.get("tools") or []),
   )
 
 
@@ -924,6 +927,8 @@ async def apply_source_revision(
       if previous_bundle != published:
         unlink_app_bundle(app.id, previous_bundle)
       db.refresh(app)
+      # A preloaded service host pins the runtime it imported.
+      service_preload.retire(app.id, keep_revision=app.runtime_revision)
       try:
         await asyncio.to_thread(
           applied_app_runtime.prune_runtime, app,

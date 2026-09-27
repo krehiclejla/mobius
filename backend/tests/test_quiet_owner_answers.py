@@ -200,14 +200,18 @@ def _goal(chat, approval_run, status='pending'):
     db.commit()
 
 
-def test_quiet_answer_cannot_orphan_unfinished_goal(client, chat, auth, approval_run):
+def test_quiet_answer_closes_a_card_of_an_unfinished_goal(client, chat, auth, approval_run):
+  """A card is not a Goal's required next owner: closing it quietly leaves the
+  unfinished Goal open and idle, which is simply the owner's turn."""
   _goal(chat, approval_run)
   qid = _ask_quiet(client, chat, approval_run).json()['question_id']
   response = _quiet(client, chat, auth, qid)
-  assert response.status_code == 409, response.text
-  assert 'unfinished Goal' in response.text
-  assert _row(chat.id)[0] == qid and _row(chat.id)[2] == []
-  assert 'answers' not in _block(chat.id, qid)
+  assert response.status_code == 200, response.text
+  assert _row(chat.id)[0] is None and _row(chat.id)[2] == []
+  with SessionLocal() as db:
+    goal = db.get(models.ChatGoal, approval_run[0].run_token)
+    assert goal.status == 'open'
+    assert goal.plan_json['tasks'][0]['status'] == 'pending'
 
 
 def test_completed_plan_can_close_without_changing_goal(client, chat, auth, approval_run):
@@ -216,17 +220,6 @@ def test_completed_plan_can_close_without_changing_goal(client, chat, auth, appr
   assert _quiet(client, chat, auth, qid).status_code == 200
   with SessionLocal() as db:
     assert db.get(models.ChatGoal, approval_run[0].run_token).plan_json['tasks'][0]['status'] == 'completed'
-
-
-@pytest.mark.parametrize('same_goal', [False, True])
-def test_only_exact_goal_monitor_allows_quiet_closure(client, chat, auth, approval_run, monkeypatch, same_goal):
-  from app import delegations
-  _goal(chat, approval_run)
-  qid = _ask_quiet(client, chat, approval_run).json()['question_id']
-  monkeypatch.setattr(delegations, 'background_helper_goal_ids', lambda *_: {
-      approval_run[0].run_token if same_goal else 'another-goal'})
-  response = _quiet(client, chat, auth, qid)
-  assert response.status_code == (200 if same_goal else 409), response.text
 
 
 def test_mixed_card_and_native_questions_keep_normal_continuation():
@@ -260,26 +253,6 @@ def test_quiet_answer_releases_only_preexisting_followup_via_normal_queue(
   assert scheduled[0]['next_user']['content'] == 'B: queued follow-up'
   assert not scheduled[0]['next_user'].get('continuation_reason')
   assert _row(chat.id)[2] == []
-
-
-def test_ordinary_followup_does_not_own_unfinished_goal(client, chat, auth, approval_run):
-  _goal(chat, approval_run)
-  qid = _ask_quiet(client, chat, approval_run).json()['question_id']
-  get_writer().submit(AppendPending(chat_id=chat.id,
-      user_msg={'role': 'user', 'content': 'B unrelated', 'cid': 'b'})).result(timeout=5)
-  before = _row(chat.id)[2]
-  assert _quiet(client, chat, auth, qid).status_code == 409
-  assert _row(chat.id)[0] == qid and _row(chat.id)[2] == before
-
-
-def test_same_goal_continuation_owns_handoff(client, chat, auth, approval_run):
-  _goal(chat, approval_run)
-  qid = _ask_quiet(client, chat, approval_run).json()['question_id']
-  get_writer().submit(AppendPending(chat_id=chat.id, user_msg={
-      'role': 'user', 'kind': 'continuation', 'content': 'Continue', 'cid': 'handoff',
-      'continuation_reason': 'goal_handoff', 'goal_id': approval_run[0].run_token,
-  })).result(timeout=5)
-  assert _quiet(client, chat, auth, qid).status_code == 200
 
 
 def test_failed_quiet_commit_keeps_card_open_for_identical_retry(
@@ -337,24 +310,6 @@ def test_quiet_close_after_stop_does_not_revive_goal_or_release_queued_b(
   with SessionLocal() as db:
     run = db.get(models.ChatRun, approval_run[0].run_token)
     assert run.status == 'stopped' and db.get(models.ChatGoal, run.goal_id).plan_json['tasks'][0]['status'] == 'pending'
-
-
-def test_latest_physical_goal_stop_not_original_author_owns_quiet_closure(
-    client, chat, auth, approval_run):
-  from datetime import datetime, timedelta, UTC
-  from app.chat_writer import FinishRun
-  _goal(chat, approval_run)
-  qid = _ask_quiet(client, chat, approval_run).json()['question_id']
-  root_id = approval_run[0].run_token
-  get_writer().submit(FinishRun(chat_id=chat.id, run_token=root_id,
-      terminal_status='completed')).result(timeout=5)
-  with SessionLocal() as db:
-    db.add(make_goal_run(db, id='later-stopped', chat_id=chat.id, root_run_id=root_id,
-        goal_id=root_id, goal_objective='Finish the repair', status='stopped',
-        provider='codex', started_at=datetime.now(UTC) + timedelta(seconds=1)))
-    db.commit()
-  response = _quiet(client, chat, auth, qid)
-  assert response.status_code == 200, response.text
 
 
 def test_legacy_actor_checks_latest_card_at_write_time(client, chat, approval_run):
