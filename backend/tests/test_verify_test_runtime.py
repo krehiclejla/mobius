@@ -265,7 +265,15 @@ def test_node_runtime_satisfies_the_pinned_agent_browser_engine():
   assert "--engine-strict --strict-allow-scripts" in apt_layer
   for package in ("jq", "ripgrep", "sqlite3", "unzip"):
     assert re.search(rf"\b{package}\b", apt_layer)
-  assert "printf '{}\\n' > /app/agent-browser-config.json" in dockerfile
+  # The image-owned agent-browser config registers nothing a workspace could
+  # extend: empty on amd64, and only the image's own Chromium on arm64.
+  config_layer = dockerfile[
+    dockerfile.index("RUN install -d -m 0755 /app"):
+    dockerfile.index("chmod 0644 /app/agent-browser-config.json")
+  ]
+  assert "printf '{\"executablePath\": \"/usr/bin/chromium\"}\\n';" in config_layer
+  assert "printf '{}\\n';" in config_layer
+  assert "fi > /app/agent-browser-config.json" in config_layer
   assert "node:24-trixie-slim sh -c" in preship
   assert "node:22" not in dockerfile
   assert "node:22" not in preship

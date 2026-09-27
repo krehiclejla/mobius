@@ -1,9 +1,11 @@
 """Shared cron declaration and parsing primitives for installed apps."""
 
+import json
 import os
 import re
 import shlex
 import subprocess
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -45,6 +47,116 @@ def cron_mutation_blocked_in_test_runtime() -> bool:
 def schedule_state_dir(app_id: int) -> Path:
   """Owner schedule declarations live with app data, not editable source."""
   return Path(get_settings().data_dir) / "apps" / str(int(app_id)) / "schedule"
+
+
+_SCHEDULE_CHOICE_FILE = "choice.json"
+_DECLARED_ENTRY_RE = re.compile(
+  r"""^\s*ENTRY=(?:"([^"]+)"|'([^']+)')\s*$""", re.M,
+)
+
+
+@dataclass(frozen=True)
+class ScheduleChoice:
+  """Who chose an app's current schedule, and what they chose.
+
+  ``source`` is ``"owner"`` for a schedule set through the schedule route
+  (by the owner or the app's own settings screen) and ``"manifest"`` for the
+  default the platform registered from the app's manifest. ``cron`` is the
+  chosen cadence, zone-local when ``timezone`` is set. ``manifest_default`` is
+  the manifest default in force when the choice was recorded; it tells a later
+  update whether the app has changed its schedule contract since.
+  """
+
+  source: str
+  cron: str
+  job: str
+  timezone: str | None = None
+  manifest_default: str | None = None
+
+
+def record_schedule_choice(app_id: int, choice: ScheduleChoice) -> None:
+  """Atomically record provenance beside the durable schedule declaration."""
+  state_dir = schedule_state_dir(app_id)
+  state_dir.mkdir(parents=True, exist_ok=True)
+  target = state_dir / _SCHEDULE_CHOICE_FILE
+  tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+  tmp.write_text(json.dumps(asdict(choice), sort_keys=True), encoding="utf-8")
+  os.replace(tmp, target)
+
+
+def clear_schedule_choice(app_id: int) -> None:
+  (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).unlink(missing_ok=True)
+
+
+def _read_schedule_choice(app_id: int) -> ScheduleChoice | None:
+  try:
+    raw = json.loads(
+      (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).read_text(),
+    )
+    return ScheduleChoice(
+      source=str(raw["source"]),
+      cron=str(raw["cron"]),
+      job=str(raw["job"]),
+      timezone=raw.get("timezone") or None,
+      manifest_default=raw.get("manifest_default") or None,
+    )
+  except (OSError, ValueError, TypeError, KeyError):
+    return None
+
+
+def _undocumented_owner_choice(app_id: int) -> ScheduleChoice | None:
+  """A zone-owned declaration written before provenance was recorded.
+
+  Until provenance existed, every accepted update re-registered the manifest
+  default in server time, so a surviving timezone-owned declaration could
+  only have come from the schedule route: it is the owner's choice.
+  """
+  from app import cron_tz
+
+  try:
+    text = (schedule_state_dir(app_id) / "init-cron.sh").read_text()
+    declaration = cron_tz.parse_zone_declaration(text)
+  except (OSError, ValueError):
+    return None
+  entry = _DECLARED_ENTRY_RE.search(text)
+  if declaration is None or entry is None:
+    return None
+  job = crontab_command_path(entry.group(1) or entry.group(2) or "")
+  if not job:
+    return None
+  timezone, zone_cron = declaration
+  return ScheduleChoice(
+    source="owner", cron=zone_cron, job=Path(job).name, timezone=timezone,
+  )
+
+
+def owner_schedule_to_keep(
+  app_id: int, default: str, job: str,
+) -> ScheduleChoice | None:
+  """The owner's schedule choice that survives an accepted manifest.
+
+  An update or local apply keeps the owner's choice while the app's schedule
+  contract is unchanged: the same scheduled job, and either the same manifest
+  default as when the owner chose, or a daily default where the owner also
+  chose a daily time (an app retiming its daily default does not override the
+  owner's daily time). A different job or cadence kind returns ``None`` so the
+  new default applies.
+  """
+  from app import cron_tz
+
+  choice = _read_schedule_choice(app_id)
+  if choice is None:
+    choice = _undocumented_owner_choice(app_id)
+  if choice is None or choice.source != "owner" or choice.job != job:
+    return None
+  if choice.manifest_default == default:
+    return choice
+  if (
+    cron_tz.parse_daily_cron(choice.cron) is not None
+    and cron_tz.parse_daily_cron(default) is not None
+  ):
+    return choice
+  return None
 
 
 def register_cron(

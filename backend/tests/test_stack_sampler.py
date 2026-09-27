@@ -43,6 +43,9 @@ def test_known_idle_frames_count_as_waiting():
 
   assert stack_sampler._is_waiting(frame("/usr/lib/python3.12/asyncio/runners.py", "run"))
   assert stack_sampler._is_waiting(frame("/x/openai_codex/client.py", "_read_message"))
+  assert stack_sampler._is_waiting(
+    frame("/usr/lib/python3/site-packages/watchdog/observers/inotify_c.py", "do_poll"),
+  )
   assert not stack_sampler._is_waiting(frame("/data/platform/backend/app/chat.py", "run_chat"))
 
 

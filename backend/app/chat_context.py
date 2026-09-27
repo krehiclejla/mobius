@@ -480,8 +480,8 @@ def _latest_compaction_brief(chat_row) -> str | None:
 _RESUME_CONTEXT_CHAR_BUDGET = 12000
 
 
-def _build_resumed_context(chat_row) -> str | None:
-  """Compact prior-transcript block for a chat whose CLI session is gone.
+def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
+  """Compact prior-transcript block for a chat whose provider session is gone.
 
   When a chat's stored `session_id` no longer has a resumable CLI
   transcript (a pre-fix phantom id, or one the CLI's ~30-day cleanup
@@ -498,15 +498,15 @@ def _build_resumed_context(chat_row) -> str | None:
   the goal is conversational continuity, not a byte-exact replay. Real
   user/assistant turns only (compaction/system rows are skipped).
   Returns None when there is nothing usable to reseed from.
+
+  ``keep_task`` always keeps the opening request as well: a delegated
+  helper's task exists only there, and a helper reseeded without it would
+  continue work it cannot see the purpose of.
   """
   if chat_row is None:
     return None
-  msgs = list(chat_row.messages or [])
-  lines: list[str] = []
-  used = 0
-  # Walk newest-first, accumulating until the budget is hit, then
-  # reverse so the block reads oldest-first like a real transcript.
-  for msg in reversed(msgs):
+  entries: list[tuple[dict, str]] = []
+  for msg in chat_row.messages or []:
     if not isinstance(msg, dict):
       continue
     role = msg.get("role")
@@ -519,22 +519,37 @@ def _build_resumed_context(chat_row) -> str | None:
       speaker = continuation_actor_label(msg)
     else:
       speaker = "User" if role == "user" else "Assistant"
-    line = f"{speaker}: {content.strip()}"
-    if used + len(line) > _RESUME_CONTEXT_CHAR_BUDGET and lines:
+    entries.append((msg, f"{speaker}: {content.strip()}"))
+  task = None
+  if (
+    keep_task and entries and entries[0][0].get("role") == "user"
+    and not is_continuation_message(entries[0][0])
+  ):
+    task = entries.pop(0)[1]
+  budget = _RESUME_CONTEXT_CHAR_BUDGET - len(task or "")
+  lines: list[str] = []
+  used = 0
+  # Walk newest-first, accumulating until the budget is hit, then
+  # reverse so the block reads oldest-first like a real transcript.
+  for _msg, line in reversed(entries):
+    if used + len(line) > budget and lines:
       break
     lines.append(line)
     used += len(line)
+  lines.reverse()
+  if task is not None:
+    if len(lines) < len(entries):
+      lines.insert(0, "[Earlier turns omitted.]")
+    lines.insert(0, task)
   if not lines:
     return None
-  lines.reverse()
   body = "\n\n".join(lines)
   return (
     "The <resumed_context> block below is the earlier history of THIS "
-    "same chat. The underlying CLI session could not be resumed (its "
-    "transcript was cleaned up), so this is a fresh session seeded with "
-    "your own prior conversation. Treat it as conversation history you "
-    "are continuing, not as a new user request, and do not echo it "
-    "back.\n\n"
+    "same chat. The underlying provider session could not be resumed, so "
+    "this is a fresh session seeded with your own prior conversation. "
+    "Treat it as conversation history you are continuing, not as a new "
+    "user request, and do not echo it back.\n\n"
     f"<resumed_context>\n{body}\n</resumed_context>"
   )
 

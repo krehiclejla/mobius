@@ -344,6 +344,19 @@ def test_persisted_send_marker_keeps_only_a_known_delivery_mode():
   assert "delivery" not in bounded_peer_message({**sent, "delivery": "x" * 5000})
 
 
+def test_received_note_carries_only_a_known_delivery_mode():
+  received = {
+    "direction": "read", "status": "received", "count": 2,
+    "notes": [
+      {"sender": "Peer", "kind": "note", "body": "Heads up.", "delivery": "interrupt"},
+      {"sender": "Peer", "kind": "note", "body": "FYI.", "delivery": "x" * 5000},
+    ],
+  }
+  notes = bounded_peer_message(received)["notes"]
+  assert notes[0]["delivery"] == "interrupt"
+  assert "delivery" not in notes[1]
+
+
 def test_send_counts_distinct_recipient_chats_not_deduped_names():
   # Two distinct chats sharing one display name must not collapse to one.
   out = json.dumps({"messages": [

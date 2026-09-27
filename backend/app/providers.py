@@ -852,6 +852,19 @@ class ClaudeProvider(BaseProvider):
     return env
 
 
+# Möbius owns helpers for every provider (``spawn_agent`` on the control
+# server), so every Codex launch switches Codex's own sub-agent tools off.
+# ``agents.enabled=false`` is the switch that wins: without it a model catalog
+# entry's ``multi_agent_version`` (bundled models say "v2") re-enables the
+# ``collaboration.*`` tools regardless of the feature flags. The v2 feature
+# outranks that switch in turn, so it must stay off too.
+CODEX_NATIVE_HELPERS_OFF = (
+  "agents.enabled=false",
+  "features.multi_agent=false",
+  "features.multi_agent_v2.enabled=false",
+)
+
+
 class CodexProvider(BaseProvider):
   """OpenAI Codex provider.
 
@@ -1047,8 +1060,7 @@ class MobiusProvider(BaseProvider):
       "features.remote_compaction_v2=false",
       "features.apps=false",
       "features.plugins=false",
-      "features.multi_agent=false",
-      "features.multi_agent_v2.enabled=false",
+      *CODEX_NATIVE_HELPERS_OFF,
       "features.standalone_web_search=true",
       # The capability is intentionally enabled for this provider; do not
       # surface Codex's generic experimental-feature warning as a chat error.

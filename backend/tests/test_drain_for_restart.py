@@ -198,6 +198,34 @@ def test_drain_persists_paused_note_and_preserves_partials():
   assert _run("drain-note-1")["restart_nonce"] == "restart-nonce-drain"
 
 
+def test_drain_suspends_a_turn_whose_stop_would_end_its_work_for_good():
+  """A helper-host agent that is stopped can never be resumed, so a restart
+  must suspend it instead; the turn still parks for its continuation."""
+  class _SuspendableHandle(_Handle):
+    suspend_calls = 0
+
+    async def suspend(self, timeout: float = 2.0) -> bool:
+      del timeout
+      self.suspend_calls += 1
+      registry.unregister(self.chat_id, self.kind)
+      return True
+
+  _seed("drain-suspend-1")
+  sink = chat_mod._ChatEventSink(
+    create_broadcast("drain-suspend-1"), "drain-suspend-1",
+    run_token="rt-drain-suspend-1",
+  )
+  chat_mod.register_active_sink("drain-suspend-1", sink)
+  handle = _SuspendableHandle("drain-suspend-1")
+  registry.register(handle)
+
+  _run_drain()
+  _drain_writer()
+
+  assert (handle.suspend_calls, handle.stop_calls) == (1, 0)
+  assert _run("drain-suspend-1")["park_reason"] == "restart"
+
+
 def test_drain_pause_survives_claude_interrupt_terminal(monkeypatch):
   """Claude reports a provider error while honoring the drain interrupt."""
   cid = "drain-claude-interrupt"

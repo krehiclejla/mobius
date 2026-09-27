@@ -1054,3 +1054,14 @@ def test_refusals_read_as_their_reason_not_the_wire_envelope(body, reason):
   control = _control_module()
   assert control._refusal_message(body) == reason
   assert "{" not in control._refusal_message(body) or body.startswith("<")
+
+
+def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  goal = {"id": "g", "revision": 9, "objective": "Ship", "next_action": "Run the probe"}
+  for status, shown in (("open", True), ("completed", False)):
+    monkeypatch.setattr(control, "_agent_api_call", lambda *a, **k: {
+      "goal": {**goal, "status": status}, "plan": None,
+    })
+    assert ("Next action: Run the probe" in control._call_update_goal({})) is shown

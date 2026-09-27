@@ -225,6 +225,65 @@ def test_a_resumed_helper_reports_to_its_current_follow_up_turn(tmp_path):
   assert host._turn_for_parent("toolu_launch") is follow_up
 
 
+def test_a_dispatcher_that_answers_without_the_call_is_asked_again(tmp_path):
+  """Seen live after a restart: the dispatcher replied "OK" without calling,
+  so the resumed helper waited out 90 s and was rebuilt from its history. The
+  host asks again at once, and each dispatch is used once, so a late original
+  call and the repeated one can never launch two helpers."""
+  host = _claude_host(tmp_path)
+  queries: list[str] = []
+  decisions: list[str] = []
+
+  class _ForgetfulDispatcher:
+    async def query(self, line):
+      queries.append(line)
+      if len(queries) == 1:
+        host._dispatcher_replied()  # "OK", and no call
+        return
+      dispatch_id = line.split()[1]
+      for tool_use_id in ("toolu_late", "toolu_again"):
+        decision = await host.pre_tool_use(
+          {"tool_name": "Agent", "tool_input": {"description": dispatch_id}},
+          tool_use_id, None,
+        )
+        decisions.append(decision["hookSpecificOutput"]["permissionDecision"])
+      host._on_task_started(_Started("agent-1", "toolu_late"))
+      host._dispatcher_replied()
+      asyncio.get_running_loop().call_soon(turn.finish, "completed")
+
+  host._client = _ForgetfulDispatcher()
+  turn = _turn(tmp_path)
+  asyncio.run(host.run_turn(turn))
+
+  assert queries == ["SPAWN d1", "SPAWN d1"]
+  assert decisions == ["allow", "deny"]
+  assert (turn.status, turn.dispatch_error, turn.agent_id) == (
+    "completed", None, "agent-1",
+  )
+
+
+def test_a_late_end_of_the_previous_run_never_ends_a_follow_up(tmp_path):
+  """Each run reports its end more than once. A follow-up is mapped to the
+  agent before the agent resumes, so the late report once completed it
+  instantly with no answer (seen with the live CLI)."""
+  host = _claude_host(tmp_path)
+  first = _turn(tmp_path, dispatch_id="d1")
+  host._turn_by_tool_use["toolu_launch"] = first
+  host._on_task_started(_Started("agent-1", "toolu_launch"))
+  host._on_task_end("agent-1", "completed", None, None)
+  assert first.status == "completed"
+
+  follow_up = _turn(tmp_path, dispatch_id="d2")
+  follow_up.agent_id = "agent-1"
+  host._turn_by_agent["agent-1"] = follow_up  # as run_turn maps a MESSAGE
+  host._on_task_end("agent-1", "completed", None, None)  # the late report
+  assert not follow_up.done.is_set()
+
+  host._on_task_started(_Started("agent-1", "toolu_launch"))
+  host._on_task_end("agent-1", "completed", "answer", None)
+  assert (follow_up.status, follow_up.summary) == ("completed", "answer")
+
+
 def test_a_helper_lost_with_its_host_is_reseeded_not_messaged(tmp_path):
   lost = _turn(tmp_path, dispatch_id="d1")
   lost.agent_id, lost.launch_tool_use_id = "agent-1", "toolu_1"
@@ -240,6 +299,240 @@ def test_a_helper_lost_with_its_host_is_reseeded_not_messaged(tmp_path):
   assert claude_host.parse_session(
     claude_host.resume_reference("sess-1", kept),
   ) == ("sess-1", "agent-2", "toolu_2")
+
+
+class _Started:
+  task_type = "local_agent"
+
+  def __init__(self, task_id, tool_use_id):
+    self.task_id, self.tool_use_id = task_id, tool_use_id
+
+
+class _DispatcherClient:
+  """Stands in for the host's Claude Code process: it launches or messages
+  exactly the registered spec, the helper's agent reports that it started,
+  and ``settle`` then ends the turn the way the scenario needs."""
+
+  def __init__(self, host, settle):
+    self.host, self.settle = host, settle
+    self.dispatched: list[tuple[str, dict]] = []
+
+  async def query(self, line):
+    verb, dispatch_id = line.split()
+    turn = self.host._turn_by_dispatch[dispatch_id]
+    tool = "Agent" if verb == "SPAWN" else "SendMessage"
+    key = "description" if verb == "SPAWN" else "summary"
+    decision = await self.host.pre_tool_use(
+      {"tool_name": tool, "tool_input": {key: dispatch_id}},
+      f"toolu_{verb.lower()}", None,
+    )
+    self.dispatched.append(
+      (verb, decision["hookSpecificOutput"]["updatedInput"]),
+    )
+    # A resumed helper reports under the tool call that first launched it.
+    self.host._on_task_started(_Started(turn.agent_id or "agent-1", "toolu_spawn"))
+    asyncio.get_running_loop().call_soon(self.settle, turn, verb)
+
+
+def _host_turns(tmp_path, monkeypatch, settle):
+  """Run helper turns through the real host turn and dispatch bookkeeping."""
+  import contextlib
+  from app import process_groups
+
+  host = claude_host.ClaudeHelperHost(
+    _key(), options_factory=None, session_file=tmp_path / "host.json",
+  )
+  host.session_id = "host-session"
+  host._client = client = _DispatcherClient(host, settle)
+  saved: list[str] = []
+
+  class _Manager:
+    @contextlib.asynccontextmanager
+    async def lease(self, _key, _factory):
+      yield host
+
+  async def record_reference(_chat_id, reference):
+    saved.append(reference)
+
+  monkeypatch.setattr(helper_hosts, "MANAGER", _Manager())
+  monkeypatch.setattr(claude_host, "record_reference", record_reference)
+  monkeypatch.setattr(process_groups, "terminate_run_processes", lambda *a, **k: 0)
+
+  def turn(user_message, session_id=None):
+    return asyncio.run(claude_host.run_claude_host_turn(
+      user_message=user_message, session_id=session_id,
+      base_env={"CHAT_ID": "child", "TMPDIR": str(tmp_path)},
+      chat_id="child", skill_text="helper", bc=None, agent_settings=None,
+      skills_enabled=False, run_policy=None, connector_plan=None,
+      resumed_context=None, helper_host_key=_key(), data_dir=str(tmp_path),
+    ))
+
+  return turn, client, saved
+
+
+def test_a_helper_interrupted_mid_task_resumes_its_own_agent_with_its_task(
+  tmp_path, monkeypatch,
+):
+  """Regression: a planned restart stopped two running helpers, and each came
+  back as a brand-new helper whose whole prompt was the generic "resume the
+  interrupted work" continuation, so it audited the restart instead of its
+  task. The interrupted turn never settled cleanly, so its agent was never
+  recorded and the continuation had nothing to resume.
+
+  The helper's chat must name its agent from the moment the agent exists;
+  the continuation then reaches that agent, whose transcript holds the task.
+  """
+  def restart_stops_the_first_turn(turn, verb):
+    turn.finish("stopped" if verb == "SPAWN" else "completed")
+
+  turn, client, saved = _host_turns(tmp_path, monkeypatch, restart_stops_the_first_turn)
+
+  interrupted = turn("ORIGINAL TASK: audit the Reflection runs")
+  # The stopped turn reports an error, so its own result never becomes the
+  # chat's session; the pointer saved at agent start is what survives.
+  assert interrupted["error"]
+  assert claude_host.parse_session(saved[-1]) == (
+    "host-session", "agent-1", "toolu_spawn",
+  )
+
+  continuation = "Resume the interrupted owner work after the planned server restart."
+  turn(continuation, saved[-1])
+
+  (first_verb, first), (verb, resumed) = client.dispatched
+  assert first_verb == "SPAWN" and first["prompt"].startswith("ORIGINAL TASK")
+  assert verb == "MESSAGE"
+  assert resumed["to"] == "agent-1" and resumed["message"] == continuation
+
+
+def test_a_lost_host_leaves_the_helper_pointing_at_a_reseed(tmp_path, monkeypatch):
+  """A host that dies under a turn fails it, and a failed turn's result never
+  reaches the chat; the chat must still stop naming the dead agent."""
+  def host_dies(_turn, _verb):
+    client.host._fail_open_turns()
+
+  turn, client, saved = _host_turns(tmp_path, monkeypatch, host_dies)
+
+  result = turn("task")
+
+  assert result["error"]
+  assert claude_host.parse_session(saved[0])[1] == "agent-1"
+  assert claude_host.parse_session(saved[-1]) == ("host-session", None, None)
+
+
+def test_a_restart_suspends_a_helper_by_ending_its_host_not_stopping_its_agent(
+  tmp_path,
+):
+  """Claude Code never resumes an agent it was told to stop, but resumes one
+  whose host process ended, with its task (checked against the live CLI). A
+  planned restart must therefore end the host; an owner's Stop still stops
+  the agent for good."""
+  async def scenario():
+    host = claude_host.ClaudeHelperHost(
+      _key(), options_factory=None, session_file=tmp_path / "host.json",
+    )
+    client = _DispatcherClient(host, settle=lambda _turn, _verb: None)
+    stopped_agents: list[str] = []
+
+    async def stop_task(agent_id):
+      stopped_agents.append(agent_id)
+
+    async def disconnect():
+      return None
+
+    client.stop_task, client.disconnect = stop_task, disconnect
+    host._client = client
+    turn = _turn(tmp_path)
+    handle = claude_host.ActiveClaudeHelperTurn("child", host, turn, "marker")
+
+    async def run():
+      try:
+        await host.run_turn(turn)
+      finally:
+        handle.mark_finished()
+
+    running = asyncio.create_task(run())
+    await asyncio.wait_for(turn.started.wait(), 1)
+    suspended = await handle.suspend(timeout=1)
+    await running
+    host._client = client  # an owner's Stop, on a live host
+    await host.stop(turn)
+    return suspended, host, turn, stopped_agents
+
+  suspended, host, turn, stopped_agents = asyncio.run(scenario())
+
+  assert suspended and turn.done.is_set() and not host.alive
+  # Only the owner's Stop told Claude Code to stop the agent.
+  assert stopped_agents == ["agent-1"]
+
+
+def test_a_usage_limit_inside_a_host_parks_like_the_private_runner(
+  tmp_path, monkeypatch,
+):
+  """Four helpers that hit the session limit failed as "The helper failed."
+  and never resumed: in a host the limit arrives only as the helper's own
+  API-error message. It must reach the turn's result as a limit."""
+  from claude_agent_sdk.types import AssistantMessage, TextBlock
+  from app import chat as chat_mod
+
+  limit_text = "You've hit your session limit · resets 12:50am (UTC)"
+  host = claude_host.ClaudeHelperHost(
+    _key(), options_factory=None, session_file=tmp_path / "host.json",
+  )
+  routed = _turn(tmp_path)
+  host._turn_by_tool_use["toolu_spawn"] = routed
+
+  class _Stream:
+    async def receive_messages(self):
+      yield AssistantMessage(
+        content=[TextBlock(text=limit_text)], model="claude",
+        parent_tool_use_id="toolu_spawn", error="rate_limit",
+      )
+
+  host._client = _Stream()
+  asyncio.run(host._read())
+  assert routed.api_error == ("rate_limit", limit_text)
+
+  def limit_ends_the_turn(turn, _verb):
+    turn.api_error = routed.api_error
+    turn.finish("failed")
+
+  turn, _client, _saved = _host_turns(tmp_path, monkeypatch, limit_ends_the_turn)
+  result = turn("task")
+
+  assert result["error"] == limit_text
+  assert chat_mod._is_limit_terminal(result)
+
+
+def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
+  tmp_path, monkeypatch, caplog,
+):
+  """Two helpers failed with "could not start" and left nothing to diagnose;
+  the timeout records the dispatcher's own last reply, and the host's logs
+  reach the persistent chat log."""
+  import logging
+  from app import startup
+
+  monkeypatch.setattr(claude_host, "DISPATCH_START_TIMEOUT", 0.05)
+  host = claude_host.ClaudeHelperHost(
+    _key(), options_factory=None, session_file=tmp_path / "host.json",
+  )
+
+  class _SilentDispatcher:
+    async def query(self, _line):
+      host.dispatcher_last = "server_error: API Error: 529 Overloaded"
+
+  host._client = _SilentDispatcher()
+  turn = _turn(tmp_path)
+  with caplog.at_level(logging.WARNING, logger="app.claude_helper_host"):
+    asyncio.run(host.run_turn(turn))
+
+  assert turn.dispatch_error == "timeout"
+  assert "529 Overloaded" in caplog.text and "tool_call_seen=False" in caplog.text
+
+  startup._route_diagnostics_to_chat_log(None)
+  from app.chat_logging import get_chat_log_handler
+  for name in ("app.helper_hosts", "app.claude_helper_host"):
+    assert get_chat_log_handler() in logging.getLogger(name).handlers
 
 
 def test_host_helper_sessions_round_trip():
@@ -335,3 +628,22 @@ def test_connector_capabilities_do_not_change_the_host_key(monkeypatch):
   first = chat_mod._helper_host_key(db, policy, provider_id="codex", connector_plan=plan("tok-1"))
   second = chat_mod._helper_host_key(db, policy, provider_id="codex", connector_plan=plan("tok-2"))
   assert first == second
+
+
+def test_every_hosted_helper_gets_the_claude_register(tmp_path):
+  """Hosted helpers get the same Claude register as a top-level turn."""
+  from contextlib import ExitStack
+  from types import SimpleNamespace
+
+  factory = claude_host._host_options(
+    key=SimpleNamespace(cwd=str(tmp_path)), host_env={},
+    skill_text="CONSTITUTION", connector_plan=None, skills_enabled=False,
+    model=None,
+  )
+  host = SimpleNamespace(stderr_tail=[], pre_tool_use=None, post_tool_use=None)
+  for resume in (None, "host-session"):
+    with ExitStack() as stack:
+      options = factory(host, resume, stack)
+    for agent in options.agents.values():
+      assert agent.prompt.startswith("CONSTITUTION")
+      assert "# Interruptions in Möbius" in agent.prompt

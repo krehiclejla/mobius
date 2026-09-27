@@ -739,6 +739,11 @@ async def mirror_to_ledger(app_id: int, record_id: str) -> None:
       record = read_record(record_path)
     except Exception:
       return
+    if record.get("autopilot") == block:
+      # A rewrite would still bump the record's version and notify its
+      # watchers, so incremental readers re-read it and the scheduled job
+      # treated a refused terminal cleanup as new work on every pass.
+      return
     record["autopilot"] = block
     try:
       write_record(record_path, record)

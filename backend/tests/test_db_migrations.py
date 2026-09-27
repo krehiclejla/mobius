@@ -1390,6 +1390,32 @@ def test_run_migrations_adds_owner_auto_resume_default(tmp_path):
   assert value in (False, 0)
 
 
+def test_run_migrations_adds_nullable_owner_timezone(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'owner-timezone.db'}")
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE TABLE apps (id INTEGER PRIMARY KEY, name VARCHAR(255))"
+    ))
+    conn.execute(text(
+      "CREATE TABLE owner (id INTEGER PRIMARY KEY, username VARCHAR(64), "
+      "hashed_password VARCHAR(255))"
+    ))
+    conn.execute(text(
+      "INSERT INTO owner (id, username, hashed_password) "
+      "VALUES (1, 'owner', 'hash')"
+    ))
+
+  run_migrations(eng)
+  run_migrations(eng)
+
+  cols = {c["name"]: c for c in inspect(eng).get_columns("owner")}
+  assert cols["timezone"]["nullable"] is True
+  with eng.connect() as conn:
+    assert conn.execute(text(
+      "SELECT timezone FROM owner WHERE id = 1"
+    )).scalar_one() is None
+
+
 def test_retire_restart_resume_toggle_lifts_stranded_chats(tmp_path):
   """The one-time retirement drops the owner seed column and lifts every chat a
   prior toggle latched off, while preserving a cancelled delegation child's
@@ -1728,6 +1754,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0069_chat_pending_queue_index",
     "0070_delegation_goal_task",
     "0071_delegation_result_identity",
+    "0072_owner_timezone",
   ]
   assert second == first
 

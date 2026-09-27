@@ -25,6 +25,7 @@ from app.delegations import (
   normalize_cwd,
   parent_root_run_id,
   publish_parent_waiting_changed,
+  record_result_read_by_parent,
   retry_limit_park,
   serialize_delegation,
 )
@@ -367,6 +368,37 @@ def get_delegation(
   if include_history:
     child = db.query(models.Chat).filter(models.Chat.id == row.child_chat_id).first()
     payload["history"] = list(child.messages or []) if child is not None else []
+  return payload
+
+
+@router.post(
+  "/{delegation_id}/result-read",
+  dependencies=[Depends(reject_cross_site)],
+)
+def read_delegation_result(
+  delegation_id: str,
+  principal: Principal = Depends(get_delegation_principal),
+  db: Session = Depends(get_db),
+):
+  """Hand a helper's result to its parent agent and record that it was read.
+
+  The agent-side read behind `list_agents`: a settled result returned here in
+  full has reached the parent, so it is marked delivered and later wakes do
+  not bring it back. Viewing a helper (GET) records nothing.
+  """
+  row = _row_for_principal(db, delegation_id, principal)
+  if principal.chat_id and principal.chat_id != row.parent_chat_id:
+    raise HTTPException(
+      status_code=403, detail="Only the helper's parent chat may read its result.",
+    )
+  payload = serialize_delegation(db, row)
+  if (
+    payload.get("result")
+    and not payload.get("result_truncated")
+    and record_result_read_by_parent(db, row)
+  ):
+    db.commit()
+    publish_parent_waiting_changed(row.parent_chat_id)
   return payload
 
 

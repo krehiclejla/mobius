@@ -608,6 +608,26 @@ export function _anchorReapplyNeeded(scrollEl, mode, lastAnchorTop) {
 }
 
 
+/** Whether the viewport has physically moved off a settled ANCHOR_AT.
+ *
+ * A settled anchor is the controller's record of what the reader sees. The
+ * reader can still move the viewport without an owned gesture — inertial
+ * momentum that outlives the gesture's settle edge, or a touch that stops or
+ * re-flicks momentum without reporting input — and those scrolls are
+ * deliberately ignored as layout-owned. This compares the scrollTop the anchor
+ * encodes (clamped to the reachable range) with the actual one. An anchor
+ * whose target no longer resolves reports false: its semantic address is the
+ * only location left and must not be replaced by a measurement. */
+export function anchorModeDisplaced(scrollEl, mode) {
+  if (!scrollEl || mode?.kind !== 'ANCHOR_AT') return false
+  const el = _anchorEl(scrollEl, mode)
+  if (!el) return false
+  const target = Math.max(0, _scrollTopOf(scrollEl, el) - mode.offset)
+  const maxScrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight)
+  return Math.abs(scrollEl.scrollTop - Math.min(target, maxScrollTop)) > 1
+}
+
+
 
 /** Spacer height needed so the latest user message can sit near the
  *  top of the viewport, with the PIN_OFFSET breathing room above it, or so a

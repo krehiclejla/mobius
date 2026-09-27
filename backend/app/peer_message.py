@@ -276,12 +276,16 @@ def bounded_peer_message(value: Any) -> dict | None:
       body = _clip(note.get("body"), MAX_BODY_CHARS)
       if not body:
         continue
-      notes.append({
+      bounded_note = {
         "sender": _clip(note.get("sender"), MAX_NAME_CHARS),
         "kind": _kind(note.get("kind")),
         "body": body,
         "body_truncated": bool(note.get("body_truncated")),
-      })
+      }
+      delivery = _delivery(note.get("delivery"))
+      if delivery:
+        bounded_note["delivery"] = delivery
+      notes.append(bounded_note)
     return {
       "direction": DIRECTION_READ,
       "status": STATUS_RECEIVED,

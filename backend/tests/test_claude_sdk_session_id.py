@@ -281,3 +281,26 @@ def test_resumed_context_truncates_to_budget():
   # (plus the fixed wrapper prose).
   assert "0 xxxx" not in block
   assert len(block) < _RESUME_CONTEXT_CHAR_BUDGET + 2000
+
+
+def test_a_reseeded_helper_always_keeps_its_task():
+  """A helper's task lives only in its opening request; long later turns
+  must never push it out of the reseed, or the helper resumes blind."""
+  from app.chat_context import _RESUME_CONTEXT_CHAR_BUDGET, _build_resumed_context
+
+  big = "x" * 4000
+  msgs = [{"role": "user", "content": "TASK: audit the three Reflection runs"}]
+  msgs += [{"role": "assistant", "content": f"{i} {big}"} for i in range(6)]
+  msgs.append({"role": "assistant", "content": "LATEST progress"})
+
+  assert "TASK: audit" not in _build_resumed_context(_FakeChatRow(msgs))
+  block = _build_resumed_context(_FakeChatRow(msgs), keep_task=True)
+  assert block.index("User: TASK: audit") < block.index(
+    "[Earlier turns omitted.]"
+  ) < block.index("LATEST progress")
+  assert "0 xxxx" not in block
+  assert len(block) < _RESUME_CONTEXT_CHAR_BUDGET + 2000
+
+  short = _build_resumed_context(_FakeChatRow(msgs[:1] + msgs[-1:]), keep_task=True)
+  assert "omitted" not in short
+  assert short.count("TASK: audit") == 1

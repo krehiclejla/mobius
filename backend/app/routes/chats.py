@@ -3123,6 +3123,11 @@ def _app_chat_summary(chat: models.Chat, usage: dict) -> dict:
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
     "activity_at": chat.activity_at.isoformat() if chat.activity_at else None,
     "has_messages": bool(chat.has_messages),
+    # A saved owner-input card is waiting: the app can show that its chat
+    # needs the owner without reading the transcript.
+    "awaiting_owner": bool(chat.pending_question_id),
+    # An agent turn is live now; an app shows this rather than guessing.
+    "running": is_chat_running(chat.id),
     "provider": chat.provider or "claude",
     "scope": _app_chat_scope(chat),
     "scope_label": _app_chat_scope_label(chat),

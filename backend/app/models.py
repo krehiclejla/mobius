@@ -84,6 +84,11 @@ class Owner(Base):
   # than a boolean flag) so we can correlate first-completion against
   # other onboarding signals later — same shape as a SCD type 1 row.
   walkthrough_completed_at = Column(DateTime, nullable=True, default=None)
+  # The owner's IANA timezone as last reported by the shell's browser. Plain
+  # daily app schedules (manifest defaults such as "30 5 * * *") are owned in
+  # this zone so they fire at that wall time for the owner. Null until a
+  # shell has reported it; server time applies meanwhile.
+  timezone = Column(String(64), nullable=True, default=None)
   # Monotonic JWT-validity generation. Every owner-derived token (the
   # 30-day login token, the 8h app token, the run-bound agent token, the
   # 90-day service token) is stamped with the owner's token_epoch at

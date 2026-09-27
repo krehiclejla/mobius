@@ -585,7 +585,8 @@ def update_app_schedule(
   counterpart to run-job: a mini-app settings screen can tune its own
   recurring job, but an app token cannot rewrite a sibling's crontab.
   The scaffold writes both the live crontab and durable init-cron.sh so
-  the change survives container restarts.
+  the change survives container restarts, and the recorded owner provenance
+  keeps it across app updates that leave the schedule contract unchanged.
   """
   require_nondelegated_owner_control(principal)
   if principal.app_id is not None and principal.app_id != app_id:
@@ -627,16 +628,28 @@ def update_app_schedule(
   if not (accepted_root / job_name).is_file():
     raise HTTPException(status_code=400, detail="Job script not found in the applied revision.")
   slug = app.slug
+  manifest_schedule = _manifest_schedule(accepted_root)
+  # Provenance lets accepted updates keep this choice instead of resetting it
+  # to the manifest default (see app_cron.owner_schedule_to_keep).
+  choice = app_cron.ScheduleChoice(
+    source="owner",
+    cron=body.cron,
+    job=job_name,
+    timezone=timezone,
+    manifest_default=manifest_schedule[0] if manifest_schedule else None,
+  )
   if timezone is not None:
     materialized = cron_tz.materialize_zone_cron(body.cron, timezone)
     app_cron.register_cron(
       slug, materialized, job_path, app_id,
       timezone=timezone, zone_cron=body.cron,
     )
+    app_cron.record_schedule_choice(app_id, choice)
     return {
       "cron": materialized, "job": job_name,
       "timezone": timezone, "zone_cron": body.cron,
     }
   app_cron.register_cron(slug, body.cron, job_path, app_id)
+  app_cron.record_schedule_choice(app_id, choice)
   return {"cron": body.cron, "job": job_name, "timezone": None,
           "zone_cron": None}

@@ -315,6 +315,21 @@ def _job_command(job: Path, app_id: int) -> list[str]:
   return [*interpreter, str(job), str(app_id)]
 
 
+def _reclaim_job_file_cache(app_id: int) -> None:
+  """Release file pages the finished job left cached.
+
+  Jobs run git, gh, and provider tools outside any chat turn, so the
+  settled-turn cleanup never sees them, and on a metered host their cached
+  pages stay billable memory. Optional work: a failure is logged and never
+  changes the job's exit status.
+  """
+  try:
+    from app.file_cache import reclaim_background_work_cache
+    reclaim_background_work_cache(DATA_DIR)
+  except Exception as exc:
+    _log(app_id, f"file cache advice failed: {exc!r}")
+
+
 def _execute_job(
   app_id: int,
   resolved: Path,
@@ -403,6 +418,7 @@ def _execute_job(
       _emit_cron_outcome(app_id, resolved, rc, duration_ms)
     if rc != 0:
       _log(app_id, f"job exited rc={rc}: {resolved}")
+    _reclaim_job_file_cache(app_id)
     return rc
   finally:
     lease.unlink(missing_ok=True)

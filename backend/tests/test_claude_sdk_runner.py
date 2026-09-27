@@ -484,6 +484,80 @@ async def test_steer_requeries_on_interrupt_terminal(monkeypatch):
   ]
 
 
+_CLI_CUT_TEXT = (
+  "The user doesn't want to proceed with this tool use. The tool use was "
+  "rejected (eg. if it was a file edit, the new_string was NOT written to the "
+  "file). STOP what you are doing and wait for the user to tell you how to "
+  "proceed."
+)
+
+
+@pytest.mark.asyncio
+async def test_command_cut_by_a_steer_shows_as_cut_not_refused(monkeypatch):
+  """The CLI answers a call cut by the steer's interrupt with its refusal
+  text; the chat shows the delivery instead, and not as a failure."""
+  class _Client(_FakeClient):
+    async def receive_response(self):
+      if len(self.queries) == 1:
+        yield _stream_delta("text_delta", text="running it")
+        assert await steer_into_active_turn("cut-label-chat", "helper done")
+        yield UserMessage(content=[
+          ToolResultBlock(
+            tool_use_id="tu-cut", content=_CLI_CUT_TEXT, is_error=True,
+          ),
+        ])
+        yield _interrupt_result()
+        return
+      yield _stream_delta("text_delta", text="re-running")
+      yield _success_result()
+
+  _install_fake_client(monkeypatch, _Client)
+  bus = _ChatBus()
+  await _run_turn("cut-label-chat", bc=bus, prompt="start task")
+
+  outputs = [e for e in bus.events if e["type"] == "tool_output"]
+  assert outputs == [{
+    "type": "tool_output", "content": "Cut to deliver a message",
+    "tool_use_id": "tu-cut", "output_complete": True,
+  }]
+
+
+@pytest.mark.asyncio
+async def test_cut_label_names_the_steer_and_the_stop():
+  class _Client:
+    async def interrupt(self):
+      pass
+
+  steered = ActiveClaudeClient(_Client(), chat_id="cut-label-steer")
+  await steered.steer("why?", [{"role": "user", "cid": "c1"}], ["c1"])
+  assert steered.cut_tool_label == "Cut to deliver a message"
+
+  stopped = ActiveClaudeClient(_Client(), chat_id="cut-label-stop")
+  stopped.mark_finished()
+  await stopped.interrupt()
+  assert stopped.cut_tool_label == "Stopped"
+
+  idle = ActiveClaudeClient(_Client(), chat_id="cut-label-idle")
+  assert idle.cut_tool_label is None
+
+
+def test_only_our_own_cut_relabels_the_cli_refusal():
+  msg = UserMessage(content=[
+    ToolResultBlock(tool_use_id="cut", content=_CLI_CUT_TEXT, is_error=True),
+    ToolResultBlock(tool_use_id="real", content="real output", is_error=True),
+    ToolResultBlock(tool_use_id="said", content=_CLI_CUT_TEXT, is_error=False),
+  ])
+  for cut_label, shown, exit_code in (
+    ("Stopped", "Stopped", None), (None, _CLI_CUT_TEXT, 1),
+  ):
+    bus = _Bus()
+    dispatch_sdk_message(msg, bus, None, cut_label=cut_label)
+    assert [
+      (e["content"], e.get("output_exit_code"))
+      for e in bus.events if e["type"] == "tool_output"
+    ] == [(shown, exit_code), ("real output", 1), (_CLI_CUT_TEXT, None)]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_id", [None, "sess-1"])
 async def test_steer_interrupt_racing_turn_end_is_a_resumable_pause(
@@ -1105,6 +1179,76 @@ async def test_stop_during_helper_phase_ends_the_turn_without_the_followup(
   assert not result.get("error")
   assert clients[0].interrupts == 1
   assert len(clients[0].read) == 3
+
+
+@pytest.mark.asyncio
+async def test_resumed_turn_reads_past_the_inherited_task_notification_result(
+  monkeypatch,
+):
+  """A task left running by the previous CLI process does not end this turn.
+
+  On resume Claude reports that task as stopped and closes its own model-less
+  turn for it before reading the new query (observed with Claude Code 2.1).
+  Taking that empty result as the answer drops the resumed turn with no reply.
+  """
+
+  inherited = TaskNotificationMessage(
+    subtype="task_notification", data={}, task_id="old-shell",
+    status="stopped", output_file="/tmp/old-shell",
+    summary="Background shell command didn't finish",
+    uuid="done-old-shell", session_id="sess-resumed", tool_use_id="old-bash",
+  )
+  empty = ResultMessage(
+    subtype="success", duration_ms=1, duration_api_ms=0, is_error=False,
+    num_turns=0, session_id="sess-resumed", stop_reason=None,
+    total_cost_usd=0.0, usage={"input_tokens": 0, "output_tokens": 0},
+    result="",
+  )
+
+  class _Client(_OneStreamClient):
+    def _messages(self):
+      return [
+        inherited,
+        empty,
+        AssistantMessage(
+          content=[TextBlock(text="Resumed the owner's work.")],
+          model="claude-sonnet", session_id="sess-resumed",
+        ),
+        _success_result("sess-resumed", cost=0.05),
+      ]
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  monkeypatch.setattr(
+    claude_sdk_runner, "_persist_session_id", _ignore_session_persistence,
+  )
+  bus = _Bus()
+
+  result = await _run_turn(
+    "inherited-notification", bc=bus, prompt="resume", cwd="/data",
+  )
+
+  assert result["cost_usd"] == 0.05
+  assert not result.get("error")
+  assert len(clients[0].read) == 4
+  assert next(
+    event for event in bus.events if event["type"] == "text_final"
+  )["content"] == "Resumed the owner's work."
+
+
+def test_inherited_notification_marks_only_its_own_model_less_result():
+  tracker = claude_events.NativeContinuationTracker()
+  tracker.task_started("own-shell", "local_bash", "spawn-own")
+  tracker.task_finished("own-shell")
+  assert tracker.is_inherited_notification_result(0, False) is False
+
+  tracker.task_finished("old-shell")
+  # An error or a result with model turns still belongs to the query.
+  assert tracker.is_inherited_notification_result(0, True) is False
+  tracker.task_finished("old-shell")
+  assert tracker.is_inherited_notification_result(2, False) is False
+  tracker.task_finished("old-shell")
+  assert tracker.is_inherited_notification_result(0, False) is True
+  assert tracker.is_inherited_notification_result(0, False) is False
 
 
 def test_native_continuation_defers_only_a_result_not_seen_while_active():
@@ -1763,6 +1907,8 @@ async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   assert "TaskOutput" not in options.system_prompt
   assert 'until [ -e "$TMPDIR/job.exit" ]' in options.system_prompt
   assert "confirm its saved receipt" in options.system_prompt
+  # A steer or Stop cut makes the CLI word the call as refused; it was not.
+  assert "not anyone refusing the call" in options.system_prompt
   assert options.max_buffer_size == 10 * 1024 * 1024
   assert set(claude_sdk_runner._CLAUDE_NATIVE_SCHEDULING_TOOLS) <= set(
     options.disallowed_tools
@@ -2933,6 +3079,8 @@ async def test_mid_turn_person_message_is_framed_as_owed_a_visible_reply():
   person = claude_sdk_runner._steer_redirect_message(texts, from_person=True)
   assert person.startswith("The partner sent this message while you were")
   assert "visible response" in person
+  # A steer usually adds to the work; it replaces it only when it says so.
+  assert "unless it asks you to stop or change course" in person
   assert "why not X?" in person and "helper finished" in person
 
   context = claude_sdk_runner._steer_redirect_message(

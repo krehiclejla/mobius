@@ -223,7 +223,9 @@ async def list_public_values(
       ),
     )
     if include_content:
-      storage_routes._include_json_listing_content(entries, base)
+      entries, next_cursor = storage_routes._with_json_listing_content(
+        entries, next_cursor, base,
+      )
     for entry in entries:
       entry["path"] = _relative_listing_path(grant, entry.get("path", ""))
   return {"entries": entries, "next_cursor": next_cursor}

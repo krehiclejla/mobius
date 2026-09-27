@@ -933,3 +933,23 @@ def test_update_rejects_mismatched_reviewed_state(client, owner_token):
     headers={"Authorization": f"Bearer {owner_token}"},
   )
   assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_unchanged_mirror_does_not_rewrite_the_ledger_record(db):
+  """A no-op rewrite changes the record's version, so every incremental
+  ledger reader (and the scheduled cleanup) saw fresh work each pass."""
+  autopilot.stamp_grant(db, 1, "rec", head_sha="abc")
+  _write_record(1, "rec", _open_pr_record("rec"))
+  record_path = (
+    Path(get_settings().data_dir) / "apps" / "1" / "contributions" / "rec.json"
+  )
+  await autopilot.mirror_to_ledger(1, "rec")
+  first = record_path.stat().st_mtime_ns
+  assert json.loads(record_path.read_text())["autopilot"]["enabled"] is True
+
+  os.utime(record_path, ns=(first - 10_000_000, first - 10_000_000))
+  settled = record_path.stat().st_mtime_ns
+  await autopilot.mirror_to_ledger(1, "rec")
+
+  assert record_path.stat().st_mtime_ns == settled

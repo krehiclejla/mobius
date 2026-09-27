@@ -20,7 +20,10 @@ import {
 } from './chatChangesQueries.js'
 
 export function useChatContributions(chatId, { enabled = true } = {}) {
-  const appsQuery = appQueries.list.useQuery({ enabled })
+  // Only locates the Contribute app in the Shell's list, which the system
+  // stream keeps live. Enabling a stale observer would otherwise start its own
+  // read before the stream subscribes, and the stream always discards it.
+  const appsQuery = appQueries.list.useQuery({ enabled, staleTime: Infinity })
   const appId = contributeAppId(appsQuery.data)
   const app = contributeApp(appsQuery.data, appId)
   const queryKey = useMemo(

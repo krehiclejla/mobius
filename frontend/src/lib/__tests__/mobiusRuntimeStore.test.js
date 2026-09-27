@@ -415,6 +415,9 @@ test('content listings page at the server byte-budget boundary', async () => {
   for (let i = 0; i < 33; i++) {
     server.seed(`records/${String(i).padStart(2, '0')}.json`, { id: i })
   }
+  // Roughly twelve bodies per page: the server, not a tiny client page size,
+  // decides where each content page ends.
+  server.setContentPageBytes(JSON.stringify({ id: 10 }).length * 12)
 
   const entries = await s.list('records', { includeContent: true })
   assert.equal(entries.length, 33)
@@ -423,7 +426,7 @@ test('content listings page at the server byte-budget boundary', async () => {
     request => request.url.includes('/apps-list/'),
   )
   assert.equal(listRequests.length, 3)
-  assert.equal(listRequests.every(request => request.url.includes('limit=16')), true)
+  assert.equal(listRequests.every(request => request.url.includes('limit=500')), true)
 })
 
 test('batched list content keeps a newer queued JSON write visible', async () => {

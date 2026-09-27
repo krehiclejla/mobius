@@ -427,11 +427,17 @@ async function handleStorageRpc(message) {
 		}
 		if (method === "list") {
 			const options = args[1] || {};
-			const url = "/api/public-storage?prefix=" + encodeURIComponent(args[0] || "") + (options.includeContent ? "&include_content=true" : "");
-			const response = await fetch(url, { headers: authHeaders });
-			if (!response.ok) throw httpError(response);
-			const data = await response.json();
-			return ok(Array.isArray(data.entries) ? data.entries : []);
+			const entries = [];
+			let cursor = null;
+			do {
+				const url = "/api/public-storage?limit=500&prefix=" + encodeURIComponent(args[0] || "") + (options.includeContent ? "&include_content=true" : "") + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+				const response = await fetch(url, { headers: authHeaders });
+				if (!response.ok) throw httpError(response);
+				const data = await response.json();
+				if (Array.isArray(data.entries)) entries.push(...data.entries);
+				cursor = data.next_cursor || null;
+			} while (cursor);
+			return ok(entries);
 		}
 		if (method === "durableWrite") {
 			const [path, data, options = {}] = args;

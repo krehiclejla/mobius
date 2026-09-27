@@ -360,3 +360,16 @@ def test_every_app_response_shows_the_reviewed_tools(client, auth, db):
   assert shown["agent_tools"] == [LOG_TOOL]
   listed = {row["id"]: row for row in client.get("/api/apps/", headers=auth).json()}
   assert listed[app.id]["agent_tools"] == [LOG_TOOL]
+
+
+def test_an_app_may_load_one_tool_up_front(db):
+  validate_manifest_contract(_manifest(tools=[{**LOG_TOOL, "always_load": True}]))
+  with pytest.raises(ManifestContractError, match="always_load"):
+    validate_manifest_contract(_manifest(tools=[{**LOG_TOOL, "always_load": "yes"}]))
+  _app(db, "reflection", contract=_contract([{**LOG_TOOL, "always_load": True}]))
+  _app(db, "memory", contract=_contract([{**LOG_TOOL, "name": "search"}]))
+
+  listings = {tool.exposed_name: tool.listing() for tool in app_tools.live_app_tools(db)}
+
+  assert listings["reflection_log_friction"]["_meta"] == {"anthropic/alwaysLoad": True}
+  assert "_meta" not in listings["memory_search"]

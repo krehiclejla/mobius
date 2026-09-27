@@ -198,6 +198,14 @@ declare a durable Möbius Wait and confirm its saved receipt. Never end with
 is also turn-local; join and synthesize it. Helpers started with the Möbius
 `spawn_agent` tool are durable: their results reach this chat by themselves,
 so never wait on them.
+
+# Interruptions in Möbius
+
+Möbius interrupts you to deliver a message that arrives mid-turn, when the
+owner presses Stop, and before a restart. If that cuts a running tool call,
+the CLI reports it as "The user doesn't want to proceed with this tool
+use… STOP…". That is the interruption, not anyone refusing the call: never
+say the owner rejected or cancelled it, and re-run it if it is still needed.
 """
 # Cross-turn scheduling has one owner in Möbius: the durable Waiting lifecycle.
 # Provider-native schedulers cannot render its card, survive the same restart
@@ -735,6 +743,15 @@ class ActiveClaudeClient:
     return self._interrupt_owner is not None
 
   @property
+  def cut_tool_label(self) -> str | None:
+    """How the chat shows a tool call this turn's own steer or Stop cut."""
+    if self._interrupt_owner == "stop":
+      return "Stopped"
+    if self._interrupt_owner == "steer":
+      return "Cut to deliver a message"
+    return None
+
+  @property
   def owner_card_end(self) -> bool:
     """Whether a continuation owner-input card ended this turn."""
     return self._interrupt_owner == "card"
@@ -791,18 +808,21 @@ class ActiveClaudeClient:
 def _steer_redirect_message(texts: list[str], *, from_person: bool) -> str:
   """Frame mid-turn input for the requery on the still-connected client.
 
-  A person's message is a conversational turn, not context to absorb: framing
-  it as "continue the same task" let agents fold a question into their work
-  and never answer it where the partner can see. Agent-originated carriers
-  (helper results, peer notes) remain context for the ongoing work.
+  A person's message is owed a visible acknowledgement (a question folded
+  silently into the work went unanswered), but it usually adds to the current
+  task rather than replacing it, so the agent keeps going unless it is told to
+  stop or change course. Agent-originated carriers (helper results, peer
+  notes) remain context for the ongoing work.
   """
   text = "\n\n".join(texts)
   if from_person:
     return (
-      "The partner sent this message while you were working. Reply to it in "
-      "your visible response before continuing: answer any question and "
-      "acknowledge any correction or change of direction. Then continue the "
-      "task as the message directs:\n\n"
+      "The partner sent this message while you were working. It usually "
+      "adds to your current task rather than replacing it: unless it asks "
+      "you to stop or change course, keep going with what you were doing and "
+      "fold it in where it fits, or handle it once the current step is done. "
+      "Acknowledge it in your visible response and answer any question it "
+      "asks:\n\n"
       f"{text}"
     )
   return (
@@ -1602,11 +1622,21 @@ async def run_claude_sdk_turn(
             current_session_id,
             native_work=native_work,
             usage_state=usage_state,
+            cut_label=active_client.cut_tool_label,
           )
           if terminal is None:
             # No boundary cut here: a steer already interrupted in `steer()`;
             # its terminal ResultMessage drives the requery below.
             continue
+          if isinstance(
+            sdk_msg, ResultMessage,
+          ) and native_work.is_inherited_notification_result(
+            sdk_msg.num_turns, sdk_msg.is_error,
+          ):
+            # A resumed session answered a task its previous process left
+            # unsettled before reading this turn's query. That empty result is
+            # not this turn's answer; keep reading the same stream for it.
+            break
           if (
             isinstance(sdk_msg, ResultMessage)
             and active_client.turn_cut_owned

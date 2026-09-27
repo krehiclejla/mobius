@@ -834,3 +834,72 @@ def test_served_frontend_freshness_names_why_the_bundle_is_behind(
   signature, _ = fw._source_snapshot()
   fw._write_source_stamp(signature)
   assert fw.served_frontend_freshness()["stale"] is False
+
+
+def test_change_events_ignore_the_same_hidden_and_dependency_trees_the_scan_prunes(fw_dirs):
+  frontend = fw_dirs["frontend"]
+  assert not fw._is_frontend_source_path(frontend / "src" / ".Shell.jsx.swp")
+  assert not fw._is_frontend_source_path(frontend / "src" / ".cache" / "x.js")
+  assert not fw._is_frontend_source_path(
+    frontend / "src" / "vendor" / "node_modules" / "x.js",
+  )
+  assert fw._is_frontend_source_path(frontend / "src" / "components" / "Shell.jsx")
+
+
+class _RecordingHandler(fw.FileSystemEventHandler):
+  def __init__(self):
+    self.paths = []
+    self.seen = threading.Event()
+
+  def on_any_event(self, event):
+    if not event.is_directory and event.event_type in ("created", "modified", "closed"):
+      self.paths.append(event.src_path)
+      self.seen.set()
+
+
+def test_source_edit_is_seen_through_change_events_before_the_safety_scan(fw_dirs):
+  """An edit rebuilds promptly without scanning every file every few seconds."""
+  frontend = fw_dirs["frontend"]
+  (frontend / "src").mkdir()
+  (frontend / "public").mkdir()
+  handler = _RecordingHandler()
+  observers = fw._start_source_observers(handler)
+  try:
+    kinds = sorted(type(observer).__name__ for observer in observers)
+    assert kinds == ["InotifyObserver", "PollingObserverVFS"]
+    scan = next(o for o in observers if isinstance(o, fw.PollingObserverVFS))
+    assert scan.timeout == fw._SAFETY_POLL_INTERVAL_SECS
+    time.sleep(0.2)
+    (frontend / "src" / "Shell.jsx").write_text("export {}", encoding="utf-8")
+    assert handler.seen.wait(5), "change event did not arrive"
+    assert str(frontend / "src" / "Shell.jsx") in handler.paths
+  finally:
+    fw._stop_observers(observers)
+
+
+def test_scan_keeps_interactive_cadence_when_change_events_are_unavailable(
+  fw_dirs, monkeypatch,
+):
+  (fw_dirs["frontend"] / "src").mkdir()
+
+  class NoEvents:
+    reaped = False
+
+    def schedule(self, *_args, **_kwargs):
+      return None
+
+    def start(self):
+      # inotify_init runs when the observer starts, so the limit surfaces here.
+      raise OSError("inotify instance limit reached")
+
+    def unschedule_all(self):
+      type(self).reaped = True
+
+  monkeypatch.setattr(fw, "Observer", NoEvents)
+  observers = fw._start_source_observers(_RecordingHandler())
+  try:
+    assert [type(o).__name__ for o in observers] == ["PollingObserverVFS"]
+    assert observers[0].timeout == fw._POLL_INTERVAL_SECS
+    assert NoEvents.reaped, "a partially started change-event observer must be reaped"
+  finally:
+    fw._stop_observers(observers)

@@ -539,6 +539,40 @@ def mark_walkthrough_complete(
   return Response(status_code=204)
 
 
+class OwnerTimezoneUpdate(BaseModel):
+  timezone: str
+
+
+@owner_router.get("/timezone")
+def get_owner_timezone(
+  owner: models.Owner = Depends(get_current_owner),
+) -> dict:
+  """Returns the owner's recorded IANA timezone, or null before any report."""
+  return {"timezone": owner.timezone}
+
+
+@owner_router.put("/timezone", dependencies=[Depends(reject_cross_site)])
+def set_owner_timezone(
+  body: OwnerTimezoneUpdate,
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+) -> dict:
+  """Records the owner's IANA timezone as reported by the shell's browser.
+
+  Plain daily app schedules registered on install or update are owned in this
+  zone. Changing it does not rewrite schedules already registered.
+  """
+  from app import cron_tz
+
+  zone = body.timezone.strip()
+  if not cron_tz.valid_timezone(zone):
+    raise HTTPException(400, f"Unknown IANA timezone: {zone!r}")
+  if owner.timezone != zone:
+    owner.timezone = zone
+    db.commit()
+  return {"timezone": zone}
+
+
 # Compose: a single outer router so routes/__init__.py's frozen
 # `_load("settings")` picks up all the surfaces.
 router.include_router(settings_router)

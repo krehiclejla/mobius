@@ -180,3 +180,30 @@ def test_symlinked_directory_is_not_traversed(tmp_path, monkeypatch):
   monkeypatch.setattr(os, 'posix_fadvise', lambda *args: calls.append(args))
   assert file_cache.reclaim_file_cache([source])['files'] == 0
   assert calls == []
+
+
+def test_background_work_cleanup_covers_every_repository_pack_but_no_chat_profile(
+  tmp_path, monkeypatch,
+):
+  """Scheduled jobs and boot read the same packs a turn does, with no chat."""
+  for repo in ("platform", "contrib/candidate", "worktrees/candidate", "apps/example"):
+    (tmp_path / repo / ".git" / "objects" / "pack").mkdir(parents=True)
+  (tmp_path / "agent-browser-profiles" / "chat-any").mkdir(parents=True)
+  calls = []
+  monkeypatch.setattr(file_cache, "settled_tool_paths", lambda: ("tool",))
+  monkeypatch.setattr(
+    file_cache, "reclaim_file_cache",
+    lambda paths, **kw: calls.append((tuple(paths), kw)),
+  )
+
+  file_cache.reclaim_background_work_cache(tmp_path)
+
+  assert calls[0] == (("tool",), {"skip_mapped": False})
+  source_paths, source_policy = calls[1]
+  assert source_policy == {}
+  assert set(source_paths) == {
+    tmp_path / repo / ".git" / "objects" / "pack" for repo in (
+      "platform", "contrib/candidate", "worktrees/candidate", "apps/example",
+    )
+  }
+  assert all("agent-browser-profiles" not in str(path) for path in source_paths)

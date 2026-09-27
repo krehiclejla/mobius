@@ -1,5 +1,19 @@
 // Own cancellable, live-required drawer reads for both chats and installed apps.
 
+// The Shell's system stream reads both drawer lists live after every
+// (re)connect, and discards any read begun before its subscription existed,
+// because that read can miss the events that follow. A mount-time refetch of a
+// persisted list always starts first, so it was always discarded — yet the
+// service worker still finished that download, doubling a list that grows with
+// every chat. Once the Shell mounts, its stream owns these refreshes. A list
+// with no cached data still loads on mount. Defaults match by key prefix, and
+// no other query key starts with these list keys.
+export function letSystemStreamOwnListRefresh(queryClient, listQueries) {
+  for (const queries of listQueries) {
+    queryClient.setQueryDefaults(queries.keys.all, { refetchOnMount: false })
+  }
+}
+
 export async function fetchFreshShellList(queryClient, queries, {
   signal,
   timeoutMs,

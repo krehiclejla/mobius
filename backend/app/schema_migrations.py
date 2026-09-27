@@ -5472,6 +5472,24 @@ def _add_delegation_result_identity(eng) -> None:
         ))
 
 
+def _add_owner_timezone(eng) -> None:
+  """Add the owner's durable IANA timezone (models.Owner.timezone).
+
+  Nullable with no backfill: schedules keep server time until a shell
+  reports the owner's zone.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "owner" not in inspector.get_table_names():
+    return
+  columns = {column["name"] for column in inspector.get_columns("owner")}
+  if "timezone" in columns:
+    return
+  with eng.begin() as conn:
+    conn.execute(text("ALTER TABLE owner ADD COLUMN timezone VARCHAR(64) NULL"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5553,6 +5571,7 @@ _SCHEMA_MIGRATIONS = (
   ("0069_chat_pending_queue_index", _add_chat_pending_queue_index),
   ("0070_delegation_goal_task", _add_delegation_goal_task),
   ("0071_delegation_result_identity", _add_delegation_result_identity),
+  ("0072_owner_timezone", _add_owner_timezone),
 )
 
 

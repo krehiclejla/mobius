@@ -134,6 +134,39 @@ def test_background_group_is_preferred_oom_victim(monkeypatch, tmp_path):
   assert process_groups.AGENT_OOM_SCORE_ADJ == 1000
 
 
+def test_an_exited_member_is_skipped_not_reported(caplog):
+  """Every helper host logged "OOM preference failed … Permission denied":
+  Claude Code's short startup commands had exited but were not yet reaped,
+  and the kernel gives such a process's /proc files to root. The live group
+  still became the preferred victim; the warning was a false alarm."""
+  import os
+  import subprocess
+  import time
+
+  leader = subprocess.Popen(["sh", "-c", "true & exec sleep 30"], start_new_session=True)
+  try:
+    deadline = time.monotonic() + 5
+    while len(process_groups._process_group_members(leader.pid)) < 2:
+      assert time.monotonic() < deadline, "the unreaped child never appeared"
+      time.sleep(0.05)
+    zombie = next(p for p in process_groups._process_group_members(leader.pid) if p != leader.pid)
+    with open(f"/proc/{zombie}/stat") as handle:
+      assert handle.read().rsplit(")", 1)[1].split()[0] == "Z"
+
+    with caplog.at_level(logging.WARNING):
+      assert process_groups.lower_process_group_priority(
+        leader.pid, logger=logging.getLogger(__name__), label="test",
+      ) is True
+
+    assert "OOM preference failed" not in caplog.text
+    with open(f"/proc/{leader.pid}/oom_score_adj") as handle:
+      assert int(handle.read()) == process_groups.AGENT_OOM_SCORE_ADJ
+    assert os.getpriority(os.PRIO_PROCESS, leader.pid) >= process_groups.BACKGROUND_PROCESS_NICE
+  finally:
+    leader.kill()
+    leader.wait()
+
+
 def _command_in_own_session(run_token):
   """A tool command as providers start it: its own session, the run's env."""
   import os

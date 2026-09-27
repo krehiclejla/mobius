@@ -490,22 +490,30 @@ def _list_directory_page(
   return entries, next_cursor
 
 
-def _include_json_listing_content(
-  entries: list[dict], base: Path,
-) -> None:
-  """Adds parsed ``content`` to eligible JSON file entries in place.
+def _with_json_listing_content(
+  entries: list[dict], next_cursor: str | None, base: Path,
+) -> tuple[list[dict], str | None]:
+  """Adds parsed ``content`` to eligible JSON entries; returns the page.
 
   Every candidate is resolved again through the storage path guard, so a
-  listing can never make a symlink readable. Invalid JSON, files that changed
-  type/size after the directory scan, and files outside the strict per-file or
-  aggregate byte budgets simply remain metadata-only; callers can fall back to
-  an ordinary ``get`` for those exceptional entries.
+  listing can never make a symlink readable. Oversized files, invalid JSON,
+  and files that changed type/size after the directory scan remain
+  metadata-only; callers can fall back to an ordinary ``get`` for those
+  exceptional entries.
+
+  The aggregate byte budget ENDS the page instead of silently stripping
+  content from later eligible entries: when the next small JSON file would
+  not fit, the page stops before it and ``next_cursor`` resumes there. So a
+  caller may ask for a full-size page and still receive every eligible body
+  — a large collection costs a handful of budget-sized requests rather than
+  many tiny ones, each of which rescans the directory. Every page reads at
+  least one candidate, so pagination always advances.
   """
   # This is an I/O budget, not merely a response-size budget. Invalid JSON
   # must consume it too; otherwise a page of 500 malformed 64 KiB files could
   # still force ~32 MiB of reads before returning no content at all.
   read_bytes = 0
-  for entry in entries:
+  for index, entry in enumerate(entries):
     if (
       entry.get("type") != "file"
       or not str(entry.get("name", "")).endswith(".json")
@@ -518,11 +526,12 @@ def _include_json_listing_content(
       if not file_path.is_file():
         continue
       size = file_path.stat().st_size
-      remaining = _LIST_CONTENT_PAGE_MAX - read_bytes
-      if remaining <= 0:
-        break
-      if size > _LIST_CONTENT_FILE_MAX or size > remaining:
+      if size > _LIST_CONTENT_FILE_MAX:
         continue
+      remaining = _LIST_CONTENT_PAGE_MAX - read_bytes
+      if size > remaining and index > 0:
+        # Budget spent: this body belongs to the next page.
+        return entries[:index], _encode_cursor(entries[index - 1]["name"])
       # Read one byte beyond the stat'd size when the page budget permits, so
       # a file that grows during the scan is detected without an unbounded
       # read_bytes() allocation. The page budget remains a strict ceiling.
@@ -538,6 +547,7 @@ def _include_json_listing_content(
       # RecursionError (deeply nested content) is a RuntimeError, so without it
       # a list-with-content read would 500 instead of just skipping the entry.
       continue
+  return entries, next_cursor
 
 
 def _serve_file(file_path: Path, stored_mime: str | None = None):
@@ -1202,7 +1212,9 @@ def list_app_dir(
     mime_override=lambda rel: read_content_type(data_dir, scope, rel),
   )
   if include_content:
-    _include_json_listing_content(entries, base)
+    entries, next_cursor = _with_json_listing_content(
+      entries, next_cursor, base,
+    )
   return {"entries": entries, "next_cursor": next_cursor}
 
 

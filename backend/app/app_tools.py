@@ -52,13 +52,19 @@ class AppTool:
   name: str
   description: str
   input_schema: dict[str, Any]
+  # A tool the app's prompt fragment tells every agent to use is loaded up front
+  # like the platform's own controls; other app tools stay deferrable.
+  always_load: bool = False
 
   def listing(self) -> dict[str, Any]:
-    return {
+    listing = {
       "name": self.exposed_name,
       "description": self.description,
       "inputSchema": self.input_schema,
     }
+    if self.always_load:
+      listing["_meta"] = {"anthropic/alwaysLoad": True}
+    return listing
 
 
 def exposed_tool_name(slug: str, name: str) -> str:
@@ -97,6 +103,7 @@ def live_app_tools(db: Session) -> list[AppTool]:
         name=declaration["name"],
         description=declaration["description"],
         input_schema=declaration["input_schema"],
+        always_load=declaration.get("always_load") is True,
       ))
   return tools
 

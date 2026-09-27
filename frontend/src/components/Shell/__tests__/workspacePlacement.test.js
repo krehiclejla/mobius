@@ -820,11 +820,9 @@ test('shell reconciles both durable drawer lists whenever the system stream reco
   assert.match(shellSource, /useSystemEventStream\(handleSystemEvent, \{\s*onOpen: reconcileSystemStateOnOpen[,\s]/)
 })
 
-test('stale pending updates offer the canonical review surface', () => {
+test('stale pending updates never interrupt the owner', () => {
   const shellSource = readFileSync(new URL('../Shell.jsx', import.meta.url), 'utf8')
   assert.match(shellSource, /ev\.type === 'app_update_stale'/)
-  assert.match(shellSource, /appUpdateStaleMessage\(ev\)/)
-  assert.match(shellSource, /findAppStoreApp\(appsRef\.current\)/)
-  assert.match(shellSource, /label: 'Open App Store'/)
-  assert.match(shellSource, /navToRef\.current\('canvas', \{ appId: appStore\.id \}\)/)
+  assert.doesNotMatch(shellSource, /appUpdateStaleMessage\(ev\)/)
+  assert.doesNotMatch(shellSource, /findAppStoreApp\(appsRef\.current\)/)
 })

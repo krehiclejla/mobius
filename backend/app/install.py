@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -3075,6 +3076,58 @@ def _select_install_target(
   )
 
 
+def owner_timezone(db: Session) -> str | None:
+  """The owner's recorded IANA timezone, when the shell has reported one."""
+  from app import cron_tz
+
+  owner = db.query(models.Owner).order_by(models.Owner.id).first()
+  zone = owner.timezone if owner else None
+  return zone if zone and cron_tz.valid_timezone(zone) else None
+
+
+def _manifest_default_timezone(
+  default: str, owner_zone: str | None,
+) -> str | None:
+  """The zone a manifest default is registered in; ``None`` is server time.
+
+  A plain daily default (``M H * * *``) means that wall time for the owner,
+  so it is owned in the owner's timezone once known. Other cadences, and a
+  zone the server already runs in, stay ordinary server cron.
+  """
+  from app import cron_tz
+
+  if (
+    owner_zone is None
+    or cron_tz.parse_daily_cron(default) is None
+    or owner_zone == cron_tz.server_timezone_name()
+  ):
+    return None
+  return owner_zone
+
+
+def _register_app_schedule(
+  app: models.App,
+  cron: str,
+  job_path: Path,
+  zone: str | None,
+  scaffold: Path,
+) -> None:
+  from app import cron_tz
+
+  if zone is None:
+    app_cron.register_cron(app.slug, cron, job_path, app.id, scaffold=scaffold)
+    return
+  app_cron.register_cron(
+    app.slug,
+    cron_tz.materialize_zone_cron(cron, zone),
+    job_path,
+    app.id,
+    timezone=zone,
+    zone_cron=cron,
+    scaffold=scaffold,
+  )
+
+
 async def _sync_manifest_cron_unlocked(
   *,
   app: models.App,
@@ -3082,6 +3135,7 @@ async def _sync_manifest_cron_unlocked(
   drop_prior_cron: bool,
   bundled_job: bool,
   warnings: list[str],
+  owner_zone: str | None,
 ) -> None:
   """Converge one accepted manifest's cron while its source lock is held.
 
@@ -3089,6 +3143,10 @@ async def _sync_manifest_cron_unlocked(
   the same manifest contract. Keeping cron convergence here prevents either
   path from becoming add-only: an accepted update that drops its schedule must
   retire both the live entry and its replayable declaration.
+
+  A schedule the owner chose survives while the app keeps the same schedule
+  contract (``app_cron.owner_schedule_to_keep``); otherwise the manifest
+  default is registered, in ``owner_zone`` when it is a plain daily time.
   """
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
@@ -3099,20 +3157,33 @@ async def _sync_manifest_cron_unlocked(
 
   app_data_dir = Path(app.source_dir)
   app_data_dir.mkdir(parents=True, exist_ok=True)
-  if drop_prior_cron:
+  kept = (
+    app_cron.owner_schedule_to_keep(app.id, schedule["default"], cron_job_name)
+    if has_cron else None
+  )
+  if drop_prior_cron and kept is None:
     await asyncio.to_thread(_drop_app_cron, app_data_dir)
     (app_cron.schedule_state_dir(app.id) / "init-cron.sh").unlink(missing_ok=True)
+    app_cron.clear_schedule_choice(app.id)
   job_path = app_data_dir / cron_job_name
   active_cron_scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
   if has_cron and active_cron_scaffold.exists():
+    default = schedule["default"]
+    if kept is not None:
+      choice = dataclasses.replace(kept, manifest_default=default)
+    else:
+      choice = app_cron.ScheduleChoice(
+        source="manifest",
+        cron=default,
+        job=cron_job_name,
+        timezone=_manifest_default_timezone(default, owner_zone),
+        manifest_default=default,
+      )
     await asyncio.to_thread(
-      app_cron.register_cron,
-      app.slug,
-      schedule["default"],
-      job_path,
-      app.id,
-      scaffold=active_cron_scaffold,
+      _register_app_schedule,
+      app, choice.cron, job_path, choice.timezone, active_cron_scaffold,
     )
+    app_cron.record_schedule_choice(app.id, choice)
   elif has_cron:
     sentinel = app_data_dir / ".cron-pending.json"
     sentinel.write_text(
@@ -3158,6 +3229,7 @@ async def _run_post_commit_effects(
           drop_prior_cron=drop_prior_cron,
           bundled_job=bool(candidate.bundled_job),
           warnings=warnings,
+          owner_zone=owner_timezone(db),
         )
     except HTTPException as exc:
       log.warning(

@@ -98,6 +98,6 @@ test('Shell reconciles both query completion and direct mutation paths', () => {
   )
   assert.match(
     queries,
-    /function useAppsQuery\(\{ reconcile, enabled = true \} = \{\}\)/,
+    /function useAppsQuery\(\{ reconcile, enabled = true, staleTime \} = \{\}\)/,
   )
 })

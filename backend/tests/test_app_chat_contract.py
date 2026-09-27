@@ -724,3 +724,30 @@ def test_an_app_chat_keeps_the_name_its_app_gave_it(client, owner_token, db):
     )
   }
   assert locked == {named.json()["id"]: True, unnamed.json()["id"]: False}
+
+
+def test_app_chat_list_shows_when_a_chat_awaits_the_owner(client, owner_token, db):
+  _app_id, app_token = _make_app(client, owner_token, "asking-app")
+  auth = {"Authorization": f"Bearer {app_token}"}
+  waiting = client.post("/api/app-chats", json={"title": "Asks"}, headers=auth).json()["id"]
+  idle = client.post("/api/app-chats", json={"title": "Idle"}, headers=auth).json()["id"]
+  row = db.query(models.Chat).filter(models.Chat.id == waiting).one()
+  row.pending_question_id = "question-1"
+  db.commit()
+
+  listed = {chat["id"]: chat["awaiting_owner"] for chat in client.get("/api/app-chats", headers=auth).json()}
+
+  assert listed[waiting] is True
+  assert listed[idle] is False
+
+
+def test_app_chat_list_shows_whether_a_run_is_live(client, owner_token, db, monkeypatch):
+  _app_id, app_token = _make_app(client, owner_token, "running-app")
+  auth = {"Authorization": f"Bearer {app_token}"}
+  live = client.post("/api/app-chats", json={"title": "Live"}, headers=auth).json()["id"]
+  idle = client.post("/api/app-chats", json={"title": "Idle"}, headers=auth).json()["id"]
+  monkeypatch.setattr("app.routes.chats.is_chat_running", lambda chat_id: chat_id == live)
+
+  listed = {chat["id"]: chat["running"] for chat in client.get("/api/app-chats", headers=auth).json()}
+
+  assert listed == {live: True, idle: False}

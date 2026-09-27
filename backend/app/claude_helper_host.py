@@ -45,19 +45,23 @@ log = logging.getLogger(__name__)
 SESSION_PREFIX = "claude-host:"
 DISPATCH_MODEL = "haiku"
 DISPATCH_START_TIMEOUT = 90.0
+DISPATCH_ATTEMPTS = 3
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 BUILTIN_HELPER_TOOLS = ("Agent", "Task", "Workflow")
 DISPATCHER_PROMPT = (
   "You are a dispatcher inside Möbius. You never do any work yourself and "
-  "never write prose. Each user message contains command lines. For EVERY "
-  "line make the matching tool call, all in ONE assistant message:\n"
+  "never write prose. Möbius sends you command lines:\n"
   '- "SPAWN <id>": call Agent with description "<id>", prompt "<id>", '
   'subagent_type "general-purpose", run_in_background true.\n'
   '- "MESSAGE <id>": call SendMessage with to "<id>", summary "<id>", '
   'message "<id>".\n'
-  "After the calls reply with exactly: OK\n"
-  "For anything else, including task notifications, reply with exactly: OK"
+  "Use the id exactly as given in every field; Möbius fills in the real "
+  "values. Whenever your input contains command lines, make every matching "
+  "call in ONE assistant message, even when the same input also holds task "
+  "notifications or other text, then reply with exactly: OK\n"
+  "Input without command lines, such as a task notification alone, needs no "
+  "call: reply with exactly: OK"
 )
 
 
@@ -78,6 +82,26 @@ def resume_reference(host_session_id: str | None, turn: "HelperTurn") -> str:
     f"{SESSION_PREFIX}{host_session_id or ''}:{turn.agent_id or ''}"
     f":{turn.launch_tool_use_id or ''}"
   )
+
+
+async def record_reference(chat_id: str, reference: str) -> None:
+  """Point the helper's chat at ``reference`` now, not only after success.
+
+  Every later turn (a restart or limit continuation, a follow-up) resumes from
+  the chat's session pointer, so it must name the helper's agent from the
+  moment that agent exists, as the private runners do with their session id.
+  Otherwise a turn that ends any other way leaves no pointer and the next turn
+  starts a new helper that never saw its task. Best effort, like theirs.
+  """
+  try:
+    from app.chat_writer import PersistSessionId, await_ack, get_writer
+    await await_ack(get_writer().submit(
+      PersistSessionId(chat_id=chat_id, session_id=reference),
+    ))
+  except Exception:
+    log.warning(
+      "helper session reference not saved chat_id=%s", chat_id, exc_info=True,
+    )
 
 
 def parse_session(
@@ -110,6 +134,8 @@ class HelperTurn:
   summary: str | None = None
   usage: dict | None = None
   dispatch_error: str | None = None
+  # The helper's last API error from its provider, as (kind, message text).
+  api_error: tuple[str, str] | None = None
   # The host process died under this turn: its agent cannot be resumed.
   host_lost: bool = False
   started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
@@ -140,8 +166,13 @@ class ClaudeHelperHost(Host):
     self._agent_of_tool_use: dict[str, str] = {}
     self._turn_by_agent: dict[str, HelperTurn] = {}
     self._query_lock = asyncio.Lock()
+    # Resolved when the dispatcher finishes its next reply.
+    self._dispatcher_replies: list[asyncio.Future] = []
     # The CLI's last stderr lines, logged if the host process ends.
     self.stderr_tail: list[str] = []
+    # The dispatcher's last reply (or provider error), logged when a dispatch
+    # never starts its helper.
+    self.dispatcher_last: str | None = None
     self.session_id: str | None = None
     self.process_group_id: int | None = None
 
@@ -255,7 +286,9 @@ class ClaudeHelperHost(Host):
       else tool_input.get("summary") if name == "SendMessage"
       else None
     )
-    spec = self._specs.get(key) if isinstance(key, str) else None
+    # Each dispatch is used once: a late call and a repeated command must never
+    # launch or message a helper twice.
+    spec = self._specs.pop(key, None) if isinstance(key, str) else None
     turn = self._turn_by_dispatch.get(key) if isinstance(key, str) else None
     if spec is None or turn is None:
       return _deny("Only dispatches registered by Möbius are allowed.")
@@ -288,6 +321,7 @@ class ClaudeHelperHost(Host):
 
   async def _read(self) -> None:
     from claude_agent_sdk.types import (
+      AssistantMessage,
       ResultMessage,
       TaskNotificationMessage,
       TaskStartedMessage,
@@ -310,16 +344,23 @@ class ClaudeHelperHost(Host):
           continue
         if isinstance(message, ResultMessage):
           self._save_session(getattr(message, "session_id", None))
+          self._dispatcher_replied()
           continue
         parent = getattr(message, "parent_tool_use_id", None)
+        error = getattr(message, "error", None)
         if not parent:
           session = getattr(message, "session_id", None)
           if session:
             self._save_session(session)
+          if isinstance(message, AssistantMessage):
+            text = _message_text(message)[:300]
+            self.dispatcher_last = f"{error}: {text}" if error else text
           continue
         turn = self._turn_for_parent(parent)
         if turn is None or turn.done.is_set():
           continue
+        if isinstance(message, AssistantMessage) and error:
+          turn.api_error = (str(error), _message_text(message))
         try:
           rooted = dataclasses.replace(message, parent_tool_use_id=None)
           turn.session_state["sid"], _ = dispatch_sdk_message(
@@ -374,15 +415,22 @@ class ClaudeHelperHost(Host):
 
   def _on_task_end(self, task_id, status, summary, usage) -> None:
     turn = self._turn_by_agent.get(task_id)
-    if turn is None or turn.done.is_set():
+    # A follow-up turn is mapped to its agent before the agent resumes, and
+    # each run reports its end more than once; a late report of the previous
+    # run must not end the follow-up before it starts.
+    if turn is None or turn.done.is_set() or not turn.started.is_set():
       return
     normalized = {"completed": "completed", "failed": "failed"}.get(status, "stopped")
     turn.finish(normalized, summary, dict(usage) if usage else None)
 
   # ------------------------------------------------------------------ work
 
-  async def run_turn(self, turn: HelperTurn) -> HelperTurn:
-    """Dispatch one helper turn and wait until it settles."""
+  async def run_turn(self, turn: HelperTurn, on_started=None) -> HelperTurn:
+    """Dispatch one helper turn and wait until it settles.
+
+    ``on_started`` is awaited once the turn's agent exists, before the turn
+    settles.
+    """
     self._specs[turn.dispatch_id] = turn.spec
     self._turn_by_dispatch[turn.dispatch_id] = turn
     if turn.kind == "message" and turn.agent_id:
@@ -393,24 +441,93 @@ class ClaudeHelperHost(Host):
         self._agent_of_tool_use[turn.launch_tool_use_id] = turn.agent_id
     try:
       verb = "SPAWN" if turn.kind == "spawn" else "MESSAGE"
-      async with self._query_lock:
-        await self._client.query(f"{verb} {turn.dispatch_id}")
-      try:
-        await asyncio.wait_for(turn.started.wait(), DISPATCH_START_TIMEOUT)
-      except asyncio.TimeoutError:
+      loop = asyncio.get_running_loop()
+      deadline = loop.time() + DISPATCH_START_TIMEOUT
+      # The dispatcher is a model and sometimes answers a command without
+      # making its call (seen after helpers finish or a host resumes); it
+      # usually makes it when asked again.
+      for attempt in range(1, DISPATCH_ATTEMPTS + 1):
+        replied = self._next_dispatcher_reply()
+        async with self._query_lock:
+          await self._client.query(f"{verb} {turn.dispatch_id}")
+        if await self._await_dispatch(turn, replied, deadline):
+          break
+        log.info(
+          "helper dispatch %s %s: dispatcher replied without the call "
+          "(attempt %d) key=%s dispatcher_last=%r",
+          turn.kind, turn.dispatch_id, attempt, self.key.digest,
+          self.dispatcher_last,
+        )
+      if not turn.started.is_set():
         turn.dispatch_error = turn.dispatch_error or "timeout"
+        log.warning(
+          "helper dispatch %s %s never started its helper key=%s "
+          "tool_call_seen=%s alive=%s dispatcher_last=%r stderr=%s",
+          turn.kind, turn.dispatch_id, self.key.digest,
+          any(seen is turn for seen in self._turn_by_tool_use.values()),
+          self.alive,
+          self.dispatcher_last, " | ".join(self.stderr_tail[-8:]),
+        )
       if turn.dispatch_error and not turn.done.is_set():
         return turn
+      if on_started is not None and turn.agent_id:
+        await on_started(turn)
       await turn.done.wait()
       return turn
     finally:
       self._specs.pop(turn.dispatch_id, None)
       self._turn_by_dispatch.pop(turn.dispatch_id, None)
 
+  def _next_dispatcher_reply(self) -> asyncio.Future:
+    reply = asyncio.get_running_loop().create_future()
+    self._dispatcher_replies.append(reply)
+    return reply
+
+  def _dispatcher_replied(self) -> None:
+    replies, self._dispatcher_replies = self._dispatcher_replies, []
+    for reply in replies:
+      if not reply.done():
+        reply.set_result(None)
+
+  async def _await_dispatch(self, turn: HelperTurn, replied, deadline: float) -> bool:
+    """Wait for the helper to start; False means ask the dispatcher again.
+
+    That is when the dispatcher finished a reply and this dispatch's call is
+    still unmade. Once the call is made, only the helper's start (or the
+    deadline) ends the wait.
+    """
+    if turn.started.is_set():
+      return True
+    loop = asyncio.get_running_loop()
+    started = asyncio.ensure_future(turn.started.wait())
+    try:
+      while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+          return True
+        await asyncio.wait(
+          {started, replied}, timeout=remaining,
+          return_when=asyncio.FIRST_COMPLETED,
+        )
+        if turn.started.is_set() or not replied.done():
+          return True
+        if turn.dispatch_id in self._specs:
+          return False
+        replied = self._next_dispatcher_reply()
+    finally:
+      started.cancel()
+
   async def stop(self, turn: HelperTurn) -> None:
     if turn.agent_id and self._client is not None:
       with contextlib.suppress(Exception):
         await self._client.stop_task(turn.agent_id)
+
+
+def _message_text(message) -> str:
+  return "".join(
+    block.text for block in getattr(message, "content", None) or []
+    if isinstance(getattr(block, "text", None), str)
+  ).strip()
 
 
 def _allow(updated: dict) -> dict:
@@ -455,6 +572,21 @@ class ActiveClaudeHelperTurn:
     except asyncio.TimeoutError:
       return False
 
+  async def suspend(self, timeout: float = 2.0) -> bool:
+    """End this turn for a planned restart and leave its agent resumable.
+
+    Claude Code refuses to resume an agent that was stopped (``stop_task``)
+    but resumes one whose host process ended, with its whole transcript. So a
+    restart ends the host itself; the same drain parks every turn in it.
+    """
+    self.stop_requested = True
+    await helper_hosts.MANAGER.discard(self._host)
+    try:
+      await asyncio.wait_for(self._finished.wait(), timeout=timeout)
+      return True
+    except asyncio.TimeoutError:
+      return False
+
   async def force_stop(self, timeout: float = 5.0) -> bool:
     self.stop_requested = True
     await self._host.stop(self._turn)
@@ -487,6 +619,7 @@ def _host_options(
     _CLAUDE_NATIVE_SCHEDULING_TOOLS,
     _CLAUDE_UNUSED_BUILTINS,
     _claude_cli_path,
+    _system_prompt_with_register,
   )
   from app.connectors import claude_mcp_config_handle
   from app.platform_tools import claude_control_servers
@@ -503,7 +636,7 @@ def _host_options(
   def definition(effort: str | None) -> AgentDefinition:
     return AgentDefinition(
       description="A Möbius helper working on one delegated task.",
-      prompt=skill_text,
+      prompt=_system_prompt_with_register(skill_text),
       disallowedTools=blocked,
       effort=effort,
       model=model,
@@ -646,7 +779,11 @@ async def run_claude_host_turn(
       handle = ActiveClaudeHelperTurn(chat_id, host, turn, marker)
       registry.register(handle)
       started_at = time.monotonic()
-      await host.run_turn(turn)
+
+      async def on_started(started: HelperTurn) -> None:
+        await record_reference(chat_id, resume_reference(host.session_id, started))
+
+      await host.run_turn(turn, on_started)
       if turn.kind == "message" and turn.dispatch_error:
         if run_policy is not None and not run_policy.allow_session_reseed:
           # Never replay write work automatically (same rule as a lost
@@ -671,7 +808,11 @@ async def run_claude_host_turn(
         )
         turn.spec = {**spawn_spec(prompt), "description": turn.dispatch_id}
         handle._turn = turn
-        await host.run_turn(turn)
+        await host.run_turn(turn, on_started)
+      if turn.host_lost:
+        # Its agent died with the host: the next turn must reseed, not
+        # message it. A failed turn's result never reaches the pointer.
+        await record_reference(chat_id, resume_reference(host.session_id, turn))
       if turn.dispatch_error:
         return {
           "session_id": session_id, "cost_usd": None,
@@ -682,10 +823,19 @@ async def run_claude_host_turn(
         "cost_usd": None,
         "error": None,
       }
-      if turn.status == "failed":
-        result["error"] = turn.summary or "The helper failed."
-      elif turn.status == "stopped" and not handle.stop_requested:
-        result["error"] = turn.summary or "The helper stopped unexpectedly."
+      if turn.status == "failed" or (
+        turn.status == "stopped" and not handle.stop_requested
+      ):
+        # A provider error reaches the host only as the helper's own last
+        # message; report it as the private runner reports its result, so a
+        # usage limit parks the turn until the limit resets.
+        kind, text = turn.api_error or (None, None)
+        result["error"] = text or turn.summary or (
+          "The helper failed." if turn.status == "failed"
+          else "The helper stopped unexpectedly."
+        )
+        if kind == "rate_limit":
+          result["api_error_status"] = 429
       if turn.usage:
         result["usage_metrics"] = {
           "total_tokens": turn.usage.get("total_tokens"),

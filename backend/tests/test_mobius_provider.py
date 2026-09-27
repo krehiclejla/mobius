@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 
 from app import providers
 from app.schemas import AgentSettingsOverride, ChatProviderSwitch
@@ -61,6 +62,16 @@ def test_subscription_route_reconnects_a_stalled_stream():
 
   assert "model_providers.mobius_trial.stream_max_retries=2" in overrides
   assert "model_providers.mobius_trial.request_max_retries=2" in overrides
+
+
+def test_subscription_codex_home_config_keeps_native_sub_agents_off(tmp_path):
+  _provider().build_env({}, str(tmp_path))
+  config = tomllib.loads(
+    (tmp_path / "cli-auth" / "mobius" / "config.toml").read_text()
+  )
+  assert config["agents"]["enabled"] is False
+  assert config["features"]["multi_agent"] is False
+  assert config["features"]["multi_agent_v2"]["enabled"] is False
 
 
 def test_subscription_search_uses_codex_native_provider_endpoint():

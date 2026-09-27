@@ -174,23 +174,32 @@ def browser_tool_paths() -> tuple[Path, ...]:
   return tuple(roots)
 
 
-def settled_turn_paths(data_dir: str | Path, chat_id: str) -> tuple[Path, ...]:
-  """Return caches a settled turn may leave hot, without walking checkouts.
+def repository_pack_paths(data_dir: str | Path) -> tuple[Path, ...]:
+  """Return every managed repository's flat pack directory.
 
-  Git history reads fault whole pack files, so advise each managed
-  repository's flat pack directory. Walking every checkout instead touched
-  hundreds of thousands of small files per turn — seconds of server CPU —
-  and reclaimed no more than the packs alone. Deliberately exclude
-  databases, app data, shared files, and ``cli-auth``.
+  Git history reads fault whole pack files, so advising the pack directories
+  is enough. Walking every checkout instead touched hundreds of thousands of
+  small files per pass — seconds of server CPU — and reclaimed no more than
+  the packs alone. Deliberately excludes databases, app data, shared files,
+  and ``cli-auth``.
   """
   data = Path(data_dir)
-  roots = [data / "agent-browser-profiles" / f"chat-{chat_id}"]
+  roots = []
   for pattern in ('platform', 'contrib/*', 'worktrees/*', 'apps/*'):
     for checkout in data.glob(pattern):
       if checkout.is_symlink() or checkout.parent.is_symlink():
         continue
       roots.append(checkout / '.git' / 'objects' / 'pack')
   return tuple(roots)
+
+
+def settled_turn_paths(data_dir: str | Path, chat_id: str) -> tuple[Path, ...]:
+  """Return caches a settled turn may leave hot, without walking checkouts."""
+  data = Path(data_dir)
+  return (
+    data / "agent-browser-profiles" / f"chat-{chat_id}",
+    *repository_pack_paths(data),
+  )
 
 
 def settled_tool_paths() -> tuple[Path, ...]:
@@ -218,3 +227,16 @@ def reclaim_settled_cache(data_dir: str | Path, chat_id: str) -> None:
   """Called by the existing settled-turn worker; no new scheduler or timer."""
   reclaim_file_cache(settled_tool_paths(), skip_mapped=False)
   reclaim_file_cache(settled_turn_paths(data_dir, chat_id))
+
+
+def reclaim_background_work_cache(data_dir: str | Path) -> None:
+  """Evict tool and git-history pages left by work that ran outside a turn.
+
+  Scheduled app jobs and boot (platform reconcile, update swap, app
+  bootstrap) read the same tools and packs a chat turn does, but no turn
+  settles after them, so without this their pages stayed billable until the
+  host ran short of memory. Callers are those existing boundaries: the app-job
+  runner after its child exits, and one pass once boot is ready.
+  """
+  reclaim_file_cache(settled_tool_paths(), skip_mapped=False)
+  reclaim_file_cache(repository_pack_paths(data_dir))

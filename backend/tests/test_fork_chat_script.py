@@ -221,6 +221,10 @@ def test_codex_uses_sdk_thread_fork_and_read_only_turn(tmp_path, monkeypatch):
     "features.skill_mcp_dependency_install=false",
     'mcp_servers={"mobius_control"={enabled=false},'
     '"owner.connector"={enabled=false}}',
+    # A forked session must not regain Codex's native sub-agents either.
+    "agents.enabled=false",
+    "features.multi_agent=false",
+    "features.multi_agent_v2.enabled=false",
   )
   assert all(
     name not in calls["config"]["env"]

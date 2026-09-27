@@ -30,6 +30,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 from watchdog.observers.polling import PollingObserverVFS
 
 from app.build_admission import (
@@ -45,6 +47,14 @@ from app.file_cache import frontend_tool_paths, reclaim_file_cache
 log = logging.getLogger(__name__)
 
 _DEBOUNCE_SECS = 1.75
+# Kernel change events drive rebuilds. They once silently dropped edits on the
+# /data volume (15422b67e6), so a filtered full-tree scan still runs as a safety
+# net: a dropped event delays that rebuild by at most this long instead of
+# stranding it. Each scan stats every source file (~1k files, ~13 ms CPU), so
+# scanning every couple of seconds cost ~0.6% of a core forever while idle.
+_SAFETY_POLL_INTERVAL_SECS = 30.0
+# Where the kernel offers no change events, the scan is the only detector and
+# keeps the interactive cadence.
 _POLL_INTERVAL_SECS = 2.0
 _INCOMPLETE_GRACE_SECS = 30.0
 _WATCH_RESTART_BACKOFF_MAX = 30.0
@@ -116,7 +126,10 @@ def _source_tree_scandir(
   """
   scan_path = path or "."
   try:
-    at_root = Path(scan_path).resolve() == frontend_root.resolve()
+    # Watchdog joins child paths onto the scheduled root string, so a lexical
+    # comparison identifies the root; resolving every directory on every scan
+    # was a third of the scan's CPU.
+    at_root = os.path.normpath(scan_path) == os.path.normpath(frontend_root)
     entries = os.scandir(scan_path)
   except OSError:
     return
@@ -137,7 +150,68 @@ def _is_frontend_source_path(path: str | Path) -> bool:
     return False
   if len(rel.parts) == 1:
     return rel.name in _ROOT_SOURCE_FILES
-  return bool(rel.parts and rel.parts[0] in _SOURCE_DIRS)
+  if not rel.parts or rel.parts[0] not in _SOURCE_DIRS:
+    return False
+  # Match the scan's pruning, so editor swap files and nested dependency trees
+  # cannot trigger a build through change events either.
+  return not any(
+    part.startswith(".") or part == "node_modules" for part in rel.parts[1:]
+  )
+
+
+def _start_source_observers(handler: FileSystemEventHandler) -> list[BaseObserver]:
+  """Start change-event watching plus the filtered safety scan.
+
+  Change events cover only build inputs: the frontend root's own entries (for
+  its config files) and the source directories, never node_modules or build
+  generations. If the kernel cannot provide events, the scan alone keeps the
+  interactive cadence.
+  """
+  observers: list[BaseObserver] = []
+  poll_interval = _SAFETY_POLL_INTERVAL_SECS
+  events = Observer()
+  try:
+    events.schedule(handler, str(_FRONTEND_DIR), recursive=False)
+    for name in sorted(_SOURCE_DIRS):
+      source_dir = _FRONTEND_DIR / name
+      if source_dir.is_dir():
+        events.schedule(handler, str(source_dir), recursive=True)
+    events.start()
+    observers.append(events)
+  except OSError as exc:
+    # Each source directory gets its own inotify instance, so hitting the
+    # instance or watch limit fails partway and leaves the earlier emitters
+    # running, each holding a thread and an fd that feed a queue nobody drains.
+    # Reap them so the degraded scan-only path leaves nothing behind.
+    events.unschedule_all()
+    log.warning(
+      "frontend change events unavailable (%s); scanning source every %ss",
+      exc, _POLL_INTERVAL_SECS,
+    )
+    poll_interval = _POLL_INTERVAL_SECS
+  scan = PollingObserverVFS(
+    stat=os.stat,
+    listdir=lambda path: _source_tree_scandir(_FRONTEND_DIR, path),
+    polling_interval=poll_interval,
+  )
+  scan.schedule(handler, str(_FRONTEND_DIR), recursive=True)
+  observers.append(scan)
+  try:
+    scan.start()
+  except Exception:
+    _stop_observers(observers)
+    raise
+  return observers
+
+
+def _stop_observers(observers: list[BaseObserver]) -> None:
+  for observer in observers:
+    try:
+      observer.stop()
+      if observer.ident is not None:
+        observer.join(timeout=2)
+    except RuntimeError:
+      pass
 
 
 def _source_paths() -> list[Path]:
@@ -841,24 +915,16 @@ class _FrontendHandler(FileSystemEventHandler):
     self._incomplete_notified = False
     self._last_staging_signature = _tree_signature(_STAGING_DIST_DIR)
     self._watch_thread: threading.Thread | None = None
-    self._source_observer: PollingObserverVFS | None = None
+    self._source_observers: list[BaseObserver] = []
     self._watch_lock_fh = _acquire_watch_lock() if start_threads else None
     if start_threads:
       try:
-        self._source_observer = PollingObserverVFS(
-          stat=os.stat,
-          listdir=lambda path: _source_tree_scandir(_FRONTEND_DIR, path),
-          polling_interval=_POLL_INTERVAL_SECS,
-        )
-        self._source_observer.schedule(
-          self, str(_FRONTEND_DIR), recursive=True,
-        )
         self._watch_thread = threading.Thread(
           target=self._build_loop,
           name="frontend-vite-build",
           daemon=True,
         )
-        self._source_observer.start()
+        self._source_observers = _start_source_observers(self)
         self._watch_thread.start()
         # Recover an edit saved before a prior shutdown, but do not spend a
         # full Vite heap on every ordinary container boot when dist is fresh.
@@ -877,14 +943,8 @@ class _FrontendHandler(FileSystemEventHandler):
     self._build_requested.set()
     self._cancel_pending_publish()
     self._terminate_watch_process(signal.SIGTERM)
-    if self._source_observer is not None:
-      try:
-        self._source_observer.stop()
-        if self._source_observer.ident is not None:
-          self._source_observer.join(timeout=2)
-      except RuntimeError:
-        pass
-      self._source_observer = None
+    _stop_observers(self._source_observers)
+    self._source_observers = []
     if self._watch_thread is not None and self._watch_thread.ident is not None:
       self._watch_thread.join(timeout=5)
     if self._watch_process_running():

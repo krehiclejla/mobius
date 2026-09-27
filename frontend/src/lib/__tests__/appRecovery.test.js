@@ -3,16 +3,8 @@ import assert from 'node:assert/strict'
 
 import {
   appCrashReportDraft,
-  appUpdateStaleMessage,
   findAppStoreApp,
 } from '../appRecovery.js'
-
-test('explains how to recover a stale update without alarming about live state', () => {
-  assert.equal(
-    appUpdateStaleMessage({ appName: 'Reflection' }),
-    'The pending update for Reflection changed upstream. Review the latest update and start again. The previous version is still running.',
-  )
-})
 
 test('crash report drafts never leave an empty error fence', () => {
   assert.equal(

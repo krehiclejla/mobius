@@ -70,6 +70,13 @@ _LOCAL_PACKAGE_WARNING = (
   "and skills; a future reviewed Store update may replace them."
 )
 
+_STORE_LOCAL_PACKAGE_DIVERGED = (
+  "This app is Store-managed, so its live tools, service, schedule, and "
+  "skills come from the reviewed package. Your local mobius.json changes to "
+  "those were NOT applied by this ordinary apply. Re-apply with "
+  "--accept-local-package to make the local manifest authoritative."
+)
+
 
 @dataclass(frozen=True)
 class ApplyResult:
@@ -314,6 +321,7 @@ async def _sync_accepted_app_side_effects(
         drop_prior_cron=drop_prior_cron,
         bundled_job=bool(schedule and schedule.get("job")),
         warnings=warnings,
+        owner_zone=install.owner_timezone(db),
       )
     except Exception as exc:
       log.exception("app apply: cron sync failed post-commit")
@@ -374,6 +382,70 @@ def _read_manifest(snapshot_dir: Path) -> dict:
   except ManifestContractError as exc:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
   return dict(manifest)
+
+
+def _reviewed_package_surface(contract) -> dict:
+  """Author-declared package fields that ordinary Store apply cannot change.
+
+  Kept deliberately narrow to the surface an agent edits in mobius.json and
+  that the reviewed contract owns for a Store app — tools, service, schedule,
+  skills, embedded agent, and system prompt. Host-normalized parts (schema,
+  runtime, public, offline) are excluded so a contract-schema bump since
+  install can never masquerade as a local edit.
+  """
+  contract = contract if isinstance(contract, dict) else {}
+  agent = contract.get("agent")
+  agent = agent if isinstance(agent, dict) else {}
+  return {
+    "tools": agent.get("tools") or [],
+    "skills": agent.get("skills") or [],
+    "system_prompt": agent.get("system_prompt"),
+    "embeds_agent": bool(agent.get("embeds_agent", False)),
+    "service": contract.get("service"),
+    "background": contract.get("background"),
+  }
+
+
+def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str | None:
+  """Warn when a Store app's local package declarations differ from live.
+
+  Ordinary apply of a Store-managed app publishes the compiled entry but keeps
+  the reviewed package metadata, so local mobius.json edits to tools, service,
+  schedule, or skills are silently dropped. This compares the contract those
+  local declarations *would* produce under --accept-local-package against the
+  live one and returns a warning only when they genuinely differ. It is
+  best-effort: any read or parse problem returns None so a valid apply is never
+  blocked by the check.
+  """
+  try:
+    raw = (snapshot_dir / "mobius.json").read_bytes()
+    if len(raw) > MANIFEST_MAX_BYTES:
+      return None
+    manifest = json.loads(raw)
+    validate_manifest_contract(manifest)
+  except (OSError, UnicodeDecodeError, json.JSONDecodeError, ManifestContractError):
+    return None
+  if not isinstance(manifest, dict):
+    return None
+  # Mirror the effective normalization the accept-local path applies before
+  # building the contract, so the comparison reflects exactly what accepting
+  # this manifest would install.
+  effective = dict(manifest)
+  effective.setdefault("offline_capable", app.offline_capable)
+  effective.setdefault("embeds_agent", app.embeds_agent)
+  service = effective.get("service")
+  if isinstance(service, dict):
+    service = dict(service)
+    service.setdefault("id", app.service_id)
+    effective["service"] = service
+  try:
+    accepted = contract_from_manifest(effective)
+  except Exception:
+    return None
+  live = app.capability_contract if isinstance(app.capability_contract, dict) else {}
+  if _reviewed_package_surface(accepted) != _reviewed_package_surface(live):
+    return _STORE_LOCAL_PACKAGE_DIVERGED
+  return None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:
@@ -586,6 +658,7 @@ def _apply_local_manifest_runtime(
     contract_permissions=manifest.get("permissions") or {},
     service=service,
     tools=list(manifest.get("tools") or []),
+    model_provider=manifest.get("model_provider"),
   )
 
 
@@ -709,8 +782,24 @@ async def apply_source_revision(
         if not store_managed or accept_local_package
         else None
       )
+      store_divergence_warning = (
+        _store_local_package_divergence(app, snapshot_dir)
+        if store_managed and not accept_local_package and app is not None
+        else None
+      )
       if manifest is not None:
         _validate_local_identity(source_path, manifest, app)
+        provider = manifest.get("model_provider")
+        if (not store_managed and isinstance(provider, dict)
+            and provider.get("transport") == "identity_broker"):
+          # The broker signs with the owner's Möbius account, so only the
+          # reviewed Möbius · You package may route turns through it. Local
+          # apps declare their own HTTPS endpoint and app-secret key.
+          raise AppApplyError(
+            "local_model_broker",
+            "Local apps may declare an HTTPS model provider with their own "
+            "app secret, not the protected Möbius broker transport.",
+          )
         schedule = manifest.get("schedule")
         job_name = schedule.get("job") if isinstance(schedule, dict) else None
         if job_name:
@@ -902,6 +991,8 @@ async def apply_source_revision(
         static_materialized = False
         if store_managed and accept_local_package:
           warnings = (*warnings, _LOCAL_PACKAGE_WARNING)
+        elif store_divergence_warning:
+          warnings = (*warnings, store_divergence_warning)
         return ApplyResult(app=app, mode="unchanged", warnings=warnings)
 
       app.jsx_source = source
@@ -941,6 +1032,8 @@ async def apply_source_revision(
       )
       if store_managed and accept_local_package:
         warnings = (*warnings, _LOCAL_PACKAGE_WARNING)
+      elif store_divergence_warning:
+        warnings = (*warnings, store_divergence_warning)
       return ApplyResult(
         app=app,
         mode="created" if created else "updated",

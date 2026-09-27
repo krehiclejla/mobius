@@ -65,10 +65,25 @@ def lower_process_group_priority(
       with open(f"/proc/{pid}/oom_score_adj", "w") as handle:
         handle.write(str(AGENT_OOM_SCORE_ADJ))
     except OSError as exc:
+      # A member that already exited (a startup command its parent has not
+      # reaped yet) holds no memory, and the kernel gives its /proc files to
+      # root, so the write is refused; there is nothing to adjust.
+      if _has_exited(pid):
+        continue
       logger.warning(
         "%s OOM preference failed pid=%s pgid=%s: %s", label, pid, pgid, exc,
       )
   return True
+
+
+def _has_exited(pid: int) -> bool:
+  """Whether ``pid`` is gone or a zombie awaiting its parent."""
+  try:
+    with open(f"/proc/{pid}/stat") as handle:
+      state = handle.read().rsplit(")", 1)[1].split()[0]
+  except (OSError, IndexError):
+    return True
+  return state in ("Z", "X")
 
 
 def _process_group_members(pgid: int) -> list[int]:

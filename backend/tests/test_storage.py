@@ -427,8 +427,9 @@ def test_list_can_include_bounded_json_content(
 ):
   """The opt-in batches small JSON reads without changing the default.
 
-  Oversized files and entries beyond the aggregate response budget stay
-  metadata-only, which gives callers an explicit per-file fallback path.
+  Oversized or invalid files stay metadata-only (the per-file fallback path).
+  The aggregate read budget ends the page instead of stripping bodies, so an
+  eligible entry past the budget arrives with its content on the next page.
   """
   app_id = _make_app(client, owner_token)
   for name, doc in (
@@ -462,10 +463,19 @@ def test_list_can_include_bounded_json_content(
     headers=auth,
   )
   assert included.status_code == 200
-  by_name = {entry["name"]: entry for entry in included.json()["entries"]}
-  assert by_name["a.json"]["content"] == {"id": "a", "value": "small"}
-  assert "content" not in by_name["b.json"]
+  first = included.json()
+  assert [entry["name"] for entry in first["entries"]] == ["a.json"]
+  assert first["entries"][0]["content"] == {"id": "a", "value": "small"}
+  assert first["next_cursor"]
+  rest = client.get(
+    f"/api/storage/apps-list/{app_id}/records?include_content=true"
+    f"&cursor={first['next_cursor']}",
+    headers=auth,
+  ).json()
+  by_name = {entry["name"]: entry for entry in rest["entries"]}
+  assert by_name["b.json"]["content"] == {"id": "b", "value": "small"}
   assert "content" not in by_name["note.txt"]
+  assert rest["next_cursor"] is None
 
   # Malformed candidates consume the same bounded read budget even though
   # they add nothing to the response. Otherwise a page of invalid records
@@ -481,11 +491,12 @@ def test_list_can_include_bounded_json_content(
     headers=auth,
   )
   assert bounded.status_code == 200
-  bounded_by_name = {
-    entry["name"]: entry for entry in bounded.json()["entries"]
-  }
-  assert "content" not in bounded_by_name["0-invalid.json"]
-  assert "content" not in bounded_by_name["a.json"]
+  bounded_page = bounded.json()
+  assert [entry["name"] for entry in bounded_page["entries"]] == [
+    "0-invalid.json",
+  ]
+  assert "content" not in bounded_page["entries"][0]
+  assert bounded_page["next_cursor"]
 
 
 def test_list_includes_directories(client, auth, owner_token):
@@ -1770,3 +1781,50 @@ def test_shared_connect_credentials_are_owner_only(client, auth, owner_token):
   assert client.get(
     "/api/storage/shared/connect/outbound/config.json", headers=auth,
   ).status_code == 200
+
+
+def test_full_size_content_pages_deliver_every_body_in_few_requests(
+  client, auth, owner_token, monkeypatch,
+):
+  """A large collection listed at the maximum page size loses no content.
+
+  The byte budget splits it into a few budget-sized pages; each eligible
+  record carries its body on exactly one page, and non-JSON siblings still
+  appear as metadata.
+  """
+  app_id = _make_app(client, owner_token)
+  records_dir = Path(get_settings().data_dir) / "apps" / str(app_id) / "ledger"
+  records_dir.mkdir(parents=True)
+  for index in range(60):
+    (records_dir / f"r{index:03d}.json").write_text(
+      json.dumps({"id": index, "pad": "x" * 200}),
+    )
+    (records_dir / f"r{index:03d}.diff").write_text("diff")
+  one = (records_dir / "r000.json").stat().st_size
+  monkeypatch.setattr(storage_routes, "_LIST_CONTENT_PAGE_MAX", one * 25)
+
+  seen, pages, cursor = {}, 0, None
+  while True:
+    query = "limit=500&include_content=true" + (
+      f"&cursor={cursor}" if cursor else ""
+    )
+    body = client.get(
+      f"/api/storage/apps-list/{app_id}/ledger?{query}", headers=auth,
+    ).json()
+    pages += 1
+    for entry in body["entries"]:
+      assert entry["name"] not in seen
+      seen[entry["name"]] = entry
+    cursor = body["next_cursor"]
+    if not cursor:
+      break
+
+  assert pages == 3
+  assert len(seen) == 120
+  bodies = [e for name, e in seen.items() if name.endswith(".json")]
+  assert all("content" in entry for entry in bodies)
+  assert sorted(entry["content"]["id"] for entry in bodies) == list(range(60))
+  assert all(
+    "content" not in entry for name, entry in seen.items()
+    if name.endswith(".diff")
+  )

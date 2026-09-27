@@ -62,6 +62,9 @@ export function makeServer() {
   let signalStatus = 204
   let online = true
   let weakResponseEtags = false
+  // Like the backend, an include-content page ends once its JSON bodies
+  // reach this many bytes, resuming at the next unread body.
+  let contentPageBytes = Infinity
   // path -> status to force on the NEXT matching write (poison/transient tests).
   const forcedWriteStatus = new Map()
   const log = []                    // every fetch the runtime made
@@ -149,7 +152,14 @@ export function makeServer() {
       const remaining = [...byName.values()]
         .sort((a, b) => a.name.localeCompare(b.name))
         .filter(entry => entry.name > after)
-      const entries = remaining.slice(0, limit)
+      let entries = remaining.slice(0, limit)
+      let bodyBytes = 0
+      const overflow = entries.findIndex((entry, index) => {
+        if (!Object.hasOwn(entry, 'content')) return false
+        bodyBytes += JSON.stringify(entry.content).length
+        return index > 0 && bodyBytes > contentPageBytes
+      })
+      if (overflow > 0) entries = entries.slice(0, overflow)
       const nextCursor = remaining.length > entries.length
         ? Buffer.from(entries.at(-1).name).toString('base64url')
         : null
@@ -226,6 +236,7 @@ export function makeServer() {
     signalEvents,
     setSignalStatus(status) { signalStatus = status },
     setWeakResponseEtags(value = true) { weakResponseEtags = value },
+    setContentPageBytes(bytes) { contentPageBytes = bytes },
     // Force the NEXT write to `path` to return `status` (e.g. 422 poison, 503
     // transient). Consumed once.
     forceWrite(path, status) { forcedWriteStatus.set(path, status) },

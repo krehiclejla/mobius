@@ -370,7 +370,7 @@ def _public_task_event(
         (description or agent_type)[:_COLLAB_DESCRIPTION_MAX]
         or "Background helper"
       ),
-      "task_type": agent_type or None,
+      "task_type": "codex_agent",
       "tool_use_id": tool_use_id,
     }
   if event_type == "agent_terminal":
@@ -738,7 +738,12 @@ def _tool_start_event(item: Any, sdk: dict[str, Any]) -> dict[str, Any] | None:
   return None
 
 
-def _tool_completed_events(item: Any, sdk: dict[str, Any]) -> list[dict[str, Any]]:
+def _tool_completed_events(
+  item: Any,
+  sdk: dict[str, Any],
+  *,
+  streamed_command_output: str | None = None,
+) -> list[dict[str, Any]]:
   """Builds Möbius tool-end events from a completed typed item."""
   image_view_cls = sdk.get("ImageViewThreadItem")
   if image_view_cls is not None and isinstance(item, image_view_cls):
@@ -765,7 +770,14 @@ def _tool_completed_events(item: Any, sdk: dict[str, Any]) -> list[dict[str, Any
     return []
 
   if isinstance(item, sdk["CommandExecutionThreadItem"]):
-    output = (item.aggregated_output or "").strip()
+    # Codex normally repeats the complete command output on the completed
+    # ThreadItem. Some dynamic-tool command paths emit every delta but leave
+    # `aggregated_output` empty. The runner joins those exact deltas and passes
+    # them here so the terminal event remains authoritative for transcript
+    # persistence, generic output stashing, and protocol receipts.
+    output = (
+      item.aggregated_output or streamed_command_output or ""
+    ).strip()
     exit_code = getattr(item, "exit_code", None)
     events: list[dict[str, Any]] = [{
       "type": "tool_output",

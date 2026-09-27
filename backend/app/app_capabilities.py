@@ -22,7 +22,9 @@ CONTRACT_SCHEMA = 6
 
 _PUBLIC_NETWORK_RULE_LIMIT = 16
 _PUBLIC_QUERY_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_PRESERVE_SERVICE = object()
+# Keyword default for local-contract projections whose absence (None) is a
+# meaningful removal: omit the argument to keep the currently accepted value.
+_PRESERVE_ACCEPTED = object()
 
 
 def _normalize_public_query(value: Any, *, rule_index: int) -> dict[str, Any]:
@@ -635,15 +637,18 @@ def contract_from_app_state(
   capabilities: dict[str, Any] | None = None,
   public_access: dict[str, Any] | None = None,
   contract_permissions: dict[str, Any] | None = None,
-  service: dict[str, Any] | None | object = _PRESERVE_SERVICE,
+  service: dict[str, Any] | None | object = _PRESERVE_ACCEPTED,
   tools: list[dict[str, Any]] | None = None,
+  model_provider: dict[str, Any] | None | object = _PRESERVE_ACCEPTED,
 ) -> dict[str, Any]:
   """Build an accurate contract for an owner-authored local app.
 
   Store installs derive their complete contract from the reviewed manifest.
   Local apps are created and edited directly by their owner, so their durable
   database state is authoritative for server permissions while ``mobius.json``
-  is authoritative for host-mediated runtime capabilities.
+  is authoritative for host-mediated runtime capabilities — including an
+  app-secret model provider, which reaches no turn until the owner saves its
+  key in the app.
   """
   if capabilities is None:
     capabilities = runtime_declaration_from_contract(
@@ -685,7 +690,7 @@ def contract_from_app_state(
     "public_access": public_access,
     "tools": tools,
   }
-  if service is _PRESERVE_SERVICE and isinstance(
+  if service is _PRESERVE_ACCEPTED and isinstance(
     getattr(app, "capability_contract", None), dict,
   ):
     accepted_service = app.capability_contract.get("service")
@@ -699,6 +704,11 @@ def contract_from_app_state(
         service["aliases"] = list(accepted_service["aliases"])
   if isinstance(service, dict):
     manifest["service"] = service
+  if model_provider is _PRESERVE_ACCEPTED:
+    accepted = getattr(app, "capability_contract", None)
+    model_provider = accepted.get("model_provider") if isinstance(accepted, dict) else None
+  if isinstance(model_provider, dict):
+    manifest["model_provider"] = model_provider
   return contract_from_manifest(manifest)
 
 

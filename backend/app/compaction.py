@@ -430,7 +430,7 @@ async def _run_codex_summarize_turn(
   effort: str | None,
 ) -> str:
   """Run an ephemeral, read-only Codex turn and return its final message."""
-  from app.providers import get_provider
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, get_provider
 
   provider = get_provider(provider_id)
 
@@ -463,12 +463,11 @@ async def _run_codex_summarize_turn(
     "browser_use_external",
     "browser_use_full_cdp_access",
     "computer_use",
-    "multi_agent",
     "image_generation",
     "goals",
   ):
     cmd.extend(("--disable", feature))
-  for override in provider.codex_config_overrides():
+  for override in (*CODEX_NATIVE_HELPERS_OFF, *provider.codex_config_overrides()):
     cmd.extend(("--config", override))
   if model:
     cmd.extend(("--model", model))

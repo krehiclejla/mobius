@@ -44,7 +44,9 @@ RUN useradd -m -s /bin/bash mobius
 # agent-browser downloads its own Chromium during `install`; we move it
 # to /opt/agent-browser so both root and the mobius user share a single
 # Chromium copy via the symlinks below (~/.agent-browser is where
-# agent-browser looks by default).
+# agent-browser looks by default). Chrome for Testing publishes no Linux
+# ARM64 build, so arm64 images install Debian's Chromium instead; the trusted
+# agent-browser config below points agent turns at it.
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
 ARG CODEX_VERSION=0.157.1
@@ -60,7 +62,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       --allow-scripts="@openai/codex@${CODEX_VERSION},agent-browser@${AGENT_BROWSER_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "agent-browser@${AGENT_BROWSER_VERSION}" \
-    && agent-browser install \
+    && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
+         apt-get install -y --no-install-recommends chromium \
+         && mkdir -p /root/.agent-browser; \
+       else \
+         agent-browser install; \
+       fi \
     && mv /root/.agent-browser /opt/agent-browser \
     && chown -R mobius:mobius /opt/agent-browser \
     && git_version="$(git --version | awk '{print $3}')" \
@@ -119,9 +126,15 @@ RUN ln -s /opt/agent-browser /root/.agent-browser \
 
 # Agent turns point AGENT_BROWSER_CONFIG here so untrusted workspace config
 # cannot register executable plugins. Runtime settings still travel through
-# explicit AGENT_BROWSER_* environment variables owned by chat.py.
+# explicit AGENT_BROWSER_* environment variables owned by chat.py. On arm64
+# this image-owned file also names the Debian Chromium installed above, since
+# no downloaded Chrome for Testing exists there.
 RUN install -d -m 0755 /app \
-    && printf '{}\n' > /app/agent-browser-config.json \
+    && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
+         printf '{"executablePath": "/usr/bin/chromium"}\n'; \
+       else \
+         printf '{}\n'; \
+       fi > /app/agent-browser-config.json \
     && chmod 0644 /app/agent-browser-config.json
 
 # openai/codex-plugin-cc — Claude Code plugin that exposes Codex as a

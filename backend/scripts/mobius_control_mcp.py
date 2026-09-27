@@ -898,7 +898,11 @@ def _call_list_agents(arguments: dict[str, Any]) -> dict:
     raise ValueError("list_agents takes only an optional helper")
   if arguments.get("helper"):
     row = _find_helper(arguments["helper"])
-    detail = _agent_api_call("GET", f"/api/delegations/{row['id']}")
+    # Reading a finished result is receiving it: the platform records that,
+    # so it does not wake this chat later to deliver the same result again.
+    detail = _agent_api_call(
+      "POST", f"/api/delegations/{row['id']}/result-read", {},
+    )
     return _helper_view(detail, result=True)
   return {"helpers": [_helper_view(row) for row in _helper_rows()]}
 

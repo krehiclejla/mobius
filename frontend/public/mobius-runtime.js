@@ -1255,8 +1255,7 @@ function makeStorage({ appId, appInstanceId = null, getToken, isOnline = null })
 			const entries = [];
 			let cursor = null;
 			for (let guard = 0; guard < 1e4; guard++) {
-				const include = options.includeContent ? "&include_content=true" : "";
-				const q = `?limit=${options.includeContent ? 16 : 500}${include}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+				const q = `?limit=500${options.includeContent ? "&include_content=true" : ""}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
 				const res = await fetchWithAppToken(getToken, `/api/storage/apps-list/${appId}/${prefix || ""}${q}`, {}, fetchBounded);
 				if (!res.ok) throw new Error(`HTTP ${res.status}`);
 				const body = await res.json();

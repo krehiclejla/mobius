@@ -81,6 +81,35 @@ async def acquire_codex_session_activity_async(
   return ownership
 
 
+def codex_home_in_use(data_dir: str | Path, *, proc_root: Path = Path("/proc")) -> bool:
+  """Whether any process holds a file inside CODEX_HOME open.
+
+  Möbius launchers hold the shared lock, but a Codex CLI started from an
+  agent's shell does not. Every Codex process keeps its rollout or SQLite
+  stores open while it works, so an open descriptor beneath CODEX_HOME is the
+  evidence that covers those too. The sweep's own lock descriptor names the
+  directory itself, not a path inside it.
+  """
+  home = os.path.join(os.path.realpath(Path(data_dir) / "cli-auth" / "codex"), "")
+  try:
+    pids = [name for name in os.listdir(proc_root) if name.isdigit()]
+  except OSError:
+    return False
+  for pid in pids:
+    fd_dir = proc_root / pid / "fd"
+    try:
+      descriptors = os.listdir(fd_dir)
+    except OSError:
+      continue
+    for descriptor in descriptors:
+      try:
+        if os.readlink(fd_dir / descriptor).startswith(home):
+          return True
+      except OSError:
+        continue
+  return False
+
+
 def try_acquire_codex_session_sweep(
   data_dir: str | Path,
 ) -> CodexSessionLock | None:

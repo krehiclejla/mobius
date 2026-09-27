@@ -1251,6 +1251,15 @@ async def test_codex_synthesis_disables_tools_and_isolates_cwd(
     if value == "--disable"
   }
   assert {"shell_tool", "unified_exec", "apps", "browser_use"} <= disabled
+  configured = {
+    captured["cmd"][index + 1]
+    for index, value in enumerate(captured["cmd"][:-1])
+    if value == "--config"
+  }
+  # Native sub-agents come back via the model catalog unless agents are off.
+  assert {
+    "agents.enabled=false", "features.multi_agent_v2.enabled=false",
+  } <= configured
 
 
 def test_latest_compaction_brief_reads_newest_portable_seed():

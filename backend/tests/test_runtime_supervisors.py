@@ -7,8 +7,10 @@ import pytest
 
 from app.broadcast import SystemBroadcast
 from app.runtime_supervisors import (
+  PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS,
+  PROVIDER_SESSION_RETENTION_INTERVAL_SECS,
   RuntimeSupervisors,
-  sweep_provider_sessions_if_idle,
+  provider_retention_delay_after,
 )
 
 
@@ -29,60 +31,21 @@ class _EmptySession:
     return False
 
 
-class _RetentionRegistry:
-  def __init__(self, idle=True):
-    self.idle = idle
-    self.closed = False
-    self.reopened = False
-    self.lease = None
-
-  def acquire_quiescing_admission_lease(self):
-    self.closed = True
-    self.lease = object()
-    return self.lease
-
-  def is_idle(self):
-    return self.idle
-
-  def release_admission_lease(self, lease):
-    assert lease is self.lease
-    self.reopened = True
-    self.closed = False
-
-
-@pytest.mark.asyncio
-async def test_provider_retention_defers_after_a_bounded_active_runner_wait():
-  called = False
-
-  def sweep(_data_dir):
-    nonlocal called
-    called = True
-    return {}
-
-  result = await sweep_provider_sessions_if_idle(
-    "/data", sweep=sweep, runner_registry=_RetentionRegistry(idle=False),
-    quiesce_timeout_secs=0,
-  )
-
-  assert result["status"] == "deferred_active"
-  assert result["waited_seconds"] >= 0
-  assert called is False
-
-
-@pytest.mark.asyncio
-async def test_provider_retention_reopens_admission_after_failure():
-  registry = _RetentionRegistry()
-
-  def fail(_data_dir):
-    raise RuntimeError("sweep failed")
-
-  with pytest.raises(RuntimeError, match="sweep failed"):
-    await sweep_provider_sessions_if_idle(
-      "/data", sweep=fail, runner_registry=registry,
-    )
-
-  assert registry.reopened is True
-  assert registry.closed is False
+def test_retention_retries_soon_while_codex_is_busy_or_a_backlog_remains():
+  """The sweep waits only for Codex, so a skipped or partial pass must not
+  leave a busy installation's backlog for another six hours."""
+  assert provider_retention_delay_after(
+    {"status": "skipped_active"},
+  ) == PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS
+  assert provider_retention_delay_after(
+    {"status": "completed", "stores": {"complete": False}},
+  ) == PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS
+  assert provider_retention_delay_after(
+    {"status": "completed", "stores": {"complete": True}},
+  ) == PROVIDER_SESSION_RETENTION_INTERVAL_SECS
+  assert provider_retention_delay_after(
+    {"status": "completed", "stores": {"status": "failed"}},
+  ) == PROVIDER_SESSION_RETENTION_INTERVAL_SECS
 
 
 @pytest.mark.asyncio
@@ -441,3 +404,25 @@ async def test_stalled_delegation_wake_cannot_block_other_recovery(
   assert "autopilot-lease-recovery" in supervisors._tasks
   await supervisors.stop()
   assert supervisors._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_boot_file_cache_reclaim_runs_off_the_event_loop_and_failure_stays_optional(
+  monkeypatch,
+):
+  import app.file_cache as file_cache
+  supervisors = _supervisors()
+  loop_thread = threading.get_ident()
+  calls = []
+
+  def reclaim(data_dir):
+    calls.append((data_dir, threading.get_ident()))
+    raise OSError("advice unavailable")
+
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", reclaim)
+  supervisors.reclaim_boot_file_cache()
+  await supervisors._tasks["boot-file-cache-reclaim"]
+
+  assert [data_dir for data_dir, _thread in calls] == ["/tmp"]
+  assert calls[0][1] != loop_thread
+  await supervisors.stop()

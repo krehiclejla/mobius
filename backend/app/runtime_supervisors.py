@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from pathlib import Path
 from typing import Protocol
 
@@ -31,10 +30,9 @@ AUTOPILOT_LEASE_RECOVERY_INTERVAL_SECS = 60.0
 CAPACITY_MONITOR_INTERVAL_SECS = 300.0
 CAPACITY_MONITOR_DOMAIN_EVERY_N_TICKS = 6
 PROVIDER_SESSION_RETENTION_INTERVAL_SECS = 6 * 60 * 60
-# Retention may briefly close new-run admission so a busy installation gets a
-# real maintenance opportunity. Existing runs are never stopped.
-PROVIDER_SESSION_RETENTION_QUIESCE_TIMEOUT_SECS = 30.0
-PROVIDER_SESSION_RETENTION_QUIESCE_POLL_SECS = 0.25
+# A Codex-only sweep skipped by an active Codex, or stopped by its store budget,
+# retries this soon; it blocks nothing but Codex launches, and only briefly.
+PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS = 5 * 60
 # OOM watchdog: the counter read is a single tiny file, but the per-tick process
 # sample walks the cgroup, so we sample fast only through the boot window (when a
 # resume burst can OOM) and back off afterwards. The kernel's oom_kill counter is
@@ -54,48 +52,18 @@ class RuntimeSettings(Protocol):
   data_dir: str
 
 
-async def sweep_provider_sessions_if_idle(
-  data_dir: str,
-  *,
-  sweep=None,
-  runner_registry=None,
-  quiesce_timeout_secs: float = PROVIDER_SESSION_RETENTION_QUIESCE_TIMEOUT_SECS,
-) -> dict:
-  """Run retention after a bounded, non-disruptive runner drain.
+def provider_retention_delay_after(result: dict) -> float:
+  """Seconds until the next Codex retention sweep.
 
-  Closing admission first prevents a busy installation from continually
-  missing the instant when it happens to be idle. Existing runners drain
-  normally; a timeout defers maintenance rather than interrupting work.
+  The sweep waits only for Codex (its lock plus open-file evidence), never for
+  unrelated agents, so a skipped or budget-limited pass retries soon instead
+  of leaving a busy installation's backlog for another six hours.
   """
-  if sweep is None:
-    from app.provider_session_retention import sweep_stale_provider_sessions
-    sweep = sweep_stale_provider_sessions
-  if runner_registry is None:
-    from app.runner_registry import registry
-    runner_registry = registry
-  lease = runner_registry.acquire_quiescing_admission_lease()
-  if lease is None:
-    return {"status": "skipped_competing_maintenance"}
-  try:
-    started = time.monotonic()
-    deadline = started + max(0.0, quiesce_timeout_secs)
-    while not runner_registry.is_idle():
-      remaining = deadline - time.monotonic()
-      if remaining <= 0:
-        return {
-          "status": "deferred_active",
-          "waited_seconds": time.monotonic() - started,
-        }
-      await asyncio.sleep(
-        min(PROVIDER_SESSION_RETENTION_QUIESCE_POLL_SECS, remaining),
-      )
-    result = await asyncio.to_thread(sweep, data_dir)
-    return {
-      "waited_seconds": time.monotonic() - started,
-      **result,
-    }
-  finally:
-    runner_registry.release_admission_lease(lease)
+  if result.get("status") == "skipped_active":
+    return PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS
+  if not (result.get("stores") or {}).get("complete", True):
+    return PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS
+  return PROVIDER_SESSION_RETENTION_INTERVAL_SECS
 
 
 class RuntimeSupervisors:
@@ -123,6 +91,24 @@ class RuntimeSupervisors:
     self._tasks[name] = asyncio.create_task(
       coroutine, name=f"mobius:{name}",
     )
+
+  def reclaim_boot_file_cache(self) -> None:
+    """Release file pages boot left cached, once the server is ready.
+
+    Boot reconciles the platform checkout, may finish an update swap, and
+    bootstraps apps before any turn exists, so no settled-turn cleanup follows
+    that git and tool I/O. One pass at readiness, off the event loop.
+    """
+    async def reclaim():
+      from app.file_cache import reclaim_background_work_cache
+      try:
+        await asyncio.to_thread(
+          reclaim_background_work_cache, self.settings.data_dir,
+        )
+      except Exception:
+        self.log.debug("boot file cache advice failed", exc_info=True)
+
+    self._spawn("boot-file-cache-reclaim", reclaim())
 
   async def start_process_services(self) -> None:
     """Start services that are safe without a serviceable database."""
@@ -521,35 +507,36 @@ class RuntimeSupervisors:
 
     async def provider_session_retention_loop():
       # Codex rollout JSONL is resumable context, not permanent owner data.
-      # Startup owns the immediate, pre-DB sweep. Periodic cleanup may run only
-      # while runner admission is atomically closed on an idle registry; mtime
-      # alone cannot protect a rollout racing with thread_resume on Unix.
+      # Startup owns the immediate, pre-DB sweep. Periodic sweeps need only
+      # Codex to be idle: the exclusive Codex lock excludes every Möbius
+      # launcher (a rollout cannot race thread_resume), and open-file evidence
+      # excludes a Codex started outside them. Other agents keep running.
+      from app.provider_session_retention import sweep_stale_provider_sessions
+      # The startup sweep is budget-limited; follow up on any backlog soon.
+      delay = PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS
       while True:
-        await asyncio.sleep(PROVIDER_SESSION_RETENTION_INTERVAL_SECS)
+        await asyncio.sleep(delay)
+        delay = PROVIDER_SESSION_RETENTION_INTERVAL_SECS
         try:
-          result = await sweep_provider_sessions_if_idle(
-            self.settings.data_dir,
+          result = await asyncio.to_thread(
+            sweep_stale_provider_sessions, self.settings.data_dir,
           )
-          if result["status"] == "deferred_active":
-            self.log.info(
-              "provider session retention deferred after %.1fs waiting for active agents",
-              result["waited_seconds"],
-            )
-            continue
-          if result["status"] == "skipped_competing_maintenance":
-            self.log.info(
-              "provider session retention skipped by another maintenance boundary",
-            )
-            continue
+          delay = provider_retention_delay_after(result)
           if result["status"] == "skipped_active":
             self.log.info(
-              "provider session retention skipped while an external Codex process holds its lock",
+              "provider session retention skipped while Codex is active",
             )
             continue
           if result["reclaimed_bytes"]:
             self.log.info(
               "provider session retention reclaimed %d bytes from %d files",
               result["reclaimed_bytes"], result["removed_files"],
+            )
+          if result.get("store_reclaimed_bytes"):
+            self.log.info(
+              "Codex store compaction reclaimed %d bytes (complete=%s)",
+              result["store_reclaimed_bytes"],
+              result.get("stores", {}).get("complete"),
             )
           if result["errors"]:
             self.log.warning(

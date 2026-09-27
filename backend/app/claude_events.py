@@ -81,11 +81,19 @@ class NativeContinuationTracker:
 
   Ordinary background shells can run forever, so they never own turn
   completion here.
+
+  A resumed session can also report a task its previous CLI process started
+  and never settled (the process was stopped mid-task, for example by a
+  restart). Claude answers that inherited notification with its own model-less
+  turn and result *before* reading the new query, so that result is not the
+  owner turn's boundary either.
   """
 
   _active_tasks: set[str] = field(default_factory=set)
   _tasks_seen_at_result: set[str] = field(default_factory=set)
   _settled_before_result: bool = False
+  _started_tasks: set[str] = field(default_factory=set)
+  _inherited_notification: bool = False
 
   @property
   def pending_count(self) -> int:
@@ -99,10 +107,13 @@ class NativeContinuationTracker:
   ) -> None:
     if not task_id:
       return
+    self._started_tasks.add(task_id)
     if task_type in DEFERRING_TASK_TYPES:
       self._active_tasks.add(task_id)
 
   def task_finished(self, task_id: str | None) -> None:
+    if task_id and task_id not in self._started_tasks:
+      self._inherited_notification = True
     if not task_id or task_id not in self._active_tasks:
       return
     self._active_tasks.discard(task_id)
@@ -119,6 +130,20 @@ class NativeContinuationTracker:
     closes the continuation instead of opening another one.
     """
     self._settled_before_result = False
+
+  def is_inherited_notification_result(
+    self, num_turns: int | None, is_error: bool,
+  ) -> bool:
+    """Whether one result only closes Claude's turn for an inherited task.
+
+    Every result ends whatever turn Claude opened for an earlier inherited
+    notification, so the marker clears here. Only a clean result that ran no
+    model turn is that notification's own answer; a result with model turns
+    (or an error) belongs to the query and keeps its ordinary handling.
+    """
+    inherited = self._inherited_notification
+    self._inherited_notification = False
+    return inherited and not is_error and not num_turns
 
   def observe_result(self) -> bool:
     """Record one result; return whether it is not yet the run boundary."""
@@ -237,6 +262,12 @@ def _format_tool_output(content: Any) -> str:
   return json.dumps(content, ensure_ascii=True)
 
 
+# Möbius delivers a steer or Stop through the CLI's interrupt (its Esc key),
+# and the CLI answers a tool call it cuts with an error result starting with
+# this refusal. Nobody refused the call, so the chat shows why it was cut.
+CLI_CUT_RESULT_PREFIX = "The user doesn't want to proceed with this tool use."
+
+
 def _server_web_search_input(inp: dict[str, Any]) -> str:
   """Return the displayed query from Claude's server web_search input."""
   if not isinstance(inp, dict):
@@ -341,8 +372,12 @@ def dispatch_sdk_message(
   current_session_id: str | None,
   native_work: NativeContinuationTracker | None = None,
   usage_state: dict[str, Any] | None = None,
+  cut_label: str | None = None,
 ) -> tuple[str | None, dict | None]:
   """Translates one SDK message into broadcast events.
+
+  ``cut_label`` is how the chat shows a tool call this turn's own steer or
+  Stop cut, in place of the CLI's refusal text.
 
   Returns ``(new_session_id, terminal_result_or_None)``. When the
   message is a ResultMessage, the caller receives the final result
@@ -690,6 +725,11 @@ def dispatch_sdk_message(
     for block in content:
       if isinstance(block, ToolResultBlock):
         output = _format_tool_output(block.content)
+        is_error = block.is_error
+        if (
+          cut_label and is_error and output.startswith(CLI_CUT_RESULT_PREFIX)
+        ):
+          output, is_error = cut_label, False
         # Carry the tool_use_id (matches the ToolUseBlock's .id) so the sink can
         # key a stash of the full output and the block can fetch it by id.
         bc.publish({
@@ -697,7 +737,7 @@ def dispatch_sdk_message(
           "content": output,
           "tool_use_id": block.tool_use_id,
           "output_complete": True,
-          **({"output_exit_code": 1} if block.is_error else {}),
+          **({"output_exit_code": 1} if is_error else {}),
         })
         if output.startswith("Web search results for query"):
           sources = sources_from_websearch_text(output)

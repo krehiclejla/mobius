@@ -141,7 +141,7 @@ function useChatAppArtifactsQuery(chatId, { enabled = true } = {}) {
   })
 }
 
-function useAppsQuery({ reconcile, enabled = true } = {}) {
+function useAppsQuery({ reconcile, enabled = true, staleTime } = {}) {
   return useQuery({
     queryKey: appsKey,
     queryFn: async (context) => {
@@ -149,6 +149,7 @@ function useAppsQuery({ reconcile, enabled = true } = {}) {
       return reconcile ? reconcile(rows) : rows
     },
     enabled,
+    ...(staleTime === undefined ? {} : { staleTime }),
   })
 }
 

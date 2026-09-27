@@ -457,11 +457,13 @@ async def _fork_codex_async(
       _codex_rollout(codex_home, source_session_id), after_call_id
     )
   )
-  config_overrides = _codex_mcp_isolation_overrides(
+  from app.providers import CODEX_NATIVE_HELPERS_OFF
+
+  config_overrides = (*_codex_mcp_isolation_overrides(
     cwd,
     env,
     runner=mcp_inventory_runner,
-  )
+  ), *CODEX_NATIVE_HELPERS_OFF)
   config = CodexConfig(
     codex_bin=shutil.which("codex"),
     cwd=cwd,

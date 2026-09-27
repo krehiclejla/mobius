@@ -20,6 +20,18 @@ from app import app_cron, app_jobs, models
 from app.config import get_settings
 
 
+@pytest.fixture(autouse=True)
+def background_cache_advice(monkeypatch):
+  """Runner tests record cache advice instead of advising real host tools."""
+  import app.file_cache as file_cache
+  calls = []
+  monkeypatch.setattr(
+    file_cache, "reclaim_background_work_cache",
+    lambda data_dir: calls.append(Path(data_dir)),
+  )
+  return calls
+
+
 def _accepted_context(source, app_id=57):
   runtime = source.parent.parent / "app-runtime" / str(app_id) / ("a" * 64)
   shutil.copytree(source, runtime, dirs_exist_ok=True)
@@ -794,3 +806,51 @@ def test_missing_runtime_context_never_executes_editable_source(tmp_path, monkey
   context = {"source_dir": str(source)}
   assert runner._runtime_job(7, job, context) is None
   assert runner._runtime_job(7, job, {**context, "runtime_dir": None}) is None
+
+
+def _finished_job_runner(tmp_path, monkeypatch, *, exit_code):
+  runner = _load_runner()
+  data_dir = tmp_path / "data"
+  source = data_dir / "apps" / "memory"
+  source.mkdir(parents=True)
+  job = source / "fetch.sh"
+  job.write_text("#!/bin/sh\nexit 0\n")
+  job.chmod(0o755)
+  monkeypatch.setattr(runner, "DATA_DIR", data_dir)
+  monkeypatch.setattr(runner, "SUPERVISOR_LOG", data_dir / "cron-logs" / "app-jobs.log")
+  monkeypatch.setattr(runner, "_mint_app_token", lambda _app_id: "app-token")
+  monkeypatch.setattr(runner, "_app_is_live", lambda *_args: True)
+  monkeypatch.setattr(
+    runner, "_job_context", lambda *_args: _accepted_context(source),
+  )
+  monkeypatch.setattr(runner.os, "getsid", lambda _pid: os.getpid())
+  monkeypatch.setattr(
+    runner.subprocess, "Popen",
+    lambda *_args, **_kwargs: types.SimpleNamespace(wait=lambda: exit_code),
+  )
+  monkeypatch.setattr(runner.sys, "argv", ["app-job-runner.py", "57", str(job)])
+  return runner, data_dir
+
+
+def test_finished_job_releases_background_file_cache(
+  tmp_path, monkeypatch, background_cache_advice,
+):
+  """A job's git/tool reads must not stay billable memory after it exits."""
+  runner, data_dir = _finished_job_runner(tmp_path, monkeypatch, exit_code=3)
+
+  assert runner.run() == 3
+  assert background_cache_advice == [data_dir]
+
+
+def test_cache_advice_failure_never_changes_the_job_outcome(tmp_path, monkeypatch):
+  import app.file_cache as file_cache
+  runner, data_dir = _finished_job_runner(tmp_path, monkeypatch, exit_code=0)
+
+  def unavailable(_data_dir):
+    raise OSError("advice unavailable")
+
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", unavailable)
+
+  assert runner.run() == 0
+  log = (data_dir / "cron-logs" / "app-jobs.log").read_text()
+  assert "file cache advice failed" in log

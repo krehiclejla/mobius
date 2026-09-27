@@ -1641,8 +1641,11 @@ async def drain_all_for_restart(
   async def _stop_candidate(chat_id: str, handles: list) -> bool:
     all_interrupted = True
     for handle in handles:
+      # Every parked turn must stay resumable; a handle whose stop would end
+      # its work for good offers suspend (see RunnerHandle).
+      end = getattr(handle, "suspend", None) or handle.stop
       try:
-        stopped = await handle.stop(
+        stopped = await end(
           timeout=min(RESTART_HANDLE_STOP_TIMEOUT_SECS, timeout)
         )
       except asyncio.CancelledError:
@@ -4961,6 +4964,36 @@ def _should_enable_coordination_tools(
   )
 
 
+async def _refuse_delegated_write_replay(
+  *, bc, db, chat_id: str, run_token: str | None, run_gen: int | None,
+  provider_id: str | None, agent_activity_binding,
+) -> chat_queue.TerminalDisposition:
+  """End a write helper's turn whose earlier session cannot be resumed.
+
+  Its durable history is intact, but replaying write work from it is the
+  parent's decision, never an automatic one.
+  """
+  from app.delegations import REVIEW_REQUIRED_MARKER
+  sink = _ChatEventSink(
+    bc, chat_id, run_token=run_token,
+    agent_activity_binding=agent_activity_binding,
+  )
+  register_active_sink(chat_id, sink)
+  sink.publish({
+    "type": "error",
+    "message": (
+      f"{REVIEW_REQUIRED_MARKER}: The delegated write session could not be "
+      "resumed. Its durable history is intact, but Möbius will not replay "
+      "write work automatically. Review the child history and start a new "
+      "task if another pass is needed."
+    ),
+  })
+  return await _complete_turn(
+    bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
+    provider_id=provider_id, cost_usd=0, close_browser=False,
+  )
+
+
 async def _run_chat_impl_with_db(
   messages: list[schemas.ChatMessage],
   chat_id: str = "",
@@ -5157,11 +5190,13 @@ async def _run_chat_impl_with_db(
   )
 
   # Helper completion is durable activity, not human conversation. Ordinary
-  # owner turns intentionally receive every available result in this chat;
+  # turns intentionally receive every available result in this chat;
   # automatic activity continuations are bound to their exact source work so
-  # one logical root cannot admit or consume a sibling root's result.
+  # one logical root cannot admit or consume a sibling root's result. A
+  # delegated helper that started its own helpers is their parent too: its
+  # turns receive and latch those results exactly like a top-level chat's.
   activity_results: tuple[tuple[str, str], ...] = ()
-  if run_policy is None and chat_id:
+  if chat_id:
     from app.delegations import (
       activity_continuation_delivery_source_work_id,
       build_delegation_result_context,
@@ -5476,14 +5511,22 @@ async def _run_chat_impl_with_db(
   if startup_context:
     system_prompt = f"{system_prompt}\n\n{startup_context}"
 
+  # A delegated helper's task exists only in its own transcript. A helper that
+  # starts a fresh provider session after earlier turns (its first turn ended
+  # before the provider named a session, or it never started) would otherwise
+  # receive only this turn's input — a restart continuation or a follow-up —
+  # and work without its task. Such a session is seeded with that history.
+  fresh_delegated_session = (
+    run_policy is not None and not session_id and len(messages) > 1
+  )
   # A close() below detaches chat_row. Precompute the only provider-time value
-  # that still reads it (the bounded Claude fallback for a missing CLI
-  # transcript) while the Session can refresh attributes expired by the
+  # that still reads it (the bounded fallback for a session that cannot be
+  # resumed) while the Session can refresh attributes expired by the
   # prompt/settings snapshot commits.
   resumed_context_fallback = (
-    _build_resumed_context(chat_row)
+    _build_resumed_context(chat_row, keep_task=run_policy is not None)
     if (
-      session_id
+      (session_id or fresh_delegated_session)
       and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
       and (run_policy is None or run_policy.allow_session_reseed)
     )
@@ -5575,6 +5618,15 @@ async def _run_chat_impl_with_db(
     if run_policy is not None
     else str(data_dir) if data_dir.exists() else str(Path.cwd())
   )
+
+  if fresh_delegated_session:
+    if not run_policy.allow_session_reseed:
+      return await _refuse_delegated_write_replay(
+        bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
+        provider_id=provider_id, agent_activity_binding=agent_activity_binding,
+      )
+    if resumed_context_fallback:
+      user_message = f"{resumed_context_fallback}\n\n{user_message}"
 
   # SDK dispatch: route both Claude and Codex through their official
   # Agent SDK runners.
@@ -5756,24 +5808,10 @@ async def _run_chat_impl_with_db(
       session_id, cwd, sdk_env.get("CLAUDE_CONFIG_DIR")
     ):
       if run_policy is not None and not run_policy.allow_session_reseed:
-        from app.delegations import REVIEW_REQUIRED_MARKER
-        sink = _ChatEventSink(
-          bc, chat_id, run_token=run_token,
+        return await _refuse_delegated_write_replay(
+          bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
+          provider_id=provider_id,
           agent_activity_binding=agent_activity_binding,
-        )
-        register_active_sink(chat_id, sink)
-        sink.publish({
-          "type": "error",
-          "message": (
-            f"{REVIEW_REQUIRED_MARKER}: The delegated write session could "
-            "not be resumed after restart. Its durable history is intact, but "
-            "Möbius will not replay write work automatically. Review the child "
-            "history and start a new task if another pass is needed."
-          ),
-        })
-        return await _complete_turn(
-          bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
-          provider_id=provider_id, cost_usd=0, close_browser=False,
         )
       log.warning(
         "claude session %s for chat %s has no resumable transcript; "

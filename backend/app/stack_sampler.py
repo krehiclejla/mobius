@@ -35,6 +35,8 @@ _WAIT_FRAMES: frozenset[tuple[str, str]] = frozenset({
   # Codex's client blocks on line reads from its app-server's pipes.
   ("openai_codex/client.py", "_read_message"),
   ("openai_codex/client.py", "_drain"),
+  # Watchdog's inotify reader blocks in poll() with no timeout between events.
+  ("watchdog/observers/inotify_c.py", "do_poll"),
 })
 
 _APP_ROOT = str(Path(__file__).resolve().parent) + "/"

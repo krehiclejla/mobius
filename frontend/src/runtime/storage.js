@@ -1434,13 +1434,12 @@ export function makeStorage({ appId, appInstanceId = null, getToken, isOnline = 
       let cursor = null
       for (let guard = 0; guard < 10000; guard++) {
         const include = options.includeContent ? '&include_content=true' : ''
-        // The server's include-content contract allows at most 64 KiB per
-        // JSON file and 1 MiB per page. Ask for at most 16 content-bearing
-        // entries so every valid file selected for the page can fit the I/O
-        // budget. This turns list({includeContent:true}) into a complete,
-        // bounded batch primitive instead of forcing callers to rediscover an
-        // N+1 fallback when a 500-entry metadata page exhausts the byte cap.
-        const pageLimit = options.includeContent ? 16 : 500
+        // Include-content pages carry at most 64 KiB per JSON file and 1 MiB
+        // in total; the server ends a page at that budget and resumes at the
+        // next unread body, so a full-size request still receives every
+        // eligible body. Full pages keep a large collection to a handful of
+        // requests (each rescans the directory) instead of hundreds.
+        const pageLimit = 500
         const q = `?limit=${pageLimit}${include}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
         const res = await fetchWithAppToken(
           getToken,

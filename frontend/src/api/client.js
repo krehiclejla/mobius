@@ -1294,6 +1294,13 @@ export const api = {
         method: 'POST',
       }),
     },
+    // Idempotent: the server writes only when the zone changed.
+    timezone: {
+      save: (timezone) => apiFetch('/owner/timezone', {
+        method: 'PUT',
+        body: JSON.stringify({ timezone }),
+      }),
+    },
   },
   theme: {
     get: () => apiFetch('/theme'),

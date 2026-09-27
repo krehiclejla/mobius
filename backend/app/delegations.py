@@ -1313,11 +1313,32 @@ def _activity_continuation_run_id(db: Session, row: models.Delegation) -> str:
   Keyed by the result (its child run), not the helper: a follow-up result
   must open its own continuation instead of attaching to the finished one
   that delivered the helper's earlier result.
+
+  A completed continuation whose admitted envelope does not name this
+  helper never received its result (an earlier delegated parent's checkpoint
+  admitted none), so the still-owed result gets one retry identity. A
+  nonterminal one keeps the original identity for restart recovery, and a
+  retry that also ends without it is not retried again.
   """
   result_run_id = current_result_run_ids(db, [row.id]).get(row.id, "")
   basis = f"{row.parent_chat_id}\0{row.id}\0{result_run_id}"
-  digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()
-  return f"{_ACTIVITY_RUN_PREFIX}{digest[:48]}"
+
+  def run_id(value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_ACTIVITY_RUN_PREFIX}{digest[:48]}"
+
+  first = run_id(basis)
+  attempt = db.query(
+    models.ChatRun.status, models.ChatRun.activity_delivery_json,
+  ).filter(
+    models.ChatRun.id == first, models.ChatRun.chat_id == row.parent_chat_id,
+  ).first()
+  if attempt is not None and attempt.status == "completed":
+    envelope = attempt.activity_delivery_json
+    admitted = envelope.get("delegation_ids") if isinstance(envelope, dict) else None
+    if row.id not in (admitted or ()):
+      return run_id(f"{basis}\0retry")
+  return first
 
 
 def _wake_message_results(message: object) -> dict[str, str | None]:
@@ -1871,6 +1892,26 @@ def mark_results_delivered(
       if updated and column is models.Delegation.delivered_run_id:
         changed.add(delegation_id)
   return changed
+
+
+def record_result_read_by_parent(db: Session, row: models.Delegation) -> bool:
+  """Record that the parent agent read this helper's settled result; no commit.
+
+  An agent can read a finished helper's result in-turn (the `list_agents`
+  control tool) before automatic delivery reaches it — a helper waiting on its
+  own sub-helpers must, because a Claude helper host is never steerable. That
+  read is receipt: without this record the result still looked owed when the
+  reader's turn ended, so the wake sweep started the reader again and it
+  repeated its whole final report to its own parent. Only the current settled
+  result is marked, so a follow-up that is still running stays owed.
+  """
+  results = settled_result_run_ids(db, [row.id])
+  if not results:
+    return False
+  return bool(mark_results_delivered(
+    db, results, incorporated=True,
+    filters=(models.Delegation.parent_chat_id == row.parent_chat_id,),
+  ))
 
 
 def _wake_recovery_groups(
@@ -2473,9 +2514,13 @@ async def steer_results_into_running_parent(
       # Never jump ahead of owner-authored or other queued work.
       if list(chat.pending_messages or []):
         return False
-      rows = _wake_eligible_rows_for_parent(db, parent_chat_id, source_work_id)
-      recorded = _recorded_parent_wake_ids(db, parent_chat_id)
-      rows = [row for row in rows if row.id not in recorded]
+      # A result the live turn already admitted into its context latches only
+      # at that turn's Finalize; steering it in again would be a duplicate.
+      rows = _wake_eligible_rows_for_parent(
+        db, parent_chat_id, source_work_id,
+        pending_ids=_recorded_parent_wake_ids(db, parent_chat_id)
+        | _delivered_to_live_parent_runs(db, {parent_chat_id}),
+      )
       if not rows:
         return False
       results = settled_result_run_ids(db, [row.id for row in rows])
@@ -2553,8 +2598,10 @@ async def _deliver_parent_wake_once(
 
   Busy, owner-question, parked, stopped, and superseded parents retain the
   durable result without queueing machine-authored input. A normal later turn
-  receives it from provider context. Existing hidden carriers remain eligible
-  only for their exact pre-upgrade recovery path.
+  receives it from provider context. A later owner turn does not supersede an
+  undelivered result, unless the owner stopped the helper's source work.
+  Existing hidden carriers remain eligible only for their exact pre-upgrade
+  recovery path.
   """
   import app.chat_queue as chat_queue
   from app.chat import is_chat_running

@@ -1507,8 +1507,11 @@ async def update_check(
       return _pending_result(pending, pending_state)
     # One digest owns the complete declared package: manifest/capabilities,
     # executable source, icon, static assets, and seeds. The one-time synthetic
-    # migration baseline has no manifest, so its first real-origin commit is
-    # intentionally offered once and then future checks compare exact packages.
+    # migration baseline of a catalog app has no manifest but does have its
+    # Git origin, so no exact compare exists: its first real-origin commit is
+    # offered once (install replaces the bridge on exactly this condition) and
+    # future checks compare exact packages. Comparing only code here would hide
+    # manifest-only releases forever.
     if "mobius.json" in recorded_tree:
       try:
         _, recorded_digest = install.package_content_digest_from_tree(
@@ -1517,6 +1520,8 @@ async def update_check(
       except install.PackageContentError:
         return _unknown()
       update_available = recorded_digest != candidate.source_digest
+    elif await asyncio.to_thread(app_git.has_origin, repo):
+      update_available = True
     else:
       try:
         capability_changes = diff_contracts(

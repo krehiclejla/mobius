@@ -3,6 +3,7 @@
 import {
   _topmostVisibleMsg,
   _scrollTopOf,
+  anchorModeDisplaced,
   anchorModeForElement,
   anchorModeFromScroll,
   contentHoldModeFromScroll,
@@ -529,6 +530,25 @@ export function modeForForegroundReturn(scrollEl) {
 export function modeForChatExit(scrollEl) {
   if (!scrollEl) return null
   return contentHoldModeFromScroll(scrollEl)
+}
+
+
+/** Whether a surface relinquishing the reading coordinate must re-measure it
+ *  from physical geometry instead of transferring its settled address.
+ *
+ *  Live FOLLOW/PIN modes always freeze. A settled ANCHOR_AT transfers by its
+ *  semantic address, because a world reflow (the viewport box changed size)
+ *  makes a fresh measurement lose its nested part. With the viewport box
+ *  unchanged there is no reflow to protect against: if the viewport has moved
+ *  off the anchor anyway, the reader moved it without an owned gesture, and
+ *  what is on screen is the only true reading location. */
+export function handoffNeedsPhysicalFreeze(scrollEl, mode, observedViewport) {
+  if (mode?.kind !== 'ANCHOR_AT') return true
+  if (!scrollEl || observedViewport?.element !== scrollEl) return false
+  const viewportUnchanged = scrollEl.clientHeight > 0
+    && Math.abs(scrollEl.clientHeight - observedViewport.height) < 1
+    && Math.abs(scrollEl.clientWidth - observedViewport.width) < 1
+  return viewportUnchanged && anchorModeDisplaced(scrollEl, mode)
 }
 
 

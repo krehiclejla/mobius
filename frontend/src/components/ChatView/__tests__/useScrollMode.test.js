@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   _anchorModeIntersectsContent,
   _anchorReapplyNeeded,
+  anchorModeDisplaced,
   _computeSpacerH,
   _pinReapplyNeeded,
   applyMode,
@@ -26,6 +27,7 @@ import {
   isNearPhysicalBottom,
   layoutMayOwnScroll,
   modeForChatExit,
+  handoffNeedsPhysicalFreeze,
   modeForDisclosureToggle,
   modeForForegroundReturn,
   modeForQuestionSubmission,
@@ -2532,4 +2534,58 @@ test('durable queue anchors lose submission authority and cannot restore off-con
   const offContent = _validateSavedMode({ ...captured, offset: -500 }, [], scrollEl)
   assert.notEqual(offContent.offset, -500)
   assert.equal(offContent.submissionLayoutHold, undefined)
+})
+
+
+// Reading-position handoff: a settled anchor must not outlive a viewport the
+// reader moved without an owned gesture (momentum after the settle edge).
+function handoffScrollEl({ scrollTop, clientWidth = 400 }) {
+  return {
+    scrollHeight: 5000,
+    scrollTop,
+    clientHeight: 800,
+    clientWidth,
+    querySelector(selector) {
+      return selector === '[data-key="k-1"]' ? { offsetTop: 2000 } : null
+    },
+  }
+}
+const settledAnchor = { kind: 'ANCHOR_AT', key: 'k-1', offset: 100 }
+
+test('a settled anchor still on screen is not displaced', () => {
+  assert.equal(anchorModeDisplaced(handoffScrollEl({ scrollTop: 1900 }), settledAnchor), false)
+})
+
+test('momentum that carried the viewport past a settled anchor displaces it', () => {
+  assert.equal(anchorModeDisplaced(handoffScrollEl({ scrollTop: 2600 }), settledAnchor), true)
+})
+
+test('an unresolvable anchor is never reported displaced', () => {
+  assert.equal(anchorModeDisplaced(
+    handoffScrollEl({ scrollTop: 2600 }),
+    { kind: 'ANCHOR_AT', key: 'gone', offset: 0 },
+  ), false)
+})
+
+test('leaving a chat re-measures an anchor the reader scrolled off untracked', () => {
+  const scrollEl = handoffScrollEl({ scrollTop: 2600 })
+  const observed = { element: scrollEl, height: 800, width: 400 }
+  assert.equal(handoffNeedsPhysicalFreeze(scrollEl, settledAnchor, observed), true)
+})
+
+test('leaving a chat transfers an on-screen anchor by its semantic address', () => {
+  const scrollEl = handoffScrollEl({ scrollTop: 1900 })
+  const observed = { element: scrollEl, height: 800, width: 400 }
+  assert.equal(handoffNeedsPhysicalFreeze(scrollEl, settledAnchor, observed), false)
+})
+
+test('a reflowed viewport keeps the semantic anchor instead of re-measuring', () => {
+  const scrollEl = handoffScrollEl({ scrollTop: 2600, clientWidth: 900 })
+  const observed = { element: scrollEl, height: 800, width: 400 }
+  assert.equal(handoffNeedsPhysicalFreeze(scrollEl, settledAnchor, observed), false)
+})
+
+test('live follow still freezes physically on handoff', () => {
+  const scrollEl = handoffScrollEl({ scrollTop: 4200 })
+  assert.equal(handoffNeedsPhysicalFreeze(scrollEl, { kind: 'FOLLOW_BOTTOM' }, null), true)
 })

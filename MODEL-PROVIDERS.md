@@ -3,8 +3,12 @@
 An installed app may declare one model provider in `mobius.json`. The accepted
 capability contract, rather than editable source, is projected into the same
 provider registry used by chats, model pickers, app pickers, and background
-agents. The provider appears shortly after install/Apply and disappears shortly
-after uninstall (registry reads are throttled for one second). Existing chats
+agents. That includes owner-built local apps: their `mobius.json` declaration
+is accepted with each source Apply (and kept across owner permission edits),
+limited to the HTTPS app-secret transport below; the broker transport stays
+reserved for the reviewed Möbius · You package. The provider appears shortly
+after install/Apply and disappears shortly after uninstall (registry reads are
+throttled for one second). Existing chats
 retain their saved provider/model selection but
 cannot run it while the provider app is absent; Möbius does not silently send
 those chats to a different company.

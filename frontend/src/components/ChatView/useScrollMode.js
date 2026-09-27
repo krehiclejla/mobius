@@ -101,6 +101,7 @@ import {
   composerTailIntentRequestsFollow,
   delayedSendWillPin,
   gestureLayoutRetryDelay,
+  handoffNeedsPhysicalFreeze,
   layoutMayOwnScroll,
   modeAfterQuestionResponseStart,
   modeAfterReaderGesture,
@@ -600,9 +601,14 @@ export default function useScrollMode({
         readerLocationExplicitRef.current = true
         // Main-effect cleanup has already settled pending input to ANCHOR_AT.
         // Preserve that address: re-measuring after a world reflow can lose its
-        // nested part. Live FOLLOW/PIN modes still need one physical freeze.
+        // nested part. Live FOLLOW/PIN modes still need one physical freeze,
+        // as does an anchor the reader moved off without an owned gesture.
         persistMode({
-          freezeToCurrentPosition: modeRef.current.kind !== 'ANCHOR_AT',
+          freezeToCurrentPosition: handoffNeedsPhysicalFreeze(
+            scrollRef.current,
+            modeRef.current,
+            observedScrollViewportRef.current,
+          ),
         })
       }
       readingPositionOwnerRef.current = false
