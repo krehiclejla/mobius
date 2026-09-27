@@ -111,6 +111,8 @@ def _public_host_html(app: models.App, token: str) -> str:
     },
   }
   script_url = f"/{PUBLIC_HOST_SCRIPT}?v={_host_script_rev()}"
+  # The app document is opaque-origin, so delegated features must name `*`:
+  # a bare entry targets only the src origin (see APP_FRAME_ALLOW in the shell).
   return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -135,7 +137,7 @@ def _public_host_html(app: models.App, token: str) -> str:
   </style>
 </head>
 <body>
-  <iframe id="app" title="{title}"></iframe>
+  <iframe id="app" title="{title}" allow="fullscreen *; gamepad *"></iframe>
   <div id="status" role="status">Opening {title}…</div>
   <script type="application/json" id="mobius-public-host">{_json_for_slot(config)}</script>
   <script type="module" src="{script_url}"></script>

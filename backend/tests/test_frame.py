@@ -86,6 +86,30 @@ def test_frame_returns_etag_and_cache_control(client, owner_token):
   assert "allow-same-origin" not in sandbox
 
 
+def test_app_frame_lets_games_lock_the_pointer_without_gaining_origin_authority(
+  client, owner_token,
+):
+  """Desktop mouse-look needs pointer lock in the app frame itself.
+
+  Sandbox flags are inherited, so a packaged game's own static-embed grant is
+  inert unless its enclosing app frame carries the flag too. The grant must not
+  bring any origin, modal, or unconditional top-navigation authority with it.
+  """
+  app_id = _make_app(
+    client, {"Authorization": f"Bearer {owner_token}"}, "pointer-lock-test",
+  )
+
+  policy = client.get(f"/api/apps/{app_id}/frame").headers[
+    "content-security-policy"
+  ]
+  sandbox = policy.split(";", 1)[0].split()
+  assert sandbox[0] == "sandbox"
+  assert "allow-pointer-lock" in sandbox
+  assert "allow-same-origin" not in sandbox
+  assert "allow-modals" not in sandbox
+  assert "allow-top-navigation" not in sandbox
+
+
 def test_loopback_frame_can_fetch_from_its_delivery_origin(
   client, owner_token,
 ):

@@ -69,7 +69,12 @@ def app_frame_csp(
   if gateway is not None and gateway != origin:
     frame_sources.append(gateway)
   return (
-    "sandbox allow-scripts allow-forms allow-popups "
+    # `allow-pointer-lock` gives games desktop mouse-look. Sandbox flags are
+    # inherited by nested frames, so without it here a packaged game's own
+    # static-embed grant (see `static_embed_csp`) could never take effect.
+    # Locking needs a user gesture and Esc always releases it; it adds no
+    # origin, storage, or navigation authority.
+    "sandbox allow-scripts allow-forms allow-pointer-lock allow-popups "
     "allow-popups-to-escape-sandbox "
     "allow-top-navigation-by-user-activation; "
     f"default-src {resource_source}; "

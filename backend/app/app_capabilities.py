@@ -378,6 +378,18 @@ RUNTIME_CAPABILITY_DEFINITIONS: dict[str, dict[str, Any]] = {
       "max_bytes": (64 * 1024, 256 * 1024 * 1024),
     },
   },
+  "device.motion": {
+    "version": 1,
+    "kind": "session",
+    "title": "Read motion and tilt",
+    "description": (
+      "Read the device's motion and orientation sensors while this app is visible."
+    ),
+    "risk": "device",
+    "lifecycle": "active_frame",
+    "default_limits": {"max_rate_hz": 60},
+    "hard_limits": {"max_rate_hz": (1, 120)},
+  },
   "workspace.screen-control": {
     "version": 1,
     "kind": "session",

@@ -832,6 +832,44 @@ useEffect(() => {
 
   Element fullscreen remains unavailable for this path on iOS. In a launch where `matchMedia('(display-mode: fullscreen)').matches`, skip the redundant request — but do not infer that iOS removed its own status bar.
 
+### Mouse-look and controllers
+
+App frames, including the shell, standalone, and public-link hosts, grant pointer
+lock and the Gamepad API directly, so a game uses the ordinary browser APIs:
+
+- **Pointer lock:** call `canvas.requestPointerLock()` from a click, then read
+  `movementX`/`movementY`. Esc always releases it; show a "click to play"
+  overlay on `pointerlockchange` when it is released. Phones have no pointer
+  lock, so keep touch controls as the mobile path.
+- **Gamepad:** poll `navigator.getGamepads()` each frame after a
+  `gamepadconnected` event. Controllers only report once the page has focus
+  and a button is pressed.
+
+For tilt or motion controls, declare `device.motion` and open it from a tap:
+the shell requests the sensor permission (iOS asks once) and streams samples
+while the app is visible. The raw sensor events are not available in the frame.
+
+```json
+"capabilities": {
+  "device.motion": { "version": 1, "reason": "Steer by tilting the phone.", "limits": { "max_rate_hz": 60 } }
+}
+```
+
+```js
+startButton.onclick = () => {
+  const motion = window.mobius.capabilities.open('device.motion', { rateHz: 60 })
+  motion.on('sample', ({ orientation, motion: m, screenAngle }) => {
+    // orientation: {alpha, beta, gamma} in degrees; m.accelerationIncludingGravity: {x, y, z}
+    // screenAngle: 0/90/180/270. Rotate tilt axes for landscape play.
+  })
+  motion.ready.catch(showTouchControls) // denied or no sensors: fall back
+  // motion.finish() when the level ends; hiding the app stops it automatically
+}
+```
+
+Desktops usually have no sensors: samples may never arrive or may carry only
+`null` values, so keep keyboard or touch controls.
+
 ### Splash / status-bar color
 
 Set `"theme_color"` and `"background_color"` (`#rrggbb`) in `mobius.json` to pin the OS splash + status-bar color to your app's own background. Omit them and Möbius defaults the status bar to the owner's current **theme** color (not a color sampled from your icon), so an undeclared app still blends with the platform.

@@ -386,7 +386,7 @@ expose shell tokens, paths, browser internals, or another app's activity.
 Add primitives only after a real app needs them. Likely families are:
 
 - `media.microphone.capture`, `media.camera.capture`
-- `device.storage`, `device.asset-cache`
+- `device.storage`, `device.asset-cache`, `device.motion`
 - `files.open`, `files.save`
 - `clipboard.read`, `clipboard.write`
 - `location.current`, `location.watch`
@@ -435,6 +435,17 @@ app-owned identifiers; values must be JSON. This storage is best-effort and
 device-local: clearing site data removes it, it is not synchronized, and it is
 not a substitute for `window.mobius.storage` when data belongs to the owner or
 must be shared between visitors.
+
+### Motion and orientation sensors
+
+`device.motion` streams `devicemotion` and `deviceorientation` readings to the
+visible frame as `sample` events. The frame cannot listen itself: iOS grants
+the sensors only after `requestPermission()` in a trusted document, and other
+browsers withhold them from cross-origin frames. The shell provider asks for
+that permission from the tap that opened the session, then emits samples no
+faster than the reviewed `max_rate_hz` (1–120, default 60). Each sample carries
+the latest motion, the orientation, and the screen angle. The session is
+`active_frame`, so hiding the app finishes it and releases the listeners.
 
 ### Large public assets stored on one device
 

@@ -23,6 +23,7 @@ import { readSafeAreaInsets, zeroInsets } from '../../lib/safeAreaInsets.js'
 import { createCapabilityHost } from '../../lib/capabilityHost.js'
 import { builtInCapabilityProviders } from '../../lib/capabilityProviders.js'
 import { clampCameraPreviewRect } from '../../lib/cameraPreview.js'
+import { APP_FRAME_ALLOW } from '../../lib/appFrameDelegation.js'
 import { requestAppCodeWarm } from '../../lib/appPrecache.js'
 import { appHostRequest } from '../../lib/appHostRequest.js'
 import {
@@ -1543,8 +1544,8 @@ const AppCanvas = forwardRef(function AppCanvas({
             style={{ opacity: loaded ? 1 : 0 }}
             src={serviceSurfaceFrameUrl(serviceSurface.url, serviceSurface.correlation)}
             title={appName || serviceSurface.slug}
-            sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-same-origin allow-top-navigation-by-user-activation"
-            allow="clipboard-read; clipboard-write; fullscreen"
+            sandbox="allow-scripts allow-forms allow-pointer-lock allow-popups allow-downloads allow-same-origin allow-top-navigation-by-user-activation"
+            allow="clipboard-read; clipboard-write; fullscreen; gamepad"
           />
         )}
         {!loaded && (
@@ -1681,7 +1682,9 @@ const AppCanvas = forwardRef(function AppCanvas({
             // withholds it.
             data-app-id={isLive ? appId : undefined}
             data-frame-version={v}
-            allow="clipboard-write; fullscreen"
+            // Pointer lock is a sandbox flag in the frame's response CSP
+            // (backend `app_frame_csp`), not a delegated feature.
+            allow={APP_FRAME_ALLOW}
             allowFullScreen
             onLoad={() => handleFrameLoad(v)}
           />
