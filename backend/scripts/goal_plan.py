@@ -154,7 +154,14 @@ def main() -> int:
   show_parser = sub.add_parser("show", help="print Goal lifecycle status and the current or named plan")
   show_parser.add_argument("--goal-id")
   sub.add_parser("list", help="list retained Goal obligations in this chat")
-  sub.add_parser("stop", help="honor an explicit owner Stop using the existing chat stop controller")
+  sub.add_parser(
+    "stop",
+    help=(
+      "press this chat's Stop: ends your own run at once, leaving the Goal "
+      "paused; only as the last action after an explicit owner stop, never "
+      "to close a Goal"
+    ),
+  )
   resume_parser = sub.add_parser("resume", help="attach this ordinary attempt to existing unfinished work")
   resume_parser.add_argument("goal_id")
   sub.add_parser(

@@ -89,5 +89,11 @@ python3 /data/platform/backend/scripts/goal_plan.py complete --result 'Verified 
 
 `complete` validates and records completion; no separate preflight is required.
 `goal_plan.py check-complete` is an optional read-only task diagnostic, not
-completion. A green plan or ended attempt leaves the Goal open. After owner
-Stop, summarize and run `goal_plan.py stop` last.
+completion. A green plan or ended attempt leaves the Goal open.
+
+When the owner calls off or redirects a Goal, finish what they asked instead,
+mark unfinished tasks `cancelled`, then run `complete --result 'Owner called
+off: reason'`. Never settle a Goal with `stop`: it presses this chat's own Stop,
+ends your run at once, cuts off anything after it, and leaves the Goal paused.
+Use `goal_plan.py stop` only when the owner explicitly asks you to stop, as the
+last action after summarizing.
