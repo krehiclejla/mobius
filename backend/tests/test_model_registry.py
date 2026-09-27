@@ -161,7 +161,9 @@ def test_fallback_models_shape_matches_registry_entries():
   entries = providers._fallback_models("claude")
   assert entries, "fallback must be non-empty for a known provider"
   for e in entries:
-    assert set(e) == {
+    # effort_levels is optional capability metadata, present only for models
+    # whose scale differs from the provider default.
+    assert set(e) - {"effort_levels"} == {
       "id", "label", "provider", "available", "context_window",
     }
     assert e["provider"] == "claude"
@@ -194,6 +196,18 @@ def test_model_specific_effort_levels_are_registry_metadata(monkeypatch):
     if row["id"] == "claude-opus-4-8"
   )
   assert entry["effort_levels"] == ["low", "medium", "high", "max"]
+
+
+def test_models_without_effort_publish_an_explicit_empty_scale():
+  # Anthropic rejects the effort parameter on these models, so the offline
+  # registry must say "no effort" rather than fall back to the full scale.
+  by_id = {row["id"]: row for row in providers._fallback_models("claude")}
+  for model_id in ("claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929"):
+    assert by_id[model_id]["effort_levels"] == []
+    assert providers.model_supports_effort(model_id) is False
+  assert "effort_levels" not in by_id["claude-opus-4-8"]
+  assert providers.model_supports_effort("claude-opus-4-8") is True
+  assert providers.model_supports_effort(None) is True
 
 
 def test_mobius_effort_scale_uses_the_public_product_model():
@@ -534,3 +548,38 @@ async def test_forgetting_a_provider_catalog_waits_out_an_inflight_fetch(
     assert "claude" not in providers._model_registry_cache
   finally:
     providers.invalidate_model_cache()
+
+
+@pytest.mark.asyncio
+async def test_live_claude_models_without_effort_capability_hide_effort(
+  tmp_path, monkeypatch,
+):
+  """The Models API states effort support per model; a model without it gets
+  an empty scale, while other models keep the provider default."""
+  future = int(time.time() * 1000) + 3_600_000
+  _write_creds(tmp_path, access="tok", refresh="r", expires_at=future)
+
+  def handler(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"data": [
+      {
+        "id": "claude-future-haiku",
+        "display_name": "Claude Future Haiku",
+        "capabilities": {"effort": {"supported": False}},
+      },
+      {
+        "id": "claude-future-opus",
+        "display_name": "Claude Future Opus",
+        "capabilities": {"effort": {"supported": True}},
+      },
+    ]})
+
+  _install_mock_transport(monkeypatch, handler)
+
+  live_models = await providers._fetch_claude_models(str(tmp_path))
+  entries = {
+    row["id"]: row for row in providers._live_model_entries("claude", live_models)
+  }
+
+  assert entries["claude-future-haiku"]["effort_levels"] == []
+  assert "effort_levels" not in entries["claude-future-opus"]
+

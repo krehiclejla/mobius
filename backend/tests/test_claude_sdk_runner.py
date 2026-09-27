@@ -1739,6 +1739,25 @@ async def test_claude_new_and_resumed_turns_exclude_native_owner_questions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["high", "ultracode"])
+async def test_saved_effort_never_reaches_a_model_that_rejects_it(
+  monkeypatch, effort,
+):
+  # A global or saved effort still rides along after the owner picks a model
+  # without an effort setting; the API rejects the parameter on such a model.
+  clients = _install_fake_client(monkeypatch)
+
+  await _run_turn(
+    "chat-no-effort", bc=_Bus(), cwd="/data",
+    agent_settings={"model": "claude-haiku-4-5-20251001", "effort": effort},
+  )
+
+  options = clients[0].options
+  assert options.model == "claude-haiku-4-5-20251001"
+  assert options.effort is None
+
+
+@pytest.mark.asyncio
 async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   clients = _install_fake_client(monkeypatch)
 

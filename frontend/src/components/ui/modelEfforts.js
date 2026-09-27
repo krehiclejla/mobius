@@ -8,15 +8,17 @@ function labelForEffort(value) {
  * Resolves the effort scale for one registry model.
  *
  * Providers still supply the default scale, while an optional
- * `effort_levels` array on a model can narrow, reorder, or extend it. That
- * keeps today's registry backwards-compatible and gives future models a
- * declarative capability surface instead of adding model-id conditionals to
- * every picker.
+ * `effort_levels` array on a model can narrow, reorder, or extend it. An
+ * empty array means the model takes no effort setting, so pickers hide the
+ * control. That keeps today's registry backwards-compatible and gives future
+ * models a declarative capability surface instead of adding model-id
+ * conditionals to every picker.
  */
 export function modelEfforts(providerEfforts, model) {
   const defaults = Array.isArray(providerEfforts) ? providerEfforts : []
   const levels = model?.effort_levels
-  if (!Array.isArray(levels) || levels.length === 0) return defaults
+  if (!Array.isArray(levels)) return defaults
+  if (levels.length === 0) return []
 
   const known = new Map(defaults.map((effort) => [effort.value, effort]))
   const resolved = []

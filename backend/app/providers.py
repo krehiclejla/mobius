@@ -84,8 +84,15 @@ MODEL_LABELS = {
 # Optional model-specific effort capability overrides. Provider defaults remain
 # the fallback, so adding a new model normally needs no entry. Add a row only
 # when a model supports a narrower, reordered, or extended effort scale; the
-# registry carries it to every shell/app picker as data.
+# registry carries it to every shell/app picker as data. An empty scale means
+# the model takes no effort setting at all, so pickers hide the control and the
+# runner never sends one.
 MODEL_EFFORT_LEVELS: dict[str, list[str]] = {
+  # Anthropic rejects the effort parameter on these models. Live discovery
+  # reads the same fact from the Models API capabilities; these rows keep the
+  # offline fallback and the runner consistent with it.
+  "claude-sonnet-4-5-20250929": [],
+  "claude-haiku-4-5-20251001": [],
   # Keep the failure fallback aligned with Codex's shipped catalog. Live
   # discovery below carries each model's own advertised scale, so future
   # changes do not require a platform release.
@@ -259,6 +266,11 @@ def normalize_background_agent_settings(data_dir: str) -> bool:
     current.pop("fallback", None)
     settings["background_agents"] = current
     return write_agent_settings(data_dir, settings)
+
+
+def model_supports_effort(model: str | None) -> bool:
+  """False only for a model known to reject any effort setting."""
+  return MODEL_EFFORT_LEVELS.get(model or "") != []
 
 
 def _model_belongs_to_other_provider(model: str, provider: str) -> bool:
@@ -1547,7 +1559,7 @@ def _live_model_entries(
       "provider": provider_id,
       "available": True,
     }
-    if isinstance(efforts, list) and efforts:
+    if isinstance(efforts, list):
       entry["effort_levels"] = efforts
     elif model_id in MODEL_EFFORT_LEVELS:
       entry["effort_levels"] = MODEL_EFFORT_LEVELS[model_id]
@@ -1851,6 +1863,12 @@ async def _fetch_claude_models(data_dir: str) -> list[dict[str, Any]]:
     max_input = entry.get("max_input_tokens")
     if isinstance(max_input, int) and not isinstance(max_input, bool):
       model["context_window"] = max_input
+    # A model that rejects the effort parameter gets an explicit empty scale;
+    # every other model keeps the provider's default scale.
+    capabilities = entry.get("capabilities")
+    effort = capabilities.get("effort") if isinstance(capabilities, dict) else None
+    if isinstance(effort, dict) and effort.get("supported") is False:
+      model["effort_levels"] = []
     models.append(model)
   return models
 

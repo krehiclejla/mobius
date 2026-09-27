@@ -1337,8 +1337,13 @@ async def run_claude_sdk_turn(
   # Both are session-wide on the SDK but Möbius spawns one `query()`
   # per turn, so passing them here applies to *this* turn — which is
   # exactly the "apply on next turn" semantics the slash picker promises.
+  from app.providers import _model_belongs_to_other_provider, model_supports_effort
   _model = (agent_settings or {}).get("model") or None
   _effort = (agent_settings or {}).get("effort") or None
+  # A saved or global default effort must not reach a model that rejects the
+  # parameter (the picker hides the control, but defaults still carry one).
+  if not model_supports_effort(_model):
+    _effort = None
   # The "ultracode" tier maps to xhigh effort for the SDK flag (which only
   # accepts low/medium/high/xhigh/max) and arms the Workflow-tool
   # orchestration via the keyword trigger appended to this turn's prompt.
@@ -1350,7 +1355,6 @@ async def run_claude_sdk_turn(
   # effective settings normally reject this before the SDK boundary. Keep the
   # boundary strict too: a legacy/corrupt value must never become an implicit
   # provider-chosen model.
-  from app.providers import _model_belongs_to_other_provider
   if _model and _model_belongs_to_other_provider(_model, "claude"):
     raise ValueError(
       f"Selected model {_model!r} does not belong to provider 'claude'."

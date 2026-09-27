@@ -952,7 +952,8 @@ class ModelEntry(BaseModel):
   # Optional per-model capability metadata. Absent means "use the provider's
   # default scale" so older registry producers and newly-discovered models keep
   # working. A future model with a narrower/different scale can declare it here
-  # without teaching every picker about that model id.
+  # without teaching every picker about that model id. An empty list means the
+  # model takes no effort setting.
   effort_levels: list[str] | None = None
   # Effective pre-compaction capacity for this exact model. The composer uses
   # it before a chat has a run, so a new chat can show `0 / N` immediately

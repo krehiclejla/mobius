@@ -26,6 +26,12 @@ test('modelEfforts honors model-specific levels and future values', () => {
   )
 })
 
+test('modelEfforts hides effort for a model that takes no effort setting', () => {
+  const efforts = modelEfforts(providerEfforts, { id: 'haiku', effort_levels: [] })
+  assert.deepEqual(efforts, [])
+  assert.equal(validEffort(efforts, 'high'), '')
+})
+
 test('validEffort replaces a level unsupported by the selected model', () => {
   assert.equal(validEffort(providerEfforts, 'max'), 'medium')
   assert.equal(validEffort(providerEfforts, 'high'), 'high')
