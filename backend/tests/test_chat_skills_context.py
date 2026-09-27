@@ -246,6 +246,20 @@ def test_goal_routing_rechecks_phase_transitions_and_prefers_platform_tool():
   assert "Do not end a run merely to refresh context" in planning_normalized
 
 
+def test_called_off_goal_settles_through_update_goal_not_chat_stop():
+  # Stopping the chat presses its own Stop, so an agent that uses it to close
+  # a Goal interrupts its own turn; a called-off Goal settles via update_goal.
+  repo = Path(__file__).resolve().parents[2]
+  planning = " ".join((
+    repo / "backend" / "scripts" / "seed-skills" / "goal-planning.md"
+  ).read_text(encoding="utf-8").split())
+
+  assert "set its unfinished tasks to `cancelled` with `update_goal`" in planning
+  assert "`complete: 'Owner called off: reason'`" in planning
+  assert "Never settle a Goal by stopping the chat" in planning
+  assert "Only when the owner explicitly asks you to stop" in planning
+
+
 def test_goal_turns_end_plainly_unless_a_promise_needs_a_waker():
   repo = Path(__file__).resolve().parents[2]
   core = (repo / "skill" / "core.md").read_text(encoding="utf-8")

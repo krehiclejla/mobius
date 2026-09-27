@@ -68,5 +68,11 @@ After verifying the original outcome, call `update_goal` with `complete:
 'Verified evidence'` (plus `finished_claims` for exact claimed actions this Goal
 performed). It validates and records completion and is refused while tasks or
 helpers are unfinished; a green plan or ended attempt leaves the Goal open.
-After an owner Stop, summarize, then honor it last with
+
+When the owner calls off or redirects a Goal, do what they asked instead, set
+its unfinished tasks to `cancelled` with `update_goal`, then call it with
+`complete: 'Owner called off: reason'`. Never settle a Goal by stopping the
+chat: that presses this chat's own Stop, ends your run at once, cuts off
+anything after it, and leaves the Goal paused. Only when the owner explicitly
+asks you to stop, summarize, then honor it last with
 `mapi -X POST /api/chat/stop -d "{\"chat_id\":\"$CHAT_ID\"}"`.
