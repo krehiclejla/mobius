@@ -1745,16 +1745,30 @@ async def test_saved_effort_never_reaches_a_model_that_rejects_it(
 ):
   # A global or saved effort still rides along after the owner picks a model
   # without an effort setting; the API rejects the parameter on such a model.
+  # The runner reads the same registry entry as the picker, so a model only the
+  # live catalog marks as effortless is covered too.
+  from app import providers
+
+  async def registry(_data_dir, force_refresh=False):
+    return {"claude": [
+      {"id": "claude-live-no-effort", "effort_levels": []},
+      {"id": "claude-live-default"},
+    ]}
+
+  monkeypatch.setattr(providers, "list_models", registry)
   clients = _install_fake_client(monkeypatch)
 
+  for model in ("claude-live-no-effort", "claude-haiku-4-5-20251001"):
+    await _run_turn(
+      f"chat-no-effort-{model}", bc=_Bus(), cwd="/data",
+      agent_settings={"model": model, "effort": effort},
+    )
   await _run_turn(
-    "chat-no-effort", bc=_Bus(), cwd="/data",
-    agent_settings={"model": "claude-haiku-4-5-20251001", "effort": effort},
+    "chat-default-effort", bc=_Bus(), cwd="/data",
+    agent_settings={"model": "claude-live-default", "effort": "high"},
   )
 
-  options = clients[0].options
-  assert options.model == "claude-haiku-4-5-20251001"
-  assert options.effort is None
+  assert [client.options.effort for client in clients] == [None, None, "high"]
 
 
 @pytest.mark.asyncio

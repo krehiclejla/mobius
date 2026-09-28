@@ -204,10 +204,31 @@ def test_models_without_effort_publish_an_explicit_empty_scale():
   by_id = {row["id"]: row for row in providers._fallback_models("claude")}
   for model_id in ("claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929"):
     assert by_id[model_id]["effort_levels"] == []
-    assert providers.model_supports_effort(model_id) is False
   assert "effort_levels" not in by_id["claude-opus-4-8"]
-  assert providers.model_supports_effort("claude-opus-4-8") is True
-  assert providers.model_supports_effort(None) is True
+
+
+@pytest.mark.asyncio
+async def test_effort_support_follows_the_registry_entry_the_pickers_use(
+  monkeypatch,
+):
+  """A live entry decides; the static rows answer only for unlisted models."""
+  async def registry(_data_dir, force_refresh=False):
+    return {"claude": [
+      {"id": "claude-live-no-effort", "effort_levels": []},
+      {"id": "claude-live-default"},
+      {"id": "claude-haiku-4-5-20251001", "effort_levels": ["low", "high"]},
+    ]}
+
+  monkeypatch.setattr(providers, "list_models", registry)
+
+  assert await providers.model_supports_effort("/data", "claude-live-no-effort") is False
+  assert await providers.model_supports_effort("/data", "claude-live-default") is True
+  # The live entry outranks the static fallback row for the same model.
+  assert await providers.model_supports_effort("/data", "claude-haiku-4-5-20251001") is True
+  # Unlisted: the offline fallback row still answers.
+  assert await providers.model_supports_effort("/data", "claude-sonnet-4-5-20250929") is False
+  assert await providers.model_supports_effort("/data", "claude-unlisted") is True
+  assert await providers.model_supports_effort("/data", None) is True
 
 
 def test_mobius_effort_scale_uses_the_public_product_model():

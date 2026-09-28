@@ -268,11 +268,6 @@ def normalize_background_agent_settings(data_dir: str) -> bool:
     return write_agent_settings(data_dir, settings)
 
 
-def model_supports_effort(model: str | None) -> bool:
-  """False only for a model known to reject any effort setting."""
-  return MODEL_EFFORT_LEVELS.get(model or "") != []
-
-
 def _model_belongs_to_other_provider(model: str, provider: str) -> bool:
   """True when `model` is a KNOWN model for some OTHER provider.
   Use this to reject cross-provider mismatches without blocking
@@ -2083,6 +2078,23 @@ async def list_models(
       result[pid] = entries
 
   return result
+
+
+async def model_supports_effort(data_dir: str, model: str | None) -> bool:
+  """Whether ``model`` takes an effort setting, per the pickers' registry entry.
+
+  The runner asks the same registry the pickers render, so a model the live
+  catalog marks as taking no effort (an empty ``effort_levels`` scale) never
+  receives a saved or default one. The static rows answer only for a model the
+  registry does not list.
+  """
+  if not model:
+    return True
+  for entries in (await list_models(data_dir)).values():
+    for entry in entries:
+      if entry.get("id") == model:
+        return entry.get("effort_levels") != []
+  return MODEL_EFFORT_LEVELS.get(model) != []
 
 
 def invalidate_model_cache() -> None:

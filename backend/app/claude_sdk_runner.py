@@ -1342,7 +1342,8 @@ async def run_claude_sdk_turn(
   _effort = (agent_settings or {}).get("effort") or None
   # A saved or global default effort must not reach a model that rejects the
   # parameter (the picker hides the control, but defaults still carry one).
-  if not model_supports_effort(_model):
+  from app.config import get_settings
+  if not await model_supports_effort(get_settings().data_dir, _model):
     _effort = None
   # The "ultracode" tier maps to xhigh effort for the SDK flag (which only
   # accepts low/medium/high/xhigh/max) and arms the Workflow-tool
