@@ -183,6 +183,8 @@ test('ChatView routes both offscreen attention nudges through the controller', (
     'the tail resumable block is found by walking the visible message tail')
   assert.match(chatView, /hasPendingResume && resumeCardOffscreen/,
     'the nudge shows only when the resume card is offscreen')
+  assert.match(chatView, /const hasPendingResume = !!pendingResumeBlock\s*&& !turnActive/,
+    'a running continuation retires the resume nudge even though the paused note is still the durable tail')
   assert.match(chatView, /Turn paused — tap to resume/,
     'the non-park nudge copy names the pause')
   assert.match(chatView, /Queued to continue/,

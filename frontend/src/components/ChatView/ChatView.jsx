@@ -5516,6 +5516,9 @@ export default function ChatView({
   // then just looks stopped. Detect the tail resumable block so the offscreen
   // nudge + SR status can name the recovery. A pause is terminal (the turn has
   // ended), so it only ever lives in `messages`, never in a live stream item.
+  // That also means the paused note stays at the durable tail while its
+  // continuation streams (the continuation marker is hidden), so a running turn
+  // must retire the cue: the pause it names has already been acted on.
   const pendingResumeBlock = tailResumableBlock(messages)
   const resourcePause = isResourcePause(pendingResumeBlock)
     ? pendingResumeBlock
@@ -5524,6 +5527,7 @@ export default function ChatView({
   // An open question is the single blocker: answering it IS the continuation,
   // so don't surface a competing Resume (which the backend would now refuse).
   const hasPendingResume = !!pendingResumeBlock
+    && !turnActive
     && !hasPendingQuestion
     && !resourcePause
     && !modelCapacityPause
