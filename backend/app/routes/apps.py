@@ -270,6 +270,7 @@ async def create_app_source_folder(
     target = _resolve_app_source_path(root, body.path)
     if target == root:
       raise HTTPException(400, "The app source root already exists.")
+    workspace_files.require_parent_folders(target)
     try:
       target.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -323,6 +324,7 @@ async def move_app_source_path(
       raise HTTPException(404, "Source path not found.")
     if destination.exists():
       raise HTTPException(409, "A file or folder already uses the destination.")
+    workspace_files.require_parent_folders(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
       os.replace(source, destination)
