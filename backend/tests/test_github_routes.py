@@ -1989,6 +1989,14 @@ def test_rest_get_injects_auth_and_forwards_query(client, auth, monkeypatch):
   assert r.headers["X-RateLimit-Remaining"] == "4321"
 
 
+def test_rest_control_character_path_is_a_client_error(client, auth, monkeypatch):
+  _write_token(token="gh-rest-tok")
+  _install_mock_transport(monkeypatch, _fail)
+  r = client.get("/api/github/api/repos/x%00y", headers=auth)
+  assert r.status_code == 400
+  assert r.json()["detail"] == "Invalid GitHub API path."
+
+
 def test_rest_requires_connection(client, auth):
   r = client.get("/api/github/api/user", headers=auth)
   assert r.status_code == 401

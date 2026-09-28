@@ -517,13 +517,17 @@ async def github_rest(
   if request.url.query:
     target = f"{target}?{request.url.query}"
   async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
-    req = client.build_request("GET", target, headers={
-      "Authorization": f"Bearer {token}",
-      "Accept": (
-        request.headers.get("accept") or "application/vnd.github+json"
-      ),
-      "User-Agent": "mobius",
-    })
+    try:
+      req = client.build_request("GET", target, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": (
+          request.headers.get("accept") or "application/vnd.github+json"
+        ),
+        "User-Agent": "mobius",
+      })
+    except httpx.InvalidURL:
+      # A control character in the captured path (e.g. %00) cannot form a URL.
+      raise HTTPException(status_code=400, detail="Invalid GitHub API path.")
     return await _forward_capped(client, req)
 
 
