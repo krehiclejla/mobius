@@ -306,23 +306,6 @@ async def read_write_body(request: Request) -> bytes:
   )
 
 
-def require_parent_folders(target: Path) -> None:
-  """Refuse a destination whose nearest existing ancestor is a file.
-
-  Saving ``notes.md/draft.md`` or moving into ``notes.md/sub/`` would need a
-  folder where a file already sits; answer that as a conflict instead of
-  letting ``mkdir`` fail as a server error.
-  """
-  for parent in target.parents:
-    if parent.is_dir():
-      return
-    if parent.exists() or parent.is_symlink():
-      raise HTTPException(status_code=409, detail={
-        "code": "parent_is_file",
-        "message": "A parent of this path is a file.",
-      })
-
-
 def write_file(
   root: Path,
   target: Path,
@@ -338,7 +321,6 @@ def write_file(
   automation that means to discard a concurrent revision.
   """
   path = target.relative_to(root).as_posix()
-  require_parent_folders(target)
   if not force:
     require_revision(target, path, expected_revision)
   storage_io.atomic_write(target, content)

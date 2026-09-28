@@ -182,12 +182,14 @@ def test_shared_state_beneath_a_value_is_rejected_without_changing_it(client, au
       json={"expected_version": None, "value": ["other"]},
     )
     assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "parent_is_file"
 
   deleted = client.put(
     f"{base}/board.json/cards.json", headers=auth,
     json={"expected_version": None, "delete": True},
   )
   assert deleted.status_code == 400, deleted.text
+  assert deleted.json()["detail"]["code"] == "parent_is_file"
 
   state = client.get(base, headers=auth).json()
   assert state["values"] == {"board.json": ["card"]}

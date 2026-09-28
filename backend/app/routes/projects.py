@@ -52,6 +52,7 @@ from app.deps import (
   get_project_principal, reject_cross_site, resolve_project_principal,
 )
 from app.path_utils import validate_path_within_base
+from app.storage_io import make_parent_folders, require_parent_folders
 from app.project_activity import append_project_change, project_change_view
 from app.project_templates import LINKED_APP_GUIDANCE, linked_app_id
 from app.theme import DEFAULT_THEME, theme_data
@@ -2026,7 +2027,7 @@ async def create_project_folder(
   if target == root:
     raise HTTPException(400, "The project root already exists.")
   async with fs_locks.source_dir_lock(str(root)):
-    workspace_files.require_parent_folders(target)
+    require_parent_folders(target)
     try:
       target.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -2638,8 +2639,7 @@ async def move_project_path(
       raise HTTPException(404, "Source path not found.")
     if dest.exists():
       raise HTTPException(409, "A file or folder already uses the destination.")
-    workspace_files.require_parent_folders(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    make_parent_folders(dest)
     try:
       os.replace(source, dest)
     except OSError as exc:

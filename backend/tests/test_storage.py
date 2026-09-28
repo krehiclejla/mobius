@@ -1591,6 +1591,7 @@ def test_move_beneath_a_file_is_rejected_cleanly(client, auth, owner_token):
     headers=auth,
   )
   assert r.status_code == 400
+  assert r.json()["detail"]["code"] == "parent_is_file"
   assert client.get(
     f"/api/storage/apps/{app_id}/b.json", headers=auth
   ).json() == {"k": 2}
@@ -1604,6 +1605,7 @@ def test_write_beneath_a_file_is_rejected_cleanly(client, auth, owner_token):
     f"/api/storage/apps/{app_id}/a.json/child.json", json={"k": 2}, headers=auth,
   )
   assert r.status_code == 400
+  assert r.json()["detail"]["code"] == "parent_is_file"
   assert client.get(
     f"/api/storage/apps/{app_id}/a.json", headers=auth
   ).json() == {"k": 1}

@@ -28,7 +28,7 @@ limit_glibc_arenas()
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import inspect as inspect_database
@@ -65,7 +65,7 @@ from app.response_policy import (
   shell_csp,
   static_embed_csp,
 )
-from app.storage_io import atomic_write
+from app.storage_io import ParentIsFile, atomic_write
 from app import activity, models
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
@@ -375,6 +375,17 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(ParentIsFile)
+async def _parent_is_file_handler(_request: Request, exc: ParentIsFile):
+  # Every storage, project, app-source, and shared-state write creates its
+  # folders through storage_io, so one mapping gives them one answer.
+  return JSONResponse(
+    status_code=400,
+    content={"detail": {"code": "parent_is_file", "message": str(exc)}},
+  )
+
 
 # Global request-body backstop. Endpoints that read raw bodies stream-cap
 # themselves (storage PUT 50 MB, icon 12 MB via storage_io.read_capped_body),

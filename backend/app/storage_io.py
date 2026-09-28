@@ -104,6 +104,33 @@ def etag_matches(token: str, if_match: str) -> bool:
   return False
 
 
+class ParentIsFile(NotADirectoryError):
+  """A path cannot exist because one of its parents is a file.
+
+  Raised before any folder is created, so a write or move beneath
+  ``notes.json`` fails cleanly instead of as a ``mkdir`` error. ``main.py``
+  answers it once for every route as ``400 parent_is_file``.
+  """
+
+  def __init__(self) -> None:
+    super().__init__("A parent of this path is a file.")
+
+
+def require_parent_folders(target: Path) -> None:
+  """Raise ``ParentIsFile`` unless ``target``'s nearest existing ancestor is a folder."""
+  for parent in target.parents:
+    if parent.is_dir():
+      return
+    if os.path.lexists(parent):
+      raise ParentIsFile()
+
+
+def make_parent_folders(target: Path) -> None:
+  """Create ``target``'s missing parent folders, refusing a file in the way."""
+  require_parent_folders(target)
+  target.parent.mkdir(parents=True, exist_ok=True)
+
+
 def atomic_write(
   file_path: Path, content: str | bytes, *, mode: int = 0o644,
 ) -> None:
@@ -118,7 +145,7 @@ def atomic_write(
   truncation. A crash mid-write leaves only the temp file; the target is never
   partial.
   """
-  file_path.parent.mkdir(parents=True, exist_ok=True)
+  make_parent_folders(file_path)
   data = content.encode("utf-8") if isinstance(content, str) else content
   # Unique temp name (mkstemp) so concurrent writers to the same path don't
   # collide on the temp file itself. mkstemp creates 0600, so private callers

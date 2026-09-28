@@ -131,7 +131,7 @@ def test_blank_project_starts_without_chat_and_has_confined_files(
   assert not any(p.startswith("artifacts/") for p in recursive_paths)
 
 
-def test_project_paths_beneath_a_file_are_a_conflict_not_a_server_error(
+def test_project_paths_beneath_a_file_are_rejected_not_a_server_error(
   client, auth,
 ):
   project = client.post(
@@ -162,7 +162,7 @@ def test_project_paths_beneath_a_file_are_a_conflict_not_a_server_error(
     ),
   )
   for response in attempts:
-    assert response.status_code == 409, response.text
+    assert response.status_code == 400, response.text
     assert response.json()["detail"]["code"] == "parent_is_file"
 
   assert client.get(f"{base}/file?path=a.txt", headers=auth).json()["content"] == "a.txt"

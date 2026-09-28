@@ -139,7 +139,7 @@ def test_app_source_mutations_use_revision_guards_and_confined_paths(client, aut
   assert traversal.status_code == 400
 
 
-def test_app_source_paths_beneath_a_file_are_a_conflict_not_a_server_error(
+def test_app_source_paths_beneath_a_file_are_rejected_not_a_server_error(
   client, auth,
 ):
   app, root = _source_app(client, auth)
@@ -156,7 +156,7 @@ def test_app_source_paths_beneath_a_file_are_a_conflict_not_a_server_error(
     ),
   )
   for response in attempts:
-    assert response.status_code == 409, response.text
+    assert response.status_code == 400, response.text
     assert response.json()["detail"]["code"] == "parent_is_file"
   assert (root / "index.jsx").is_file()
   assert (root / "styles" / "main.css").is_file()

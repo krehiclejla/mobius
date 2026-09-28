@@ -222,23 +222,6 @@ def _recheck_app_identity(db: Session, app_id: int, expected_nonce) -> None:
 # the CAS check and the quota computation atomic against a concurrent same-app
 # write or an interleaved uninstall.
 
-def reject_file_ancestor(target: Path) -> None:
-  """Reject a destination whose nearest existing ancestor is not a directory.
-
-  A write or move creates missing parent folders, which cannot happen beneath
-  an existing file (`notes.json/today.json`). Checking first turns that into
-  the same clean 400 as a directory destination instead of a failed `mkdir`
-  surfacing as a 500.
-  """
-  for parent in target.parents:
-    if parent.is_dir():
-      return
-    if parent.exists() or parent.is_symlink():
-      raise HTTPException(
-        status_code=400, detail="A parent of this path is a file.",
-      )
-
-
 def check_write_precondition(
   file_path: Path, if_match: str | None, if_none_match: str | None,
 ) -> int:
@@ -249,7 +232,6 @@ def check_write_precondition(
   """
   if file_path.is_dir():
     raise HTTPException(status_code=400, detail="Destination is a directory.")
-  reject_file_ancestor(file_path)
   if if_none_match is not None and if_none_match.strip() == "*":
     if file_path.exists():
       raise HTTPException(status_code=412, detail="Storage precondition failed.")
@@ -806,8 +788,7 @@ async def move_app_file(
       raise HTTPException(
         status_code=400, detail="Cannot move a folder into itself.",
       )
-    reject_file_ancestor(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    storage_io.make_parent_folders(dst)
     shutil.move(str(src), str(dst))
     # Carry the MIME sidecar(s) to the new path so the moved bytes keep their
     # stored type, and the old path keeps no stale sidecar.
@@ -1103,7 +1084,6 @@ async def write_shared_file(
   # write below — same contract as the per-app write.
   if file_path.is_dir():
     raise HTTPException(status_code=400, detail="Destination is a directory.")
-  reject_file_ancestor(file_path)
   # Snapshot pre-write size for size_delta. Same best-effort pattern
   # as the per-app write path: missing file or stat failure = 0.
   try:
