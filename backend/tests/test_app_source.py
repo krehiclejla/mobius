@@ -139,6 +139,29 @@ def test_app_source_mutations_use_revision_guards_and_confined_paths(client, aut
   assert traversal.status_code == 400
 
 
+def test_app_source_paths_beneath_a_file_are_a_conflict_not_a_server_error(
+  client, auth,
+):
+  app, root = _source_app(client, auth)
+  base = f"/api/apps/{app['id']}/source"
+  attempts = (
+    client.put(
+      f"{base}/file?path=index.jsx/child.jsx", headers=auth,
+      json={"content": "x", "expected_revision": None},
+    ),
+    client.post(f"{base}/folder", headers=auth, json={"path": "index.jsx/sub"}),
+    client.post(
+      f"{base}/move", headers=auth,
+      json={"from_path": "styles/main.css", "to_path": "index.jsx/main.css"},
+    ),
+  )
+  for response in attempts:
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "parent_is_file"
+  assert (root / "index.jsx").is_file()
+  assert (root / "styles" / "main.css").is_file()
+
+
 def test_app_source_reports_its_own_git_changes_and_diff(client, auth):
   app, root = _source_app(client, auth)
   (root / "index.jsx").write_text(

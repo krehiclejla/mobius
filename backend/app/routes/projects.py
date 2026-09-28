@@ -2026,6 +2026,7 @@ async def create_project_folder(
   if target == root:
     raise HTTPException(400, "The project root already exists.")
   async with fs_locks.source_dir_lock(str(root)):
+    workspace_files.require_parent_folders(target)
     try:
       target.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -2637,6 +2638,7 @@ async def move_project_path(
       raise HTTPException(404, "Source path not found.")
     if dest.exists():
       raise HTTPException(409, "A file or folder already uses the destination.")
+    workspace_files.require_parent_folders(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
       os.replace(source, dest)
