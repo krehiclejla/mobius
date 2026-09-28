@@ -74,6 +74,24 @@ def test_missing_anchor_fails_closed_to_the_ordinary_recent_page():
   assert page == messages[-20:]
 
 
+def test_before_cursor_is_clamped_to_the_transcript():
+  messages = [{"role": "user", "ts": index} for index in range(4)]
+
+  def window(before):
+    page, offset, _ = _chat_detail_window(
+      messages, limit=5, before=before, anchor_key=None,
+    )
+    return page, offset
+
+  # A negative cursor names nothing before the first message; it must not wrap
+  # around to Python's from-the-end slicing.
+  assert window(-3) == ([], 0)
+  assert window(0) == ([], 0)
+  assert window(2) == (messages[:2], 0)
+  # A cursor past the end is the tail, reported at a real offset.
+  assert window(99_999) == (messages, 0)
+
+
 def test_compacts_multi_step_activity_and_preserves_render_metadata():
   source = {"title": "Reference", "url": "https://example.com/reference"}
   messages = [{

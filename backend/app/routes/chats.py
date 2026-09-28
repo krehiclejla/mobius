@@ -560,8 +560,12 @@ def _chat_detail_window(
     start = max(0, total - limit)
     return messages[start:], start, False
   if before is not None:
-    start = max(0, before - limit)
-    return messages[start:before], start, None
+    # `before` is an absolute index cursor. Clamp it to the transcript so a
+    # negative value can't wrap to Python's from-the-end slicing, and an
+    # out-of-range one can't report an offset past the last message.
+    end = min(max(before, 0), total)
+    start = max(0, end - limit)
+    return messages[start:end], start, None
   start = max(0, total - limit)
   return messages[start:], start, None
 
