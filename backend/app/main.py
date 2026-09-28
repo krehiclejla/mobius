@@ -28,7 +28,7 @@ limit_glibc_arenas()
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import inspect as inspect_database
@@ -38,6 +38,7 @@ from starlette.concurrency import run_in_threadpool
 from app.config import get_settings
 from app.database import (
   Base,
+  IntegerOutOfRange,
   SessionLocal,
   engine,
   reset_database_request_label,
@@ -375,6 +376,11 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(IntegerOutOfRange)
+async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
+  return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 # Global request-body backstop. Endpoints that read raw bodies stream-cap
 # themselves (storage PUT 50 MB, icon 12 MB via storage_io.read_capped_body),

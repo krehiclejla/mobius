@@ -72,6 +72,10 @@ def reset_database_request_label(token: Token) -> None:
   _request_label.reset(token)
 
 
+class IntegerOutOfRange(ValueError):
+  """A bound integer (usually an id from a URL) exceeds the database range."""
+
+
 def _make_engine():
   """Creates the SQLAlchemy engine, ensuring the DB directory exists."""
   _assert_test_database_isolated()
@@ -132,6 +136,16 @@ def _make_engine():
         elapsed_ms,
         label,
       )
+  @event.listens_for(eng, "handle_error")
+  def _reject_out_of_range_integer(context):
+    # sqlite3 refuses to bind an int outside 64 bits with a bare OverflowError
+    # (e.g. GET /api/apps/99999999999999999999). No row can carry such a
+    # value, so report it as invalid input instead of an internal error.
+    if isinstance(context.original_exception, OverflowError):
+      raise IntegerOutOfRange(
+        "A number in this request is too large.",
+      ) from context.original_exception
+
   if is_sqlite:
     # NullPool opens a fresh connection per session, so this runs constantly
     # under load. The policy itself lives in sqlite_policy so the standalone
