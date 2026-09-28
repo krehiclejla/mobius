@@ -917,11 +917,33 @@ def test_open_item_places_beside_this_chat_in_the_background_by_default(monkeypa
 
   control._call_open_item({"kind": "app", "id": 42})
 
-  assert sent == [("POST", "/api/notify", {
+  assert sent == [("GET", "/api/apps/42", None), ("POST", "/api/notify", {
     "type": "open_item", "itemKind": "app", "itemId": "42",
     "sourceKind": "chat", "sourceId": "chat-1",
     "placement": "beside-source", "activation": "background",
   })]
+
+
+@pytest.mark.parametrize("kind,item_id,lookup", [
+  ("app", 404404, "/api/apps/404404"),
+  ("chat", "gone/chat", "/api/chats/gone%2Fchat?limit=1&compact=true"),
+])
+def test_open_item_refuses_a_missing_item_instead_of_reporting_it_opened(
+  monkeypatch, kind, item_id, lookup,
+):
+  control = _control_module()
+  sent = []
+  def call(method, path, payload=None, *, timeout=10):
+    sent.append((method, path))
+    raise RuntimeError("Refused (404): not found")
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  monkeypatch.setattr(control, "_agent_api_call", call)
+  monkeypatch.setattr(control, "_agent_api_json", call)
+
+  with pytest.raises(ValueError, match="nothing was opened"):
+    control._call_open_item({"kind": kind, "id": item_id})
+
+  assert sent == [("GET", lookup)]
 
 
 def test_request_secret_saves_a_sealed_card_and_never_offers_reveal(monkeypatch):
