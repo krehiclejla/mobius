@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import time
 from hashlib import sha256
@@ -129,10 +130,14 @@ def _hosts_dir() -> Path:
   return d
 
 
+_HOST_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")
+
+
 def _host_path(host_id: str) -> Path:
-  # host ids are minted by _new_id() (alnum + underscore) so they are safe as
-  # a filename, but guard against traversal from any other caller.
-  if not host_id or "/" in host_id or "\\" in host_id or host_id.startswith("."):
+  # host ids are minted by _new_id() ("h_" + 16 hex), so anything outside a
+  # short safe filename is not a host: this also keeps an overlong id from
+  # reaching the filesystem, where it fails as ENAMETOOLONG (HTTP 500).
+  if not _HOST_ID_RE.fullmatch(host_id or ""):
     raise HTTPException(status_code=400, detail="Invalid host id.")
   return _hosts_dir() / f"{host_id}.json"
 

@@ -2824,3 +2824,11 @@ def test_serve_all_respawns_and_stops_removed_connections(monkeypatch):
   b_thread = created[1]
   assert b_thread.name == "mobius-connect-h_b"
   assert b_thread.args[1].is_set()
+
+
+def test_malformed_host_id_is_rejected_before_touching_the_filesystem(client, auth):
+  """An overlong or odd id is a 400, not an ENAMETOOLONG server error."""
+  for host_id in ("a" * 300, ".hidden", "h_ok$"):
+    response = client.get(f"/api/connect/hosts/{host_id}/commands", headers=auth)
+    assert response.status_code == 400, response.text
+  assert client.get("/api/connect/hosts/h_0123456789abcdef/commands", headers=auth).status_code == 404
