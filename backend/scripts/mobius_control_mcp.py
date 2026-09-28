@@ -946,37 +946,9 @@ def _call_notify_owner(arguments: dict[str, Any]) -> str:
   return f"Sent. Tapping it opens {payload['target']}."
 
 
-def _require_live_item(kind: Any, item_id: Any) -> None:
-  """Refuse an open for an app or chat that does not exist or was deleted.
-
-  /api/notify accepts any well-formed request and the shell silently skips an
-  item it cannot find, so without this lookup the tool would tell the agent
-  it opened something the owner never sees.
-  """
-  if kind == "app":
-    try:
-      path = f"/api/apps/{int(str(item_id))}"
-    except ValueError:
-      raise ValueError("open_item app id must be a number") from None
-  elif kind == "chat":
-    path = f"/api/chats/{quote(str(item_id), safe='')}?limit=1&compact=true"
-  else:
-    raise ValueError("open_item kind must be app or chat")
-  try:
-    _agent_api_json("GET", path)
-  except RuntimeError as exc:
-    if str(exc).startswith("Refused (404)"):
-      raise ValueError(
-        f"No live {kind} {item_id} exists (it may have been deleted); "
-        "nothing was opened."
-      ) from None
-    raise
-
-
 def _call_open_item(arguments: dict[str, Any]) -> str:
   _require_args(OPEN_ITEM_TOOL, arguments, {"kind", "id", "activation"}, ("kind", "id"))
   activation = arguments.get("activation", "background")
-  _require_live_item(arguments["kind"], arguments["id"])
   _agent_api_call("POST", "/api/notify", {
     "type": "open_item",
     "itemKind": arguments["kind"],
