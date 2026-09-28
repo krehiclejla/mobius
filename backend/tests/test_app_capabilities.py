@@ -435,26 +435,6 @@ def test_device_storage_is_a_small_reviewed_invoke_capability():
   assert storage["limits"] == {"max_bytes": 32 * 1024}
 
 
-def test_device_motion_is_a_visible_only_session_with_a_reviewed_rate_ceiling():
-  runtime = normalize_runtime_capabilities(_manifest(capabilities={
-    "device.motion": {
-      "version": 1,
-      "reason": "Steer the ship by tilting the phone.",
-      "limits": {"max_rate_hz": 30},
-    },
-  }))
-
-  motion = runtime["device.motion"]
-  assert motion["kind"] == "session"
-  assert motion["risk"] == "device"
-  assert motion["lifecycle"] == "active_frame"
-  assert motion["limits"] == {"max_rate_hz": 30}
-  with pytest.raises(ValueError):
-    normalize_runtime_capabilities(_manifest(capabilities={
-      "device.motion": {"version": 1, "reason": "Too fast.", "limits": {"max_rate_hz": 500}},
-    }))
-
-
 def test_speech_capabilities_separate_model_management_from_generation():
   runtime = normalize_runtime_capabilities(_manifest(capabilities={
     "device.speech-models": {

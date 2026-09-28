@@ -23,7 +23,6 @@ import { readSafeAreaInsets, zeroInsets } from '../../lib/safeAreaInsets.js'
 import { createCapabilityHost } from '../../lib/capabilityHost.js'
 import { builtInCapabilityProviders } from '../../lib/capabilityProviders.js'
 import { clampCameraPreviewRect } from '../../lib/cameraPreview.js'
-import { APP_FRAME_ALLOW } from '../../lib/appFrameDelegation.js'
 import { requestAppCodeWarm } from '../../lib/appPrecache.js'
 import { appHostRequest } from '../../lib/appHostRequest.js'
 import {
@@ -1682,9 +1681,15 @@ const AppCanvas = forwardRef(function AppCanvas({
             // withholds it.
             data-app-id={isLive ? appId : undefined}
             data-frame-version={v}
-            // Pointer lock is a sandbox flag in the frame's response CSP
-            // (backend `app_frame_csp`), not a delegated feature.
-            allow={APP_FRAME_ALLOW}
+            // The app document is sandboxed to an opaque origin, so a bare
+            // `allow="feature"` (which targets only the src origin) never
+            // reaches it: delegated features must name `*`, which still
+            // reaches only this frame and what it nests. An explicit
+            // `fullscreen` entry overrides `allowFullScreen`, so it needs `*`
+            // too. `clipboard-write` stays bare because apps copy through the
+            // host clipboard broker. Pointer lock is a sandbox flag in the
+            // frame's response CSP (backend `app_frame_csp`), not a feature.
+            allow="clipboard-write; fullscreen *; gamepad *"
             allowFullScreen
             onLoad={() => handleFrameLoad(v)}
           />

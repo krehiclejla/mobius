@@ -112,7 +112,7 @@ def _public_host_html(app: models.App, token: str) -> str:
   }
   script_url = f"/{PUBLIC_HOST_SCRIPT}?v={_host_script_rev()}"
   # The app document is opaque-origin, so delegated features must name `*`:
-  # a bare entry targets only the src origin (see APP_FRAME_ALLOW in the shell).
+  # a bare entry targets only the src origin (same grant as the shell's frame).
   return f"""<!doctype html>
 <html lang="en">
 <head>
