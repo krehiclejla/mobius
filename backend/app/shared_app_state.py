@@ -140,6 +140,10 @@ def write_state(
     target = _target(row, path)
     if target.exists() and not target.is_file():
       raise HTTPException(400, "Shared app data paths must identify files.")
+    if any(parent.is_file() for parent in target.parents):
+      # ``board.json/cards.json`` cannot be created beneath a stored value.
+      # A 409 here would read as a version conflict to clients.
+      raise HTTPException(400, "A parent of this shared app data path is a value.")
     current_version = file_version_token(target) if target.is_file() else None
     if current_version != expected_version:
       raise HTTPException(409, {"version": current_version})
