@@ -340,3 +340,43 @@ def test_public_app_storage_aliases_remain_until_released_app_cutover(client, au
   assert client.delete(
     f"{base}/storage/public/submissions/value.json", headers=bearer,
   ).status_code == 204
+
+
+def test_full_public_write_area_rejects_empty_values_and_new_folders(
+  client, auth, monkeypatch,
+):
+  """Empty values and deep paths still occupy disk, so they count against the cap.
+
+  Charging only content bytes let anonymous visitors keep creating empty files
+  and uncounted folders after the area reported itself full.
+  """
+  app = _create(client, auth)
+  assert _publish(client, auth, app["id"]).status_code == 200
+  token = _public_token(client, app["slug"])
+  bearer = {"Authorization": f"Bearer {token}"}
+  text = {**bearer, "Content-Type": "text/plain"}
+  charge = public_storage.PUBLIC_WRITE_ENTRY_CHARGE_BYTES
+  monkeypatch.setattr(public_storage, "PUBLIC_WRITE_SUBTREE_MAX_BYTES", 3 * charge)
+
+  for name in ("a.txt", "b.txt", "c.txt"):
+    assert client.put(
+      f"/api/public-storage/public/submissions/{name}", content=b"", headers=text,
+    ).status_code == 204
+  assert client.put(
+    "/api/public-storage/public/submissions/d.txt", content=b"", headers=text,
+  ).status_code == 413
+  # Overwriting an existing value is charged only its delta, so it still fits.
+  assert client.put(
+    "/api/public-storage/public/submissions/a.txt", content=b"x", headers=text,
+  ).status_code == 204
+
+  assert client.delete(
+    "/api/public-storage/public/submissions/c.txt", headers=bearer,
+  ).status_code == 204
+  # One free entry cannot pay for a file plus the folders above it.
+  assert client.put(
+    "/api/public-storage/public/submissions/x/y/z.txt", content=b"", headers=text,
+  ).status_code == 413
+  assert client.put(
+    "/api/public-storage/public/submissions/c.txt", content=b"", headers=text,
+  ).status_code == 204

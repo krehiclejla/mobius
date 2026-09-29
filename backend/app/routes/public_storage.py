@@ -11,6 +11,8 @@ storage implementation.
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +35,44 @@ router = APIRouter(prefix="/api/public-storage", tags=["public-storage"])
 PUBLIC_STORAGE_READ_ROOT = "public"
 PUBLIC_WRITE_MAX_VALUE_BYTES = 64 * 1024
 PUBLIC_WRITE_SUBTREE_MAX_BYTES = 8 * 1024 * 1024
+# Anonymous writes are charged for the disk they really occupy: every file and
+# directory takes at least one filesystem block, even when it holds no bytes.
+# Charging only content bytes let empty values and deep paths grow the public
+# area without bound once it was "full"; this minimum makes the one byte cap
+# also bound its entry count (8 MiB / 4 KiB = 2048 entries).
+PUBLIC_WRITE_ENTRY_CHARGE_BYTES = 4096
+
+
+def _entry_charge(size: int) -> int:
+  return max(size, PUBLIC_WRITE_ENTRY_CHARGE_BYTES)
+
+
+def _subtree_charge(subtree: Path) -> int:
+  """Charged usage of an anonymous write area: files and directories alike."""
+  if not subtree.is_dir():
+    return 0
+  total = 0
+  for root, dirs, files in os.walk(subtree):
+    total += PUBLIC_WRITE_ENTRY_CHARGE_BYTES * len(dirs)
+    for name in files:
+      try:
+        st = os.lstat(os.path.join(root, name))
+      except OSError:
+        continue
+      if stat.S_ISREG(st.st_mode):
+        total += _entry_charge(st.st_size)
+  return total
+
+
+def _missing_directories(subtree: Path, file_path: Path) -> int:
+  """Directories below ``subtree`` that writing ``file_path`` would create."""
+  missing = 0
+  parent = file_path.parent
+  while parent != subtree and subtree in parent.parents:
+    if not parent.exists():
+      missing += 1
+    parent = parent.parent
+  return missing
 
 
 @dataclass(frozen=True)
@@ -261,8 +301,12 @@ async def write_public_value(
       file_path, if_match, if_none_match,
     )
     subtree = base / _actual_path(grant, write_root)
-    subtree_before = storage_io.app_dir_usage(subtree) if subtree.is_dir() else 0
-    if subtree_before - before_size + new_size > PUBLIC_WRITE_SUBTREE_MAX_BYTES:
+    replaced = _entry_charge(before_size) if file_path.is_file() else 0
+    charged_after = (
+      _subtree_charge(subtree) - replaced + _entry_charge(new_size)
+      + PUBLIC_WRITE_ENTRY_CHARGE_BYTES * _missing_directories(subtree, file_path)
+    )
+    if charged_after > PUBLIC_WRITE_SUBTREE_MAX_BYTES:
       raise HTTPException(413, "This app's public submission area is full.")
     version = storage_routes.commit_write(
       settings.data_dir, grant.app_id, actual, file_path, content, stored_mime,
