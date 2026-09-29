@@ -790,9 +790,9 @@ class PushUnsubscribeRequest(BaseModel):
 class NotificationAction(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
-  action: str
-  title: str
-  target: str | None = None
+  action: str = Field(max_length=64)
+  title: str = Field(max_length=200)
+  target: str | None = Field(default=None, max_length=2048)
   resource_type: Literal["chat", "app", "project"] | None = None
   resource_id: str | None = Field(default=None, min_length=1, max_length=128)
   resource_generation: str | None = Field(
@@ -852,11 +852,18 @@ class NotificationAction(BaseModel):
 
 
 class NotificationSendRequest(BaseModel):
-  title: str
-  body: str | None = None
-  icon: str | None = None
-  target: str | None = None
-  actions: list[NotificationAction] | None = None
+  # Mini-apps (untrusted code) and public app services can send notifications,
+  # and every row is kept in the owner's history, so each field is bounded.
+  # The limits sit far above a readable notification; they only stop a sender
+  # from storing megabytes per call.
+  title: str = Field(max_length=500)
+  body: str | None = Field(default=None, max_length=8000)
+  # The push service worker shows this image on the owner's device, which then
+  # fetches it. Only same-origin paths are accepted so a sender cannot make the
+  # device contact a server of its choosing.
+  icon: str | None = Field(default=None, max_length=512)
+  target: str | None = Field(default=None, max_length=2048)
+  actions: list[NotificationAction] | None = Field(default=None, max_length=4)
   # Defaults to 'agent' so the common agent-authored curl works
   # with just {title, body}. Apps should pass 'app' + their id.
   source_type: str = "agent"
@@ -869,6 +876,15 @@ class NotificationSendRequest(BaseModel):
   tag: str | None = Field(
     default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$",
   )
+
+  @field_validator("icon")
+  @classmethod
+  def require_same_origin_icon(cls, value: str | None) -> str | None:
+    if value is not None and (
+      not value.startswith("/") or value.startswith("//") or "\\" in value
+    ):
+      raise ValueError("icon must be a same-origin path such as /icons/icon-192.png")
+    return value
 
   @field_validator("target")
   @classmethod

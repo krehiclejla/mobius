@@ -121,3 +121,34 @@ def test_tag_outside_the_short_safe_charset_is_rejected(client, auth, tag):
     "/api/notifications/send", headers=auth, json={"title": "t", "tag": tag},
   )
   assert response.status_code == 422
+
+
+@pytest.mark.parametrize("overrides", [
+  {"title": "x" * 501},
+  {"body": "x" * 8001},
+  {"icon": "https://tracker.example/pixel.png"},
+  {"icon": "//tracker.example/pixel.png"},
+  {"target": "/shell/?app=1&x=" + "x" * 2048},
+  {"actions": [{"action": f"a{i}", "title": "Go"} for i in range(5)]},
+  {"actions": [{"action": "open", "title": "x" * 201}]},
+])
+def test_app_notification_fields_are_bounded(client, auth, db, overrides):
+  """An app token is untrusted code: it cannot store megabytes per notification
+  in the owner's history or make the owner's device fetch an external icon."""
+  headers = _app_auth(db, _app(db, "bounded-sender"))
+  res = client.post(
+    "/api/notifications/send", headers=headers,
+    json={"title": "Ping", "body": "hello", **overrides},
+  )
+  assert res.status_code == 422, res.text
+  assert client.get("/api/notifications", headers=auth).json() == []
+
+
+def test_app_notification_accepts_same_origin_icon_and_readable_text(client, auth, db):
+  headers = _app_auth(db, _app(db, "ordinary-sender"))
+  res = client.post("/api/notifications/send", headers=headers, json={
+    "title": "t" * 500, "body": "b" * 8000, "icon": "/icons/icon-192.png",
+  })
+  assert res.status_code == 200, res.text
+  row = client.get("/api/notifications", headers=auth).json()[0]
+  assert row["icon"] == "/icons/icon-192.png"
