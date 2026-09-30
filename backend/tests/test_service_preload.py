@@ -103,7 +103,7 @@ def _gone(pid: int) -> bool:
   try:
     with open(f"/proc/{pid}/stat") as handle:
       return handle.read().split(")")[-1].split()[0] == "Z"
-  except FileNotFoundError:
+  except (FileNotFoundError, ProcessLookupError):
     return True
 
 
@@ -308,3 +308,24 @@ def test_the_production_event_loop_starts_hosts_with_only_their_own_descriptors(
 
   with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
     runner.run(scenario())
+
+
+def test_gone_handles_process_exiting_after_stat_open(monkeypatch):
+  class ExitedStat:
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def read(self): raise ProcessLookupError(3, "No such process")
+
+  monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: ExitedStat())
+  assert _gone(12345) is True
+
+
+def test_gone_does_not_hide_unrelated_read_errors(monkeypatch):
+  class UnreadableStat:
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def read(self): raise PermissionError(13, "Permission denied")
+
+  monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: UnreadableStat())
+  with pytest.raises(PermissionError):
+    _gone(12345)
