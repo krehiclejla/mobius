@@ -1370,6 +1370,11 @@ async def run_claude_sdk_turn(
       ),
       "include_partial_messages": True,
       "max_buffer_size": _CLAUDE_SDK_MAX_BUFFER_SIZE,
+      # Chat text is data, not a Claude Code command line: the SDK marks each
+      # outgoing user message client-composed, including resumed turns and
+      # internally queued steering. Native @file and /command shortcuts are
+      # deliberately unavailable in Möbius chats.
+      "verbatim_prompts": True,
       "can_use_tool": can_use_tool,
       "disallowed_tools": [
         *_CLAUDE_BUILTIN_HELPER_TOOLS,
@@ -1592,6 +1597,11 @@ async def run_claude_sdk_turn(
             and active_client.turn_cut_owned
             and (
               sdk_msg.stop_reason == "interrupt"
+              # Newer SDKs name an interrupt by its terminal reason even when
+              # the last model stop_reason was not `interrupt`.
+              or sdk_msg.terminal_reason in (
+                "aborted_streaming", "aborted_tools",
+              )
               # A card end lands while the card's tool is the last action, so
               # the CLI's terminal carries stop_reason `tool_use`/null (observed
               # `terminal_reason: "hook_stopped"` for the PostToolUse cut, and
