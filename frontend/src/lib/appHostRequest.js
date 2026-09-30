@@ -8,17 +8,33 @@ const REQUEST_TYPES = new Set([
 ])
 
 /**
+ * Whether the owner has just interacted with this document or a frame inside
+ * it. A click in a (cross-origin) app frame also activates its ancestors, so
+ * the shell can see that the owner acted without trusting the frame's word.
+ * Browsers without the User Activation API report false (fail closed).
+ */
+export function hasTransientUserActivation(nav = globalThis.navigator) {
+  return nav?.userActivation?.isActive === true
+}
+
+/**
  * Narrow the frame's navigation request wire format before it leaves the
  * exact-window-attributed AppCanvas boundary. Hosts receive one small, stable
  * contract rather than the frame's arbitrary postMessage object.
+ *
+ * `autoSend` submits the draft as the owner's own first message in a new
+ * owner chat, which runs with the owner's full authority (including connected
+ * services an app's own chats never receive). An app is untrusted code, so the
+ * host honors it only when the caller vouches that the owner just acted in the
+ * visible app (`mayAutoSend`); otherwise the text arrives as an editable draft.
  */
-export function appHostRequest(message) {
+export function appHostRequest(message, { mayAutoSend = false } = {}) {
   if (!message || !REQUEST_TYPES.has(message.type)) return null
   if (message.type === 'moebius:new-chat') {
     return {
       type: message.type,
       draft: typeof message.draft === 'string' ? message.draft : '',
-      autoSend: message.autoSend === true,
+      autoSend: message.autoSend === true && mayAutoSend === true,
     }
   }
   if (message.type === 'moebius:open-chat') {

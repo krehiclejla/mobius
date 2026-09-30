@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { appHostRequest } from '../appHostRequest.js'
+import { appHostRequest, hasTransientUserActivation } from '../appHostRequest.js'
 
 test('app host requests expose only the reviewed navigation contract', () => {
   assert.deepEqual(appHostRequest({
@@ -81,4 +81,22 @@ test('source import requests retain only the bounded source identity, never a ch
   assert.equal(result.kind, undefined)
   assert.equal(result.token, undefined)
   assert.equal(appHostRequest({ type: 'moebius:projects', requestId: 'projects:abc:2', action: 'import-sources' }).action, 'import-sources')
+})
+
+test('an app can auto-send a new owner chat only right after the owner acts', () => {
+  const request = { type: 'moebius:new-chat', draft: 'run this', autoSend: true }
+  // Untrusted app code alone (hidden pane, timer, no click) only stages a draft.
+  assert.equal(appHostRequest(request).autoSend, false)
+  assert.equal(appHostRequest(request, { mayAutoSend: false }).autoSend, false)
+  assert.equal(appHostRequest(request, { mayAutoSend: 'yes' }).autoSend, false)
+  assert.deepEqual(appHostRequest(request, { mayAutoSend: true }), {
+    type: 'moebius:new-chat', draft: 'run this', autoSend: true,
+  })
+})
+
+test('user activation is read from the browser and fails closed', () => {
+  assert.equal(hasTransientUserActivation({ userActivation: { isActive: true } }), true)
+  assert.equal(hasTransientUserActivation({ userActivation: { isActive: false } }), false)
+  assert.equal(hasTransientUserActivation({}), false)
+  assert.equal(hasTransientUserActivation(undefined), false)
 })
