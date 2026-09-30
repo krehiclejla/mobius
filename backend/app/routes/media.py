@@ -1,13 +1,17 @@
 """Authenticated chat-media serving routes."""
 
+import json
 import mimetypes
+import posixpath
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from app import models
 from app.auth_helpers import TokenSource, get_auth_token_source
+from app.chat_transcript import materialized_messages
 from app.config import get_settings
 from app.database import get_db
 from app.deps import resolve_media_or_header_owner
@@ -26,6 +30,41 @@ _RASTER_MEDIA_TYPES = {
 }
 
 _AGENT_TMP_ROOT = Path("/tmp")
+
+
+def _tool_input_path(value) -> str:
+  """The file path a tool block recorded, raw or inside its JSON input."""
+  text = value.strip() if isinstance(value, str) else ""
+  if text.startswith("{"):
+    try:
+      parsed = json.loads(text)
+    except ValueError:
+      return ""
+    if not isinstance(parsed, dict):
+      return ""
+    text = parsed.get("path") or parsed.get("file_path") or ""
+    text = text.strip() if isinstance(text, str) else ""
+  return text
+
+
+def _chat_viewed_tmp_image(chat, filename: str) -> bool:
+  """Whether this chat's own transcript records viewing ``/tmp/<filename>``.
+
+  ``/tmp`` is shared by every chat and agent on the instance. The route exists
+  to render an image this chat's agent looked at, so it serves only paths a
+  tool block in this chat named — never an arbitrary guess from any holder of
+  a chat-scoped media token (which includes an app's embedded chat).
+  """
+  wanted = posixpath.normpath("/tmp/" + filename)
+  for message in materialized_messages(chat):
+    blocks = message.get("blocks") if isinstance(message, dict) else None
+    for block in blocks if isinstance(blocks, list) else []:
+      if not isinstance(block, dict) or block.get("type") != "tool":
+        continue
+      recorded = _tool_input_path(block.get("input"))
+      if recorded.startswith("/tmp/") and posixpath.normpath(recorded) == wanted:
+        return True
+  return False
 
 
 def _authorize_chat_media(chat_id, token_src, db):
@@ -103,6 +142,12 @@ def serve_agent_tmp_image(
   protects browser image requests just like durable chat media.
   """
   _authorize_chat_media(chat_id, token_src, db)
+  chat = db.query(models.Chat).filter(
+    models.Chat.id == chat_id,
+    models.Chat.deleted_at.is_(None),
+  ).first()
+  if chat is None or not _chat_viewed_tmp_image(chat, filename):
+    raise HTTPException(status_code=404, detail="Image not found.")
   file_path = validate_path_within_base(filename, _AGENT_TMP_ROOT)
   if not file_path.is_file():
     raise HTTPException(status_code=404, detail="Image not found.")
