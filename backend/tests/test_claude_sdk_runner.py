@@ -1250,7 +1250,11 @@ def test_native_continuation_defers_only_a_result_not_seen_while_active():
   assert slow.observe_result() is False
 
 
-def _interrupt_result(session_id: str = "sess-1") -> ResultMessage:
+def _interrupt_result(
+  session_id: str = "sess-1", *,
+  stop_reason: str | None = "interrupt",
+  terminal_reason: str | None = None,
+) -> ResultMessage:
   """The terminal an SDK interrupt produces — error_during_execution."""
   return ResultMessage(
     subtype="error_during_execution",
@@ -1259,13 +1263,18 @@ def _interrupt_result(session_id: str = "sess-1") -> ResultMessage:
     is_error=True,
     num_turns=1,
     session_id=session_id,
-    stop_reason="interrupt",
+    stop_reason=stop_reason,
+    terminal_reason=terminal_reason,
     total_cost_usd=0.01,
     usage={"input_tokens": 1, "output_tokens": 2},
   )
 
 
-async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
+async def _run_claude_stop_outcome(
+  monkeypatch, mode: str, *, owned: bool,
+  stop_reason: str | None = "interrupt",
+  terminal_reason: str | None = None,
+):
   """Run one fake response stream, with an owner Stop in flight when `owned`.
 
   The Stop goes through the public `interrupt()`: it records ownership before
@@ -1293,7 +1302,9 @@ async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
         while not self.interrupts:
           await asyncio.sleep(0)
       if mode == "terminal":
-        yield _interrupt_result()
+        yield _interrupt_result(
+          stop_reason=stop_reason, terminal_reason=terminal_reason,
+        )
         return
       if mode == "resultless":
         return
@@ -1374,6 +1385,33 @@ async def test_owner_stop_turns_claude_interrupt_result_into_clean_terminal(
   assert result["terminal_status"] == "interrupted"
   assert result["cost_usd"] == 0.01
   assert result["usage"] == {"input_tokens": 1, "output_tokens": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_reason", ["aborted_streaming", "aborted_tools"])
+async def test_owner_stop_uses_structured_claude_terminal_reason(
+  monkeypatch, terminal_reason,
+):
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "terminal", owned=True,
+    stop_reason="tool_use", terminal_reason=terminal_reason,
+  )
+
+  assert result["error"] is None
+  assert result["terminal_status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_unowned_claude_abort_stays_an_error_with_structured_reason(
+  monkeypatch,
+):
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "terminal", owned=False,
+    stop_reason="tool_use", terminal_reason="aborted_tools",
+  )
+
+  assert result["error"] == "Execution interrupted."
+  assert result.get("terminal_status") is None
 
 
 @pytest.mark.asyncio
@@ -1761,6 +1799,21 @@ async def test_claude_new_and_resumed_turns_exclude_native_owner_questions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", [None, "sess-1"])
+@pytest.mark.parametrize("prompt", ["Review this text: @private-file", "/compact"])
+async def test_claude_chat_prompts_are_literal_on_new_and_resumed_turns(
+  monkeypatch, session_id, prompt,
+):
+  """Quoted paths and slash text must not invoke Claude Code shortcuts."""
+  clients = _install_fake_client(monkeypatch)
+
+  await _run_turn("literal-chat", prompt=prompt, session_id=session_id)
+
+  assert clients[0].options.verbatim_prompts is True
+  assert clients[0].queries == [prompt]
+
+
+@pytest.mark.asyncio
 async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   clients = _install_fake_client(monkeypatch)
 
@@ -1779,6 +1832,7 @@ async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
     claude_sdk_runner._system_prompt_with_register("system")
   )
   assert "$MOBIUS_GENERATED_DIR" in options.system_prompt
+  assert "Create downloadable deliverables only when the owner explicitly requests" in options.system_prompt
   assert options.system_prompt.startswith("system")
   assert "# Concise register" in options.system_prompt
   assert "# Execution lifetimes in Möbius" in options.system_prompt

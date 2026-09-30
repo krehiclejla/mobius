@@ -4452,6 +4452,9 @@ def test_run_codex_sdk_turn_controls_prompt_layers(monkeypatch, session_id):
   assert "$MOBIUS_GENERATED_DIR" in (
     captured["thread_options"]["base_instructions"]
   )
+  assert "Create downloadable deliverables only when the owner explicitly requests" in (
+    captured["thread_options"]["base_instructions"]
+  )
   assert captured["thread_options"]["developer_instructions"] == ""
   assert captured["thread_options"]["personality"] == "none"
   thread_mcp = captured["thread_options"]["config"]["mcp_servers"]

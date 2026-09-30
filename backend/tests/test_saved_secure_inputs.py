@@ -386,7 +386,8 @@ def test_supervised_recovery_does_not_interrupt_an_owned_consumer(client, chat, 
   assert _state(chat.id, qid)[0] == "completed"
 
 
-def test_timeout_kills_consumer_descendants_not_only_parent(tmp_path, monkeypatch):
+@pytest.mark.parametrize("proc_exit_error", [None, FileNotFoundError, ProcessLookupError])
+def test_timeout_kills_consumer_descendants_not_only_parent(tmp_path, monkeypatch, proc_exit_error):
   import os
   pid_file = tmp_path / "child.pid"
   program = (
@@ -404,10 +405,20 @@ def test_timeout_kills_consumer_descendants_not_only_parent(tmp_path, monkeypatc
   from pathlib import Path
   import time
 
+  if proc_exit_error is not None:
+    read_text = Path.read_text
+
+    def read_after_exit(path, *args, **kwargs):
+      if path == Path(f"/proc/{child_pid}/stat"):
+        raise proc_exit_error()
+      return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_after_exit)
+
   def child_state():
     try:
       return Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
       return "gone"
 
   # The group is killed on timeout; a loaded host may take a moment to act on
