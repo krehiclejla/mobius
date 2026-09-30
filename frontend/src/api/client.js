@@ -1228,6 +1228,21 @@ export const api = {
       'Service surface request failed',
     ),
   },
+  // The instance-wide GitHub account. Settings owns connect/disconnect;
+  // apps only read status through their own github_connect grant.
+  github: {
+    status: (options = {}) => apiFetch('/github/status', options),
+    connectStart: (privateRepos, options = {}) => apiFetch('/github/connect/start', {
+      ...options, method: 'POST', body: JSON.stringify({ private_repos: !!privateRepos }),
+    }),
+    connectPoll: (attemptId, options = {}) => apiFetch('/github/connect/poll', {
+      ...options, method: 'POST', body: JSON.stringify({ attempt_id: attemptId }),
+    }),
+    connectCancel: (attemptId, options = {}) => apiFetch('/github/connect/cancel', {
+      ...options, method: 'POST', body: JSON.stringify({ attempt_id: attemptId }),
+    }),
+    disconnect: (options = {}) => apiFetch('/github/connect', { ...options, method: 'DELETE' }),
+  },
   settings: {
     get: () => apiFetch('/settings'),
     providerUsage: (provider) => apiFetch(

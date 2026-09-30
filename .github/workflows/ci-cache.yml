@@ -1,0 +1,27 @@
+name: CI dependency cache
+
+# Pull requests can restore caches saved on main, but the Tests workflow never
+# runs on main itself. Save the backend environment there whenever its inputs
+# change, so a new pull request starts from a warm cache.
+on:
+  push:
+    branches: [main]
+    paths:
+      - backend/requirements.lock
+      - backend/requirements-static.txt
+      - Dockerfile
+      - frontend/package-lock.json
+      - .github/actions/backend-env/**
+      - .github/workflows/ci-cache.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-env:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/backend-env

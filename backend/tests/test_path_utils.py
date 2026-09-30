@@ -18,14 +18,16 @@ from app.path_utils import validate_chat_id, validate_path_within_base
 @pytest.mark.parametrize("chat_id", [
   "123e4567-e89b-42d3-a456-426614174000",
   "123E4567-E89B-42D3-A456-426614174000",
+  "123e4567-e89b-52d3-a456-426614174000",
+  "123e4567-e89b-12d3-a456-426614174000",
 ])
-def test_validate_chat_id_accepts_dashed_uuid4(chat_id):
+def test_validate_chat_id_accepts_canonical_dashed_uuids(chat_id):
   assert validate_chat_id(chat_id) is None
 
 
 @pytest.mark.parametrize("chat_id", [
   "not-a-uuid",
-  "123e4567-e89b-12d3-a456-426614174000",
+  "123e4567e89b42d3a456426614174000",
   "../123e4567-e89b-42d3-a456-426614174000",
 ])
 def test_validate_chat_id_preserves_invalid_id_response(chat_id):

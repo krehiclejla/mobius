@@ -166,6 +166,35 @@ def test_shared_state_allows_independent_paths_without_global_conflicts(client, 
   assert set(state["versions"]) == {"board.json", "settings.json"}
 
 
+def test_shared_state_beneath_a_value_is_rejected_without_changing_it(client, auth, db):
+  project, _output = _built_project(client, auth, db)
+  instance = _create_instance(client, auth, project.id)
+  base = f"/api/shared-apps/{instance['id']}/state"
+  saved = client.put(
+    f"{base}/board.json", headers=auth,
+    json={"expected_version": None, "value": ["card"]},
+  )
+  assert saved.status_code == 200, saved.text
+
+  for nested in ("board.json/cards.json", "board.json/deep/cards.json"):
+    response = client.put(
+      f"{base}/{nested}", headers=auth,
+      json={"expected_version": None, "value": ["other"]},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "parent_is_file"
+
+  deleted = client.put(
+    f"{base}/board.json/cards.json", headers=auth,
+    json={"expected_version": None, "delete": True},
+  )
+  assert deleted.status_code == 400, deleted.text
+  assert deleted.json()["detail"]["code"] == "parent_is_file"
+
+  state = client.get(base, headers=auth).json()
+  assert state["values"] == {"board.json": ["card"]}
+
+
 def test_shared_state_ignores_only_atomic_write_crash_artifacts(client, auth, db):
   project, _output = _built_project(client, auth, db)
   instance = _create_instance(client, auth, project.id)

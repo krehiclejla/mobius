@@ -4,6 +4,7 @@ import {
   PROVIDER_AVAILABILITY_PHASE,
   configuredProviderOrder,
   configuredProviderSet,
+  mobiusOutOfCredit,
   providerAvailabilityNeedsAttention,
   resolveProviderAvailability,
   visibleProviderModels,
@@ -72,4 +73,12 @@ test('attention means status failure or no configured provider, not optional dis
     phase: PROVIDER_AVAILABILITY_PHASE.READY,
     configuredProviders: new Set(['codex']),
   }), false)
+})
+
+test('Möbius is out of credit only when its balance says nothing is spendable', () => {
+  assert.equal(mobiusOutOfCredit({ trial: { balance: { spendable_units: 0 } } }), true)
+  assert.equal(mobiusOutOfCredit({ trial: { balance: { spendable_units: 1_250_000 } } }), false)
+  // No balance (signed out, app caller, broker unreachable) is not a verdict.
+  assert.equal(mobiusOutOfCredit({ trial: null }), false)
+  assert.equal(mobiusOutOfCredit(undefined), false)
 })

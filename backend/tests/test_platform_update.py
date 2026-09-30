@@ -2809,7 +2809,7 @@ def test_platform_update_uses_explicit_activation_levels(monkeypatch, deployment
   assert classify(["docs/backend/app/notes.md"])["level"] == "live"
 
 
-def test_container_replacement_blocks_local_only_image_inputs(tmp_path, monkeypatch):
+def test_local_image_changes_report_local_only_image_inputs(tmp_path, monkeypatch):
   marker = tmp_path / "activation.json"
   monkeypatch.setattr(pu, "RESTART_NEEDED_FLAG", marker)
   pu._write_activation_marker(
@@ -2819,7 +2819,7 @@ def test_container_replacement_blocks_local_only_image_inputs(tmp_path, monkeypa
     image_paths=[],
   )
 
-  assert pu.container_replacement_blockers() == ["Dockerfile"]
+  assert pu.local_image_changes() == ["Dockerfile"]
 
 
 def test_container_replacement_accepts_image_input_covered_by_upstream(
@@ -2834,10 +2834,10 @@ def test_container_replacement_accepts_image_input_covered_by_upstream(
     image_paths=["Dockerfile"],
   )
 
-  assert pu.container_replacement_blockers() == []
+  assert pu.local_image_changes() == []
 
 
-def test_served_runtime_module_is_not_an_image_replacement_blocker(
+def test_served_runtime_module_is_not_a_local_image_change(
   tmp_path, monkeypatch,
 ):
   """The frozen launcher starts the broker from the served checkout, so a local
@@ -2851,10 +2851,10 @@ def test_served_runtime_module_is_not_an_image_replacement_blocker(
     image_paths=[],
   )
 
-  assert pu.container_replacement_blockers() == ["Dockerfile"]
+  assert pu.local_image_changes() == ["Dockerfile"]
 
 
-def test_image_owned_runtime_is_an_image_replacement_blocker(
+def test_image_owned_runtime_is_a_local_image_change(
   tmp_path, monkeypatch,
 ):
   """Every other module under backend/runtime still comes verbatim from the
@@ -2868,7 +2868,7 @@ def test_image_owned_runtime_is_an_image_replacement_blocker(
     image_paths=[],
   )
 
-  assert pu.container_replacement_blockers() == [
+  assert pu.local_image_changes() == [
     "Dockerfile", "backend/runtime/restart_ledger.py",
   ]
 
@@ -2922,10 +2922,10 @@ def test_served_runtime_edit_asks_for_a_restart_not_a_new_image(
   # from the served revision advancing after boot rather than from an image
   # remainder.
   assert status["activation"]["required_actions"] == ["server_restart"]
-  assert pu.container_replacement_blockers(_served_sha(platform), platform) == []
+  assert pu.local_image_changes(_served_sha(platform), platform) == []
 
 
-def test_replacement_blocks_local_image_owned_runtime_drift(
+def test_local_image_changes_report_image_owned_runtime_drift(
   clone_env,
 ):
   _, platform = clone_env
@@ -2935,7 +2935,7 @@ def test_replacement_blocks_local_image_owned_runtime_drift(
     edits={"backend/runtime/restart_ledger.py": "local-only\n"},
   )
 
-  assert pu.container_replacement_blockers(official, platform) == [
+  assert pu.local_image_changes(official, platform) == [
     "backend/runtime/restart_ledger.py",
   ]
 
@@ -2952,20 +2952,20 @@ def test_replacement_carries_a_local_served_runtime_edit(
     edits={"backend/runtime/identity_broker.py": "local-only\n"},
   )
 
-  assert pu.container_replacement_blockers(official, platform) == []
+  assert pu.local_image_changes(official, platform) == []
 
 
-def test_replacement_blocks_unmarked_local_image_input_drift(clone_env):
+def test_local_image_changes_report_unmarked_image_input_drift(clone_env):
   """Direct local commits to image inputs never write an activation marker,
-  yet the official image would silently replace them; the blockers check must
+  yet the official image does not run them; the report must
   derive that drift from the histories themselves."""
   _, platform = clone_env
   official = _git(platform, "rev-parse", "HEAD").stdout.strip()
 
-  assert pu.container_replacement_blockers(official, platform) == []
+  assert pu.local_image_changes(official, platform) == []
 
   _local_commit(platform, edits={"Dockerfile": "FROM local-only\n"})
-  assert pu.container_replacement_blockers(official, platform) == [
+  assert pu.local_image_changes(official, platform) == [
     "Dockerfile",
   ]
 
@@ -2978,17 +2978,17 @@ def test_reviewed_image_target_does_not_treat_incoming_dockerfile_as_local(
   target = _advance_origin(origin, edits={"Dockerfile": "FROM official-new\n"})
   _git(platform, "fetch", "origin")
 
-  assert pu.container_replacement_blockers(
+  assert pu.local_image_changes(
     target, platform, local_change_base=current,
   ) == []
 
   _local_commit(platform, edits={"Dockerfile": "FROM local-divergence\n"})
-  assert pu.container_replacement_blockers(
+  assert pu.local_image_changes(
     target, platform, local_change_base=current,
   ) == ["Dockerfile"]
 
 
-def test_local_image_change_already_in_a_further_changed_target_is_not_a_blocker(
+def test_local_image_change_already_in_a_further_changed_target_is_not_reported(
   clone_env,
 ):
   """A local fix the release already contains, plus more release edits to the
@@ -3010,14 +3010,14 @@ def test_local_image_change_already_in_a_further_changed_target_is_not_a_blocker
   )
   _git(platform, "fetch", "origin")
 
-  assert pu.container_replacement_blockers(
+  assert pu.local_image_changes(
     target, platform, local_change_base=base,
   ) == []
 
   _local_commit(
     platform, edits={"Dockerfile": "FROM base\nRUN one-local-only\n\n\n\nRUN two\n"},
   )
-  assert pu.container_replacement_blockers(
+  assert pu.local_image_changes(
     target, platform, local_change_base=base,
   ) == ["Dockerfile"]
 
@@ -3056,7 +3056,6 @@ def test_reviewed_image_plan_binds_digest_and_preserves_live_tree(
   assert preview["plan_id"] == pu._update_plan_id(current, target, digest)
   assert reviewed["target_sha"] == target
   assert reviewed["activation"]["level"] == "image_rebuild"
-  assert reviewed["blockers"] == []
   assert _served_sha(platform) == current
 
   with pytest.raises(pu.PlatformUpdateError, match="update_plan_invalid"):
@@ -3104,7 +3103,7 @@ def test_explicit_ghcr_preview_fails_closed_when_source_fetch_fails(
   assert _served_sha(platform) == served
 
 
-def test_replacement_blocks_image_input_renamed_out_of_its_owned_path(
+def test_local_image_changes_report_input_renamed_out_of_its_owned_path(
   clone_env,
 ):
   """Rename detection must not hide the removed image-owned source path."""
@@ -3117,7 +3116,7 @@ def test_replacement_blocks_image_input_renamed_out_of_its_owned_path(
   _git(platform, "mv", "Dockerfile", "docs/Dockerfile")
   _git(platform, "commit", "-q", "-m", "move image input out")
 
-  assert pu.container_replacement_blockers(official, platform) == [
+  assert pu.local_image_changes(official, platform) == [
     "Dockerfile",
   ]
 
@@ -3138,7 +3137,7 @@ def test_stale_marker_coverage_cannot_excuse_newer_image_input_drift(
   }), encoding="utf-8")
 
   _local_commit(platform, edits={"Dockerfile": "FROM drifted-later\n"})
-  assert pu.container_replacement_blockers(official, platform) == [
+  assert pu.local_image_changes(official, platform) == [
     "Dockerfile",
   ]
 
@@ -3165,12 +3164,12 @@ def test_marker_coverage_survives_newer_descendant_official_image(
   )
   _git(platform, "fetch", "origin")
 
-  assert pu.container_replacement_blockers(
+  assert pu.local_image_changes(
     target, platform, local_change_base=applied,
   ) == []
 
   _local_commit(platform, edits={"Dockerfile": "FROM local-only\n"})
-  assert pu.container_replacement_blockers(
+  assert pu.local_image_changes(
     target, platform, local_change_base=applied,
   ) == ["Dockerfile"]
 
@@ -3197,7 +3196,7 @@ def test_legacy_activation_marker_is_normalized_before_current_runtime_reads(
     "paths": ["Dockerfile"],
     "image_paths": [],
   }
-  assert pu.container_replacement_blockers() == ["Dockerfile"]
+  assert pu.local_image_changes() == ["Dockerfile"]
   assert receipt.read_text() == "v2"
 
 
@@ -3388,36 +3387,167 @@ def test_status_no_restart_when_only_tests_changed(clone_env):
   assert status["state"] == pu.PlatformUpdateState.UP_TO_DATE.value
 
 
-def test_status_ignores_boot_script_repair_already_matching_running_image(
+def test_status_owes_no_image_for_a_local_edit_to_an_image_input(
   clone_env, monkeypatch,
 ):
-  """A served-checkout SHA cannot make an already-baked boot script stale.
+  """Only official image inputs the running image lacks are owed.
 
-  Boot scripts run from the image, unlike the Python checkout. Restoring one
-  to the image's exact bytes must clear a false image-rebuild prompt.
+  The image runs the official release's boot script. A local edit to it stays
+  in the checkout, but no official replacement can run it, so it must not
+  raise an image-rebuild prompt that a replacement could never clear.
   """
   _, platform = clone_env
   path = "backend/scripts/init_chat_summaries.py"
-  seed = platform / path
-  seed.parent.mkdir(parents=True)
-  seed.write_text("old seed\n")
-  _git(platform, "add", path)
-  _git(platform, "commit", "-q", "-m", "old seed")
-  served = _served_sha(platform)
-  pu.SERVING_SOURCE_FILE.write_text("platform\n")
-  pu.SERVING_SHA_FILE.write_text(served + "\n")
-
   baked = "running image script\n"
-  _local_commit(platform, edits={path: baked})
+  official = _local_commit(platform, edits={path: baked}, msg="official seed")
+  _git(platform, "branch", "-f", "upstream", official)
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(official + "\n")
   monkeypatch.setattr(pu, "_build_info", lambda: {
     "image_inputs": {path: hashlib.sha256(baked.encode()).hexdigest()},
   })
 
+  _local_commit(platform, edits={path: "local customization\n"})
   status = pu.platform_status(platform)
 
   assert status["needs_restart"] is False
   assert status["state"] == pu.PlatformUpdateState.UP_TO_DATE.value
   assert status["activation"]["level"] == "live"
+
+  # An official change the image lacks is still owed.
+  _git(platform, "branch", "-f", "upstream", _local_commit(
+    platform, edits={path: "newer official script\n"}, msg="official change",
+  ))
+  status = pu.platform_status(platform)
+  assert status["state"] == pu.PlatformUpdateState.ACTIVATION_NEEDED.value
+  assert status["activation"]["level"] == "image_rebuild"
+
+
+def test_status_owes_the_image_of_a_contained_release_past_a_stale_marker(
+  clone_env, monkeypatch,
+):
+  """The image runs release A, the recorded upstream still says A, but the
+  checkout contains official release B, which changes an image input. B's
+  image is owed: a stale marker must not excuse it."""
+  origin, platform = clone_env
+  path = "backend/scripts/init_chat_summaries.py"
+  release_a = _advance_origin(origin, edits={path: "release a\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", release_a)
+  _git(platform, "branch", "-f", "upstream", release_a)
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "image_inputs": {path: hashlib.sha256(b"release a\n").hexdigest()},
+  })
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(release_a + "\n")
+  assert pu.platform_status(platform)["activation"]["level"] == "live"
+
+  release_b = _advance_origin(origin, edits={path: "release b\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", release_b)
+  pu.SERVING_SHA_FILE.write_text(release_b + "\n")
+  assert pu.recorded_upstream_sha(platform) == release_a
+
+  status = pu.platform_status(platform)
+  assert status["activation"]["level"] == "image_rebuild"
+  finish = pu.platform_update_preview(platform, target_sha=release_b)
+  assert finish["operation"] == "finish"
+  assert "image_rebuild" in finish["activation"]["required_actions"]
+
+  # A newer release fetched but not installed does not hide B's image either.
+  _advance_origin(origin, edits={"release-c.txt": "c\n"})
+  pu._fetch(platform)
+  assert pu._contained_official_source(platform) == release_b
+  assert pu.platform_status(platform)["activation"]["level"] == "image_rebuild"
+  # Finish cannot offer release A's image for source that holds B; the owner
+  # is sent to the update that installs a release containing B.
+  with pytest.raises(pu.PlatformUpdateError, match="applied_release_unavailable"):
+    pu.applied_release_sha(platform)
+
+
+def test_damaged_deployed_runtime_stays_owed_even_when_the_release_matches(
+  clone_env, monkeypatch, tmp_path,
+):
+  """Filtering local customizations never hides a deployed protected module
+  that differs from what the image itself recorded."""
+  _, platform = clone_env
+  path = "backend/runtime/restart_ledger.py"
+  official = _local_commit(platform, edits={path: "image\n"})
+  _git(platform, "branch", "-f", "upstream", official)
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "image_inputs": {path: hashlib.sha256(b"image\n").hexdigest()},
+  })
+  deployed = tmp_path / "deployed-runtime"
+  deployed.mkdir()
+  monkeypatch.setenv("MOBIUS_PROTECTED_RUNTIME_DIR", str(deployed))
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(official + "\n")
+
+  # A local edit with the image's own module deployed is a customization.
+  (deployed / "restart_ledger.py").write_text("image\n", encoding="utf-8")
+  _local_commit(platform, edits={path: "local\n"})
+  pu.SERVING_SHA_FILE.write_text(_served_sha(platform) + "\n")
+  assert pu.platform_status(platform)["activation"]["level"] == "live"
+
+  # The same checkout with a damaged deployed module still owes the image.
+  (deployed / "restart_ledger.py").write_text("damaged\n", encoding="utf-8")
+  status = pu.platform_status(platform)
+  assert status["activation"]["level"] == "image_rebuild"
+  assert status["activation"]["reasons"][0]["paths"] == [path]
+
+  # A link to the image's bytes is not the image's module, and a named pipe
+  # is never opened for reading (it would block status forever).
+  genuine = tmp_path / "genuine.py"
+  genuine.write_text("image\n", encoding="utf-8")
+  (deployed / "restart_ledger.py").unlink()
+  (deployed / "restart_ledger.py").symlink_to(genuine)
+  assert pu.platform_status(platform)["activation"]["level"] == "image_rebuild"
+  (deployed / "restart_ledger.py").unlink()
+  os.mkfifo(deployed / "restart_ledger.py")
+
+  def stalled(_signum, _frame):
+    raise AssertionError("status blocked opening a deployed named pipe")
+
+  previous = signal.signal(signal.SIGALRM, stalled)
+  signal.alarm(5)
+  try:
+    status = pu.platform_status(platform)
+  finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, previous)
+  assert status["activation"]["level"] == "image_rebuild"
+
+
+def test_source_only_update_keeping_a_local_dockerfile_needs_no_image(
+  clone_env, monkeypatch,
+):
+  """An agent-finished update that keeps a local Dockerfile customization
+  and changes no official image input is a restart, not a replacement."""
+  origin, platform = clone_env
+  official = _advance_origin(origin, edits={"Dockerfile": "FROM official\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", official)
+  _git(platform, "branch", "-f", "upstream", official)
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "image_inputs": {"Dockerfile": hashlib.sha256(b"FROM official\n").hexdigest()},
+  })
+  _local_commit(platform, edits={"Dockerfile": "FROM official\nRUN local\n"})
+  current = _served_sha(platform)
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(current + "\n")
+  target = _advance_origin(origin, edits={"release.txt": "reviewed\n"})
+  pu._fetch(platform)
+  plan = _apply_plan(current, target, platform)
+  plan.pop("repo")
+
+  pu.park_update_for_agent(**plan, repo=platform)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+
+  prepared = pu.read_prepared_update()
+  assert prepared["requires_image"] is False
+  assert pu._git_blob(platform, prepared["prepared"], "Dockerfile") == (
+    b"FROM official\nRUN local\n"
+  )
 
 
 def test_status_requires_an_image_for_python_dependency_changes(
@@ -5049,14 +5179,18 @@ def test_only_an_owed_container_replacement_blocks_newer_updates(clone_env):
   }
 
 
-def test_blockers_are_fixed_on_a_frozen_copy_and_late_edits_return_after_boot(
+def test_local_image_edits_survive_a_parked_update_and_late_edits_return(
   clone_env,
 ):
+  """A local image-owned edit is kept, not reverted: the update finishes
+  around it and never asks the agent to discard it."""
   origin, platform = clone_env
   script = "backend/scripts/init_chat_summaries.py"
   _local_commit(platform, edits={script: "local boot tweak\n"})
   current = _served_sha(platform)
-  target = _advance_origin(origin, edits={"release.txt": "reviewed\n"})
+  target = _advance_origin(origin, edits={
+    "release.txt": "reviewed\n", "Dockerfile": "FROM official-new\n",
+  })
   pu._fetch(platform)
   plan = _apply_plan(current, target, platform)
   plan.pop("repo")
@@ -5065,12 +5199,10 @@ def test_blockers_are_fixed_on_a_frozen_copy_and_late_edits_return_after_boot(
 
   assert pending["stage"] == "resolve"
   parked = pu._read_conflict_flag()["overlay"]
-  assert parked["blockers"] == [script]
-  worktree = Path(parked["worktree"])
+  assert "blockers" not in parked
   content = pu._platform_conflict_resolver_message(target, [], parked)
-  assert script in content and f"git checkout {target} -- <path>" in content
+  assert script not in content and "git checkout" not in content
 
-  _git(worktree, "rm", "-q", script)  # the release does not ship this file
   # Another chat keeps working on the live checkout meanwhile.
   _local_commit(platform, edits={"notes.txt": "late live edit\n"})
 
@@ -5087,7 +5219,7 @@ def test_blockers_are_fixed_on_a_frozen_copy_and_late_edits_return_after_boot(
   assert _finish_prepared(platform) == "replayed"
   assert (platform / "release.txt").read_text() == "reviewed\n"
   assert (platform / "notes.txt").read_text() == "late live edit\n"
-  assert not (platform / script).exists()
+  assert (platform / script).read_text() == "local boot tweak\n"
   assert pu._is_ancestor(platform, target, _served_sha(platform))
 
 
@@ -5204,7 +5336,7 @@ def test_host_installer_replays_exact_bundled_release_and_preserves_local_edits(
 
 
 @pytest.mark.parametrize("deployment", ["self_hosted", "railway"])
-def test_review_exposes_boot_script_customization_before_replacement_without_mutation(
+def test_review_reports_boot_script_customization_without_mutation(
   clone_env, monkeypatch, deployment,
 ):
   origin, platform = clone_env
@@ -5219,17 +5351,13 @@ def test_review_exposes_boot_script_customization_before_replacement_without_mut
   before_status = _git(platform, "status", "--porcelain").stdout
 
   preview = pu.platform_update_preview(platform, target_sha=target)
-  reviewed = pu.reviewed_container_rebuild_plan(
+  pu.reviewed_container_rebuild_plan(
     repo=platform, plan_id=preview["plan_id"], current_sha=before,
     target_sha=target, image_digest=None,
   )
 
-  assert preview["blocking_paths"] == paths
-  assert reviewed["blockers"] == preview["blocking_paths"]
-  assert preview["blocking_diff"] is not None
-  assert "backend/scripts/init_agent_context.py" in preview["blocking_diff"]
-  assert "local instructions" in preview["blocking_diff"]
-  assert preview["blocking_diff_truncated"] is False
+  assert preview["local_image_paths"] == paths
+  assert preview["actionable"] is True
   assert preview["activation"]["deployment"] == deployment
   assert _served_sha(platform) == before
   assert _git(platform, "status", "--porcelain").stdout == before_status
@@ -5237,7 +5365,7 @@ def test_review_exposes_boot_script_customization_before_replacement_without_mut
   assert all((platform / path).read_text() == "local instructions\n" for path in paths)
 
 
-def test_review_does_not_block_image_changes_already_in_the_official_release(clone_env):
+def test_review_does_not_report_image_changes_already_in_the_official_release(clone_env):
   origin, platform = clone_env
   path = "backend/scripts/init_chat_summaries.py"
   _local_commit(platform, edits={path: "same useful instructions\n"})
@@ -5247,12 +5375,10 @@ def test_review_does_not_block_image_changes_already_in_the_official_release(clo
   preview = pu.platform_update_preview(platform, target_sha=target)
 
   assert preview["activation"]["level"] == "image_rebuild"
-  assert preview["blocking_paths"] == []
-  assert preview["blocking_diff"] is None
-  assert preview["blocking_diff_truncated"] is False
+  assert preview["local_image_paths"] == []
 
 
-def test_review_exposes_uncommitted_image_input_blocker(clone_env):
+def test_review_reports_an_uncommitted_image_input_edit(clone_env):
   origin, platform = clone_env
   dockerfile = platform / "Dockerfile"
   dockerfile.write_text("FROM local-owner-image\n")
@@ -5264,9 +5390,7 @@ def test_review_exposes_uncommitted_image_input_blocker(clone_env):
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert preview["blocking_paths"] == ["Dockerfile"]
-  assert "local-owner-image" in preview["blocking_diff"]
-  assert "reviewed-official-image" in preview["blocking_diff"]
+  assert preview["local_image_paths"] == ["Dockerfile"]
 
 
 def test_review_does_not_follow_uncommitted_image_input_symlink(clone_env):
@@ -5283,9 +5407,8 @@ def test_review_does_not_follow_uncommitted_image_input_symlink(clone_env):
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert preview["blocking_paths"] == ["Dockerfile"]
-  assert str(secret) in preview["blocking_diff"]
-  assert "do-not-expose" not in preview["blocking_diff"]
+  assert preview["local_image_paths"] == ["Dockerfile"]
+  assert "do-not-expose" not in json.dumps(preview)
 
 
 def test_review_does_not_block_on_uncommitted_image_input_fifo(clone_env):
@@ -5311,8 +5434,7 @@ def test_review_does_not_block_on_uncommitted_image_input_fifo(clone_env):
     signal.alarm(0)
     signal.signal(signal.SIGALRM, previous)
 
-  assert preview["blocking_paths"] == ["Dockerfile"]
-  assert "reviewed-official-image" in preview["blocking_diff"]
+  assert preview["local_image_paths"] == ["Dockerfile"]
 
 
 def test_review_describes_a_locally_deleted_image_input(clone_env):
@@ -5327,9 +5449,7 @@ def test_review_describes_a_locally_deleted_image_input(clone_env):
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert preview["blocking_paths"] == ["Dockerfile"]
-  assert "local path is not present: Dockerfile" in preview["blocking_diff"]
-  assert "crosses a link" not in preview["blocking_diff"]
+  assert preview["local_image_paths"] == ["Dockerfile"]
 
 
 def test_review_does_not_follow_image_input_ancestor_symlink(clone_env):
@@ -5351,12 +5471,11 @@ def test_review_does_not_follow_image_input_ancestor_symlink(clone_env):
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert path in preview["blocking_paths"]
-  assert "outside-secret" not in preview["blocking_diff"]
-  assert "crosses a link" in preview["blocking_diff"]
+  assert path in preview["local_image_paths"]
+  assert "outside-secret" not in json.dumps(preview)
 
 
-def test_finish_review_exposes_local_image_blockers_too(clone_env):
+def test_finish_review_reports_local_image_changes_too(clone_env):
   _, platform = clone_env
   official = _served_sha(platform)
   path = "backend/scripts/init_chat_summaries.py"
@@ -5366,8 +5485,7 @@ def test_finish_review_exposes_local_image_blockers_too(clone_env):
   preview = pu.platform_update_preview(platform, target_sha=official)
 
   assert preview["operation"] == "finish"
-  assert preview["blocking_paths"] == [path]
-  assert "preserve me" in preview["blocking_diff"]
+  assert preview["local_image_paths"] == [path]
 
 
 # --- An update that needs a new image is activated by that image's boot -----

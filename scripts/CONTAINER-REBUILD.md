@@ -170,6 +170,71 @@ older source runs on the newer packages; the probe proves that it imports,
 nothing more. A release that also advances `deployment/self-hosted-helper.required`
 then asks you to reinstall the helper from a current trusted checkout.
 
+## Self-updating worker
+
+The installer puts a small frozen **launcher** at
+`/usr/local/libexec/mobius-rebuild-host` (`scripts/mobius-rebuild-launcher.py`)
+and seeds it with the checkout's **worker** (`scripts/mobius-rebuild-host.py`).
+The systemd units are unchanged. The launcher contains no replacement logic: it
+runs the active worker with an allowlisted environment (`python3 -I -S`, fixed
+`PATH`, `/` as working directory). It stores workers and their selection record
+(`workers.json`, with sha256 per file) root-private in `/var/lib/mobius-rebuild`,
+and refuses any file that is not root-owned, private and unchanged.
+
+After a replacement succeeds (or finds the image already live), the worker
+takes `/app/platform-baked/scripts/mobius-rebuild-host.py` out of that exact
+image ID. It creates a container without starting it, accepts exactly one
+regular file within a size and time bound, and removes the container and its
+volumes. It offers the file to the launcher as a **candidate** only when the
+file compiles and declares a `WORKER_REVISION` (read as text, never by running
+it) above every revision offered or installed so far. That high-water mark
+never drops, so neither a dropped candidate nor an older official image's
+worker is ever offered again.
+
+The launcher removes the candidate from its record before trying it on the
+next replacement, so a trial that the host interrupts is never repeated. The
+candidate becomes active only when that replacement succeeds, and only if no
+newer worker was installed while it ran. Otherwise the proven worker handles
+the retry, and `reconcile` always runs the proven worker. A faulty worker change
+therefore costs one update attempt, never the ability to update. Worker files
+are small and never deleted.
+
+Worker changes reach installed hosts through ordinary updates, taking effect
+from the replacement after the release that ships them, so keep each change
+compatible with its predecessor for one release. CI requires a higher
+`WORKER_REVISION` whenever the worker changes, and a post-publish job proves
+that each published worker reaches a host installed from the previous release
+and performs a real replacement there.
+
+Before it drains the running app, a worker records the replacement in
+`/var/lib/mobius-rebuild/transaction.json`: operation, nonce, and previous
+image ID. Compose starts the verified image through a helper-owned tag pointed
+at its ID (`mobius-rebuild-target`). If a worker is interrupted, `reconcile`
+(after the run and at boot) restores exactly the recorded previous image with
+the usual re-armed chat handoff, so the app can request the update again. The
+record is removed only when the healthy container is that image; otherwise the
+status reads `needs_recovery`. A new request waits until the record is settled.
+Failure handling, rollback and settlement run under the replacement lock that
+the installer and `reconcile` also take. The record's schema is shared by every
+worker revision.
+
+The root status records `worker_revision`, `launcher_revision` and the last
+`worker_adoption` outcome for operators. Fixed helpers keep working: the app does not require the launcher, and
+`deployment/self-hosted-helper.required` advances only for a change the
+launcher itself or an older fixed helper cannot provide.
+
+**Trust.** The worker runs as root on the host, so the authority to publish
+`ghcr.io/mobius-os/mobius:sha-*` becomes authority to publish host-root code on
+self-hosted installations that update. Only a push to `main` publishes (see
+`.github/workflows/main-image.yml`). The worker checks the image's labels
+(revision, source, architecture) for consistency. They are not a cryptographic
+publisher identity, and it pins the verified image ID rather than the mutable
+tag. The app, even compromised, can only choose among published official SHAs,
+resend or withdraw requests, and consume pull and disk resources. It cannot
+choose the repository, executable, worker, Compose topology, or host commands.
+Revision monotonicity stops an older worker from being selected; it does not
+stop an older official application image from being deployed.
+
 ## Boundary and lifecycle
 
 The app writes one fixed `request.json` into the persistent `/data` inbox. A
@@ -182,7 +247,8 @@ as `request_nonce` in its status, so the app can tell its exact replacement's
 outcome from any earlier one. It is claimed atomically on the same persistent
 filesystem before use. The app requires a helper that advertises request
 version 2 (`request_versions`); `deployment/self-hosted-helper.required`
-revision 1 asks older installations to reinstall it.
+revision 1 asks older installations to reinstall it. Installing the launcher
+once makes later worker changes arrive with updates (see above).
 
 The worker:
 

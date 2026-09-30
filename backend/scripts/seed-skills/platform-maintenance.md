@@ -40,7 +40,7 @@ Review the exact changed paths and use the smallest matching action:
 | `frontend/src/` and other frontend build inputs | The watcher rebuilds the served shell, then `shell_apply_now` applies it. A normal save triggers this automatically; source arriving through Git needs a changed frontend file touched. No server restart. |
 | `backend/app/*.py` | After compile checks, tests, and commit, one server restart loads the settled backend revision. |
 | `skill/core.md` | A server restart refreshes the cached constitution for new agent sessions only; existing sessions keep their immutable prompt snapshot. Unless new sessions need the rule immediately, leave it pending for the next separately approved restart. |
-| `backend/scripts/entrypoint.sh`, the exact `/app/scripts/*` bootstrap files it invokes, or `backend/runtime/` | Image-owned. Container replacement installs the official image for the release, which carries no local edit to these files: Finish reports one as a blocker. Batch and test the change, then prepare it as an upstream contribution; it takes effect with the release that contains it. |
+| `backend/scripts/entrypoint.sh`, the exact `/app/scripts/*` bootstrap files it invokes, or `backend/runtime/` | Image-owned. Container replacement installs the official image for the release, which carries no local edit to these files: the edit stays in the checkout, inactive, and the update reports it without waiting on it. Batch and test the change, then prepare it as an upstream contribution; it takes effect with the release that contains it. |
 | `backend/runtime/identity_broker.py` | The one served privileged runtime file: one server restart activates a valid edit; an invalid one falls back to the baked platform for that boot. |
 | `backend/scripts/pm-commit` | One server restart refreshes the installed launcher from the served checkout; no image rebuild. |
 | `backend/scripts/seed-skills/` | One server restart applies the served templates to installed skills; untouched copies advance and edited ones stay for review. No image rebuild once the container runs an image that hands this job to the server. To use an edit immediately, write identical bytes to `/data/shared/skills/<name>.md`. |
@@ -61,14 +61,27 @@ Review the exact changed paths and use the smallest matching action:
    version. New processes can use the install immediately. A long-running
    backend needs one approved server restart only when it must load the new
    package itself.
-3. If shipped behavior depends on the package, record the same resolution in
-   the owning manifest and lockfile, plus the Dockerfile only when image wiring
-   is needed. These declarations are durability metadata, not an activation
-   action. Container replacement installs the official image, so a declaration
-   becomes durable only through the release that contains it: prepare it as an
-   upstream contribution. Committed only locally, it never reaches an image and
-   blocks Finish.
-4. Treat a container rebuild as a last resort, not an ordinary closeout step.
+3. If shipped platform behavior depends on the package, record the same
+   resolution in the owning manifest and lockfile, plus the Dockerfile only
+   when image wiring is needed, and contribute it upstream. These declarations
+   are durability metadata, not an activation action: they reach installations
+   through the release that contains them. Committed only locally, they never
+   reach an image and never block updates.
+4. To keep a local or app install across container replacements, declare a
+   setup step: `{"setup":{"steps":["restore.sh"],"apt":["poppler-utils (>= 25)"]}}`
+   in the app's accepted `mobius.json` (ship scripts through `source_files`,
+   then Apply) or in `/data/customizations/mobius.json` for the instance. A
+   step script gets `check` (exit 0 ready, 1 needs apply, 2 conflict) or an
+   idempotent `apply`, runs as `mobius` from its manifest's directory (sudo as needed),
+   and writes persistent output under `/data`. Version syntax belongs to the
+   underlying manager; all `apt` entries are solved together by
+   `apt-get satisfy`, never forcing removals. Restoration runs after readiness
+   and update settlement on every boot and accepted declaration, and never
+   holds up boot or updates. `GET /api/setup` shows each step's state and the
+   running one; `POST /api/setup/rerun` cancels it and starts a fresh pass.
+   A root script can still disrupt the platform: this is restoration, not a
+   sandbox.
+5. Treat a container rebuild as a last resort, not an ordinary closeout step.
    Require it now only when the change genuinely cannot activate live, or when
    the partner explicitly asks to validate the image.
 

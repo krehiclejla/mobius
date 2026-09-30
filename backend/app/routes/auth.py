@@ -576,6 +576,7 @@ def create_app_job_token_endpoint(
       owner.token_epoch,
       app_nonce=app.token_nonce,
       expires_delta=timedelta(hours=2),
+      job_secrets=(app.capability_contract or {}).get("data", {}).get("job_secret_read", []),
     )
   }
 
@@ -675,14 +676,18 @@ _provider_login_locks = {"claude": asyncio.Lock(), "codex": asyncio.Lock()}
 
 
 async def _provider_signin_changed(provider_id: str) -> None:
-  """Show every open picker the catalog the provider's current sign-in serves.
+  """Show open pickers the models and allowance of the current sign-in.
 
   Every sign-in and sign-out ends here, so no picker keeps the offline fallback
   cached before connecting (or live models cached before disconnecting).
   """
   from app.providers import forget_provider_models
+  from app.provider_usage import forget_provider_usage
+  forget_provider_usage(provider_id, get_settings().data_dir)
   await forget_provider_models(provider_id)
-  get_system_broadcast().publish({"type": "model_providers_changed"})
+  get_system_broadcast().publish({
+    "type": "model_providers_changed", "provider": provider_id,
+  })
 
 
 def _cli_env() -> tuple[dict, str]:

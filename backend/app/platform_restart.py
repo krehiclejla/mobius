@@ -273,3 +273,99 @@ def activation_notice(row: models.ChatWait, outcome: str) -> str:
       "queued work."
     )
   return f"{lead}\n<platform_activation>{body}</platform_activation>"
+
+
+def _restart_continuation_hold() -> str:
+  from app.platform_update import late_edits_pending, read_prepared_update
+
+  if not late_edits_pending():
+    return "pending"
+  update = read_prepared_update()
+  return "restart_required" if update and update["replayed"] else "restoring_edits"
+
+
+def restart_observation_key(db: Session, chat_id: str) -> str:
+  """Version the mutable receipt projection without loading transcript JSON.
+
+  A cached card can miss the wait event during a restart. Only undelivered
+  observations remain mutable independently of the transcript; once a reply
+  or continuation settles one, the ordinary chat version owns its history.
+  """
+  rows = db.query(models.ChatWait.id, models.ChatWait.met_at).filter(
+    models.ChatWait.chat_id == chat_id,
+    models.ChatWait.kind == ACTIVATION_WAIT_KIND,
+    models.ChatWait.status == "met",
+    models.ChatWait.met_at.isnot(None),
+    models.ChatWait.resume_delivered_at.is_(None),
+  ).order_by(models.ChatWait.id).all()
+  return json.dumps([
+    [[row.id, row.met_at.isoformat()] for row in rows],
+    _restart_continuation_hold() if rows else None,
+  ], separators=(",", ":"))
+
+
+def project_restart_observations(
+  db: Session, chat_id: str, messages: list[dict],
+) -> list[dict]:
+  """Show ready-boot evidence even while continuation admission is held.
+
+  Observation is not action authority or proof that source changes loaded.
+  Derive it from the exact linked wait without rewriting saved questions,
+  answers, or restart permissions. Historical receipts survive a later reply
+  or cancellation, while their continuation state stays honest.
+  """
+  cards = [
+    block
+    for message in messages
+    for block in message.get("blocks") or []
+    if isinstance(block, dict)
+    and block.get("type") == "question"
+    and isinstance(block.get("platform_action"), dict)
+    and block["platform_action"].get("type") == "restart"
+    and isinstance(block["platform_action"].get("wait_id"), str)
+  ]
+  if not cards:
+    return messages
+  waits = {row.id: row for row in db.query(models.ChatWait).filter(
+    models.ChatWait.chat_id == chat_id,
+    models.ChatWait.id.in_({card["platform_action"]["wait_id"] for card in cards}),
+    models.ChatWait.kind == ACTIVATION_WAIT_KIND,
+    models.ChatWait.met_at.isnot(None),
+  ).all()}
+  if not waits:
+    return messages
+
+  hold = (
+    _restart_continuation_hold()
+    if any(row.status == "met" and row.resume_delivered_at is None
+           for row in waits.values()) else "pending"
+  )
+
+  observations = {}
+  for card in cards:
+    action = card["platform_action"]
+    row = waits.get(action["wait_id"])
+    if (row is None or row.linked_question_id != card.get("question_id")
+        or row.condition_json != action.get("requirement")):
+      continue
+    continuation = (
+      "delivered" if row.resume_delivered_at is not None
+      else "cancelled" if row.status == "cancelled"
+      else hold
+    )
+    observations[id(card)] = {
+      "observed_at": row.met_at.isoformat() + "Z",
+      "continuation": continuation,
+    }
+  if not observations:
+    return messages
+  return [
+    {**message, "blocks": [
+      {**block, "platform_action": {
+        **block["platform_action"], "observation": observations[id(block)],
+      }} if id(block) in observations else block
+      for block in message.get("blocks") or []
+    ]} if any(id(block) in observations for block in message.get("blocks") or [])
+    else message
+    for message in messages
+  ]

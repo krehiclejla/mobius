@@ -2735,6 +2735,74 @@ def test_reconcile_schedules_completed_activity_once_without_consuming(db, monke
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
 
+def test_parent_wake_skips_a_soft_deleted_parent_without_starting_a_continuation(
+  db, monkeypatch, caplog,
+):
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="deleted-parent",
+  )
+  _seed_idle_parent_wake_root(db, delegation_id)
+  db.get(models.Chat, parent_id).deleted_at = now_naive_utc()
+  db.commit()
+  starts = _capture_activity_starts(monkeypatch)
+
+  def unexpected_repair(*args, **kwargs):
+    pytest.fail("A deleted parent must not enter wake-state repair")
+
+  monkeypatch.setattr(
+    delegations_mod, "repair_completed_activity_deliveries", unexpected_repair,
+  )
+  monkeypatch.setattr(
+    chat_start_mod, "start_programmatic_chat_continuation", unexpected_repair,
+  )
+
+  assert asyncio.run(delegations_mod._deliver_parent_wake_once(
+    parent_id, db.get(models.Delegation, delegation_id).parent_root_run_id,
+  )) is False
+  assert starts == []
+  assert "chat writer command failed" not in caplog.text
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id is None
+  assert row.cancelled_at is None
+  assert row.notify_parent_on_complete is True
+
+
+def test_recovery_sweep_leaves_deleted_parent_result_owed_until_chat_is_recovered(
+  client, owner_token, db, monkeypatch,
+):
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="recovered-parent",
+  )
+  _seed_idle_parent_wake_root(db, delegation_id)
+  db.get(models.Chat, parent_id).deleted_at = now_naive_utc()
+  db.commit()
+  starts = _capture_activity_starts(monkeypatch)
+
+  skipped = asyncio.run(delegations_mod.wake_parents_for_completed_delegations())
+  assert skipped.attempted_groups == 0
+  assert skipped.woken_parents == 0
+  assert skipped.next_cursor is None
+  assert starts == []
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id is None
+  assert row.cancelled_at is None
+  assert row.notify_parent_on_complete is True
+
+  response = client.post(
+    f"/api/chats/{parent_id}/recover",
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  recovered = asyncio.run(delegations_mod.wake_parents_for_completed_delegations())
+  assert recovered.attempted_groups == 1
+  assert recovered.woken_parents == 1
+  assert len(starts) == 1
+  assert starts[0]["chat_id"] == parent_id
+  assert starts[0]["activity_id"] == delegation_id
+
+
 def test_recovery_selection_runs_off_the_event_loop(db, monkeypatch):
   # The correlated GROUP BY selection scan must execute in a worker thread, not
   # on the server event loop, exactly as autopilot_lease_recovery_loop offloads

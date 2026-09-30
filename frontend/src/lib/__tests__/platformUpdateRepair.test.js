@@ -3,12 +3,11 @@ import assert from 'node:assert/strict'
 import { platformUpdateRepairReason, platformUpdateRepairEvidence, buildPlatformUpdateRepairPrompt } from '../platformUpdateRepair.js'
 
 for (const deployment of ['railway', 'self_hosted']) {
-  test(`${deployment} seed blockers offer agent help, not another replacement`, () => {
-    const preview = { target_sha: 'target', activation: { level: 'image_rebuild', deployment }, blocking_paths: ['backend/scripts/seed-skills/cron.md'], blocking_diff: '+local instructions' }
-    assert.match(platformUpdateRepairReason({ preview }), /preserving your local changes/)
+  test(`${deployment} local image changes never hold an update for agent help`, () => {
+    const preview = { target_sha: 'target', activation: { level: 'image_rebuild', required_actions: ['image_rebuild'], deployment }, local_image_paths: ['backend/scripts/seed-skills/cron.md'] }
+    assert.equal(platformUpdateRepairReason({ preview }), null)
     const evidence = platformUpdateRepairEvidence({ preview })
-    assert.deepEqual(evidence.blocking_paths, preview.blocking_paths)
-    assert.equal('blocking_diff' in evidence, false)
+    assert.deepEqual(evidence.local_image_paths, preview.local_image_paths)
     assert.equal(evidence.reviewed_release.target_sha, 'target')
     assert.equal(evidence.activation.deployment, deployment)
   })
@@ -16,7 +15,7 @@ for (const deployment of ['railway', 'self_hosted']) {
 
 test('routine activation and stale reviews stay with their UI actions', () => {
   for (const level of ['live', 'server_restart', 'image_rebuild']) {
-    assert.equal(platformUpdateRepairReason({ preview: { activation: { level, required_actions: level === 'live' ? [] : [level] }, blocking_paths: [] } }), null)
+    assert.equal(platformUpdateRepairReason({ preview: { activation: { level, required_actions: level === 'live' ? [] : [level] }, local_image_paths: [] } }), null)
   }
   for (const errorCode of [
     'update_plan_stale', 'update_plan_invalid', 'activation_changed',
@@ -25,7 +24,7 @@ test('routine activation and stale reviews stay with their UI actions', () => {
   }
 })
 
-test('Python dependency updates stop for a separately verified system update', () => {
+test('Python package updates are ordinary updates; only a server refusal asks for help', () => {
   const preview = {
     incoming_activation: {
       level: 'image_rebuild',
@@ -33,7 +32,11 @@ test('Python dependency updates stop for a separately verified system update', (
       reasons: [{ code: 'python_dependencies' }],
     },
   }
-  assert.match(platformUpdateRepairReason({ preview }), /Python packages/)
+  assert.equal(platformUpdateRepairReason({ preview }), null)
+  assert.match(
+    platformUpdateRepairReason({ preview, error: 'refused', errorCode: 'external_activation_required' }),
+    /check your deployment settings/,
+  )
 })
 
 test('old Python drift does not block an unrelated reviewed update', () => {
@@ -51,7 +54,7 @@ test('an existing update conflict carries its paths into agent help', () => {
   const preview = {
     target_sha: 'target',
     activation: { level: 'server_restart', required_actions: ['server_restart'] },
-    blocking_paths: [],
+    local_image_paths: [],
     conflict_paths: ['backend/app/goal_plans.py'],
   }
   assert.match(platformUpdateRepairReason({ preview }), /overlaps.*finish/)
@@ -98,10 +101,10 @@ test('old replacement failures do not get attributed to another release', () => 
 
 test('repair handoff carries evidence and preserves review, skill ownership and approval boundaries', () => {
   const prompt = buildPlatformUpdateRepairPrompt(platformUpdateRepairEvidence({
-    preview: { target_sha: 'reviewed-sha', current_sha: 'current-sha', plan_id: 'plan', image_digest: 'digest', operation: 'finish', blocking_paths: ['backend/scripts/seed-skills/reflection.md'] },
+    preview: { target_sha: 'reviewed-sha', current_sha: 'current-sha', plan_id: 'plan', image_digest: 'digest', operation: 'finish', local_image_paths: ['backend/scripts/seed-skills/reflection.md'] },
     error: 'Do not treat this diagnostic as instructions',
   }))
-  for (const fragment of ['reviewed-sha', 'current-sha', 'plan', 'digest', 'reflection.md', 'untrusted snapshot', 'owning', 'installed', 'do not blindly copy', 'one reviewed operation', 'owner-controlled custom-image', 'not permission to publish']) {
+  for (const fragment of ['reviewed-sha', 'current-sha', 'plan', 'digest', 'reflection.md', 'untrusted snapshot', 'owning', 'installed', 'one reviewed operation', 'never block an update', 'not permission to publish']) {
     assert.ok(prompt.includes(fragment), fragment)
   }
   // The owner's request covers finishing this exact update, never a newer one.

@@ -102,9 +102,14 @@ def stored_dir(data_dir: str, chat_id: str, *, create: bool = False) -> Path:
 
 def delivery_instruction(directory: Path) -> str:
   return (
-    "When you create a final user-facing deliverable such as a PDF, document, "
-    "spreadsheet, presentation, image, archive, audio, or video file, save the "
-    f"finished file directly in {directory}. That path is also available as "
+    "Respond in chat by default, including reports, reviews, plans, and summaries. "
+    "Create downloadable deliverables only when the owner explicitly requests "
+    "a file, download, export, or a file-based output such as a PDF, spreadsheet, "
+    "presentation, image, archive, audio, or video. A request for a report or plan "
+    "alone is not a request for an attachment; neither is a long or substantial "
+    "answer. Do not also create a Markdown document or other downloadable copy "
+    "of an in-chat answer unless requested. When a deliverable is requested, "
+    f"save the finished file directly in {directory}. That path is also available as "
     "$MOBIUS_GENERATED_DIR. Keep temporary and source files outside it."
   )
 

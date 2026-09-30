@@ -10,6 +10,80 @@ const component = readFileSync(new URL('../QuestionCard.jsx', import.meta.url), 
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const css = readFileSync(new URL('../QuestionCard.css', import.meta.url), 'utf8')
 
+test('text-only questions never offer choice instructions or empty choice groups', () => {
+  for (const options of [undefined, null, []]) {
+    for (const multiSelect of [false, true]) {
+      for (const answeredMap of [undefined, { 'Which chat?': 'Example chat title' }]) {
+        const html = renderToStaticMarkup(createElement(QuestionCard, {
+          chatId: 'text-only', questionId: 'text-only-q', answeredMap,
+          questions: [{ question: 'Which chat?', options, multiSelect }],
+        }))
+        assert.doesNotMatch(html, /Choose one|Select all that apply|qcard__hint|qcard__opts|radiogroup/)
+        if (answeredMap) assert.match(html, /Example chat title/)
+        else assert.match(html, /placeholder="Type your answer…"/)
+      }
+    }
+  }
+})
+
+test('questions with choices retain single and multi-select instructions', () => {
+  for (const [multiSelect, hint, role] of [[false, 'Choose one', 'radio'], [true, 'Select all that apply', 'checkbox']]) {
+    const html = renderToStaticMarkup(createElement(QuestionCard, {
+      chatId: 'choices', questionId: 'choices-q',
+      questions: [{ question: 'Which?', options: [{ label: 'A' }, { label: 'B' }], multiSelect }],
+    }))
+    assert.ok(html.includes(hint))
+    assert.ok(html.includes(`role="${role}"`))
+    assert.match(html, /placeholder="Or type your own answer…"/)
+  }
+})
+
+test('text-only replies retain exact punctuation and lines when submitted or queued', () => {
+  const question = 'Describe the next step'
+  const reply = 'First,  keep these spaces, \nthen keep this line.\nAnd this one.'
+  for (const multiSelect of [false, true]) {
+    for (const queued of [false, true]) {
+      const records = queued ? [{
+        chatId: 'written', body: { question_id: 'written-q', answers: { [question]: reply } },
+      }] : []
+      const html = renderToStaticMarkup(createElement(LocalAnswersContext.Provider, { value: records },
+        createElement(QuestionCard, {
+          chatId: 'written', questionId: 'written-q',
+          questions: [{ question, multiSelect, options: [] }],
+          answeredMap: queued ? undefined : { [question]: reply },
+        })))
+      assert.ok(html.includes(`>${reply}</textarea>`), 'a writing-only field must not parse text as a list of choices')
+      assert.match(html, /readOnly=""/)
+      assert.doesNotMatch(html, /qcard__hint|qcard__opts/)
+    }
+  }
+})
+
+test('mixed grouped questions describe answering without inventing text-only choices', () => {
+  const html = renderToStaticMarkup(createElement(QuestionCard, {
+    chatId: 'mixed', questionId: 'mixed-q',
+    questions: [
+      { question: 'Describe the next step', options: [] },
+      { question: 'Which direction?', options: [{ label: 'Left' }, { label: 'Right' }] },
+    ],
+  }))
+  assert.match(html, /Answer each question, then submit them together\./)
+  assert.equal((html.match(/class="qcard__hint"/g) || []).length, 1)
+  assert.equal((html.match(/role="radiogroup"/g) || []).length, 1)
+  assert.match(html, /placeholder="Type your answer…"/)
+  assert.doesNotMatch(html, /questions still need|questions to submit|qcard__submit-hint/)
+})
+
+test('a written Restart card uses its displayed action list for choice instructions', () => {
+  const html = renderToStaticMarkup(createElement(QuestionCard, {
+    chatId: 'filtered-restart', questionId: 'filtered-restart-q',
+    platformAction: { type: 'restart', version: 2, status: 'awaiting_owner', restart_option_id: 'restart' },
+    questions: [{ question: 'Restart?', options: [{ id: 'retired', label: 'Retired action' }] }],
+  }))
+  assert.doesNotMatch(html, /qcard__hint|qcard__opts|Retired action/)
+  assert.match(html, /Or tell me what you’d like to do instead…/)
+})
+
 test('question option explanations remain selectable without choosing them', () => {
   const optionRule = css.match(/\.qcard__opt\s*\{[^}]*\}/s)?.[0] || ''
 
@@ -36,15 +110,15 @@ test('unanswered question cards do not have a stale gray state', () => {
     'submit button should remain in place after an answer is submitted')
   assert.match(component, /let submitLabel = writtenRestartAction \? 'Continue' : 'Submit'[\s\S]*if \(answered\) submitLabel = 'Submitted'[\s\S]*if \(submitting\) submitLabel = 'Submitting…'/,
     'the retained submit button should explain pending and answered states without rewriting legacy Restart cards')
-  assert.match(component, /\{!completedAction && \(!disabled \|\| answered\) && \(\s*<div className="qcard__hint"/,
-    'selection hints should stay in place after the answer is submitted')
+  assert.match(component, /\{!completedAction && \(!disabled \|\| answered\) && hasOptions && \(\s*<div className="qcard__hint"/,
+    'selection hints should stay in place after submission only when there are choices')
   assert.doesNotMatch(component, /qcard__opt--other/,
     'a custom answer should be a direct writing surface, not an Other option')
-  assert.match(component, /const writtenAnswer = writtenRestartResponse[\s\S]*?unmatchedAnswers\.join\(', '\)[\s\S]*?<CustomAnswerArea[\s\S]*?answered=\{selectionLocked\}[\s\S]*?value=\{selectionLocked[\s\S]*?writtenAnswer/,
+  assert.match(component, /const writtenAnswer = writtenRestartResponse \|\| !hasOptions[\s\S]*?unmatchedAnswers\.join\(', '\)[\s\S]*?<CustomAnswerArea[\s\S]*?answered=\{selectionLocked\}[\s\S]*?value=\{selectionLocked[\s\S]*?writtenAnswer/,
     'the custom answer should stay mounted and retain submitted custom text, including a written Restart response that matches an option label')
   assert.match(component, /writtenRestartAction[\s\S]*\? 'Or tell me what you’d like to do instead…'/,
     'a version-2 Restart card should replace Not now with a written response')
-  assert.match(component, /writtenRestartAction[\s\S]*q\.options\?\.filter\(opt => opt\.id === platformAction\.restart_option_id\)/,
+  assert.match(component, /writtenRestartAction[\s\S]*options\.filter\(opt => opt\.id === platformAction\.restart_option_id\)/,
     'only a version-2 Restart card should show just its exact Restart now option')
   assert.match(component, /rows=\{1\}/,
     'the custom answer should begin as one compact writing line')
@@ -83,6 +157,10 @@ test('unanswered question cards do not have a stale gray state', () => {
 test('question cards wrap long unbroken content within a mobile pane', () => {
   assert.match(css, /\.qcard\s*\{[^}]*overflow-wrap:\s*anywhere/,
     'long unbroken question and option text should not widen the card on mobile')
+  assert.match(css, /\.qcard__input\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;[^}]*word-break:\s*break-word;/s,
+    'a long pasted answer should wrap within its textarea, not widen the chat')
+  assert.match(component, /<textarea[\s\S]*?wrap="soft"[\s\S]*?value=\{value\}/,
+    'custom answers should retain soft-wrapped text without inserting newlines into the submitted URL')
 })
 
 test('question card css has no stale styling hook', () => {
@@ -102,7 +180,7 @@ test('multiple questions read as one compact decision panel', () => {
   assert.match(component, /const grouped = questions\.length > 1/)
   assert.match(component, /className=\{`qcard\$\{grouped \? ' qcard--grouped'/)
   assert.match(component, /\{questions\.length\} decisions/)
-  assert.match(component, /Choose each one, then submit them together\./)
+  assert.match(component, /Answer each question, then submit them together\./)
   assert.match(css, /\.qcard\s*\{[\s\S]*?width:\s*min\(100%, 640px\);[\s\S]*?margin:\s*10px auto;/)
   assert.match(css, /\.qcard--grouped\s*\{[\s\S]*?overflow:\s*hidden;/)
   assert.match(css, /\.qcard--grouped \.qcard__q \+ \.qcard__q\s*\{[\s\S]*?margin-top:\s*0;/)

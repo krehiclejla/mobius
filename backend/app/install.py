@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from sqlalchemy.orm import Session
 from app import (
   activity,
   app_git,
+  app_python_env,
   data_git,
   drawer_pins,
   fs_locks,
@@ -80,10 +82,11 @@ from app.manifest_contract import (
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
-  job_interpreter,
+  python_lock,
   skill_member_paths,
   static_asset_entries,
   validate_manifest_contract,
+  validate_schedule_job,
   validate_storage_destination,
 )
 # Keep the underscore alias: install._http_get calls _validate_url_safe, and
@@ -1502,7 +1505,7 @@ def package_content_digest_from_tree(
   bundled_job = required_bytes(job_name, "schedule job") if job_name else None
   if bundled_job is not None:
     try:
-      job_interpreter(bundled_job)
+      validate_schedule_job(manifest, bundled_job)
     except ManifestContractError as exc:
       raise PackageContentError(str(exc)) from exc
 
@@ -2475,7 +2478,7 @@ def read_git_install_candidate(
   bundled_job = required(job_name, "schedule job") if job_name else None
   if bundled_job is not None:
     try:
-      job_interpreter(bundled_job)
+      validate_schedule_job(manifest, bundled_job)
     except ManifestContractError as exc:
       raise ValueError(str(exc)) from exc
 
@@ -2748,7 +2751,7 @@ async def _fetch_install_candidate(
         cli, raw_base + schedule["job"], _ENTRY_MAX_BYTES,
       )
       try:
-        job_interpreter(bundled_job)
+        validate_schedule_job(manifest, bundled_job)
       except ManifestContractError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -3277,6 +3280,8 @@ async def _run_post_commit_effects(
   Every failure here becomes a warning. The app row and selected bundle are
   already durable, so this phase must never enter the pre-commit rollback path.
   """
+  from app import app_setup
+  app_setup.request_run()
   manifest = candidate.manifest
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
@@ -3534,6 +3539,74 @@ class ActivationPlan:
   capability_contract: dict
   package_id: str | None
   source_identity: str | None
+  # Built from the fetched package before the row's write transaction.
+  python_env: app_python_env.StagedEnv | None = None
+
+
+async def _stage_install_python_env(
+  data_dir: Path,
+  manifest: dict,
+  package_tree: dict[str, bytes],
+  app_id: int | None,
+  journal: InstallJournal,
+) -> app_python_env.StagedEnv | None:
+  """Build the package's declared Python env before any row is written.
+
+  A build takes minutes at worst, so it must not run inside the install's
+  SQLite write transaction. The reconciled tree exists only inside that
+  transaction, so this builds from the fetched package (its lock and service)
+  and ``_publish_install_python_env`` requires the reconciled lock to match.
+  """
+  if python_lock(manifest) is None:
+    return None
+
+  def build():
+    with tempfile.TemporaryDirectory(prefix="mobius-install-env-") as tmp:
+      root = Path(tmp)
+      for relative, content in package_tree.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(content)
+      (root / "mobius.json").write_text(json.dumps(manifest, sort_keys=True))
+      return app_python_env.prepare_env(data_dir, app_id, root)
+
+  try:
+    staged = await asyncio.to_thread(build)
+  except app_python_env.PythonEnvBuildError as exc:
+    raise HTTPException(422, detail={
+      "code": "python_env_failed",
+      "message": f"Could not build the app's Python environment. {exc}",
+    }) from exc
+  journal.rollback_actions.append(lambda: app_python_env.discard_env(staged))
+  return staged
+
+
+def _publish_install_python_env(
+  app: models.App,
+  staged: app_python_env.StagedEnv | None,
+  runtime_root: Path,
+  journal: InstallJournal,
+  data_dir: Path,
+) -> None:
+  """Link the staged env for the reconciled tree, before its pointer is published."""
+  try:
+    key = app_python_env.declared_key(runtime_root)
+  except app_python_env.PythonEnvUnavailable as exc:
+    raise HTTPException(422, detail={
+      "code": "python_env_failed", "message": str(exc),
+    }) from exc
+  if key != (staged.key if staged is not None else None):
+    # Only a local edit to the lock merged into the update can differ here.
+    raise HTTPException(409, detail={
+      "code": "python_lock_diverged",
+      "message": (
+        "This app's local source changes its Python lock, so the environment "
+        "built for the update does not match it. The update was not "
+        "installed; reconcile the lock in the app source, Apply it, and retry."
+      ),
+    })
+  if staged is not None:
+    published = app_python_env.publish_env(data_dir, app.id, staged)
+    journal.rollback_actions.append(lambda: app_python_env.unpublish_env(published))
 
 
 def _apply_manifest_metadata(
@@ -3722,6 +3795,13 @@ async def _activate_install_source(
     static_assets=plan.static_assets,
     runtime_manifest=json.dumps(manifest, sort_keys=True).encode(),
   )
+  try:
+    _publish_install_python_env(
+      app, plan.python_env, runtime_staged.root, journal, data_dir,
+    )
+  except BaseException:
+    shutil.rmtree(runtime_staged.root)
+    raise
   applied_app_runtime.publish_runtime(app, runtime_staged)
   return equivalence_target
 
@@ -4038,6 +4118,10 @@ async def install_from_manifest(
   data_dir = Path(get_settings().data_dir)
 
   try:
+    python_env = await _stage_install_python_env(
+      data_dir, manifest, published_source_tree,
+      existing.id if existing is not None else None, journal,
+    )
     app = await _prepare_app_row(
       db,
       candidate=candidate,
@@ -4598,10 +4682,14 @@ async def install_from_manifest(
             capability_contract=capability_contract,
             package_id=target.package_id,
             source_identity=target.source_identity,
+            python_env=python_env,
           ),
           journal=journal,
           data_dir=data_dir,
         )
+      else:
+        # A conflict activates nothing, so its build is never linked.
+        journal.commit_actions.append(lambda: app_python_env.discard_env(python_env))
     finally:
       # Release the per-source-dir lock (held across the merge + write for the
       # git path) BEFORE the seeds block takes app_storage_lock, preserving the

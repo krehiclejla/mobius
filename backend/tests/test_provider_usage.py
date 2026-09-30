@@ -2032,6 +2032,45 @@ WEEKLY_READY = {
 }
 
 
+@pytest.mark.asyncio
+async def test_account_switch_during_usage_probe_cannot_restore_old_allowance(
+  monkeypatch, tmp_path,
+):
+  from app import provider_usage
+
+  provider_usage._provider_usage_cache.clear()
+  provider_usage._provider_usage_locks.clear()
+  started = asyncio.Event()
+  finish_old = asyncio.Event()
+  probes = 0
+
+  async def fake_snapshot(_provider_id, _data_dir):
+    nonlocal probes
+    probes += 1
+    if probes == 1:
+      started.set()
+      await finish_old.wait()
+      return {**WEEKLY_READY, 'windows': [{
+        **WEEKLY_READY['windows'][0], 'used_percent': 100,
+      }]}
+    return {**WEEKLY_READY, 'windows': [{
+      **WEEKLY_READY['windows'][0], 'used_percent': 0,
+    }]}
+
+  monkeypatch.setattr(provider_usage, '_provider_snapshot', fake_snapshot)
+  read = asyncio.create_task(provider_usage.read_provider_usage('codex', str(tmp_path)))
+  await started.wait()
+  provider_usage.forget_provider_usage('codex', str(tmp_path))
+  finish_old.set()
+  result = await read
+
+  assert probes == 2
+  assert result['windows'][0]['used_percent'] == 0
+  assert (await provider_usage.read_provider_usage('codex', str(tmp_path)))[
+    'windows'
+  ][0]['used_percent'] == 0
+
+
 def test_the_last_reading_survives_a_restart_while_the_provider_refuses(
   monkeypatch, tmp_path,
 ):
