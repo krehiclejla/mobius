@@ -7151,3 +7151,22 @@ def test_store_merge_replay_then_code_only_apply_does_not_warn(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == []
+
+
+@pytest.mark.parametrize("git_path", [".git/config", "lib/.GIT/hooks/post-checkout"])
+def test_install_rejects_source_files_inside_git_metadata(
+  client, auth, bypass_url_validation, git_path,
+):
+  """Git refuses to track paths inside `.git`, so such a package can never
+  install. The manifest check names the problem instead of the install
+  failing later inside Git with an unexplained 500."""
+  base = "https://git-metadata.test/repo/"
+  manifest = {
+    **MANIFEST_MULTI, "id": "git-metadata-app",
+    "source_files": ["cards.js", git_path],
+  }
+  r = _install_multi(client, auth, base, manifest, JSX_IMPORTS_CARDS, CARDS_V1)
+  assert r.status_code == 400, r.text
+  assert "`.git` directory" in r.json()["detail"]
+  data_dir = Path(get_settings().data_dir)
+  assert not (data_dir / "apps" / "git-metadata-app").exists()

@@ -49,12 +49,9 @@ jobs:
       - name: Check documentation links
         run: python3 scripts/check-doc-links.py
 
-  backend:
+  backend-checks:
     runs-on: ubuntu-latest
-    # The full backend suite now reaches roughly 10 minutes on a cold hosted
-    # runner, plus dependency/setup time. Keep the cap bounded, but leave enough
-    # headroom for pytest to report assertions instead of being killed near 90%.
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,40 +59,30 @@ jobs:
           # actual target revision; a shallow checkout cannot prove that
           # already-published entries remained unchanged.
           fetch-depth: 0
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-          cache-dependency-path: |
-            backend/requirements.lock
-            backend/requirements-static.txt
-      - name: Set up Node with npm cache
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: 'npm'
-          cache-dependency-path: |
-            package-lock.json
-            frontend/package-lock.json
-      - name: Install frontend runtime deps
-        # frontend_watcher's publish validation executes the locked Acorn /
-        # eslint-scope checker. compile_jsx also uses the lockfile's Rolldown,
-        # eliminating a separate global CI pin that can drift from production.
-        working-directory: frontend
-        run: npm ci --ignore-scripts
-      - name: Use locked frontend tools
+      - uses: ./.github/actions/backend-env
+      - name: A changed replacement worker declares a higher revision
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
         run: |
-          echo "$GITHUB_WORKSPACE/frontend/node_modules/.bin" >> "$GITHUB_PATH"
-          frontend/node_modules/.bin/rolldown --version
-      - name: Install backend deps
-        working-directory: backend
-        run: >-
-          pip install --require-hashes -r requirements.lock
-          && pip install -r requirements-static.txt
-      - name: Install pinned Codex Python SDK
-        run: >-
-          pip install --no-deps
-          "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)"
+          # Installed launchers take a worker from an image only when its
+          # WORKER_REVISION is higher than any they have seen, so changed
+          # worker bytes under an unchanged revision would never ship.
+          git fetch -q origin main
+          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
+          python3 - "$base" <<'PY'
+          import re, subprocess, sys
+          path = "scripts/mobius-rebuild-host.py"
+          def revision(text):
+              found = re.findall(r"^WORKER_REVISION = ([0-9]+)$", text, re.M)
+              return int(found[0]) if found else 0
+          old = subprocess.run(["git", "show", f"{sys.argv[1]}:{path}"],
+                               capture_output=True, text=True).stdout
+          new = open(path).read()
+          assert revision(new) >= revision(old), "WORKER_REVISION decreased"
+          assert old == new or not old or revision(new) > revision(old), (
+              f"{path} changed: increase WORKER_REVISION")
+          PY
+
       - name: Run backend static analysis
         working-directory: backend
         run: |
@@ -133,18 +120,73 @@ jobs:
           -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro"
           caddy:2.9-alpine
           caddy validate --config /etc/caddy/Caddyfile
-      - name: Run pytest
+
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # Report every shard's own failures rather than cancelling siblings.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/backend-env
+      - name: Run pytest shard
         working-directory: backend
-        # Pull requests are the authoritative pre-merge gate while the merge
-        # queue is disabled, so the required backend check must run the full
-        # suite rather than only the shorter serviceability contracts above.
-        # -n auto parallelizes across the runner's CPUs — safe because the suite
-        # is already process-isolated (each xdist worker imports conftest and
-        # gets its own tempdir DATA_DIR + SQLite engine). pytest-cov combines
-        # per-worker coverage before applying --cov-fail-under.
+        # MOBIUS_TEST_SHARD selects this job's slice, balanced by the recorded
+        # file durations in tests/shard_weights.json (see tests/conftest.py).
+        # Work stealing keeps a file of slow tests from queueing on one worker.
+        # The sys.monitoring coverage core measures the same lines at almost
+        # no cost; the backend job combines every shard and applies the floor.
+        env:
+          MOBIUS_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          COVERAGE_CORE: sysmon
         run: >-
-          pytest -q -n auto --durations=25
-          --cov=app --cov-report=term:skip-covered --cov-fail-under=83
+          pytest -q -n auto --dist worksteal --durations=10
+          --cov=app --cov-report=
+          && mv .coverage ".coverage.shard-${{ matrix.shard }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: backend-coverage-${{ matrix.shard }}
+          path: backend/.coverage.shard-${{ matrix.shard }}
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  backend:
+    # The required backend check. It fails unless every backend job passed (a
+    # skipped or cancelled dependency must not read as success), then applies
+    # the coverage floor to the combined shards.
+    if: always()
+    needs: [backend-checks, backend-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every backend job
+        if: needs.backend-checks.result != 'success' || needs.backend-tests.result != 'success'
+        run: |
+          echo "backend-checks: ${{ needs.backend-checks.result }}"
+          echo "backend-tests: ${{ needs.backend-tests.result }}"
+          exit 1
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install coverage
+        run: pip install "$(grep '^coverage==' backend/requirements-static.txt)"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: backend-coverage-*
+          path: backend/coverage-shards
+          merge-multiple: true
+      - name: Enforce combined coverage
+        working-directory: backend
+        run: |
+          coverage combine coverage-shards
+          coverage report --skip-covered --fail-under=83
 
   frontend-unit:
     # Wires up the node:test unit suite that lives under
@@ -202,6 +244,9 @@ jobs:
           done
       - name: Run frontend unit tests
         working-directory: frontend
+        # Hosted runners have four CPUs; the script's default of two leaves half idle.
+        env:
+          MOBIUS_TEST_CONCURRENCY: '4'
         run: |
           npm run lint
           npm run test:coverage
@@ -215,12 +260,119 @@ jobs:
       - name: Run browser harness unit tests
         run: npm run test:e2e-harness
 
+  e2e-boot:
+    runs-on: ubuntu-latest
+    # The e2e shards run the disposable test runtime, which skips the image's
+    # boot transaction. Boot the production path on real restarts once per run
+    # so a broken transaction cannot reach main, in parallel with the shards.
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 40
+    needs: privacy
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build test image (with GHA cache)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: mobius-test:ci
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Verify the production boot transaction
+        run: scripts/test-boot-transaction.sh mobius-test:ci
+
+  upgrade-path:
+    runs-on: ubuntu-latest
+    # Existing instances update from the release they run, with that release's
+    # own updater. A change it refuses (as the previous updater refused Python
+    # package changes, #1469) strands every instance, and tests of the new
+    # code alone cannot see it. Install each candidate from the release owners
+    # run, through the same HTTP calls Settings makes. The host helper is stood
+    # in for (its own code is not exercised here) and the Settings UI is not
+    # driven. Pull requests that cannot affect this path finish at once, so
+    # the job can be required.
+    timeout-minutes: 40
+    needs: privacy
+    permissions:
+      contents: read
+      actions: read  # read the base's main-image publication
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether this change can affect updating existing instances
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          run=true
+          if [ "$EVENT" = pull_request ]; then
+            git diff --name-only "$PR_BASE" HEAD \
+              | grep -qE '^(Dockerfile|\.dockerignore|backend/requirements\.(txt|lock)|backend/runtime/|backend/scripts/(entrypoint\.sh|install_platform_release\.py|prepare-container-cutover\.py)|backend/app/(platform_update|platform_boot|platform_activation|deployment_control|restart_util|restart_ledger|main|startup|auth)\.py|backend/app/routes/(platform|admin|auth)\.py|scripts/(mobius-rebuild-host\.py|test-upgrade-path\.sh)|deployment/|\.github/workflows/test\.yml)' \
+              || run=false
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.scope.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build candidate image (with GHA cache)
+        if: steps.scope.outputs.run == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: mobius-test:ci
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Verify the previous release can install this one
+        if: steps.scope.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git fetch -q origin main
+          # The release this change branches from (a manual run has no base).
+          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
+          # Owners run the base's own image once main-image publishes it, so
+          # wait for a publication that is under way rather than testing an
+          # older updater. A commit merged in a batch never gets an image of
+          # its own; owners run the newest published ancestor instead.
+          image=ghcr.io/mobius-os/mobius
+          published() { docker manifest inspect "$image:sha-$1" >/dev/null 2>&1; }
+          if ! published "$base"; then
+            runs=$(gh api "repos/${{ github.repository }}/actions/workflows/main-image.yml/runs?head_sha=$base" \
+              --jq '[.workflow_runs[] | select(.conclusion != "failure" and .conclusion != "cancelled")] | length')
+            if [ "${runs:-0}" -gt 0 ]; then
+              for _ in $(seq 1 40); do published "$base" && break; sleep 30; done
+              published "$base" || { echo "infrastructure: the image for base $base did not publish within 20 minutes"; exit 1; }
+            fi
+          fi
+          previous=""
+          for sha in $(git rev-list --first-parent "$base"); do
+            if published "$sha"; then previous=$sha; break; fi
+          done
+          [ -n "$previous" ] || { echo "infrastructure: no published image at or before $base"; exit 1; }
+          docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
+          scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
+
   e2e:
     runs-on: ubuntu-latest
     # Keep the browser suite available for manual dispatches and any future
     # merge-group runs, but do not block ordinary pull requests while the
-    # merge queue is disabled. Backend, frontend-unit, and privacy remain
-    # required. Sharding reduces elapsed browser-suite time for the runs that
+    # merge queue is disabled. Backend, frontend-unit, privacy, and
+    # upgrade-path remain required. Sharding reduces elapsed browser-suite time for the runs that
     # do execute.
     if: github.event_name != 'pull_request'
     # A cold hosted build can spend roughly 20 minutes populating the GHA cache
@@ -284,13 +436,6 @@ jobs:
 
       - name: Verify timed Docker probe cleanup
         run: scripts/test-docker-probe.sh
-
-      - name: Verify the production boot transaction
-        # The e2e container below runs the disposable test runtime, which
-        # skips the image's boot transaction. Boot the production path on real
-        # restarts once per run so a broken transaction cannot reach main.
-        if: matrix.shard == 1
-        run: scripts/test-boot-transaction.sh mobius-test:ci
 
       - name: Start test container
         run: |

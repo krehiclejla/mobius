@@ -1947,8 +1947,11 @@ def _wake_recovery_groups(
       models.Delegation.parent_chat_id,
       models.Delegation.parent_root_run_id,
     )
+    .join(models.Chat, models.Chat.id == models.Delegation.parent_chat_id)
     .join(models.ChatRun, models.ChatRun.id == _latest_child_run_id())
     .filter(
+      # Leave results owed during the recovery window, but do not poll deleted parents.
+      models.Chat.deleted_at.is_(None),
       models.Delegation.notify_parent_on_complete.is_(True),
       models.Delegation.cancelled_at.is_(None),
       current_result_undelivered(),
@@ -2484,11 +2487,11 @@ def _committed_parent_wake_is_unowned(
 async def steer_results_into_running_parent(
   parent_chat_id: str, source_work_id: str,
 ) -> bool:
-  """Hand finished helpers' results to a parent whose turn is still running.
+  """Hand finished helpers' results to a running parent.
 
   The result travels exactly like a steered peer note: a hidden carrier is
-  queued first, then steered in naming that queued row. Either provider
-  consumes the row at its steer cut, which is also where the writer records
+  queued first, then steered in naming that queued row. The runner consumes the
+  row at its steer cut, which is also where the writer records
   the results delivered. Until then they are owed: the queued carrier keeps a
   second steer or wake from repeating them, a turn that ends first runs the
   carrier as its own turn, and a Stop drops it so the next turn carries them.
@@ -2623,7 +2626,7 @@ async def _deliver_parent_wake_once(
         .filter(models.Chat.id == parent_chat_id)
         .first()
       )
-      if parent_chat is None:
+      if parent_chat is None or parent_chat.deleted_at is not None:
         return False
       repair_completed_activity_deliveries(db, parent_chat_id)
 

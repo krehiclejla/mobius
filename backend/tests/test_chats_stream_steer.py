@@ -34,6 +34,7 @@ from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from claude_agent_sdk.types import UserMessage
 
 from app import auth as auth_mod, models, questions
 from app.broadcast import create_broadcast, get_broadcast
@@ -64,13 +65,31 @@ def _make_active_claude_client(chat_id: str):
   from app.claude_sdk_runner import ActiveClaudeClient
 
   class _Client:
+    async def query(self, prompt):
+      async for _ in prompt:
+        pass
+
     async def interrupt(self):
       return None
 
   async def _build():
-    return ActiveClaudeClient(_Client(), chat_id=chat_id)
+    handle = ActiveClaudeClient(_Client(), chat_id=chat_id)
+    handle.mark_ready()
+    return handle
 
   return asyncio.run(_build())
+
+
+def _claude_attempts(handle):
+  return list(handle._steers.values())
+
+
+async def _consume_claude_steers(handle, sink):
+  """Drive the native root replay that, not stdin write, proves consumption."""
+  for attempt in _claude_attempts(handle):
+    await handle.consume_steer(
+      UserMessage(content=attempt.text, uuid=attempt.uuid), sink,
+    )
 
 
 def _patch_codex_steer(monkeypatch, steer) -> None:
@@ -367,8 +386,14 @@ def test_direct_claude_steer_keeps_reserve_until_deferred_cut(
   assert res.json()["cut_deferred"] is True
   chat = _read_chat(chat_id)
   assert [cid_of(row) for row in chat.pending_messages] == [message_cid]
-  assert [cid_of(row) for row in handle._steer_user_msgs] == [message_cid]
-  assert handle._steer_consume_cids == [message_cid]
+  assert [
+    cid_of(row) for attempt in _claude_attempts(handle)
+    for row in attempt.user_msgs
+  ] == [message_cid]
+  assert [
+    cid for attempt in _claude_attempts(handle)
+    for cid in attempt.consume_pending_cids
+  ] == [message_cid]
 
 
 def test_pending_question_refuses_force_steer_without_holding_queue(
@@ -707,194 +732,71 @@ def test_steer_enabled_honors_global_flag():
   assert _steer_enabled(chat) is True
 
 
-def test_seal_steer_split_retains_buffer_on_failure_and_delta_clears():
-  """Adversarial hardening for `_seal_steer_split`:
+def test_claude_seal_commits_only_consumed_attempts_and_retries_failure(
+  monkeypatch,
+):
+  """A write is not a receipt; failed cuts retain only their consumed attempt."""
+  from app.claude_sdk_runner import _ClaudeSteer, _seal_steer_split
+  from app import chat_event_sink
 
-  - a split FAILURE leaves the buffer intact so the turn-end finally retries
-    (the client was already told 202 — the row must not be silently dropped);
-  - on SUCCESS only the rows actually sealed are removed, so a second steer
-    that lands during the (up to 30s) actor round-trip survives for the next
-    call rather than being wiped by a wholesale reset.
-  """
-  from app.claude_sdk_runner import _seal_steer_split
-
-  # Build the handle OUTSIDE the async body — `_make_active_claude_client`
-  # itself calls asyncio.run, which can't nest inside asyncio.run(_run()).
   handle = _make_active_claude_client("sealunit")
+  first = _ClaudeSteer(
+    uuid="first", text="Q2",
+    user_msgs=[{"role": "user", "content": "Q2", "cid": "c-q2"}],
+    consume_pending_cids=["c-q2"], consumed=True,
+  )
+  second = _ClaudeSteer(
+    uuid="second", text="Q3",
+    user_msgs=[{"role": "user", "content": "Q3", "cid": "c-q3"}],
+    consume_pending_cids=["c-q3"],
+  )
+  handle._steers = {"first": first, "second": second}
+  seen = []
+
+  async def _failed(chat_id, rows, cids, *, sink):
+    seen.append((chat_id, [row["cid"] for row in rows], cids, sink))
+    raise RuntimeError("writer down")
+
+  async def _committed(chat_id, rows, cids, *, sink):
+    seen.append((chat_id, [row["cid"] for row in rows], cids, sink))
+    return {"stored_messages": rows}
 
   async def _run():
-    handle._steer_user_msgs = [
-      {"role": "user", "content": "Q2", "ts": 10, "cid": "c-q2"}
-    ]
-    handle._steer_consume_cids = []
-
-    # 1) A failing split must NOT clear the buffer.
-    class _FailBc:
-      async def split_for_steer(self, rows, consume):
-        raise RuntimeError("writer down")
-
-    await _seal_steer_split(_FailBc(), handle, "sealunit")
-    assert [m["content"] for m in handle._steer_user_msgs] == ["Q2"]
-
-    # 2) A successful split removes only the sealed row; a steer that lands
-    #    DURING the await survives.
-    class _OkBc:
-      def __init__(self):
-        self.seen = None
-
-      async def split_for_steer(self, rows, consume):
-        self.seen = [m["content"] for m in rows]
-        # A concurrent steer arrives while we await the writer acks.
-        handle._steer_user_msgs.append(
-          {"role": "user", "content": "Q3", "ts": 11}
-        )
-
-    bc = _OkBc()
-    await _seal_steer_split(bc, handle, "sealunit")
-    assert bc.seen == ["Q2"]
-    assert [m["content"] for m in handle._steer_user_msgs] == ["Q3"]
+    sink = object()
+    monkeypatch.setattr(chat_event_sink, "commit_steer_cut", _failed)
+    with pytest.raises(RuntimeError, match="writer down"):
+      await _seal_steer_split(sink, handle, handle.chat_id)
+    assert first.consumed and not first.committed
+    assert not second.consumed and not second.committed
+    monkeypatch.setattr(chat_event_sink, "commit_steer_cut", _committed)
+    await _seal_steer_split(sink, handle, handle.chat_id)
+    assert first.committed and not second.committed
+    assert [entry[1] for entry in seen] == [["c-q2"], ["c-q2"]]
+    assert all(entry[3] is sink for entry in seen)
+    await _seal_steer_split(sink, handle, handle.chat_id)
+    assert len(seen) == 2
 
   asyncio.run(_run())
 
 
-def test_seal_publishes_the_cut_on_the_sinks_own_broadcast():
-  """The cut goes to the broadcast the SINK holds, never to a fresh lookup.
+def test_claude_unconsumed_native_input_never_seals(monkeypatch):
+  """Terminal cleanup must not turn an unacknowledged UUID into delivery."""
+  from app.claude_sdk_runner import _ClaudeSteer, _seal_steer_split
+  from app import chat_event_sink
 
-  `_seal_steer_split` also runs from the turn-end `finally`, by which point a
-  successor turn can already have registered a NEW broadcast for the same chat.
-  Resolving by chat_id there would strand the cut in an event log no client is
-  reading: A1's blocks live in the old log, so the client would never re-base
-  and would paint the continuation onto the sealed segment for the rest of the
-  turn. Also covers a leaner writer ack (no `stored_messages`): the cut still
-  names the buffered rows rather than going out empty.
-  """
-  from app.broadcast import create_broadcast, get_broadcast
-  from app.claude_sdk_runner import _seal_steer_split
+  handle = _make_active_claude_client("unconsumed")
+  handle._steers["pending"] = _ClaudeSteer(
+    uuid="pending", text="Q2",
+    user_msgs=[{"role": "user", "content": "Q2", "cid": "c-q2"}],
+    consume_pending_cids=["c-q2"],
+  )
 
-  chat_id = "sealbroadcast"
-  handle = _make_active_claude_client(chat_id)
-  turn_bc = create_broadcast(chat_id)
+  async def _must_not_commit(*args, **kwargs):
+    raise AssertionError("unconsumed rows must remain pending")
 
-  async def _run():
-    handle._steer_user_msgs = [
-      {"role": "user", "content": "Q2", "ts": 10, "cid": "c-q2"}
-    ]
-    handle._steer_consume_cids = ["c-q2"]
-
-    class _SinkLike:
-      """Mirrors `_ChatEventSink`: holds the broadcast it was built with."""
-
-      def __init__(self, bc):
-        self.bc = bc
-
-      async def split_for_steer(self, rows, consume):
-        # The writer ack shape without the echoed rows.
-        return {"pending": []}
-
-    # A successor turn registers its own broadcast before this seal runs.
-    successor_bc = create_broadcast(chat_id)
-    assert get_broadcast(chat_id) is successor_bc
-    assert successor_bc is not turn_bc
-
-    await _seal_steer_split(_SinkLike(turn_bc), handle, chat_id)
-
-    assert [e.get("type") for e in successor_bc.event_log] == []
-    cuts = [e for e in turn_bc.event_log if e.get("type") == "steered_into_turn"]
-    assert len(cuts) == 1
-    assert [m["content"] for m in cuts[0]["messages"]] == ["Q2"]
-    assert [m["cid"] for m in cuts[0]["messages"]] == ["c-q2"]
-
-  asyncio.run(_run())
-
-
-def test_writer_dedup_still_publishes_the_committed_cut():
-  """An empty stored-row echo does not undo the split that just committed.
-
-  `split_for_steer` seals A1 and resets the sink BEFORE the writer appends the
-  steered row. `stored_messages: []` means only that cid dedup found the row
-  already in the durable transcript; it does not mean the A1/A2 boundary was
-  skipped. Suppressing the cut here would leave the client appending A2 to the
-  segment the server has already sealed. The handed row still supplies the cid
-  that retires its tray entry and identifies the already-durable user turn.
-  """
-  from app.broadcast import create_broadcast
-  from app.claude_sdk_runner import _seal_steer_split
-
-  chat_id = "sealdedup"
-  handle = _make_active_claude_client(chat_id)
-  turn_bc = create_broadcast(chat_id)
-
-  async def _run():
-    row = {"role": "user", "content": "Q2", "ts": 10, "cid": "c-q2"}
-    handle._steer_user_msgs = [row]
-    handle._steer_consume_cids = ["c-q2"]
-
-    class _SinkLike:
-      def __init__(self, bc):
-        self.bc = bc
-
-      async def split_for_steer(self, rows, consume):
-        assert rows == [row]
-        assert consume == ["c-q2"]
-        # The durable writer already has this cid, but the sink-side split still
-        # sealed A1 and reset its accumulator for A2.
-        return {"stored_messages": []}
-
-    await _seal_steer_split(_SinkLike(turn_bc), handle, chat_id)
-
-    cuts = [e for e in turn_bc.event_log if e.get("type") == "steered_into_turn"]
-    assert len(cuts) == 1
-    assert cuts[0]["messages"][0]["cid"] == "c-q2"
-    assert handle._steer_user_msgs == []
-    assert handle._steer_consume_cids == []
-
-  asyncio.run(_run())
-
-
-def test_a_failing_publisher_cannot_escape_the_seal():
-  """Announcing the cut must never raise out of `_seal_steer_split`.
-
-  The turn-end `finally` awaits this function BEFORE it unregisters the handle
-  and disconnects the client, so an escaping exception would strand a live
-  handle in the registry and leave the chat looking permanently busy. The split
-  has already COMMITTED by the time the cut is published, so a broken publisher
-  is a notification loss, not a durability one — exactly the asymmetry the
-  missing-publisher branch already takes. Swallow it, log it, and still consume
-  the sealed rows so the turn-end retry does not double-append them.
-  """
-  from app.claude_sdk_runner import _seal_steer_split
-
-  chat_id = "sealpublishfail"
-  handle = _make_active_claude_client(chat_id)
-
-  async def _run():
-    handle._steer_user_msgs = [
-      {"role": "user", "content": "Q2", "ts": 10, "cid": "c-q2"}
-    ]
-    handle._steer_consume_cids = ["c-q2"]
-
-    class _ExplodingBroadcast:
-      def publish(self, event):
-        raise RuntimeError("broadcast is gone")
-
-    class _SinkLike:
-      def __init__(self, bc):
-        self.bc = bc
-        self.splits = 0
-
-      async def split_for_steer(self, rows, consume):
-        self.splits += 1
-        return {"stored_messages": list(rows)}
-
-    sink = _SinkLike(_ExplodingBroadcast())
-    await _seal_steer_split(sink, handle, chat_id)
-
-    assert sink.splits == 1
-    # The rows were committed, so they must not be re-appended by the retry.
-    assert handle._steer_user_msgs == []
-    assert handle._steer_consume_cids == []
-
-  asyncio.run(_run())
+  monkeypatch.setattr(chat_event_sink, "commit_steer_cut", _must_not_commit)
+  asyncio.run(_seal_steer_split(object(), handle, handle.chat_id))
+  assert not handle._steers["pending"].committed
 
 
 def test_sink_commit_publish_failure_does_not_reclassify_committed_cut():
@@ -928,52 +830,41 @@ def test_sink_commit_publish_failure_does_not_reclassify_committed_cut():
   asyncio.run(_run())
 
 
-def test_stop_drops_the_buffered_steer_instead_of_appending_it():
-  """A hard Stop abandons a deferred steer ENTIRELY.
+def test_stop_fences_late_claude_receipt_without_duplicate_cut(monkeypatch):
+  """Stop's generation bump makes an in-flight native replay non-committing."""
+  from app.claude_sdk_runner import ActiveClaudeClient
+  from app import chat_event_sink
 
-  Stop's contract: `/chat/stop` clears `chat.pending_messages`, reports the
-  cleared cids, and the client re-sends exactly them as one fresh turn. A
-  deferred steer's row is still IN that queue (its split never ran), so if the
-  runner kept the row buffered, the turn-end seal appended it to the turn Stop
-  had just killed while the client re-sent it — the same message twice, once
-  interrupted and once answered. `interrupt()` therefore clears the
-  transcript-side buffer too, which makes the finally's seal a no-op.
-  """
-  from app.claude_sdk_runner import ActiveClaudeClient, _seal_steer_split
+  chat_id = "stopsteer"
+  row = {"role": "user", "content": "Q2", "cid": "c-q2"}
+  commits = []
 
   class _Client:
+    async def query(self, prompt):
+      async for _ in prompt:
+        pass
+
     async def interrupt(self):
       return None
 
+  async def _commit(*args, **kwargs):
+    commits.append((args, kwargs))
+
   async def _run():
-    # Built inside THIS loop: interrupt() waits on `_finished`, which is
-    # loop-bound, so a handle constructed in a throwaway loop cannot be awaited
-    # here. mark_finished() stands in for the runner's own teardown.
-    handle = ActiveClaudeClient(_Client(), chat_id="stopsteer")
+    handle = ActiveClaudeClient(_Client(), chat_id=chat_id)
+    handle.mark_ready()
+    assert await handle.steer("Q2", [row], ["c-q2"])
+    attempt = _claude_attempts(handle)[0]
+    registry.bump_generation(chat_id)
     handle.mark_finished()
-    handle.pending_steer = ["Q2"]
-    handle._steer_user_msgs = [
-      {"role": "user", "content": "Q2", "ts": 10, "cid": "c-q2"}
-    ]
-    handle._steer_consume_cids = ["c-q2"]
-
+    monkeypatch.setattr(chat_event_sink, "commit_steer_cut", _commit)
+    await handle.consume_steer(
+      UserMessage(content=attempt.text, uuid=attempt.uuid), object(),
+    )
+    assert not commits
+    assert not attempt.consumed
     await handle.interrupt()
-
-    assert handle.pending_steer == []
-    assert handle._steer_user_msgs == []
-    assert handle._steer_consume_cids == []
-
-    # The turn-end catch-all now has nothing to append.
-    class _Bc:
-      def __init__(self):
-        self.splits = 0
-
-      async def split_for_steer(self, rows, consume):
-        self.splits += 1
-
-    bc = _Bc()
-    await _seal_steer_split(bc, handle, "stopsteer")
-    assert bc.splits == 0
+    assert not commits
 
   asyncio.run(_run())
 
@@ -981,11 +872,11 @@ def test_stop_drops_the_buffered_steer_instead_of_appending_it():
 def test_claude_force_steer_defers_to_runner_and_reorders(client, auth):
   """A Claude fast-forward (force_steer) defers its split to the runner, same
   as an ordinary steer, so the fast-forwarded rows land AFTER the sealed
-  pre-interrupt A1 (reload Q1, A1, Q2, A2) instead of merging.
+  pre-replay A1 (reload Q1, A1, Q2, A2) instead of merging.
 
   Deferring moves the queued-row consume to the runner: at the route the rows
-  stay in pending and are BUFFERED on the handle; the runner seals A1, appends
-  them, and consumes them at the interrupt boundary. Because the rows remain in
+  stay in pending and are bound to a native UUID; its root replay seals A1,
+  appends them, and consumes them. Because the rows remain in
   pending until then, a crash before the boundary drains them normally rather
   than dropping them."""
   from app.chat import _ChatEventSink, register_active_sink
@@ -1031,23 +922,24 @@ def test_claude_force_steer_defers_to_runner_and_reorders(client, auth):
     ("user", "Q1"),
   ]
   assert [m["content"] for m in (chat.pending_messages or [])] == ["use blue"]
-  # The steered row is buffered on the handle for the runner.
-  assert [m["content"] for m in handle._steer_user_msgs] == ["use blue"]
+  # The native input attempt retains the durable row until root replay.
+  assert [
+    m["content"] for a in _claude_attempts(handle) for m in a.user_msgs
+  ] == ["use blue"]
 
   async def _drive_runner():
-    sink.publish({"type": "text", "content": "A1 pre-interrupt"})
-    await _seal_steer_split(sink, handle, chat_id)
+    sink.publish({"type": "text", "content": "A1 pre-replay"})
+    await _consume_claude_steers(handle, sink)
     sink.publish({"type": "text", "content": "A2 answer"})
     await sink.finalize()
 
-  from app.claude_sdk_runner import _seal_steer_split
   asyncio.run(_drive_runner())
 
   # Reload order Q1, A1, Q2, A2 — and the queued row is consumed from pending.
   chat = _read_chat(chat_id)
   assert [(m["role"], m.get("content")) for m in chat.messages] == [
     ("user", "Q1"),
-    ("assistant", "A1 pre-interrupt"),
+    ("assistant", "A1 pre-replay"),
     ("user", "use blue"),
     ("assistant", "A2 answer"),
   ]
@@ -1385,14 +1277,14 @@ def test_falls_back_to_queue_when_flag_off(client, auth, monkeypatch):
 def test_steers_into_live_claude_turn_reserves_durable_pending(
   client, auth,
 ):
-  """Claude buffers only a row already committed to pending."""
+  """Claude admits native input only after its row is committed to pending."""
   chat_id = "claudechat"
   _make_claude_chat(chat_id, steer_enabled=True)
   handle = _make_active_claude_client(chat_id)
   registry.register(handle)
   create_broadcast(chat_id)
 
-  # No monkeypatch: the real steer_into_active_turn buffers onto the handle.
+  # No monkeypatch: real steer_into_active_turn creates a native UUID attempt.
   res = client.post(
     f"/api/chats/{chat_id}/messages",
     json={"content": "actually use blue"},
@@ -1413,11 +1305,15 @@ def test_steers_into_live_claude_turn_reserves_durable_pending(
   reserved_cid = cid_of(chat.pending_messages[0])
   assert [m["role"] for m in chat.messages] == ["user", "assistant"]
 
-  assert [m["content"] for m in handle._steer_user_msgs] == [
-    "actually use blue"
-  ]
-  assert cid_of(handle._steer_user_msgs[0]) == reserved_cid
-  assert handle._steer_consume_cids == [reserved_cid]
+  assert [
+    m["content"] for a in _claude_attempts(handle) for m in a.user_msgs
+  ] == ["actually use blue"]
+  assert [
+    cid_of(m) for a in _claude_attempts(handle) for m in a.user_msgs
+  ] == [reserved_cid]
+  assert [
+    cid for a in _claude_attempts(handle) for cid in a.consume_pending_cids
+  ] == [reserved_cid]
 
   # NO event at HTTP arrival on the deferred path. The 202's own
   # `pending_messages` (asserted above) is the single signal that keeps the row
@@ -1429,10 +1325,32 @@ def test_steers_into_live_claude_turn_reserves_durable_pending(
   assert bc.event_log == []
 
 
+def test_claude_not_ready_keeps_auto_steer_in_durable_queue(client, auth):
+  """The initial query must be on wire before a native steer can be admitted."""
+  chat_id = "claude-not-ready"
+  _make_claude_chat(chat_id, steer_enabled=True)
+  handle = _make_active_claude_client(chat_id)
+  handle._ready = False
+  registry.register(handle)
+  create_broadcast(chat_id)
+
+  res = client.post(
+    f"/api/chats/{chat_id}/messages",
+    json={"content": "do not overtake the initial query", "cid": "not-ready"},
+    headers=auth,
+  )
+  assert res.status_code == 202, res.text
+  assert res.json()["status"] == "queued"
+  assert _claude_attempts(handle) == []
+  assert [cid_of(row) for row in _read_chat(chat_id).pending_messages] == [
+    "not-ready",
+  ]
+
+
 def test_claude_runner_splits_steer_at_boundary_not_http_arrival(
   client, auth,
 ):
-  """The Claude steer split runs when the interrupted turn ENDS (A1 complete),
+  """The Claude steer split runs at the native root replay (A1 complete),
   not at HTTP arrival (A1 still empty).
 
   Reproduces the prod merge (chats 37ab92a1, 99b57536): a steer that lands
@@ -1442,7 +1360,6 @@ def test_claude_runner_splits_steer_at_boundary_not_http_arrival(
   (where A1 is complete) the durable order is Q1, A1, Q2, A2."""
   from app.broadcast import create_broadcast
   from app.chat import _ChatEventSink, register_active_sink
-  from app.claude_sdk_runner import _seal_steer_split
 
   chat_id = "claudeboundary"
   # Seed only Q1: the assistant turn is in progress and A1 has NOT streamed.
@@ -1478,12 +1395,22 @@ def test_claude_runner_splits_steer_at_boundary_not_http_arrival(
 
   async def _drive_runner():
     # A1 streams AFTER the steer (the timing the route-side split got wrong).
-    sink.publish({"type": "text", "content": "A1 pre-interrupt"})
-    # The interrupted turn ends: the runner seals A1, appends Q2, resets. In
-    # production the runner's `bc` IS the sink (chat.py passes `bc=sink`), so
-    # the split runs against the live sink here too.
-    await _seal_steer_split(sink, handle, chat_id)
-    # The requery's answer (A2) streams into the fresh sink and finalizes.
+    sink.publish({"type": "text", "content": "A1 pre-replay"})
+    # Native root replay seals A1 and consumes Q2. A child or unknown UUID
+    # is not a consumption receipt.
+    attempt = _claude_attempts(handle)[0]
+    await handle.consume_steer(
+      UserMessage(
+        content=attempt.text, uuid=attempt.uuid, parent_tool_use_id="child",
+      ), sink,
+    )
+    await handle.consume_steer(
+      UserMessage(content="unrelated", uuid="not-this-attempt"), sink,
+    )
+    assert not attempt.consumed
+    assert [m["content"] for m in _read_chat(chat_id).pending_messages] == ["Q2"]
+    await _consume_claude_steers(handle, sink)
+    # Post-replay continuation streams into the fresh sink and finalizes.
     sink.publish({"type": "text", "content": "A2 answer"})
     await sink.finalize()
 
@@ -1493,12 +1420,12 @@ def test_claude_runner_splits_steer_at_boundary_not_http_arrival(
   # between them, NOT Q1, Q2, A1\\n\\nA2.
   assert [(m["role"], m.get("content")) for m in _read_chat(chat_id).messages] == [
     ("user", "Q1"),
-    ("assistant", "A1 pre-interrupt"),
+    ("assistant", "A1 pre-replay"),
     ("user", "Q2"),
     ("assistant", "A2 answer"),
   ]
-  # The runner consumed the buffered payload (no double-split on turn end).
-  assert handle._steer_user_msgs == []
+  # The runner consumed the acknowledged attempt (no double-split at end).
+  assert all(a.committed for a in _claude_attempts(handle))
   assert _read_chat(chat_id).pending_messages in (None, [])
 
 
@@ -1510,15 +1437,13 @@ def test_claude_steer_cut_event_is_published_at_the_seal_not_at_http_arrival(
   seal — AFTER every block that belongs to A1 — and never by the route.
 
   The regression this pins: the route published the cut at HTTP arrival while
-  the split stayed at the runner's interrupt boundary seconds later. Everything
+  the split stayed at the runner's root-replay boundary seconds later. Everything
   Claude streamed in the gap was accumulated into the sealed A1 AND kept at the
   head of the client's freshly re-based stream, so it painted twice for the rest
-  of the turn. The window is never empty — the AssistantMessage that triggers
-  the boundary interrupt is dispatched to the broadcast before the interrupt
-  check runs — so this duplicated on EVERY Claude steer.
+  of the turn. A1 may keep streaming after the HTTP arrival, so only the
+  matching root UserMessage can close its segment.
   """
   from app.chat import _ChatEventSink, register_active_sink
-  from app.claude_sdk_runner import _seal_steer_split
 
   chat_id = "claudecutorder"
   db = SessionLocal()
@@ -1559,7 +1484,9 @@ def test_claude_steer_cut_event_is_published_at_the_seal_not_at_http_arrival(
   async def _drive_runner():
     # The rest of A1 streams AFTER arrival — the duplication window.
     sink.publish({"type": "text", "content": " A1 rest"})
-    await _seal_steer_split(sink, handle, chat_id)
+    await _consume_claude_steers(handle, sink)
+    # SDK replay of the same UUID must not emit another cut or append Q2 twice.
+    await _consume_claude_steers(handle, sink)
     # A2's first block follows the seal. It exists here so the cut's position
     # is pinned from BOTH sides: a cut that slipped in front of a continuation
     # block would fold A2's head into the sealed A1 and re-base after it —
@@ -1706,7 +1633,7 @@ def test_claude_reserved_row_survives_process_loss_and_sweep(
   assert [cid_of(row) for row in _read_chat(chat_id).pending_messages] == [
     message_cid,
   ]
-  assert [cid_of(row) for row in handle._steer_user_msgs] == [message_cid]
+  assert [cid_of(row) for a in _claude_attempts(handle) for row in a.user_msgs] == [message_cid]
 
   registry.reset_for_tests()
   bc.mark_completed()

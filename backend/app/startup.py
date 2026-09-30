@@ -354,7 +354,9 @@ def _freeze_legacy_app_runtimes(context: StartupContext) -> None:
     migrate_legacy_job_declarations,
     prune_runtime,
   )
-  from app import models
+  from app import app_python_env, models
+  # No Apply can run yet, so every staged env build is an interrupted one.
+  app_python_env.discard_interrupted_builds(context.settings.data_dir)
   with SessionLocal() as db:
     count, warnings = bootstrap_legacy_runtimes(db)
     service_count, service_warnings = migrate_accepted_service_contracts(db)

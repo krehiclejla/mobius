@@ -1,0 +1,120 @@
+/* The instance's GitHub account for Settings: read status, run one device-code sign-in, disconnect. */
+import { api } from '../api/client.js'
+
+// The platform stores one GitHub credential for the whole instance; Settings
+// is the only UI that changes it, and apps only read /api/github/status.
+//
+// The server owns the sign-in attempt: it paces GitHub (retry_after), expires
+// the code, and reports terminal outcomes. The browser therefore just polls
+// one identified attempt sequentially until the server says it is finished.
+
+const REQUEST_TIMEOUT_MS = 60_000
+const MAX_CONSECUTIVE_ERRORS = 3
+
+async function detail(response, fallback) {
+  const body = await response.json().catch(() => ({}))
+  return typeof body?.detail === 'string' && body.detail.trim() ? body.detail.trim() : fallback
+}
+
+async function call(request, fallback) {
+  const response = await request({ timeoutMs: REQUEST_TIMEOUT_MS })
+  if (!response.ok) {
+    const error = new Error(await detail(response, fallback))
+    error.retryable = response.status >= 500 || response.status === 429
+    throw error
+  }
+  return response.json().catch(() => ({}))
+}
+
+export const hasFullPrAccess = scopes => Array.isArray(scopes)
+  && scopes.includes('workflow')
+  && (scopes.includes('repo') || scopes.includes('public_repo'))
+
+export const hasPrivateRepoAccess = scopes => Array.isArray(scopes) && scopes.includes('repo')
+
+function attemptFrom(body) {
+  return body?.attempt_id && body.user_code && body.verification_uri
+    ? { attemptId: body.attempt_id, userCode: body.user_code, verificationUri: body.verification_uri }
+    : null
+}
+
+export async function fetchGithubStatus({ signal } = {}) {
+  try {
+    const s = await call(options => api.github.status({ ...options, signal }), 'Could not check GitHub.')
+    return {
+      state: s.connected ? 'connected' : 'disconnected',
+      login: s.login || '',
+      scopes: Array.isArray(s.scopes) ? s.scopes : [],
+      signInAvailable: !!s.device_flow_available,
+      // A sign-in already waiting on GitHub (another tab, a reload) resumes.
+      attempt: attemptFrom(s.active_attempt),
+    }
+  } catch (error) {
+    return { state: 'unknown', message: error?.message || 'Could not reach the GitHub connection service.' }
+  }
+}
+
+export async function startGithubSignIn({ privateRepos = false, signal } = {}) {
+  const body = await call(options => api.github.connectStart(privateRepos, { ...options, signal }), 'Could not start GitHub sign-in.')
+  const attempt = attemptFrom(body)
+  if (!attempt) throw new Error('GitHub sign-in started without a code. Please try again.')
+  return attempt
+}
+
+const OUTCOME_MESSAGES = {
+  access_denied: 'GitHub sign-in was denied.',
+  expired_token: 'The code expired. Please try again.',
+}
+
+// Resolves { status: 'complete' } or { status: 'failed' | 'cancelled', message }.
+export async function waitForGithubSignIn(attemptId, { signal, onRetrying = () => {} } = {}) {
+  let delayMs = 0
+  let errors = 0
+  while (!signal?.aborted) {
+    await new Promise(resolve => {
+      const done = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', done)
+        resolve()
+      }
+      const timer = setTimeout(done, delayMs)
+      signal?.addEventListener('abort', done, { once: true })
+    })
+    if (signal?.aborted) break
+    let body
+    try {
+      body = await call(options => api.github.connectPoll(attemptId, { ...options, signal }), 'Could not check GitHub sign-in.')
+      errors = 0
+      onRetrying(false)
+    } catch (error) {
+      if (signal?.aborted) break
+      errors += 1
+      const transient = error.retryable || error.name === 'TimeoutError'
+      if (!transient || errors >= MAX_CONSECUTIVE_ERRORS) {
+        return { status: 'failed', message: error.message }
+      }
+      onRetrying(true)
+      delayMs = 5_000
+      continue
+    }
+    if (body.status === 'pending') {
+      const seconds = Number(body.retry_after ?? body.interval ?? 5)
+      delayMs = Math.max(1_000, (Number.isFinite(seconds) ? seconds : 5) * 1000)
+      continue
+    }
+    if (body.status === 'complete') return { status: 'complete' }
+    return {
+      status: body.status === 'cancelled' ? 'cancelled' : 'failed',
+      message: body.message || OUTCOME_MESSAGES[body.reason] || 'GitHub sign-in did not finish. Please try again.',
+    }
+  }
+  return { status: 'cancelled' }
+}
+
+export function cancelGithubSignIn(attemptId, { signal } = {}) {
+  return call(options => api.github.connectCancel(attemptId, { ...options, signal }), 'Could not cancel GitHub sign-in.')
+}
+
+export function disconnectGithub() {
+  return call(options => api.github.disconnect(options), 'Could not disconnect GitHub.')
+}

@@ -7,6 +7,7 @@ stay addressable for in-flight jobs; Apply and startup reclaim obsolete trees.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import fcntl
 import hashlib
@@ -17,7 +18,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from app import app_git
+from app import app_git, app_python_env
 from app.config import get_settings
 from app.manifest_contract import (
   MANIFEST_MAX_BYTES,
@@ -346,21 +347,32 @@ def migrate_legacy_job_declarations(db) -> tuple[int, list[str]]:
   return migrated, warnings
 
 
-def hold_runtime(app_id: int):
+def hold_runtime(app_id: int, *, nonblocking: bool = False):
   """Pin accepted runtime files while any reader is still using them."""
   parent = Path(get_settings().data_dir) / "run" / "app-runtime-readers"
   parent.mkdir(parents=True, exist_ok=True)
   handle = (parent / f"{int(app_id)}.lock").open("a")
   try:
-    fcntl.flock(handle, fcntl.LOCK_SH)
+    fcntl.flock(handle, fcntl.LOCK_SH | (fcntl.LOCK_NB if nonblocking else 0))
     return handle
   except BaseException:
     handle.close()
     raise
 
 
+async def hold_runtime_async(app_id: int):
+  """Wait for a read pin without blocking the event loop or a worker thread."""
+  while True:
+    try:
+      return hold_runtime(app_id, nonblocking=True)
+    except BlockingIOError:
+      await asyncio.sleep(0.05)
+
+
 def prune_runtime(app, *, previous_revision: str | None = None) -> int:
-  """Bound full-tree copies, without removing files an active reader needs.
+  """Bound full-tree copies and the Python envs only they reference.
+
+  Nothing an active reader needs is removed.
 
   The existing single-flight job lock covers job-context lookup AND child
   lifetime, so pruning cannot race a job that has not published its path yet.
@@ -400,6 +412,11 @@ def prune_runtime(app, *, previous_revision: str | None = None) -> int:
       if root.name not in keep:
         shutil.rmtree(root)
         removed += 1
+    # These same locks pin every process that runs from an app env.
+    app_python_env.prune_envs(
+      get_settings().data_dir, app.id,
+      [root for root in roots if root.name in keep],
+    )
     return removed
   finally:
     for handle in reversed(handles):

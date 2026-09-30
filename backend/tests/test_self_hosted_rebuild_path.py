@@ -52,6 +52,7 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   monkeypatch.setattr(host, "LOCK", state / "replace.lock")
   monkeypatch.setattr(host, "STATUS", state / "status.json")
   monkeypatch.setattr(host, "IMAGES", state / "images.json")
+  monkeypatch.setattr(host, "TRANSACTION", state / "transaction.json")
   monkeypatch.setattr(host, "config", lambda: config)
   containers = iter([("old-container", "sha256:old"), ("new-container", "sha256:new")])
   monkeypatch.setattr(host, "app_container", lambda _config: next(containers))
@@ -84,7 +85,8 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   assert not (inbox / "request.json").exists()
   assert events[0] == "drain"
   assert events[1][0] == "compose"
-  assert events[1][2] == f"{host.IMAGE}:sha-{target}"
+  # Compose starts the verified image through the helper-owned pinned tag.
+  assert events[1][2] == host.TARGET_TAG
   assert events[2] == ("verified", "new-container", target)
   status = json.loads((control / "status.json").read_text(encoding="utf-8"))
   assert status["state"] == "succeeded"

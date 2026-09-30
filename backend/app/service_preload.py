@@ -38,7 +38,6 @@ import logging
 import os
 import signal
 import socket
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,11 +116,13 @@ def _host_program() -> Path:
   return program
 
 
-def ready_host(app, entry: Path, environment: dict[str, str]) -> _Host | None:
+def ready_host(app, python: str, entry: Path, environment: dict[str, str]) -> _Host | None:
   """Return a ready host for the app's current revision, if one exists.
 
   When the entry opts in and no host exists, start one in the background and
   return None, so this request uses an ordinary spawn instead of waiting.
+  ``python`` is the interpreter the revision runs with (``app_services``); it
+  is fixed per revision, so the host key need not include it.
   """
   key = _key(app)
   if key is None:
@@ -142,23 +143,24 @@ def ready_host(app, entry: Path, environment: dict[str, str]) -> _Host | None:
     return None
   retire(key[0], keep_revision=key[1])
   task = asyncio.get_running_loop().create_task(
-    _start_logged(key, str(getattr(app, "slug", key[0])), entry, environment),
+    _start_logged(key, str(getattr(app, "slug", key[0])), python, entry, environment),
   )
   _starting[key] = task
   task.add_done_callback(lambda _task: _starting.pop(key, None))
   return None
 
 
-async def _start_logged(key, slug, entry, environment) -> None:
+async def _start_logged(key, slug, python, entry, environment) -> None:
   try:
-    await start(key, slug, entry, environment)
+    await start(key, slug, python, entry, environment)
   except Exception:
     log.warning("Could not preload the %s service", slug, exc_info=True)
     _failed_at[key] = time.monotonic()
 
 
 async def start(
-  key: tuple[int, str], slug: str, entry: Path, environment: dict[str, str],
+  key: tuple[int, str], slug: str, python: str, entry: Path,
+  environment: dict[str, str],
 ) -> _Host | None:
   """Start and register a host; return None when the entry cannot preload."""
   parent_end, host_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -171,7 +173,7 @@ async def start(
     env["MOBIUS_PRELOAD_CONTROL_FD"] = str(host_end.fileno())
     env["MOBIUS_PRELOAD_ENTRY"] = str(entry)
     process = await asyncio.create_subprocess_exec(
-      sys.executable, str(_host_program()),
+      python, str(_host_program()),
       stdin=asyncio.subprocess.DEVNULL,
       stdout=asyncio.subprocess.DEVNULL,
       stderr=asyncio.subprocess.PIPE,

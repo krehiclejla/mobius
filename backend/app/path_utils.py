@@ -16,13 +16,13 @@ from pathlib import Path
 from fastapi import HTTPException
 
 _CHAT_ID_RE = re.compile(
-  r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+  r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
   re.IGNORECASE,
 )
 
 
 def validate_chat_id(chat_id: str) -> None:
-  """Raise HTTP 400 unless ``chat_id`` is a dashed UUID4 string."""
+  """Raise HTTP 400 unless ``chat_id`` is a canonical dashed UUID string."""
   if not _CHAT_ID_RE.match(chat_id):
     raise HTTPException(status_code=400, detail="Invalid chat id.")
 

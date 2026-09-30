@@ -42,7 +42,9 @@ from app.routes.app_publication import (
 from app.routes.app_runtime import router as runtime_router
 from app.storage_io import (
   delete_content_type_tree,
+  make_parent_folders,
   read_capped_body,
+  require_parent_folders,
   rmtree_strict as _rmtree_strict,
 )
 from app.app_capabilities import (
@@ -270,6 +272,7 @@ async def create_app_source_folder(
     target = _resolve_app_source_path(root, body.path)
     if target == root:
       raise HTTPException(400, "The app source root already exists.")
+    require_parent_folders(target)
     try:
       target.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -323,7 +326,7 @@ async def move_app_source_path(
       raise HTTPException(404, "Source path not found.")
     if destination.exists():
       raise HTTPException(409, "A file or folder already uses the destination.")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    make_parent_folders(destination)
     try:
       os.replace(source, destination)
     except OSError as exc:
@@ -523,10 +526,12 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   await asyncio.to_thread(_rmtree_strict, storage_dir)
   await asyncio.to_thread(_rmtree_strict, secrets_dir)
   from app import service_preload
+  from app.app_python_env import remove_app_envs
   from app.applied_app_runtime import runtime_parent
   # A preloaded service host runs from, and pins, the tree removed next.
   service_preload.retire(deleted_app_id)
   await asyncio.to_thread(_rmtree_strict, runtime_parent(deleted_app_id))
+  await asyncio.to_thread(remove_app_envs, settings.data_dir, deleted_app_id)
 
   # Storage is gone; only now free the row and its reusable id. A partial
   # cleanup of the slug-keyed source tree below leaves harmless orphans — those

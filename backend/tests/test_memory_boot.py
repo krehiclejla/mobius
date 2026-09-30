@@ -119,10 +119,19 @@ def test_cron_starts_only_after_per_boot_supervision_proof():
   text = ENTRYPOINT.read_text(encoding="utf-8")
   remove = text.index("rm -f /data/run/app-cron-supervision-ready")
   guard = text.index("if [ -f /data/run/app-cron-supervision-ready ]")
-  start = text.index("        cron", guard)
+  start = text.index("\n    cron\n", guard)
 
   assert remove < guard < start
   assert "cron remains disabled (fail closed)" in text
+
+
+def test_cron_health_probe_keeps_waiting_after_ninety_seconds():
+  text = ENTRYPOINT.read_text(encoding="utf-8")
+
+  assert 'until curl -sf "$_health_url"' in text
+  assert 'if [ "$_waited" -eq 90 ]' in text
+  assert "cron starts once it is" in text
+  assert "did not return 200 within 90s" not in text
 
 
 def test_boot_never_executes_app_owned_cron_declarations():

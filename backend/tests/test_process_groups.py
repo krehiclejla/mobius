@@ -145,13 +145,19 @@ def test_an_exited_member_is_skipped_not_reported(caplog):
 
   leader = subprocess.Popen(["sh", "-c", "true & exec sleep 30"], start_new_session=True)
   try:
+    def child_state():
+      for pid in process_groups._process_group_members(leader.pid):
+        if pid != leader.pid:
+          with open(f"/proc/{pid}/stat") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0]
+      return None
+
+    # The child appears while `true` may still be running; wait for it to exit
+    # into the unreaped state this case is about.
     deadline = time.monotonic() + 5
-    while len(process_groups._process_group_members(leader.pid)) < 2:
-      assert time.monotonic() < deadline, "the unreaped child never appeared"
+    while (state := child_state()) != "Z":
+      assert time.monotonic() < deadline, f"the child never became an unreaped zombie ({state})"
       time.sleep(0.05)
-    zombie = next(p for p in process_groups._process_group_members(leader.pid) if p != leader.pid)
-    with open(f"/proc/{zombie}/stat") as handle:
-      assert handle.read().rsplit(")", 1)[1].split()[0] == "Z"
 
     with caplog.at_level(logging.WARNING):
       assert process_groups.lower_process_group_priority(

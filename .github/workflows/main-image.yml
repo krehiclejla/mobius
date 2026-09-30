@@ -17,7 +17,9 @@ jobs:
   publish:
     # Forks inherit workflow files. Never allocate a runner or attempt a
     # package write outside the one repository that owns this image channel.
-    if: github.repository == 'mobius-os/mobius'
+    # Only main publishes: self-hosted launchers run the worker carried by
+    # these images as root, so a manual run on another ref must not publish.
+    if: github.repository == 'mobius-os/mobius' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
@@ -89,9 +91,40 @@ jobs:
             exit 1
           fi
 
+  host-helper-adoption:
+    # The worker inside each published image must reach installed hosts by
+    # itself. Install the helper from the previous published release, replace
+    # it with this image, and require this image's worker to become active
+    # through the real launcher, as owners' hosts will.
+    if: github.repository == 'mobius-os/mobius' && github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: The published worker arrives through the installed launcher
+        run: |
+          image=ghcr.io/mobius-os/mobius
+          previous=""
+          for sha in $(git rev-list --first-parent --max-count=200 "${GITHUB_SHA}~1"); do
+            if docker manifest inspect "$image:sha-$sha" >/dev/null 2>&1; then previous=$sha; break; fi
+          done
+          [ -n "$previous" ] || { echo "no earlier published release"; exit 1; }
+          # The installer runs as root over this runner-owned checkout.
+          sudo git config --global --add safe.directory '*'
+          sudo scripts/test-host-helper.sh "$previous" "$GITHUB_SHA"
+
   promote-main:
     if: github.repository == 'mobius-os/mobius'
-    needs: publish
+    # A release is promoted only once its worker has proven it reaches an
+    # installed launcher by itself. (Until the previous release has a
+    # launcher, that check passes with nothing to prove.)
+    needs: [publish, host-helper-adoption]
     runs-on: ubuntu-latest
     concurrency:
       group: mobius-main-image-promotion
