@@ -1123,3 +1123,47 @@ def test_login_cooldown_tracking_caps_at_10k(client):
     _auth_mod._login_failures[f"user_{i}"] = 29
     _record_login_failure(f"user_{i}")
   assert len(_auth_mod._login_cooldown_until) <= _LOGIN_TRACK_CAP
+
+
+def test_concurrent_first_setups_leave_exactly_one_owner(client, monkeypatch):
+  """Two first-boot setups racing past the "no owner yet" check must not both
+  succeed: a second, silent owner account would hold full owner authority."""
+  import threading
+
+  from sqlalchemy.orm import Session
+
+  from app import models
+  from app.database import SessionLocal
+
+  # Hold both requests at the insert so each has already passed the emptiness
+  # check — the window a real race needs, made deterministic.
+  barrier = threading.Barrier(2)
+  real_add = Session.add
+
+  def add_after_both_checked(self, instance, *args, **kwargs):
+    if isinstance(instance, models.Owner):
+      try:
+        barrier.wait(timeout=5)
+      except threading.BrokenBarrierError:
+        pass
+    return real_add(self, instance, *args, **kwargs)
+
+  monkeypatch.setattr(Session, "add", add_after_both_checked)
+  statuses = {}
+
+  def setup(username):
+    statuses[username] = client.post("/api/auth/setup", json={
+      "username": username, "password": "testpassword123",
+    }).status_code
+
+  threads = [threading.Thread(target=setup, args=(name,)) for name in ("first", "second")]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  assert sorted(statuses.values()) == [200, 400]
+  with SessionLocal() as db:
+    owners = [row.username for row in db.query(models.Owner).all()]
+  winner = next(name for name, status in statuses.items() if status == 200)
+  assert owners == [winner]
