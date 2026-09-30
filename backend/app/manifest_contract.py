@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 import json
 from urllib.parse import unquote, urlparse
+import posixpath
 import re
 import shlex
 
@@ -57,6 +58,7 @@ _SKILL_FILENAME_OK = re.compile(r"^[a-z0-9][a-z0-9._-]*\.md$")
 _SKILL_FOLDER_OK = re.compile(r"^([a-z0-9][a-z0-9._-]*)/$")
 FOLDER_SKILL_ENTRY = "SKILL.md"
 _PACKAGE_ID_OK = re.compile(r"^[a-z0-9][a-z0-9._:-]{2,127}$")
+_PYTHON_PROGRAM = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)?)?")
 _AGENT_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
@@ -126,6 +128,78 @@ def job_interpreter(job: bytes) -> tuple[str, ...]:
   return interpreter
 
 
+def python_lock(manifest) -> str | None:
+  """The dependency lock a manifest declares for its own Python, or None.
+
+  The one reading of ``python`` shared by validation and by the runtime
+  lookup in ``app_python_env``, so the two cannot disagree.
+  """
+  python = manifest.get("python")
+  if python is None:
+    return None
+  if not isinstance(python, Mapping) or set(python) != {"lock"}:
+    _fail("Manifest `python` must contain only `lock`.")
+  validate_repo_relative_path(python["lock"], "python.lock")
+  return python["lock"]
+
+
+def validate_setup(manifest) -> None:
+  """Validate optional setup steps and native Debian dependency strings."""
+  if not isinstance(manifest, Mapping):
+    _fail("Manifest must be an object.")
+  if "setup" not in manifest:
+    return
+  setup = manifest["setup"]
+  if not isinstance(setup, Mapping) or set(setup) - {"steps", "apt"}:
+    _fail("Manifest `setup` must be an object with only `steps` and `apt`.")
+  steps = setup.get("steps", [])
+  if not isinstance(steps, list):
+    _fail("Manifest `setup.steps` must be an array.")
+  for index, path in enumerate(steps):
+    validate_repo_relative_path(path, f"setup.steps[{index}]")
+  apt = setup.get("apt", [])
+  if not isinstance(apt, list) or any(
+    not isinstance(dependency, str) or not dependency.strip()
+    or dependency.startswith("-") or "\x00" in dependency
+    or "\n" in dependency or "\r" in dependency
+    for dependency in apt
+  ):
+    _fail("Manifest `setup.apt` must be an array of Debian dependency strings.")
+
+
+def python_job_arguments(interpreter: tuple[str, ...]) -> tuple[str, ...] | None:
+  """The interpreter arguments of a Python job shebang, or None for another program.
+
+  Supported forms are ``/path/to/pythonX[.Y] [args]`` and
+  ``/usr/bin/env [-S] pythonX[.Y] [args]``. Anything else that names Python
+  is rejected: in an app with its own environment it would otherwise run on
+  the platform interpreter.
+  """
+  program, rest = interpreter[0], interpreter[1:]
+  if posixpath.basename(program) == "env":
+    if rest[:1] == ("-S",):
+      rest = rest[1:]
+    if rest and _PYTHON_PROGRAM.fullmatch(rest[0]):
+      return rest[1:]
+  elif _PYTHON_PROGRAM.fullmatch(posixpath.basename(program)):
+    return rest
+  if any("python" in posixpath.basename(token) for token in interpreter):
+    _fail(
+      "Schedule job shebang names Python in an unsupported form. In an app "
+      "with a Python lock, use `#!/usr/bin/env python3` or an absolute Python "
+      "path so the job runs with the app's environment."
+    )
+  return None
+
+
+def validate_schedule_job(manifest, job: bytes) -> tuple[str, ...]:
+  """Validate one app's job declaration against that app's manifest."""
+  interpreter = job_interpreter(job)
+  if python_lock(manifest) is not None:
+    python_job_arguments(interpreter)
+  return interpreter
+
+
 def validate_slug_field(value, field: str) -> None:
   if not isinstance(value, str) or not value:
     _fail(f"Manifest `{field}` must be a non-empty string.")
@@ -170,6 +244,14 @@ def validate_repo_relative_path(path: str, field: str) -> None:
   if any("/" in part or "\\" in part for part in parts):
     _fail(
       f"Manifest `{field}` must not contain encoded path separators."
+      f"{seed_hint}"
+    )
+  # Git owns its metadata directory and refuses to track any path inside it,
+  # so a package naming one could never install; say so instead of failing
+  # later inside Git with an unexplained server error.
+  if any(part.lower() == ".git" for part in parts):
+    _fail(
+      f"Manifest `{field}` must not point inside a `.git` directory."
       f"{seed_hint}"
     )
 
@@ -507,6 +589,15 @@ def validate_manifest_contract(manifest) -> None:
       f"Manifest permission {names} has been removed; server-side app jobs "
       "run as ordinary Möbius processes."
     )
+  job_secrets = permissions.get("job_secret_read", [])
+  if (
+    not isinstance(job_secrets, list) or len(job_secrets) > 16
+    or any(not isinstance(name, str) or not re.fullmatch(
+      r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name,
+    ) for name in job_secrets)
+    or len(set(job_secrets)) != len(job_secrets)
+  ):
+    _fail("Manifest `permissions.job_secret_read` must list up to 16 unique secret names.")
   for field in RECOGNIZED_CAPABILITIES:
     if field in permissions and not isinstance(permissions[field], bool):
       _fail(f"Manifest `permissions.{field}` must be a boolean.")
@@ -751,6 +842,11 @@ def validate_manifest_contract(manifest) -> None:
           "numeric-id storage tree)."
         )
 
+  validate_setup(manifest)
+  for index, path in enumerate(manifest.get("setup", {}).get("steps", [])):
+    if path not in (source_files or []):
+      _fail(f"Manifest `setup.steps[{index}]` must be listed in `source_files`.")
+
   agent_activities = manifest.get("agent_activities", {})
   if not isinstance(agent_activities, Mapping):
     _fail("Manifest `agent_activities` must be an object.")
@@ -849,6 +945,16 @@ def validate_manifest_contract(manifest) -> None:
       )
     if service.get("access", "self") not in {"self", "apps", "public"}:
       _fail("Manifest `service.access` must be `self`, `apps`, or `public`.")
+
+  # The app's own Python environment (app_python_env). Apply and install
+  # check that the listed file exists in the accepted tree.
+  lock = python_lock(manifest)
+  if lock is not None:
+    if not isinstance(source_files, list) or lock not in source_files:
+      _fail(
+        "Manifest `python.lock` must also be listed in `source_files` so "
+        "every install contains the reviewed dependency lock."
+      )
 
   skills = manifest.get("skills")
   if skills is not None:

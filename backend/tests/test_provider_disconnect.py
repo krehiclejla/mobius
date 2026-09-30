@@ -175,7 +175,37 @@ def signin_events(monkeypatch):
 
 
 def _refreshed(events, provider):
-  return provider not in providers._model_registry_cache and events == [{'type': 'model_providers_changed'}]
+  return (
+    provider not in providers._model_registry_cache
+    and events == [{'type': 'model_providers_changed', 'provider': provider}]
+  )
+
+
+@pytest.mark.parametrize('provider', ['claude', 'codex'])
+def test_signin_change_drops_only_previous_accounts_usage(provider_home, signin_events, provider):
+  from app import provider_usage
+
+  provider_usage._provider_usage_cache.clear()
+  for name in ('claude', 'codex'):
+    key = provider_usage._cache_key(name, str(provider_home))
+    provider_usage._provider_usage_cache[key] = provider_usage._CachedProviderUsage(
+      observed_at=time.monotonic(), next_check_at=time.monotonic() + 30,
+      snapshot={'state': 'ready', 'windows': [{'used_percent': 100}]},
+    )
+    path = provider_usage._last_reading_path(str(provider_home), name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('old account reading')
+
+  asyncio.run(routes._provider_signin_changed(provider))
+
+  previous = provider_usage._cache_key(provider, str(provider_home))
+  other = provider_usage._cache_key('codex' if provider == 'claude' else 'claude', str(provider_home))
+  assert previous not in provider_usage._provider_usage_cache
+  assert other in provider_usage._provider_usage_cache
+  assert not provider_usage._last_reading_path(str(provider_home), provider).exists()
+  assert provider_usage._last_reading_path(str(provider_home), other[1]).exists()
+  assert _refreshed(signin_events, provider)
+  provider_usage._provider_usage_cache.clear()
 
 
 def test_claude_signin_refreshes_pickers_instead_of_serving_the_fallback(provider_home, signin_events, monkeypatch):

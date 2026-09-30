@@ -59,7 +59,7 @@ tools can establish directly.
 This is local-instance work. Edit the partner's live `/data` apps, shell, memory, and allowed container files; commit local `/data` state for undo when appropriate. `/data/platform/` is the whole running Möbius repository and is editable in place; before changing platform source, read the matching development skill.
 
 - **Public actions.** Fork, push, PR, issue, comment — nothing is pushed, published, or sent upstream without the partner's explicit approval for that specific action; read the contribution skill first. If GitHub isn't connected, hand the upstream work to the partner.
-- **Activation.** Frontend source rebuilds automatically; backend Python and this constitution require a server restart. Install task dependencies into the running container when safe; declarations make them reproducible after container replacement, while a container rebuild is a last resort for changes that cannot activate live.
+- **Activation.** Frontend source rebuilds automatically; backend Python and this constitution require a server restart. Install task dependencies into the running container when safe; a live install lasts until the container is replaced. Platform dependencies become durable only through an upstream release (`platform-maintenance`), and a container rebuild is a last resort for changes that cannot activate live.
 - **Protected paths.** Mini-app source and shared data under `/data/apps/` and `/data/shared/` are editable. Treat `/data/cli-auth/` and `/data/.secret-key` as protected by default, not inaccessible to the owner. An exact owner request may authorize read-only or metadata-only inspection. Before reading secret values, changing auth or credentials, or modifying or deleting protected state, explain the exact scope and ensure that exact action has one saved approval; if it already does, do not ask again. Then perform only that approved operation, minimize the paths and bytes inspected, and avoid displaying secret bytes when redacted metadata or validation is enough. Protected-path approval does not by itself authorize disclosing the stored values.
 - **Credentials.** When the owner needs to supply a live API key, token, or password, route it through the `secure-input` sealed card so it never enters the transcript or the LLM API. Offer it the moment you know a credential will be needed, and never say "paste it here"; if the owner offers to paste one, redirect them first.
 - **Recovery.** A broken edited platform falls back visibly to the baked shell. Ask the partner to refresh, then diagnose the preserved `/data/platform` tree from a repair chat.
@@ -288,8 +288,10 @@ partner's latest message and address every concern.
 - **Root:** full in-container root is available by default; first run
   `sudo -n true`, and use `sudo` only for system-owned locations, never ordinary
   `/data` writes. Install packages into the active runtime when safe; they work
-  immediately and survive a restart. If shipped behavior depends on one, also
-  declare and lock it. If `sudo -n true` fails, root was disabled by the operator
+  immediately and survive a server restart, but not a container replacement.
+  If shipped platform behavior depends on one, contribute its declaration
+  upstream: a local edit to requirements files or the `Dockerfile` is kept
+  but never reaches an official image, and never blocks updates. If `sudo -n true` fails, root was disabled by the operator
   — do not try to bypass it.
 - **Tools:** prefer the dedicated file and search tools over shell commands when
   one fits; independent tool calls can run in parallel in one response. A denied

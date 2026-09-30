@@ -13,6 +13,26 @@ from test_app_fixtures import create_local_app
 
 
 @pytest.mark.asyncio
+async def test_managed_railway_inventory_forwards_region_opt_in_only_when_requested(monkeypatch):
+  from app.routes import identity
+
+  paths = []
+
+  async def managed_response(method, path, **_kwargs):
+    assert method == "GET"
+    paths.append(path)
+    return httpx.Response(200, json={"connection": None, "instances": []})
+
+  monkeypatch.setattr(identity, "_managed_response", managed_response)
+  await identity._managed_railway_remote()
+  await identity._managed_railway_remote(include_region_options=True)
+  assert paths == [
+    "/api/instance/v1/railway",
+    "/api/instance/v1/railway?region_options=1",
+  ]
+
+
+@pytest.mark.asyncio
 async def test_linked_instance_resolves_another_accounts_handle(db, monkeypatch):
   from app.routes import identity
 
@@ -562,14 +582,25 @@ def test_linked_railway_inventory_is_proxied_without_credentials(
       return None
 
     async def get(self, url, **kwargs):
-      assert url == "https://www.mobius.you/api/account/v1/railway"
+      assert url in {
+        "https://www.mobius.you/api/account/v1/railway",
+        "https://www.mobius.you/api/account/v1/railway?region_options=1",
+      }
+      requested_urls.append(url)
       assert kwargs["headers"]["Authorization"].startswith("Bearer railway-token-")
       return Response()
 
+  requested_urls = []
   monkeypatch.setattr("app.routes.identity.httpx.AsyncClient", Client)
   response = client.get("/api/identity/railway", headers=granted)
+  opted_in = client.get("/api/identity/railway?region_options=1", headers=granted)
 
   assert response.status_code == 200
+  assert opted_in.status_code == 200
+  assert requested_urls == [
+    "https://www.mobius.you/api/account/v1/railway",
+    "https://www.mobius.you/api/account/v1/railway?region_options=1",
+  ]
   assert response.json()["railway_access"] == "available"
   assert response.json()["instances"] == [{"id": "mob_one"}]
   assert "token" not in response.text
@@ -646,6 +677,7 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
       "memory_mb": None,
       "volume_mb": None,
       "update_policy": "manual",
+      "region": "europe-west4-drams3a",
     },
     headers=granted,
   )
@@ -667,10 +699,28 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
     json={"update_policy": "manual"},
     headers=granted,
   )
+  invalid_region = client.post(
+    "/api/identity/railway/deployments",
+    json={"name": "Wrong region", "region": "unknown"},
+    headers=granted,
+  )
+  without_region = client.post(
+    "/api/identity/railway/deployments",
+    json={"name": "Legacy request"},
+    headers=granted,
+  )
+  null_region = client.post(
+    "/api/identity/railway/deployments",
+    json={"name": "No preference", "region": None},
+    headers=granted,
+  )
 
   assert connect.status_code == 200
   assert connect.json()["authorization_url"].startswith("https://www.mobius.you/")
   assert created.status_code == 202
+  assert invalid_region.status_code == 422
+  assert without_region.status_code == 202
+  assert null_region.status_code == 202
   assert renamed.status_code == 200
   assert deleted.status_code == 202
   assert storage.status_code == 200
@@ -686,6 +736,7 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
         "memory_mb": None,
         "volume_mb": None,
         "update_policy": "manual",
+        "region": "europe-west4-drams3a",
       },
     ),
     (
@@ -707,6 +758,18 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
       "PATCH",
       "https://www.mobius.you/api/account/v1/railway/instances/mob_example/updates",
       {"update_policy": "manual"},
+    ),
+    (
+      "POST",
+      "https://www.mobius.you/api/account/v1/railway/instances",
+      {"name": "Legacy request", "managed_auth": True, "cpu": None,
+       "memory_mb": None, "volume_mb": None},
+    ),
+    (
+      "POST",
+      "https://www.mobius.you/api/account/v1/railway/instances",
+      {"name": "No preference", "managed_auth": True, "cpu": None,
+       "memory_mb": None, "volume_mb": None},
     ),
   ]
 

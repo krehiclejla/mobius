@@ -20,6 +20,7 @@ from app.storage_io import (
   atomic_write,
   file_version_token,
   is_atomic_write_temp_name,
+  require_parent_folders,
 )
 from app.timeutil import now_naive_utc
 
@@ -140,6 +141,9 @@ def write_state(
     target = _target(row, path)
     if target.exists() and not target.is_file():
       raise HTTPException(400, "Shared app data paths must identify files.")
+    # Checked before the write so the rollback below never has to undo a path
+    # beneath a stored value, where unlink itself would fail.
+    require_parent_folders(target)
     current_version = file_version_token(target) if target.is_file() else None
     if current_version != expected_version:
       raise HTTPException(409, {"version": current_version})

@@ -998,8 +998,6 @@ async def _request_reviewed_rebuild_transaction(
         "This update no longer requires a container rebuild. Refresh the review.",
         status_code=409,
       )
-    if reviewed["blockers"]:
-      _raise_local_runtime_blockers(reviewed["blockers"])
 
   prepared = platform_update.read_prepared_update()
   final_check: Callable[[], None]
@@ -1044,19 +1042,6 @@ async def _request_reviewed_rebuild_transaction(
   return await _request_managed_rebuild(
     target_sha, image_digest or prepared["image_digest"] or "",
     final_check=final_check,
-  )
-
-
-def _raise_local_runtime_blockers(blockers: list[str]) -> None:
-  visible = ", ".join(blockers[:5])
-  if len(blockers) > 5:
-    visible += f", and {len(blockers) - 5} more"
-  raise DeploymentControlError(
-    "local_runtime_changes",
-    "The official image cannot preserve these local image inputs: "
-    f"{visible}. Commit them upstream, rebuild locally, or remove them "
-    "before rebuilding this container.",
-    status_code=409,
   )
 
 

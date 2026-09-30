@@ -744,7 +744,8 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   ).exists()
   test_triggers = test_workflow.split("\npermissions:\n", 1)[0]
   image_triggers = image_workflow.split("\npermissions:\n", 1)[0]
-  backend = test_workflow.split("\n  backend:\n", 1)[1].split(
+  # The backend check spans its checks, test shards, and combining gate.
+  backend = test_workflow.split("\n  backend-checks:\n", 1)[1].split(
     "\n  frontend-unit:\n", 1,
   )[0]
   e2e = test_workflow.split("\n  e2e:\n", 1)[1]
@@ -752,7 +753,11 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   assert "pull_request:\n" in test_triggers
   assert "workflow_dispatch:\n" in test_triggers
   assert "push:\n" not in test_triggers
-  assert "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)" in backend
+  backend_env = (
+    ROOT / ".github" / "actions" / "backend-env" / "action.yml"
+  ).read_text(encoding="utf-8")
+  assert backend.count("uses: ./.github/actions/backend-env") == 2
+  assert "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)" in backend_env
   for job in (backend, e2e):
     assert "github.event_name == 'pull_request'" not in job
     assert "refs/heads/integration/" not in job
@@ -762,6 +767,14 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   # and manually dispatched runs.
   assert "fail-fast: false" in e2e
   assert "shard: [1, 2, 3, 4]" in e2e
+  # The production boot transaction runs once per run in its own job, in
+  # parallel with the shards, never on a shard.
+  e2e_boot = test_workflow.split("\n  e2e-boot:\n", 1)[1].split("\n  e2e:\n", 1)[0]
+  assert "if: github.event_name != 'pull_request'" in e2e_boot
+  assert "needs: privacy" in e2e_boot
+  assert "BUILD_SHA=${{ github.sha }}" in e2e_boot
+  assert "run: scripts/test-boot-transaction.sh mobius-test:ci" in e2e_boot
+  assert "test-boot-transaction.sh" not in e2e
   # The shard denominator is derived from strategy.job-total rather than a
   # second hardcoded count, so resizing the matrix can't silently drop
   # coverage by leaving a duplicate total out of sync with it.

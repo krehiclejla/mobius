@@ -1565,6 +1565,52 @@ def test_move_rejects_traversal_in_source(client, auth, owner_token):
   assert r.status_code == 400
 
 
+def test_move_folder_into_itself_is_rejected_cleanly(client, auth, owner_token):
+  """A folder moved beneath itself is a 400 and leaves no stray folders."""
+  app_id = _make_app(client, owner_token)
+  client.put(f"/api/storage/apps/{app_id}/a/x.json", json={"k": 1}, headers=auth)
+  for target in ("a/b", "a/b/c"):
+    r = client.post(
+      f"/api/storage/apps/{app_id}/move",
+      json={"from": "a", "to": target},
+      headers=auth,
+    )
+    assert r.status_code == 400
+  listing = client.get(f"/api/storage/apps-list/{app_id}/a", headers=auth).json()
+  assert [entry["name"] for entry in listing["entries"]] == ["x.json"]
+
+
+def test_move_beneath_a_file_is_rejected_cleanly(client, auth, owner_token):
+  """A destination whose parent is a file is a 400 and the source stays put."""
+  app_id = _make_app(client, owner_token)
+  client.put(f"/api/storage/apps/{app_id}/a.json", json={"k": 1}, headers=auth)
+  client.put(f"/api/storage/apps/{app_id}/b.json", json={"k": 2}, headers=auth)
+  r = client.post(
+    f"/api/storage/apps/{app_id}/move",
+    json={"from": "b.json", "to": "a.json/nested/b.json"},
+    headers=auth,
+  )
+  assert r.status_code == 400
+  assert r.json()["detail"]["code"] == "parent_is_file"
+  assert client.get(
+    f"/api/storage/apps/{app_id}/b.json", headers=auth
+  ).json() == {"k": 2}
+
+
+def test_write_beneath_a_file_is_rejected_cleanly(client, auth, owner_token):
+  """Writing `file.json/child.json` is a 400, not a server error."""
+  app_id = _make_app(client, owner_token)
+  client.put(f"/api/storage/apps/{app_id}/a.json", json={"k": 1}, headers=auth)
+  r = client.put(
+    f"/api/storage/apps/{app_id}/a.json/child.json", json={"k": 2}, headers=auth,
+  )
+  assert r.status_code == 400
+  assert r.json()["detail"]["code"] == "parent_is_file"
+  assert client.get(
+    f"/api/storage/apps/{app_id}/a.json", headers=auth
+  ).json() == {"k": 1}
+
+
 # -- recursive folder delete --------------------------------------------
 
 

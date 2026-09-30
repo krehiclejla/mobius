@@ -579,3 +579,16 @@ async def set_owner_timezone(
 router.include_router(settings_router)
 router.include_router(models_router)
 router.include_router(owner_router)
+
+
+@router.get("/api/setup")
+def dependency_setup_status(_: models.Owner = Depends(get_current_owner)):
+  from app import app_setup
+  return app_setup.status()
+
+
+@router.post("/api/setup/rerun", status_code=202, dependencies=[Depends(reject_cross_site)])
+async def rerun_dependency_setup(_: models.Owner = Depends(get_current_owner)):
+  from app import app_setup
+  app_setup.request_run(cancel=True)
+  return {"status": "pending"}

@@ -112,6 +112,20 @@ def _is_numeric_app_id(value: str | None) -> bool:
     return False
 
 
+def _open_item_exists(db: Session, kind: str | None, item_id: str | None) -> bool:
+  """Whether an open_item names an app or chat that exists and is not deleted."""
+  if kind == "app":
+    app_id = int(float(item_id or ""))
+    if not 0 < app_id < 2**63:
+      return False
+    model, key = models.App, app_id
+  else:
+    model, key = models.Chat, item_id
+  return db.query(model.id).filter(
+    model.id == key, model.deleted_at.is_(None),
+  ).first() is not None
+
+
 class NotifyBody(BaseModel):
   # extra="forbid": an unknown key is a 422, not a silently-ignored extra. The
   # design (§6.3) calls the loose original schema out by name — the type
@@ -254,6 +268,7 @@ def publish_build_phase_to_chat(chat_id: str | None, label: str) -> None:
 def notify(
   body: NotifyBody,
   _owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
 ):
   """Publish a system event to the active chat broadcast.
 
@@ -277,11 +292,19 @@ def notify(
     event["chatId"] = body.chatId
   # Carry the typed open_item request onto the event so the Shell resolver can
   # confirm + place it. Only the fields the validator accepted are copied, so a
-  # spoofed extra can never ride along. Delivery is advisory + fire-once (§6.3):
-  # this route deliberately does NOT check the item exists — that is the shell's
-  # confirm-before-place guard (it refetches and no-ops on an absent id), so a
-  # well-formed request for a missing item is a valid 204 here, not a 404.
+  # spoofed extra can never ride along. Delivery is advisory + fire-once (§6.3).
+  # A missing or deleted item is refused here, so every caller (the open_item
+  # tool, a direct POST) learns nothing was opened; the shell still confirms
+  # before placing in case the item disappears in between.
   if body.type == "open_item":
+    if not _open_item_exists(db, body.itemKind, body.itemId):
+      raise HTTPException(
+        status_code=404,
+        detail=(
+          f"No live {body.itemKind} {body.itemId} exists (it may have been "
+          "deleted); nothing was opened."
+        ),
+      )
     event["itemKind"] = body.itemKind
     event["itemId"] = body.itemId
     if body.sourceKind is not None:

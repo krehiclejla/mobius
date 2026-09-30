@@ -1,7 +1,7 @@
 fastapi>=0.141.1,<1.0.0
 uvicorn[standard]>=0.52.4
 sqlalchemy>=2.0.52
-PyJWT[crypto]>=2.13.0,<3.0.0
+PyJWT[crypto]>=2.14.0,<3.0.0
 bcrypt>=4.1.0,<6.0.0
 cryptography>=50.0.0
 python-multipart>=0.0.18
@@ -14,7 +14,7 @@ pywebpush>=2.0.0
 pytest>=8.0
 pytest-asyncio>=0.23
 watchdog>=4.0.0
-claude-agent-sdk==0.2.160
+claude-agent-sdk==0.2.161
 # openai-codex is installed --no-deps from its pinned PyPI release in Dockerfile.
 # Its matching cli-bin package is retained for SDK compatibility, but its
 # duplicate payload is replaced in-layer with a link to the pinned npm CLI.

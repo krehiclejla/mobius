@@ -92,6 +92,7 @@ from app.run_state import (
 )
 from app.schemas import ChatCompactRequest, ChatPatch, ChatProviderSwitch
 from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
+from app.platform_restart import restart_observation_key
 from app.tool_output_storage import (
   TOOL_OUTPUT_STORAGE_PREFIX,
   decode_tool_output,
@@ -702,6 +703,9 @@ def _chat_detail_response(
       next_page[relative_index] = {**message, "continuation_reason": reason}
     page = next_page
 
+  from app.platform_restart import project_restart_observations
+  page = project_restart_observations(db, chat.id, page)
+
   settings_obj = _coerce_agent_settings(chat.agent_settings_json) or None
   # The picker's current model must match what a message would actually use. A
   # chat with no per-chat model reads the LIVE global default model, but its
@@ -733,6 +737,7 @@ def _chat_detail_response(
     # already fetches them from their durable sidecar on demand. Live turns
     # retain excerpts so the in-progress surface remains self-contained.
     "messages": page,
+    "restart_observation_key": restart_observation_key(db, chat.id),
     "pending_messages": list(chat.pending_messages or []),
     "total": total,
     "offset": start,
@@ -1737,6 +1742,7 @@ def get_chat_runtime(
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   return {
     "running": running,
+    "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
     "runtime_revision": runtime_revision,

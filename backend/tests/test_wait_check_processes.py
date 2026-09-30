@@ -2,6 +2,7 @@
 
 import asyncio
 import shlex
+import time
 
 import pytest
 
@@ -138,9 +139,17 @@ def test_timeout_reaps_children_after_the_shell_has_exited(tmp_path, monkeypatch
   ))
   assert result == (-1, "check timed out after 0.1s")
   child_pid = int(pid_file.read_text())
+
+  def child_state():
+    try:
+      with open(f"/proc/{child_pid}/stat") as stat:
+        return stat.read().split()[2]
+    except FileNotFoundError:
+      return "gone"
+
   # An adopted zombie may await the container's init; it must not be running.
-  try:
-    with open(f"/proc/{child_pid}/stat") as stat:
-      assert stat.read().split()[2] == "Z"
-  except FileNotFoundError:
-    pass
+  # A loaded host may take a moment to act on the kill.
+  deadline = time.monotonic() + 5
+  while (state := child_state()) not in {"Z", "gone"} and time.monotonic() < deadline:
+    time.sleep(0.05)
+  assert state in {"Z", "gone"}

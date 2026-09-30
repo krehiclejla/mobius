@@ -1,0 +1,56 @@
+name: Backend test environment
+description: >-
+  Restore or build the backend virtualenv and the locked frontend runtime tools
+  the backend suite executes. Shared by the Tests workflow and the dependency
+  cache warmer so both use exactly the same cache keys.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      id: python
+      with:
+        python-version: '3.12'
+    - name: Restore backend virtualenv
+      # A self-contained virtualenv restores cleanly; caching the toolcache
+      # Python itself would overlay one pip release on another.
+      id: python-deps
+      uses: actions/cache@v6
+      with:
+        path: ~/backend-venv
+        key: backend-venv-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('backend/requirements.lock', 'backend/requirements-static.txt', 'Dockerfile', '.github/actions/backend-env/action.yml') }}
+    - name: Install backend deps
+      if: steps.python-deps.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        python -m venv ~/backend-venv
+        && ~/backend-venv/bin/pip install --require-hashes -r backend/requirements.lock
+        && ~/backend-venv/bin/pip install -r backend/requirements-static.txt
+        && ~/backend-venv/bin/pip install --no-deps
+        "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)"
+    - name: Use the backend virtualenv
+      shell: bash
+      run: |
+        echo "$HOME/backend-venv/bin" >> "$GITHUB_PATH"
+        echo "VIRTUAL_ENV=$HOME/backend-venv" >> "$GITHUB_ENV"
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+    - name: Restore frontend runtime deps
+      id: frontend-deps
+      uses: actions/cache@v6
+      with:
+        path: frontend/node_modules
+        key: frontend-deps-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json', '.github/actions/backend-env/action.yml') }}
+    - name: Install frontend runtime deps
+      # frontend_watcher's publish validation executes the locked Acorn /
+      # eslint-scope checker. compile_jsx also uses the lockfile's Rolldown,
+      # eliminating a separate global CI pin that can drift from production.
+      if: steps.frontend-deps.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: frontend
+      run: npm ci --ignore-scripts
+    - name: Use locked frontend tools
+      shell: bash
+      run: |
+        echo "$GITHUB_WORKSPACE/frontend/node_modules/.bin" >> "$GITHUB_PATH"
+        frontend/node_modules/.bin/rolldown --version
