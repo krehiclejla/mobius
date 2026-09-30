@@ -5,6 +5,7 @@ static files.  API routes are registered first; the frontend SPA is
 mounted last as a catch-all so that client-side routing works.
 """
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -66,7 +67,7 @@ from app.response_policy import (
   shell_csp,
   static_embed_csp,
 )
-from app.storage_io import atomic_write
+from app.storage_io import ParentIsFile, atomic_write
 from app import activity, models
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
@@ -317,9 +318,19 @@ async def lifespan(app):
       )
     record_memory_checkpoint("startup_ready")
     supervisors.reclaim_boot_file_cache()
+  from app import app_setup
+  # Like cron mutation, restoration never runs inside the test runtime (its
+  # readiness probe would reach other tests' HTTP doubles); its own tests
+  # drive the runner directly.
+  setup_task = app_setup.start() if (
+    database_boot.serviceable and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+  ) else None
   try:
     yield
   finally:
+    if setup_task is not None:
+      setup_task.cancel()
+      await asyncio.gather(setup_task, return_exceptions=True)
     record_memory_checkpoint("shutdown_begin")
     try:
       from app.public_app_transport import close_public_fetch_clients
@@ -381,6 +392,17 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.exception_handler(IntegerOutOfRange)
 async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
   return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(ParentIsFile)
+async def _parent_is_file_handler(_request: Request, exc: ParentIsFile):
+  # Every storage, project, app-source, and shared-state write creates its
+  # folders through storage_io, so one mapping gives them one answer.
+  return JSONResponse(
+    status_code=400,
+    content={"detail": {"code": "parent_is_file", "message": str(exc)}},
+  )
+
 
 # Global request-body backstop. Endpoints that read raw bodies stream-cap
 # themselves (storage PUT 50 MB, icon 12 MB via storage_io.read_capped_body),

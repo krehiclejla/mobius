@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import difflib
 import fcntl
 import hashlib
 import json
@@ -365,7 +364,6 @@ class PlatformReviewedRebuild(TypedDict):
   local_base_sha: str
   activation: PlatformActivationImpact
   incoming_activation: PlatformActivationImpact
-  blockers: list[str]
 
 
 class _ActivationMarker(TypedDict):
@@ -441,12 +439,10 @@ class PlatformUpdatePreview(TypedDict):
   diff: str | None
   diff_truncated: bool
   conflict_paths: list[str]
-  # The same preservation check used immediately before replacement. A preview
-  # explains these blockers early; it never replaces the mutation's recheck.
-  blocking_paths: list[str]
-  # Exact local image-owned behavior an official image would replace.
-  blocking_diff: str | None
-  blocking_diff_truncated: bool
+  # Local image-owned changes the release's official image will not run
+  # (:func:`local_image_changes`). They stay in the checkout; the update
+  # reports them and never waits on them.
+  local_image_paths: list[str]
 
 
 @dataclass(frozen=True)
@@ -1173,8 +1169,38 @@ def applied_release_sha(repo: Path = PLATFORM_REPO) -> str:
     current = _update_source_tip(repo)
     for candidate in (_latest_known_release(repo), recorded_upstream_sha(repo)):
       if candidate and _is_ancestor(repo, candidate, current):
+        # Source that already holds newer official commits (merged outside an
+        # update) needs a newer image than this release's; Finish cannot name
+        # one, and the update to the newer release installs it.
+        newer = _contained_official_source(repo)
+        if newer and newer != candidate and _is_ancestor(repo, candidate, newer):
+          break
         return candidate
     raise PlatformUpdateError("applied_release_unavailable")
+
+
+def _contained_official_source(repo: Path) -> str | None:
+  """The newest official commit the checkout contains, or None.
+
+  Official history is what the newest known release descends from; its merge
+  base with the checkout is the latest official source the checkout holds,
+  even when a stale upstream marker lags it or a newer release is fetched but
+  not installed. A recorded upstream the checkout contains that is newer
+  (installed from outside the tracking ref) wins.
+  """
+  head = _rev(repo, "HEAD")
+  if not head:
+    return None
+  known = _latest_known_release(repo)
+  base = _git(
+    "merge-base", head, known, repo=repo, check=False,
+  ).stdout.strip() if known else ""
+  upstream = recorded_upstream_sha(repo)
+  if upstream and not _is_ancestor(repo, upstream, head):
+    upstream = None
+  if base and upstream:
+    return upstream if _is_ancestor(repo, base, upstream) else base
+  return base or upstream
 
 
 def _parse_legacy_activation_marker(raw: str) -> _ActivationMarker | None:
@@ -1285,24 +1311,19 @@ def _protected_runtime_status(
   )
 
 
-def container_replacement_blockers(
+def local_image_changes(
   expected_sha: str | None = None,
   repo: Path = PLATFORM_REPO,
   *,
   local_change_base: str | None = None,
 ) -> list[str]:
-  """Return local image changes absent from the official target.
+  """Local image-owned changes the official target's image will not run.
 
-  An official image can retire only activation paths whose desired content is
-  exactly the applied upstream revision. Replacing a working container while a
-  local-only Dockerfile or bootstrap-script change remains would silently
-  remove that runtime addition, so the owner action must fail closed before
-  cutover.
-
-  Protected runtime (``backend/runtime``) follows the same rule as every other
-  image input. Privileged code comes only from the reviewed image; a local
-  protected-runtime change must therefore be upstream in that exact target or
-  block replacement before chat drain.
+  Updates install the official image for their release, so a local-only
+  Dockerfile, package-list, bootstrap-script, or protected-runtime change is
+  not active after one. The change stays in the checkout, and the update
+  reports it so an agent can restore what it did another way. It never
+  blocks the update: finishing updates must not depend on local changes.
   """
   marker = _read_activation_marker()
   covered = set(marker["image_paths"]) if marker else set()
@@ -1390,8 +1411,8 @@ def container_replacement_blockers(
         path for path in image_pending
         if _local_change_in_target(repo, local_change_base, head, expected_sha, path)
       )
-    # A target/head match says nothing about uncommitted bytes. Preserve those
-    # paths as blockers until the owner commits, reverts, or reviews them.
+    # A target/head match says nothing about uncommitted bytes. Keep reporting
+    # those paths until the owner commits or reverts them.
     covered = (exact_target_coverage | carried_marker_coverage) - working_paths
   return sorted(path for path in image_pending if path not in covered)
 
@@ -1418,16 +1439,12 @@ def reviewed_container_rebuild_plan(
     ).stdout.strip() or current_sha
     incoming_activation = _incoming_activation_impact(repo, base, target_sha)
     activation = _owed_activation(repo, base, target_sha)
-    blockers = container_replacement_blockers(
-      target_sha, repo, local_change_base=base,
-    )
     return PlatformReviewedRebuild(
       target_sha=target_sha,
       image_digest=image_digest,
       local_base_sha=base,
       activation=activation,
       incoming_activation=incoming_activation,
-      blockers=blockers,
     )
 
 
@@ -1665,13 +1682,15 @@ def _incoming_activation_impact(
 
 
 def _owed_activation(
-  repo: Path, before: str, target: str,
+  repo: Path, before: str, target: str, *, release: str | None = None,
 ) -> PlatformActivationImpact:
   """Everything the running process owes once it serves ``target``: its
-  still-pending activation plus the changes from ``before``."""
+  still-pending activation plus the changes from ``before``. Image work is
+  judged against the official ``release`` ``target`` carries (``target``
+  itself unless it is a prepared local revision on top of one)."""
   return platform_activation.classify_activation(
     _without_python_inputs_installed_for(repo, [
-      *_pending_activation_paths(repo),
+      *_pending_activation_paths(repo, release=release or target),
       *_activation_paths_between(repo, before, target),
     ], target),
   )
@@ -1696,60 +1715,74 @@ def _changes_python_dependencies(
   )
 
 
-def _paths_already_active_in_image(
-  repo: Path, paths: list[str],
+def _image_work_owed(
+  repo: Path, paths: list[str], release: str | None,
 ) -> list[str]:
-  """Exclude exact image-owned files whose desired bytes already run in image.
+  """``paths`` minus the image-owned files this image already runs as the
+  official ``release`` has them.
 
-  ``SERVING_SHA_FILE`` identifies the Python checkout, not every image-owned
-  bootstrap input. A local repair can restore a seed template to the running
-  image's exact bytes while still differing from the served checkout's Git
-  commit. That is not pending activation: the image already owns and runs
-  those bytes. Keep the check exact and fail closed when a manifest or source
-  hash is unavailable.
+  An official image only ever carries the official release's image inputs,
+  so image work is owed exactly where that release differs from what this
+  image runs. A local edit to an image-owned file stays in the checkout
+  (:func:`local_image_changes` reports it), but no official replacement can
+  run it: counting it as owed would ask for a replacement that changes
+  nothing, forever, or hold the update back for it. Without a resolvable
+  release or the image's input record, every path stays owed.
   """
   baked = _build_info().get("image_inputs")
-  if not isinstance(baked, dict) or not baked:
+  if not release or not isinstance(baked, dict) or not baked:
     return paths
-  try:
-    current = platform_activation.image_input_hashes(repo)
-  except OSError:
+  if not _rev(repo, release):
     return paths
   return [
     path for path in paths
     if not (
       platform_activation.path_is_image_owned(path)
-      and _image_runs_served(repo, path, baked, current)
+      and _image_runs(repo, path, baked, _git_blob(repo, release, path))
     )
   ]
 
 
-def _image_runs_served(
-  repo: Path, path: str, baked: dict, current: dict[str, str],
+def _image_runs(
+  repo: Path, path: str, baked: dict, content: bytes | None,
 ) -> bool:
-  """Whether this image already runs the served content of one image input:
-  the exact recorded bytes, or Python package inputs it installs."""
+  """Whether this image runs ``content`` for one image input: the exact
+  recorded bytes (absent when both are absent), or Python package inputs it
+  installs."""
   if path in _PYTHON_DEPENDENCY_INPUTS:
-    return image_installs_python_input(repo, path, _served_bytes(repo, path))
-  return isinstance(baked.get(path), str) and baked[path] == current.get(path)
+    return image_installs_python_input(repo, path, content)
+  expected = baked.get(path)
+  if content is None:
+    return expected is None
+  return (
+    isinstance(expected, str)
+    and expected == hashlib.sha256(content).hexdigest()
+  )
 
 
 def _pending_activation_paths(
   repo: Path = PLATFORM_REPO,
   *,
   served_to_head: list[str] | None = None,
+  release: str | None = None,
 ) -> list[str]:
   """Every path whose activation is still owed by the running process.
 
   ``served_to_head`` lets a caller that has just diffed the served revision
   against the local head (to write the activation marker) hand that result
-  over instead of having the same pair diffed again.
+  over instead of having the same pair diffed again. Image work is judged
+  against ``release`` (an update's exact target), by default the newest
+  official release the checkout contains.
   """
   marker = _read_activation_marker()
   paths = list(marker["paths"]) if marker else []
-  paths.extend(runtime_provenance.activation_paths(
+  # A deployed protected module that is not the image's own is damage, not a
+  # local customization: it stays owed whatever the release says.
+  damaged: list[str] = []
+  for path in runtime_provenance.activation_paths(
     _protected_runtime_status(repo),
-  ))
+  ):
+    (paths if _deployed_runtime_is_image_own(path) else damaged).append(path)
   if served_to_head is None:
     served = _served_platform_sha()
     if served:
@@ -1758,9 +1791,41 @@ def _pending_activation_paths(
       except Exception:
         head = None
       served_to_head = _activation_paths_between(repo, served, head)
-  paths.extend(_paths_already_active_in_image(repo, served_to_head or []))
+  paths.extend(served_to_head or [])
   paths.extend(image_input_drift(repo) or [])
-  return sorted({str(path) for path in paths if str(path)})
+  owed = _image_work_owed(
+    repo, [str(path) for path in paths if str(path)],
+    release or _contained_official_source(repo),
+  )
+  return sorted({*owed, *damaged})
+
+
+def _deployed_runtime_is_image_own(path: str) -> bool:
+  """Whether the deployed copy of one protected-runtime path is exactly what
+  the running image recorded for it. Unknown fails closed."""
+  prefix = "backend/runtime/"
+  baked = _build_info().get("image_inputs")
+  if not path.startswith(prefix) or not isinstance(baked, dict) or not baked:
+    return False
+  expected = baked.get(path)
+  deployed = runtime_provenance.deployed_runtime_root() / path[len(prefix):]
+  try:
+    # Never follow a link or open a FIFO: only the image's own regular file
+    # counts, and anything else stays owed as damage.
+    descriptor = os.open(deployed, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+  except FileNotFoundError:
+    return expected is None
+  except OSError:
+    return False
+  try:
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+      return False
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 65536):
+      digest.update(chunk)
+  finally:
+    os.close(descriptor)
+  return expected == digest.hexdigest()
 
 
 def _build_info() -> dict:
@@ -1845,7 +1910,7 @@ def image_input_drift(repo: Path = PLATFORM_REPO) -> list[str] | None:
     path for path in candidates
     if (
       installed[path] != current.get(path) if path in installed
-      else not _image_runs_served(repo, path, baked, current)
+      else not _image_runs(repo, path, baked, _served_bytes(repo, path))
     )
   )
 
@@ -1854,9 +1919,12 @@ def _platform_activation_impact(
   repo: Path = PLATFORM_REPO,
   *,
   served_to_head: list[str] | None = None,
+  release: str | None = None,
 ) -> PlatformActivationImpact:
   return platform_activation.classify_activation(
-    _pending_activation_paths(repo, served_to_head=served_to_head),
+    _pending_activation_paths(
+      repo, served_to_head=served_to_head, release=release,
+    ),
   )
 
 
@@ -2697,7 +2765,7 @@ def _park_net_conflict(
 
 
 def _park_for_repair(
-  repo: Path, target: str, blockers: list[str], image_digest: str | None,
+  repo: Path, target: str, image_digest: str | None,
 ) -> None:
   """Open the reviewed release in the isolated candidate for an agent.
 
@@ -2719,8 +2787,7 @@ def _park_for_repair(
     )
     flag = _read_conflict_flag() or {}
     parked = {
-      **(flag.get("overlay") or {}), "blockers": blockers,
-      "image_digest": image_digest,
+      **(flag.get("overlay") or {}), "image_digest": image_digest,
     }
     _write_conflict_flag(target, list(flag.get("paths") or []), overlay=parked)
     return
@@ -2735,7 +2802,7 @@ def _park_for_repair(
   parked = {
     "mode": "net", "worktree": str(worktree), "served": source, "pre": source,
     "target": target, "paths": paths, "stage": "committed", "base": base,
-    "right": target, "blockers": blockers, "image_digest": image_digest,
+    "right": target, "image_digest": image_digest,
   }
   _write_conflict_flag(target, paths, overlay=parked)
 
@@ -2840,22 +2907,11 @@ def _prepare(
   # The image is owed for this release's changes and for any activation the
   # running image still owes (a Finish after the source already contains the
   # release has no incoming changes but still needs its image).
-  impact = _owed_activation(repo, snapshot, prepared)
+  impact = _owed_activation(repo, snapshot, prepared, release=target)
   requires_image = (
     platform_activation.ActivationLevel.IMAGE_REBUILD.value
     in impact["required_actions"]
   )
-  if requires_image:
-    differing = _git(
-      "diff", "--name-only", "--no-renames", target, prepared,
-      repo=repo, check=False,
-    ).stdout.split()
-    kept = [path for path in differing if platform_activation.path_is_image_owned(path)]
-    if kept:
-      raise PlatformUpdateError(
-        "The official image would drop these local image-owned changes: "
-        + ", ".join(kept)
-      )
   # This image's import verdict decides source it will run. Source for
   # another image is judged by that image's own boot probe, which reverts it.
   if not (requires_image and image_activates_updates()):
@@ -3742,13 +3798,16 @@ def _record_update_activation(
   """
   served = _served_platform_sha()
   changed_paths = _activation_paths_between(repo, served, head)
-  changed_paths = _paths_already_active_in_image(repo, changed_paths)
+  release = target or _contained_official_source(repo)
+  changed_paths = _image_work_owed(repo, changed_paths, release)
   incoming_impact = platform_activation.classify_activation(changed_paths)
   if incoming_impact["level"] != platform_activation.ActivationLevel.LIVE.value:
     mark_activation_needed(
       head or "", changed_paths, upstream_sha=target, repo=repo,
     )
-  return _platform_activation_impact(repo, served_to_head=changed_paths)
+  return _platform_activation_impact(
+    repo, served_to_head=changed_paths, release=release,
+  )
 
 
 def continue_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
@@ -4140,7 +4199,8 @@ def park_update_for_agent(
   image_digest: str | None = None,
   repo: Path = PLATFORM_REPO,
 ) -> UnfinishedUpdate:
-  """Hand a reviewed, blocked update to an agent on a frozen copy.
+  """Hand a reviewed update that overlaps local changes to an agent on a
+  frozen copy.
 
   The update is parked in the isolated candidate (see ``_park_for_repair``)
   so the agent never edits the live checkout, and it stays the one update to
@@ -4152,12 +4212,7 @@ def park_update_for_agent(
       target_sha=target_sha, image_digest=image_digest,
     )
     if not unfinished_update(repo):
-      base = _git(
-        "merge-base", current_sha, target_sha, repo=repo, check=False,
-      ).stdout.strip() or current_sha
-      _park_for_repair(repo, target_sha, container_replacement_blockers(
-        target_sha, repo, local_change_base=base,
-      ), image_digest)
+      _park_for_repair(repo, target_sha, image_digest)
     pending = unfinished_update(repo)
     if not pending or pending["target_sha"] != target_sha:
       raise PlatformUpdateError("update_plan_stale")
@@ -4337,7 +4392,7 @@ def empty_platform_update_preview(
     incoming_activation=incoming_activation,
     total_commits=0, commits_truncated=False,
     commits=[], files=[], diff=None, diff_truncated=False, conflict_paths=[],
-    blocking_paths=[], blocking_diff=None, blocking_diff_truncated=False,
+    local_image_paths=[],
   )
 
 
@@ -4452,98 +4507,6 @@ def _preview_diff(repo: Path, base: str, target: str) -> tuple[str | None, bool]
   return (text or None), False
 
 
-def _preview_blocking_diff(
-  repo: Path, target: str, paths: list[str],
-) -> tuple[str | None, bool]:
-  """Explain the local image-owned behavior a replacement would remove."""
-  if not paths:
-    return None, False
-  chunks: list[str] = []
-  for path in paths:
-    reviewed = _git(
-      "show", f"{target}:{path}", repo=repo, check=False,
-    )
-    reviewed_text = reviewed.stdout if reviewed.returncode == 0 else ""
-    local_text = _read_worktree_path_without_links(repo, path)
-    delta = "".join(difflib.unified_diff(
-      reviewed_text.splitlines(keepends=True),
-      local_text.splitlines(keepends=True),
-      fromfile=f"reviewed/{path}",
-      tofile=f"local/{path}",
-    ))
-    if delta and not delta.endswith("\n"):
-      delta += "\n"
-    chunks.append(delta)
-  text = "".join(chunks)
-  if len(text) > MAX_PREVIEW_DIFF_CHARS:
-    return text[:MAX_PREVIEW_DIFF_CHARS], True
-  return (text or None), False
-
-
-def _read_worktree_path_without_links(repo: Path, relative: str) -> str:
-  """Read one regular worktree file without following any path symlink.
-
-  Blocker previews are owner-visible and can be copied into a repair chat, so
-  a working-tree link must never turn this read into disclosure of a host or
-  owner-data file outside the checkout. Directory descriptors pin every path
-  component and ``O_NOFOLLOW`` closes the final-component swap race.
-  """
-  parts = Path(relative).parts
-  if (
-    not parts or relative.startswith("/")
-    or any(part in {"", ".", ".."} for part in parts)
-  ):
-    return ""
-  opened: list[int] = []
-  try:
-    current = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
-    opened.append(current)
-    for part in parts[:-1]:
-      current = os.open(
-        part,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        dir_fd=current,
-      )
-      opened.append(current)
-    try:
-      leaf = os.open(
-        parts[-1],
-        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-        dir_fd=current,
-      )
-    except FileNotFoundError:
-      return f"(local path is not present: {relative})\n"
-    except OSError:
-      try:
-        # Git represents a symlink by its destination string. Reading that
-        # string through the pinned parent descriptor remains no-follow.
-        return os.readlink(parts[-1], dir_fd=current)
-      except FileNotFoundError:
-        return f"(local path is not present: {relative})\n"
-      except OSError:
-        return f"(local path was not read because it crosses a link: {relative})\n"
-    opened.append(leaf)
-    if not stat.S_ISREG(os.fstat(leaf).st_mode):
-      return ""
-    chunks: list[bytes] = []
-    remaining = MAX_PREVIEW_DIFF_CHARS + 1
-    while remaining > 0:
-      chunk = os.read(leaf, min(65536, remaining))
-      if not chunk:
-        break
-      chunks.append(chunk)
-      remaining -= len(chunk)
-    return b"".join(chunks).decode("utf-8", errors="replace")
-  except FileNotFoundError:
-    return f"(local path is not present: {relative})\n"
-  except OSError:
-    return f"(local path was not read because it crosses a link: {relative})\n"
-  finally:
-    for descriptor in reversed(opened):
-      with contextlib.suppress(OSError):
-        os.close(descriptor)
-
-
 def platform_update_preview(
   repo: Path = PLATFORM_REPO,
   *,
@@ -4581,13 +4544,8 @@ def platform_update_preview(
       base = _git(
         "merge-base", current, target, repo=repo, check=False,
       ).stdout.strip() or current
-      preview["blocking_paths"] = container_replacement_blockers(
+      preview["local_image_paths"] = local_image_changes(
         target, repo, local_change_base=base,
-      )
-      preview["blocking_diff"], preview["blocking_diff_truncated"] = (
-        _preview_blocking_diff(
-          repo, target, preview["blocking_paths"],
-        )
       )
     return preview
 
@@ -4620,7 +4578,7 @@ def _platform_update_preview_unlocked(
       current_sha=local_sha, target_sha=target,
       image_digest=image_digest,
     )
-    activation = _platform_activation_impact(repo)
+    activation = _platform_activation_impact(repo, release=target)
     if local_sha and target and activation["level"] != "live":
       preview.update(
         state=_state_for_activation(activation).value,
@@ -4648,8 +4606,8 @@ def _platform_update_preview_unlocked(
       activation=incoming_activation,
       incoming_activation=incoming_activation,
       total_commits=0, commits_truncated=False, commits=[], files=[],
-      diff=None, diff_truncated=False, conflict_paths=[], blocking_paths=[],
-      blocking_diff=None, blocking_diff_truncated=False,
+      diff=None, diff_truncated=False, conflict_paths=[],
+      local_image_paths=[],
     )
   diff, truncated = _preview_diff(repo, base, target)
   commits = _preview_commits(repo, base, target)
@@ -4678,9 +4636,7 @@ def _platform_update_preview_unlocked(
     files=_preview_files(repo, base, target),
     diff=diff, diff_truncated=truncated,
     conflict_paths=sorted(set(conflict_paths)),
-    blocking_paths=[],
-    blocking_diff=None,
-    blocking_diff_truncated=False,
+    local_image_paths=[],
   )
 
 
@@ -4972,24 +4928,13 @@ def _platform_conflict_resolver_message(
       "load at the next restart."
     )
   if overlay and overlay.get("mode") == "net":
-    blockers = list(overlay.get("blockers") or [])
     opening = (
       "The platform update compared the final local source with the reviewed "
       "upstream source once. Both changed these paths: " + files + ".\n\n"
       if conflict_paths else
-      "The owner asked you to finish a platform update that local changes "
-      "block.\n\n"
+      "The owner asked you to finish a platform update that was predicted to "
+      "overlap local changes.\n\n"
     )
-    if blockers:
-      opening += (
-        "These image-owned files differ from the reviewed release, so its "
-        "official container image would drop what they do: "
-        + ", ".join(blockers) + ". In the candidate below, keep any behavior "
-        "that still matters through its proper owner (an upstream pull "
-        "request, the installed skill, or an app), then make each file match "
-        f"the release with `git checkout {target_sha} -- <path>` (or `git rm` "
-        "it when the release does not have it).\n\n"
-      )
     return opening + (
       "The running platform is untouched. Resolve all marked files together "
       f"in the isolated candidate at `{overlay.get('worktree')}`; preserve "

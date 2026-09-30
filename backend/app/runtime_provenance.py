@@ -63,7 +63,7 @@ class _TreeSnapshot(TypedDict):
   invalid_paths: list[str]
 
 
-def _deployed_root() -> Path:
+def deployed_runtime_root() -> Path:
   return Path(os.environ.get("MOBIUS_PROTECTED_RUNTIME_DIR", "/app/runtime"))
 
 
@@ -137,7 +137,7 @@ def protected_runtime_status(
       "mismatched_paths": [],
     }
 
-  target_root = deployed_root if deployed_root is not None else _deployed_root()
+  target_root = deployed_root if deployed_root is not None else deployed_runtime_root()
   try:
     deployed = _snapshot(target_root, include=_image_owned)
   except (OSError, UnicodeError):
@@ -187,7 +187,7 @@ def served_runtime_status(
   needs surfaces as ``behind`` instead of a misleading ``current``. ``image_epoch``
   missing means there is nothing to prove against — ``unavailable``.
   """
-  image_root = deployed_root if deployed_root is not None else _deployed_root()
+  image_root = deployed_root if deployed_root is not None else deployed_runtime_root()
   results: list[ServedRuntimeModule] = []
   for name in SERVED_RUNTIME_MODULES:
     served_epoch = _module_route_epoch(Path(source_root) / name)

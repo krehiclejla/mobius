@@ -1,9 +1,9 @@
 """POST /api/notify {open_item} — the explicit agent-initiated workspace open.
 
 Covers the strict NotifyBody whitelist (accept + 422 matrix), the system-bus-only
-fan-out classification, and the spoof/absent-item guard contract (the backend
-publishes what it validated; existence is the Shell's confirm-guard, not the API's).
-See split-pane design §6.3.
+fan-out classification, and the absent-item refusal (a missing or deleted item
+is a 404, so no caller is told something opened; the Shell still confirms
+before placing). See split-pane design §6.3.
 """
 
 import asyncio
@@ -11,7 +11,22 @@ import asyncio
 import pytest
 
 from app import broadcast as bc_mod
+from app import models
 from app.broadcast import get_system_broadcast
+from app.timeutil import now_naive_utc
+
+
+@pytest.fixture(autouse=True)
+def live_items(db):
+  """The app and chat ids these tests open, so the existence check passes."""
+  for app_id in (7, 42):
+    db.add(models.App(
+      id=app_id, slug=f"open-item-{app_id}", name=f"App {app_id}",
+      source_dir=f"/tmp/mobius-tests/open-item-{app_id}",
+      jsx_source="export default function App(){}", compiled_path="/tmp/app.js",
+    ))
+  db.add(models.Chat(id="chat-z", title="Chat Z", messages=[]))
+  db.commit()
 
 
 def _open_item_body(**overrides):
@@ -155,22 +170,30 @@ async def test_open_item_is_system_bus_only(client, auth):
 
 
 @pytest.mark.asyncio
-async def test_open_item_accepts_a_well_formed_but_nonexistent_item(client, auth):
-  """The backend does NOT verify the item exists — it publishes what it
-  validated. Guarding against a spoofed/absent id is the Shell's confirm-before-
-  place responsibility (it refetches the list and no-ops when the id is absent),
-  so a well-formed request for a non-existent app is a valid 204 here."""
+@pytest.mark.parametrize("kind,item_id", [
+  ("app", "999999"),
+  ("app", "99999999999999999999"),
+  ("chat", "chat-missing"),
+  ("app", "42"),
+  ("chat", "chat-z"),
+])
+async def test_open_item_refuses_a_missing_or_deleted_item(client, auth, db, kind, item_id):
+  """A well-formed open_item for an item that does not exist, or was deleted,
+  is a 404 and publishes nothing, so the caller never reports it opened."""
+  for model, key in ((models.App, 42), (models.Chat, "chat-z")):
+    db.get(model, key).deleted_at = now_naive_utc()
+  db.commit()
   sb = get_system_broadcast()
   q = sb.subscribe()
   try:
     r = client.post(
-      "/api/notify",
-      headers=auth,
-      json=_open_item_body(itemId="999999"),
+      "/api/notify", headers=auth,
+      json={"type": "open_item", "itemKind": kind, "itemId": item_id},
     )
-    assert r.status_code == 204, r.text
-    ev = await asyncio.wait_for(q.get(), timeout=1.0)
-    assert ev["itemId"] == "999999"
+    assert r.status_code == 404, r.text
+    assert "nothing was opened" in r.json()["detail"]
+    with pytest.raises(asyncio.TimeoutError):
+      await asyncio.wait_for(q.get(), timeout=0.2)
   finally:
     sb.unsubscribe(q)
 

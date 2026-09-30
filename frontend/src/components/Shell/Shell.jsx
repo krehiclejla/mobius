@@ -52,6 +52,7 @@ import {
   modelQueries,
   ownerQueries,
   projectQueries,
+  settingsQueries,
 } from '../../hooks/queries.js'
 import ProjectCopyImport from '../Projects/ProjectCopyImport.jsx'
 import { consumeProjectCopyRequest, clearProjectCopyRequest } from '../../lib/projectCopies.js'
@@ -208,6 +209,7 @@ import { rememberRecentDestination } from '../../lib/recentSelections.js'
 const APP_SETTINGS_SECTIONS = new Set([
   'ai-providers',
   'background-agents',
+  'github',
   'models',
 ])
 const EMPTY_LIST = Object.freeze([])
@@ -2905,6 +2907,9 @@ export default function Shell({ onInitialVisualReady }) {
     } else if (ev.type === 'model_providers_changed') {
       void modelQueries.registry.invalidate(queryClient)
       void authQueries.provider.statuses.invalidate(queryClient)
+      // A reconnect may select a different account. Never paint its predecessor's
+      // allowance while the new reading is in flight, including in open chats.
+      void settingsQueries.providerUsage.reset(queryClient, ev.provider)
     } else if (ev.type === 'app_activity') {
       // The durable marker was committed with an app-attributed notification.
       // A refetch surfaces the dot; if the app is already visible, the effect

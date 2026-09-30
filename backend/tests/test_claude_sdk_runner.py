@@ -108,6 +108,39 @@ class _FakeClient:
     yield _success_result()
 
 
+
+class _NativeClient(_FakeClient):
+  async def query(self, message):
+    if isinstance(message, str):
+      self.queries.append(message)
+    else:
+      self.queries.append([item async for item in message])
+
+
+def _native_inputs(client):
+  return [item for query in client.queries if isinstance(query, list)
+          for item in query if item.get("type") == "user"]
+
+
+def _native_cancellations(client):
+  return [item for query in client.queries if isinstance(query, list)
+          for item in query if item.get("request") == {
+            "subtype": "interrupt", "cancel_queued": True,
+          }]
+
+
+async def _wait_native(client, count=1):
+  for _ in range(1000):
+    if len(_native_inputs(client)) >= count:
+      return
+    await asyncio.sleep(0)
+  raise AssertionError("native input was not sent")
+
+
+async def _flush_native(handle):
+  await asyncio.gather(*tuple(handle._send_tasks), return_exceptions=True)
+
+
 def _install_fake_client(monkeypatch, client_cls=_FakeClient) -> list:
   """Patch the runner's client class; returns the list of created clients."""
   clients: list = []
@@ -354,134 +387,76 @@ def _stream_delta(delta_type: str, **fields: Any) -> StreamEvent:
 
 
 @pytest.mark.asyncio
-async def test_steer_into_active_turn_interrupts_immediately():
-  """A registered Claude handle buffers the steer text AND fires the
-  interrupt immediately (a soft interrupt on the same connected client),
-  rather than deferring the cut to the next content-block boundary — a
-  steer during a long-running tool call must land now, not whenever the
-  tool happens to finish."""
-  calls = []
-
-  class _Client:
-    async def interrupt(self):
-      calls.append("interrupt")
-
-  handle = ActiveClaudeClient(_Client(), chat_id="claude-steer")
-  handle.mark_generating()
+async def test_native_steers_are_fifo_and_never_interrupt():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="claude-steer")
   registry.register(handle)
   try:
+    assert await steer_into_active_turn("claude-steer", "too early") is False
+    handle.mark_ready()
     assert await steer_into_active_turn("claude-steer", "use blue") is True
-    assert handle.pending_steer == ["use blue"]
-    # The steer interrupts the live turn right away.
-    assert calls == ["interrupt"]
-    # A second rapid steer must QUEUE behind the first (FIFO), not overwrite it
-    # — both texts are already persisted to the transcript, so both must reach
-    # Claude when the runner drains the mailbox. It must NOT fire a second
-    # interrupt: `_interrupt_in_flight` guards the single cut until the first
-    # interrupt's terminal result drains the whole buffer together.
     assert await steer_into_active_turn("claude-steer", "and bold") is True
-    assert handle.pending_steer == ["use blue", "and bold"]
-    assert calls == ["interrupt"]
+    await _flush_native(handle)
+    inputs = _native_inputs(client)
+    assert [item["priority"] for item in inputs] == ["next", "next"]
+    assert "use blue" in inputs[0]["message"]["content"]
+    assert "and bold" in inputs[1]["message"]["content"]
+    assert inputs[0]["uuid"] != inputs[1]["uuid"]
+    assert client.interrupts == 0
   finally:
     registry.unregister("claude-steer", handle.kind)
 
 
+
 @pytest.mark.asyncio
-async def test_steer_before_generation_interrupts_once_streaming(
-  monkeypatch,
-):
-  """The CLI drops an interrupt sent before its query is generating, which
-  used to latch the cut so the steer landed only at natural turn end. A steer
-  in that window must interrupt exactly once, when the model starts streaming."""
-  trace: list[int] = []
-
-  class _Client(_FakeClient):
-    async def query(self, prompt):
-      await super().query(prompt)
-      if len(self.queries) == 1:
-        assert await steer_into_active_turn("early-chat", "use blue") is True
-        trace.append(self.interrupts)
-
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="starting")
-        while self.interrupts < 1:
-          await asyncio.sleep(0)
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="blue done")
-      yield _success_result()
-
+async def test_steer_before_initial_query_returns_is_not_admitted(monkeypatch):
+  observations = []
+  class _Client(_NativeClient):
+    async def query(self, message):
+      if isinstance(message, str):
+        observations.append(await steer_into_active_turn("early-chat", "too early"))
+      await super().query(message)
   clients = _install_fake_client(monkeypatch, _Client)
-  result = await asyncio.wait_for(
-    _run_turn("early-chat", prompt="start task"), timeout=5,
-  )
-
-  client = clients[0]
-  assert trace == [0]
-  assert client.interrupts == 1
-  assert len(client.queries) == 2
-  assert "use blue" in client.queries[1]
+  result = await _run_turn("early-chat")
+  assert observations == [False]
+  assert clients[0].queries == ["hello"]
   assert result["error"] is None
 
 
+
 @pytest.mark.asyncio
-async def test_steer_into_active_turn_missing_or_finished_is_false():
-  """Missing or already-finished Claude handles are not steerable."""
+async def test_steer_missing_finished_and_generation_changed_is_false():
   assert await steer_into_active_turn("missing-claude", "x") is False
-
-  class _Client:
-    async def interrupt(self):
-      raise AssertionError("finished handle must not interrupt")
-
-  handle = ActiveClaudeClient(_Client(), chat_id="finished-claude")
-  handle.mark_finished()
+  handle = ActiveClaudeClient(_NativeClient(None), chat_id="finished-claude")
   registry.register(handle)
   try:
+    handle.mark_ready()
+    registry.bump_generation("finished-claude")
+    assert await steer_into_active_turn("finished-claude", "x") is False
+    handle.mark_finished()
     assert await steer_into_active_turn("finished-claude", "x") is False
   finally:
     registry.unregister("finished-claude", handle.kind)
 
 
+
 @pytest.mark.asyncio
-async def test_steer_requeries_on_interrupt_terminal(monkeypatch):
-  """A steer fired mid-delta interrupts immediately and re-queries on the
-  SAME client when the interrupt's terminal ResultMessage arrives.
-
-  The steer fires its soft interrupt as soon as it is requested (interrupts
-  == 1), even though no completed content block preceded the terminal; the
-  pending_steer -> requery path on the terminal result then delivers the
-  steer text on the same session."""
-  class _Client(_FakeClient):
+async def test_native_steer_receipt_before_result_never_requeries(monkeypatch):
+  class _Client(_NativeClient):
     async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="working")
-        assert await steer_into_active_turn("loop-chat", "use blue") is True
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="blue done")
+      yield _stream_delta("text_delta", text="working")
+      assert await steer_into_active_turn("loop-chat", "use blue") is True
+      await _wait_native(self)
+      yield UserMessage(content="use blue", uuid=_native_inputs(self)[0]["uuid"])
+      yield UserMessage(content=[ToolResultBlock(tool_use_id="tool-1", content="done")])
       yield _success_result()
-
   clients = _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  result = await _run_turn("loop-chat", bc=bus, prompt="start task")
-
-  client = clients[0]
-  # The steer fired its interrupt immediately when requested; the terminal
-  # ResultMessage then drove the requery.
-  assert client.interrupts == 1
-  assert client.disconnected is True
-  assert client.queries[0] == "start task"
-  assert client.queries[1].startswith(
-    "New context arrived while you were working."
-  )
-  assert "use blue" in client.queries[1]
+  result = await asyncio.wait_for(_run_turn("loop-chat", prompt="start task"), timeout=2)
   assert result["error"] is None
-  assert result["cost_usd"] == 0.02
-  assert [e for e in bus.events if e["type"] == "text"] == [
-    {"type": "text", "content": "working"},
-    {"type": "text", "content": "blue done"},
-  ]
+  assert clients[0].queries[0] == "start task"
+  assert len(_native_inputs(clients[0])) == 1
+  assert clients[0].interrupts == 0
+
 
 
 _CLI_CUT_TEXT = (
@@ -493,52 +468,33 @@ _CLI_CUT_TEXT = (
 
 
 @pytest.mark.asyncio
-async def test_command_cut_by_a_steer_shows_as_cut_not_refused(monkeypatch):
-  """The CLI answers a call cut by the steer's interrupt with its refusal
-  text; the chat shows the delivery instead, and not as a failure."""
-  class _Client(_FakeClient):
+async def test_native_steer_does_not_relabel_tool_refusal(monkeypatch):
+  class _Client(_NativeClient):
     async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="running it")
-        assert await steer_into_active_turn("cut-label-chat", "helper done")
-        yield UserMessage(content=[
-          ToolResultBlock(
-            tool_use_id="tu-cut", content=_CLI_CUT_TEXT, is_error=True,
-          ),
-        ])
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="re-running")
+      assert await steer_into_active_turn("cut-label-chat", "helper done")
+      await _wait_native(self)
+      yield UserMessage(content="helper done", uuid=_native_inputs(self)[0]["uuid"])
+      yield UserMessage(content=[ToolResultBlock(tool_use_id="tu-cut", content=_CLI_CUT_TEXT, is_error=True)])
       yield _success_result()
-
   _install_fake_client(monkeypatch, _Client)
   bus = _ChatBus()
-  await _run_turn("cut-label-chat", bc=bus, prompt="start task")
-
+  await _run_turn("cut-label-chat", bc=bus)
   outputs = [e for e in bus.events if e["type"] == "tool_output"]
-  assert outputs == [{
-    "type": "tool_output", "content": "Cut to deliver a message",
-    "tool_use_id": "tu-cut", "output_complete": True,
-  }]
+  assert outputs[0]["content"] == _CLI_CUT_TEXT
+
 
 
 @pytest.mark.asyncio
-async def test_cut_label_names_the_steer_and_the_stop():
-  class _Client:
-    async def interrupt(self):
-      pass
+async def test_cut_label_names_only_stop():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="cut-label-steer")
+  handle.mark_ready()
+  assert await handle.steer("why?")
+  assert handle.cut_tool_label is None
+  handle.mark_finished()
+  await handle.interrupt()
+  assert handle.cut_tool_label == "Stopped"
 
-  steered = ActiveClaudeClient(_Client(), chat_id="cut-label-steer")
-  await steered.steer("why?", [{"role": "user", "cid": "c1"}], ["c1"])
-  assert steered.cut_tool_label == "Cut to deliver a message"
-
-  stopped = ActiveClaudeClient(_Client(), chat_id="cut-label-stop")
-  stopped.mark_finished()
-  await stopped.interrupt()
-  assert stopped.cut_tool_label == "Stopped"
-
-  idle = ActiveClaudeClient(_Client(), chat_id="cut-label-idle")
-  assert idle.cut_tool_label is None
 
 
 def test_only_our_own_cut_relabels_the_cli_refusal():
@@ -559,55 +515,29 @@ def test_only_our_own_cut_relabels_the_cli_refusal():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("session_id", [None, "sess-1"])
-async def test_steer_interrupt_racing_turn_end_is_a_resumable_pause(
-  monkeypatch, session_id,
-):
-  """A steer whose soft interrupt lands AT natural turn-end must not surface
-  the raw "Execution interrupted." provider error, nor re-run the prompt.
-
-  The turn finishes on its own exactly as the steer arrives: the steer buffers
-  its text and fires interrupt(), but the CLEAN end_turn terminal wins the race,
-  so the runner re-queries the steer text (draining pending_steer) and the stray
-  interrupt() then aborts the RE-QUERY turn — whose terminal arrives with
-  pending_steer already empty and no Stop in flight. The runner defuses the
-  error (the interrupt was ours) and marks the turn resume_incomplete so the
-  finalize seam renders a calm resumable note.
-
-  On a RESUME turn (session_id set — the production steer condition) the
-  defused error would also unlock the synthetic-no-op auto-requery guard
-  (`_seal_steer_split` resets `assistant_blocks` to []); the explicit
-  `stop_reason != "interrupt"` guard keeps the runner from silently re-running
-  the ORIGINAL prompt and re-executing its side effects."""
-
-  class _Client(_FakeClient):
+async def test_result_before_native_replay_keeps_reading_without_requery(monkeypatch):
+  class _Client(_NativeClient):
+    def __init__(self, options):
+      super().__init__(options)
+      self.responses = 0
     async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="working")
-        assert await steer_into_active_turn("steer-race-chat", "use blue") is True
-        yield _success_result()   # natural turn-end wins the race
-        return
-      # Re-query turn: the stray interrupt aborts it with zero accrued blocks.
-      yield _interrupt_result()
-
+      self.responses += 1
+      if self.responses == 1:
+        assert await steer_into_active_turn("steer-race-chat", "use blue")
+        yield _success_result()
+      else:
+        while not _native_inputs(self):
+          await asyncio.sleep(0)
+        yield UserMessage(content="use blue", uuid=_native_inputs(self)[0]["uuid"])
+        yield _success_result()
   clients = _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  # The synthetic-no-op guard keys on the sink's accrued blocks being empty.
-  bus.assistant_blocks = []
-
-  result = await _run_turn(
-    "steer-race-chat", bc=bus, prompt="start task", session_id=session_id,
-  )
-
-  # The original prompt is queried exactly once, then only the steer redirect.
-  client = clients[0]
-  assert client.queries.count("start task") == 1
-  assert len(client.queries) == 2
-  assert client.queries[1].startswith("New context arrived while you were working.")
-  # The raw provider error never surfaces; the turn is a resumable interrupt.
+  result = await _run_turn("steer-race-chat", prompt="start task")
   assert result["error"] is None
-  assert result["terminal_status"] == "interrupted"
-  assert result["resume_incomplete"] is True
+  assert clients[0].responses == 2
+  assert clients[0].queries[0] == "start task"
+  assert len(_native_inputs(clients[0])) == 1
+  assert clients[0].interrupts == 0
+
 
 
 def _tool_boundary_interrupt_result(
@@ -863,46 +793,33 @@ async def test_child_agent_card_receipt_still_interrupts_through_the_sink_path()
 
 
 @pytest.mark.asyncio
-async def test_owner_card_still_ends_the_turn_after_an_earlier_steer():
-  """A steer's cut closes at its terminal; a later saved card must still end
-  the turn instead of letting post-card text persist below the card."""
-  class _Client:
-    def __init__(self):
-      self.interrupts = 0
-
-    async def interrupt(self):
-      self.interrupts += 1
-
-  client = _Client()
+async def test_owner_card_closes_native_steer_admission():
+  client = _NativeClient(None)
   handle = ActiveClaudeClient(client, chat_id="steer-then-card")
-  handle.mark_generating()
-  assert await handle.steer("peer note") is True
-  assert handle.claim_owner_card_end() is False  # the steer owns this cut
-
-  # A clean terminal that won the race leaves the stray interrupt owned.
-  assert handle.take_steer_for_requery(interrupt_landed=False) == ["peer note"]
-  assert handle.claim_owner_card_end() is False
-  handle.mark_generating()  # the requery is streaming
-  await handle.steer("second note")
-  assert handle.take_steer_for_requery(interrupt_landed=True) == ["second note"]
-  assert handle.pending_steer == []
+  handle.mark_ready()
+  assert await handle.steer("peer note")
   assert handle.claim_owner_card_end() is True
   assert handle.owner_card_end is True
-  assert client.interrupts == 2
+  assert await handle.steer("later note") is False
+  await _flush_native(handle)
+  assert client.interrupts == 0
+
 
 
 @pytest.mark.asyncio
-async def test_stop_stays_sticky_across_a_steer_requery_boundary():
-  class _Client:
-    async def interrupt(self):
-      pass
-
-  handle = ActiveClaudeClient(_Client(), chat_id="stop-sticky")
-  await handle.steer("note")
+async def test_stop_stays_sticky_after_native_steer():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="stop-sticky")
+  handle.mark_ready()
+  assert await handle.steer("note")
+  handle.mark_finished()
   await handle.interrupt()
-  assert handle.take_steer_for_requery(interrupt_landed=True) == []
   assert handle.interrupt_requested is True
   assert handle.claim_owner_card_end() is False
+  assert await handle.steer("late") is False
+  assert client.interrupts == 0
+  assert len(_native_cancellations(client)) == 1
+
 
 
 def _assistant_text(text: str, session_id: str = "sess-1") -> AssistantMessage:
@@ -1333,7 +1250,11 @@ def test_native_continuation_defers_only_a_result_not_seen_while_active():
   assert slow.observe_result() is False
 
 
-def _interrupt_result(session_id: str = "sess-1") -> ResultMessage:
+def _interrupt_result(
+  session_id: str = "sess-1", *,
+  stop_reason: str | None = "interrupt",
+  terminal_reason: str | None = None,
+) -> ResultMessage:
   """The terminal an SDK interrupt produces — error_during_execution."""
   return ResultMessage(
     subtype="error_during_execution",
@@ -1342,13 +1263,18 @@ def _interrupt_result(session_id: str = "sess-1") -> ResultMessage:
     is_error=True,
     num_turns=1,
     session_id=session_id,
-    stop_reason="interrupt",
+    stop_reason=stop_reason,
+    terminal_reason=terminal_reason,
     total_cost_usd=0.01,
     usage={"input_tokens": 1, "output_tokens": 2},
   )
 
 
-async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
+async def _run_claude_stop_outcome(
+  monkeypatch, mode: str, *, owned: bool,
+  stop_reason: str | None = "interrupt",
+  terminal_reason: str | None = None,
+):
   """Run one fake response stream, with an owner Stop in flight when `owned`.
 
   The Stop goes through the public `interrupt()`: it records ownership before
@@ -1376,7 +1302,9 @@ async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
         while not self.interrupts:
           await asyncio.sleep(0)
       if mode == "terminal":
-        yield _interrupt_result()
+        yield _interrupt_result(
+          stop_reason=stop_reason, terminal_reason=terminal_reason,
+        )
         return
       if mode == "resultless":
         return
@@ -1457,6 +1385,33 @@ async def test_owner_stop_turns_claude_interrupt_result_into_clean_terminal(
   assert result["terminal_status"] == "interrupted"
   assert result["cost_usd"] == 0.01
   assert result["usage"] == {"input_tokens": 1, "output_tokens": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_reason", ["aborted_streaming", "aborted_tools"])
+async def test_owner_stop_uses_structured_claude_terminal_reason(
+  monkeypatch, terminal_reason,
+):
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "terminal", owned=True,
+    stop_reason="tool_use", terminal_reason=terminal_reason,
+  )
+
+  assert result["error"] is None
+  assert result["terminal_status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_unowned_claude_abort_stays_an_error_with_structured_reason(
+  monkeypatch,
+):
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "terminal", owned=False,
+    stop_reason="tool_use", terminal_reason="aborted_tools",
+  )
+
+  assert result["error"] == "Execution interrupted."
+  assert result.get("terminal_status") is None
 
 
 @pytest.mark.asyncio
@@ -1541,176 +1496,75 @@ async def test_owner_stop_does_not_hide_other_claude_process_failure(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_steer_interrupts_immediately_not_deferred_to_boundary(
-  monkeypatch,
-):
-  """THE core contract: a steer requested mid-turn interrupts the live turn
-  IMMEDIATELY — it does NOT wait for the next completed content block. The
-  cut lands as soon as the steer is requested (matching Codex's immediate
-  steer), then the interrupt's terminal result re-queries exactly once on
-  the same client.
-
-  The fake stream records the interrupt-call count at the moment each
-  message is dispatched, so the test can assert the interrupt fired the
-  instant the steer arrived (mid-delta), not at a later boundary."""
-  # (message_label, interrupts_observed_when_this_message_was_yielded)
-  interrupt_trace: list[tuple[str, int]] = []
-
-  class _Client(_FakeClient):
+async def test_native_steer_after_delta_has_no_interrupt_or_requery(monkeypatch):
+  class _Client(_NativeClient):
     async def receive_response(self):
-      if len(self.queries) == 1:
-        # First turn: deltas stream, the user steers mid-block — the
-        # interrupt fires RIGHT THEN, so the count is already 1 on the
-        # very next delta (no waiting for a completed block).
-        yield _stream_delta("text_delta", text="thinking ")
-        interrupt_trace.append(("delta-1", self.interrupts))
-        assert await steer_into_active_turn("boundary-chat", "use blue") \
-          is True
-        yield _stream_delta("text_delta", text="about it")
-        interrupt_trace.append(("delta-2-after-steer", self.interrupts))
-        # A completed block still arrives (a few tokens can stream before
-        # the interrupt takes effect); it must NOT fire a second interrupt.
-        yield _assistant_text("thinking about it")
-        interrupt_trace.append(("assistant-boundary", self.interrupts))
-        # The interrupt's terminal result. The runner's drain-then-
-        # requery path delivers the buffered steer here.
-        yield _interrupt_result()
-        return
-      # Second (re-queried) turn completes normally.
-      yield _stream_delta("text_delta", text="blue done")
+      yield _stream_delta("text_delta", text="thinking ")
+      assert await steer_into_active_turn("boundary-chat", "use blue")
+      yield _stream_delta("text_delta", text="about it")
+      await _wait_native(self)
+      yield UserMessage(content="use blue", uuid=_native_inputs(self)[0]["uuid"])
       yield _success_result()
-
   clients = _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  result = await _run_turn("boundary-chat", bc=bus, prompt="start task")
-
-  client = clients[0]
-  trace = dict(interrupt_trace)
-  # No interrupt before the steer was requested.
-  assert trace["delta-1"] == 0
-  # The interrupt fired the instant the steer arrived — the next delta
-  # already sees it (this is the whole point of the change).
-  assert trace["delta-2-after-steer"] == 1
-  # Exactly once — the later completed block did not double-interrupt.
-  assert client.interrupts == 1
-  # Exactly one re-query with the buffered steer (no double).
-  assert client.queries[0] == "start task"
-  assert len(client.queries) == 2
-  assert client.queries[1].startswith(
-    "New context arrived while you were working."
-  )
-  assert "use blue" in client.queries[1]
+  result = await _run_turn("boundary-chat")
   assert result["error"] is None
-  assert result["cost_usd"] == 0.02
-  # The finished sentence the user saw before the cut, then the steered
-  # continuation — in order, each emitted once.
-  assert [e for e in bus.events if e["type"] == "text"] == [
-    {"type": "text", "content": "thinking "},
-    {"type": "text", "content": "about it"},
-    {"type": "text", "content": "blue done"},
-  ]
+  assert clients[0].interrupts == 0
+  assert len(clients[0].queries) == 2
+
 
 
 @pytest.mark.asyncio
-async def test_steer_interrupts_once_despite_two_rapid_steers(monkeypatch):
-  """Two rapid steers before the interrupt's terminal ResultMessage must
-  fire only ONE interrupt — `_interrupt_in_flight` guards the single cut —
-  and both buffered steers ride the single requery (FIFO, exactly once).
-  Later completed blocks arriving in the drain window must not re-interrupt."""
-  class _Client(_FakeClient):
+async def test_two_native_steers_fifo_distinct_uuids(monkeypatch):
+  class _Client(_NativeClient):
     async def receive_response(self):
-      if len(self.queries) == 1:
-        # Two rapid steers: the first fires the interrupt, the second is
-        # guarded by _interrupt_in_flight and only buffers its text.
-        assert await steer_into_active_turn("multi-chat", "use blue") is True
-        assert await steer_into_active_turn("multi-chat", "and bold") is True
-        yield _assistant_text("first block")
-        await asyncio.sleep(0)  # the claimed cut is sent once streaming
-        # The SDK may still emit trailing completed blocks in the drain
-        # window before the interrupt's terminal lands. They must NOT cause
-        # a second interrupt.
-        yield _assistant_text("straggler block")
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="done")
+      assert await steer_into_active_turn("multi-chat", "use blue")
+      assert await steer_into_active_turn("multi-chat", "and bold")
+      await _wait_native(self, 2)
+      for item in _native_inputs(self):
+        yield UserMessage(content=item["message"]["content"], uuid=item["uuid"])
       yield _success_result()
-
   clients = _install_fake_client(monkeypatch, _Client)
-  result = await _run_turn("multi-chat", prompt="start task")
-
-  client = clients[0]
-  # Exactly one interrupt despite two steers and two completed blocks in the
-  # drain window — the in-flight guard held.
-  assert client.interrupts == 1
-  # Exactly one requery, carrying BOTH buffered steers in FIFO order.
-  assert len(client.queries) == 2
-  assert "use blue" in client.queries[1]
-  assert "and bold" in client.queries[1]
-  assert client.queries[1].index("use blue") < client.queries[1].index(
-    "and bold"
-  )
+  result = await _run_turn("multi-chat")
   assert result["error"] is None
+  assert len(_native_inputs(clients[0])) == 2
+  assert clients[0].interrupts == 0
+
 
 
 @pytest.mark.asyncio
-async def test_steer_after_content_already_streamed(monkeypatch):
-  """A steer requested after some content has already streamed still
-  interrupts immediately and re-queries once on the same client."""
-  class _Client(_FakeClient):
+async def test_native_steer_after_content_already_streamed(monkeypatch):
+  class _Client(_NativeClient):
     async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _assistant_text("first block")
-        # Steer arrives after the first block already streamed; it fires
-        # the interrupt immediately all the same.
-        assert await steer_into_active_turn("late-chat", "pivot") is True
-        yield _assistant_text("second block")
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="pivoted")
+      yield _assistant_text("first block")
+      assert await steer_into_active_turn("late-chat", "pivot")
+      await _wait_native(self)
+      yield UserMessage(content="pivot", uuid=_native_inputs(self)[0]["uuid"])
       yield _success_result()
-
   clients = _install_fake_client(monkeypatch, _Client)
-  result = await _run_turn("late-chat", prompt="start task")
-
-  client = clients[0]
-  assert client.interrupts == 1
-  assert len(client.queries) == 2
-  assert "pivot" in client.queries[1]
+  result = await _run_turn("late-chat")
   assert result["error"] is None
+  assert clients[0].interrupts == 0
+  assert len(clients[0].queries) == 2
+
 
 
 @pytest.mark.asyncio
-async def test_stop_drops_buffered_steer(monkeypatch):
-  """Stop is the hard teardown path: after a steer has already fired its own
-  soft interrupt, a Stop drops the buffered steer entirely (no requery for
-  abandoned work) and fires its own immediate interrupt on top."""
-  del monkeypatch  # this handle-level test needs no SDK patching
-
-  calls: list[str] = []
-
-  class _Client:
-    async def interrupt(self):
-      calls.append("interrupt")
-
-  handle = ActiveClaudeClient(_Client(), chat_id="stop-chat")
-  handle.mark_generating()
+async def test_stop_rejects_unconsumed_native_steer_without_second_interrupt():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="stop-chat")
+  handle.mark_ready()
   registry.register(handle)
   try:
-    # Steer buffers the text and fires its soft interrupt immediately.
-    assert await steer_into_active_turn("stop-chat", "use blue") is True
-    assert handle.pending_steer == ["use blue"]
-    assert calls == ["interrupt"]
-
-    # mark_finished so interrupt()'s _finished wait returns immediately.
+    assert await steer_into_active_turn("stop-chat", "use blue")
     handle.mark_finished()
     await handle.interrupt()
-
-    # Stop always cuts immediately — a second interrupt on top of the
-    # steer's — and clears the buffer so no requery fires.
-    assert calls == ["interrupt", "interrupt"]
-    assert handle.pending_steer == []
+    assert handle._steers == {}
+    assert await steer_into_active_turn("stop-chat", "late") is False
+    assert client.interrupts == 0
+    assert len(_native_cancellations(client)) == 1
   finally:
     registry.unregister("stop-chat", handle.kind)
+
 
 
 @pytest.mark.asyncio
@@ -1945,6 +1799,21 @@ async def test_claude_new_and_resumed_turns_exclude_native_owner_questions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", [None, "sess-1"])
+@pytest.mark.parametrize("prompt", ["Review this text: @private-file", "/compact"])
+async def test_claude_chat_prompts_are_literal_on_new_and_resumed_turns(
+  monkeypatch, session_id, prompt,
+):
+  """Quoted paths and slash text must not invoke Claude Code shortcuts."""
+  clients = _install_fake_client(monkeypatch)
+
+  await _run_turn("literal-chat", prompt=prompt, session_id=session_id)
+
+  assert clients[0].options.verbatim_prompts is True
+  assert clients[0].queries == [prompt]
+
+
+@pytest.mark.asyncio
 async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   clients = _install_fake_client(monkeypatch)
 
@@ -1963,14 +1832,16 @@ async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
     claude_sdk_runner._system_prompt_with_register("system")
   )
   assert "$MOBIUS_GENERATED_DIR" in options.system_prompt
+  assert "Create downloadable deliverables only when the owner explicitly requests" in options.system_prompt
   assert options.system_prompt.startswith("system")
   assert "# Concise register" in options.system_prompt
   assert "# Execution lifetimes in Möbius" in options.system_prompt
   assert "TaskOutput" not in options.system_prompt
   assert 'until [ -e "$TMPDIR/job.exit" ]' in options.system_prompt
   assert "confirm its saved receipt" in options.system_prompt
-  # A steer or Stop cut makes the CLI word the call as refused; it was not.
-  assert "not anyone refusing the call" in options.system_prompt
+  # Normal steering is no longer falsely described as an interruption.
+  assert "they do not interrupt running work" in options.system_prompt
+  assert "rather than inferring that" in options.system_prompt
   assert options.max_buffer_size == 10 * 1024 * 1024
   assert set(claude_sdk_runner._CLAUDE_NATIVE_SCHEDULING_TOOLS) <= set(
     options.disallowed_tools
@@ -3111,60 +2982,31 @@ def test_claude_text_events_have_no_id_without_message_id():
 
 
 @pytest.mark.asyncio
-async def test_mid_turn_person_message_is_framed_as_owed_a_visible_reply():
-  """A person's mid-turn message must not be absorbed as silent context.
-
-  "Continue the same task" framing let agents fold an owner's question into
-  their work and answer it only in hidden thinking. Visible rows are framed
-  as a message needing a visible reply; hidden agent carriers (helper
-  results, peer notes) stay context. The distinction resets with the buffer.
-  """
-  class _Client:
-    async def interrupt(self):
-      pass
-
-  handle = ActiveClaudeClient(_Client(), chat_id="claude-steer-framing")
-  handle.mark_generating()
-
-  await handle.steer(
-    "helper finished", [{"role": "user", "cid": "c1", "hidden": True,
-                         "kind": "delegation_result"}], ["c1"],
-  )
-  assert handle.steer_from_person is False
+async def test_native_person_and_hidden_context_framing():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="claude-steer-framing")
+  handle.mark_ready()
+  await handle.steer("helper finished", [{"role": "user", "cid": "c1", "hidden": True}], ["c1"])
   await handle.steer("why not X?", [{"role": "user", "cid": "c2"}], ["c2"])
-  assert handle.steer_from_person is True
+  await _flush_native(handle)
+  first, second = _native_inputs(client)
+  assert first["message"]["content"].startswith("New context arrived")
+  assert second["message"]["content"].startswith("The partner sent")
+  assert "visible response" in second["message"]["content"]
 
-  texts = handle.take_steer_for_requery(interrupt_landed=True)
-  assert texts == ["helper finished", "why not X?"]
-  assert handle.steer_from_person is False
-
-  person = claude_sdk_runner._steer_redirect_message(texts, from_person=True)
-  assert person.startswith("The partner sent this message while you were")
-  assert "visible response" in person
-  # A steer usually adds to the work; it replaces it only when it says so.
-  assert "unless it asks you to stop or change course" in person
-  assert "why not X?" in person and "helper finished" in person
-
-  context = claude_sdk_runner._steer_redirect_message(
-    ["peer note"], from_person=False,
-  )
-  assert context.startswith("New context arrived while you were working.")
 
 
 @pytest.mark.asyncio
-async def test_stop_clears_person_steer_framing():
-  class _Client:
-    async def interrupt(self):
-      pass
-
-  handle = ActiveClaudeClient(_Client(), chat_id="claude-steer-stop")
-  handle.mark_generating()
+async def test_stop_rejects_later_person_steer():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="claude-steer-stop")
+  handle.mark_ready()
   await handle.steer("stop that", [{"role": "user", "cid": "c3"}], ["c3"])
-  assert handle.steer_from_person is True
   handle.mark_finished()
   await handle.interrupt()
-  assert handle.pending_steer == []
-  assert handle.steer_from_person is False
+  assert handle._steers == {}
+  assert await handle.steer("later", [{"role": "user", "cid": "c4"}]) is False
+
 
 
 def _clean_zero_block_result(session_id: str = "sess-1"):
@@ -3223,3 +3065,271 @@ async def test_rejected_selected_model_does_not_fall_back_silently(monkeypatch):
   assert clients[0].queries == ["hello"]
   assert clients[0].options.model == "claude-opus-4-8"
   assert result["error"] == "Selected model may not exist or you may not have access"
+
+
+@pytest.mark.asyncio
+async def test_native_receipt_requires_matching_root_uuid_and_commits_once(monkeypatch):
+  from app import chat_event_sink
+  committed = []
+  async def commit(chat_id, rows, cids, sink):
+    committed.append((chat_id, rows, cids, sink))
+  monkeypatch.setattr(chat_event_sink, "commit_steer_cut", commit)
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="receipt-root")
+  handle.mark_ready()
+  row = {"role": "user", "cid": "c1", "content": "same"}
+  sink = object()
+  assert await handle.steer("same", [row], ["c1"])
+  await _flush_native(handle)
+  [native] = _native_inputs(client)
+  await handle.consume_steer(UserMessage(content="same", uuid="unknown"), sink)
+  await handle.consume_steer(UserMessage(content="same", uuid=native["uuid"], parent_tool_use_id="child"), sink)
+  assert committed == []
+  await handle.consume_steer(UserMessage(content="same", uuid=native["uuid"]), sink)
+  await handle.consume_steer(UserMessage(content="same", uuid=native["uuid"]), sink)
+  assert committed == [("receipt-root", [row], ["c1"], sink)]
+  assert await handle.settle_response() is False
+  assert handle._steers == {}
+
+
+@pytest.mark.asyncio
+async def test_native_dedup_by_cid_not_text():
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="dedup-native")
+  handle.mark_ready()
+  row = {"role": "user", "cid": "one", "content": "same"}
+  assert await handle.steer("same", [row], ["one"])
+  assert await handle.steer("same", [row], ["one"])
+  assert await handle.steer("same", [{**row, "cid": "two"}], ["two"])
+  await _flush_native(handle)
+  assert len(_native_inputs(client)) == 2
+  assert [x["priority"] for x in _native_inputs(client)] == ["next", "next"]
+
+
+@pytest.mark.asyncio
+async def test_native_query_failure_rejects_without_receipt():
+  class _FailClient(_NativeClient):
+    async def query(self, message):
+      raise RuntimeError("stdin failed")
+  handle = ActiveClaudeClient(_FailClient(None), chat_id="failed-native")
+  handle.mark_ready()
+  assert await handle.steer("note", [{"role": "user", "cid": "failed"}], ["failed"])
+  await _flush_native(handle)
+  assert len(handle._steers) == 1  # A late replay may still prove consumption.
+  assert await handle.settle_response() is False
+  assert handle._steers == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_wait_for_hanging_native_send():
+  sending = asyncio.Event()
+  class _HangClient(_NativeClient):
+    async def query(self, message):
+      items = [item async for item in message]
+      if items[0]["type"] == "control_request":
+        self.queries.append(items)
+        return
+      sending.set()
+      await asyncio.Event().wait()
+  client = _HangClient(None)
+  handle = ActiveClaudeClient(client, chat_id="hang-native")
+  handle.mark_ready()
+  assert await handle.steer("note", [{"role": "user", "cid": "hang"}], ["hang"])
+  await sending.wait()
+  handle.mark_finished()
+  assert await asyncio.wait_for(handle.stop(), timeout=1) is True
+  await _flush_native(handle)
+  assert handle._steers == {}
+  assert client.interrupts == 0
+  assert len(_native_cancellations(client)) == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_bump_fences_receipt_before_stop_handle(monkeypatch):
+  from app import chat_event_sink
+  committed = []
+  async def commit(*args, **kwargs):
+    committed.append((args, kwargs))
+  monkeypatch.setattr(chat_event_sink, "commit_steer_cut", commit)
+  client = _NativeClient(None)
+  handle = ActiveClaudeClient(client, chat_id="generation-receipt")
+  handle.mark_ready()
+  assert await handle.steer("note", [{"role": "user", "cid": "g1"}], ["g1"])
+  await _flush_native(handle)
+  [native] = _native_inputs(client)
+  registry.bump_generation("generation-receipt")
+  await handle.consume_steer(UserMessage(content="note", uuid=native["uuid"]), object())
+  assert committed == []
+  assert handle._steers == {}
+  handle.mark_finished()
+  assert await handle.stop() is True
+
+
+@pytest.mark.asyncio
+async def test_native_missing_receipt_at_eof_never_claims_delivery(monkeypatch):
+  from app import chat_event_sink
+  commits = []
+  async def commit(*args, **kwargs):
+    commits.append((args, kwargs))
+  monkeypatch.setattr(chat_event_sink, "commit_steer_cut", commit)
+  class _Client(_NativeClient):
+    def __init__(self, options):
+      super().__init__(options)
+      self.responses = 0
+    async def receive_response(self):
+      self.responses += 1
+      if self.responses == 1:
+        assert await steer_into_active_turn("missing-native-receipt", "note",
+          [{"role": "user", "cid": "missing"}], ["missing"])
+        yield _success_result()
+      # The native queue never replays the UUID, then closes.
+  clients = _install_fake_client(monkeypatch, _Client)
+  result = await asyncio.wait_for(_run_turn("missing-native-receipt"), timeout=2)
+  assert result["error"] is not None
+  assert commits == []
+  assert clients[0].queries[0] == "hello"
+  assert len(_native_inputs(clients[0])) == 1
+  assert clients[0].interrupts == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_receipt_seal_preserves_consumption_before_final_output(monkeypatch):
+  """A failed run can recover its consumed row, not pretend its answer succeeded."""
+  from app import chat_event_sink
+  trace = []
+  attempts = 0
+
+  async def commit(_chat, rows, cids, **kwargs):
+    nonlocal attempts
+    attempts += 1
+    trace.append("seal" if attempts == 1 else "recovered-consumption")
+    assert cids == ["receipt-failure"]
+    if attempts == 1:
+      raise RuntimeError("receipt persistence failed")
+    return {"stored_messages": rows}
+
+  async def final_files(*args, **kwargs):
+    trace.append("final-file-output")
+
+  monkeypatch.setattr(chat_event_sink, "commit_steer_cut", commit)
+  monkeypatch.setattr(claude_sdk_runner.generated_files, "publish_inbox_files", final_files)
+
+  class _Client(_NativeClient):
+    async def receive_response(self):
+      yield _assistant_text("Before the steer")
+      assert await steer_into_active_turn("receipt-failure-chat", "note",
+        [{"role": "user", "cid": "receipt-failure", "content": "note"}],
+        ["receipt-failure"])
+      await _wait_native(self)
+      yield UserMessage(content="note", uuid=_native_inputs(self)[0]["uuid"])
+      trace.append("post-receipt-frame-read")
+      yield _assistant_text("Must not be reported as a completed answer")
+      yield _success_result()
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  result = await _run_turn("receipt-failure-chat")
+  assert result["error"] == "receipt persistence failed"
+  assert trace == ["seal", "recovered-consumption", "final-file-output"]
+  assert len(_native_inputs(clients[0])) == 1
+  assert clients[0].disconnected
+
+
+@pytest.mark.asyncio
+async def test_native_prompt_hook_refuses_work_after_card_or_stop(monkeypatch):
+  clients = _install_fake_client(monkeypatch)
+  await _run_turn("native-prompt-lifetime")
+  hook = clients[0].options.hooks["UserPromptSubmit"][0].hooks[0]
+  # The closed adapter cannot be revived by a queued CLI input.
+  result = await hook({}, None, {})
+  assert result["continue_"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replayed", [False, True])
+async def test_ambiguous_native_write_retains_uuid_until_receipt_or_terminal(monkeypatch, replayed):
+  from app import chat_event_sink
+  commits = []
+
+  async def commit(_chat, rows, cids, **kwargs):
+    commits.extend(cids)
+    return {"stored_messages": rows}
+
+  monkeypatch.setattr(chat_event_sink, "commit_steer_cut", commit)
+
+  class _Client(_NativeClient):
+    async def query(self, message):
+      await super().query(message)
+      if self.queries[-1][0]["type"] == "user":
+        raise OSError("write failed after complete line reached CLI")
+
+  client = _Client(None)
+  handle = ActiveClaudeClient(client, chat_id="ambiguous-native-write")
+  handle.mark_ready()
+  assert await handle.steer("note", [{"role": "user", "cid": "ambiguous"}], ["ambiguous"])
+  await _flush_native(handle)
+  [native] = _native_inputs(client)
+  if replayed:
+    await handle.consume_steer(UserMessage(content="note", uuid=native["uuid"]), object())
+  assert await handle.settle_response() is False
+  assert commits == (["ambiguous"] if replayed else [])
+  handle.close_admission()
+  assert await handle.cancel_native_queue() is True
+  assert len(_native_cancellations(client)) == 1
+  assert await handle.cancel_native_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_owner_card_cancels_unconsumed_native_queue_before_disconnect(monkeypatch):
+  class _Client(_NativeClient):
+    async def receive_response(self):
+      handle = registry.get_handle("card-native-queue", RunnerKind.CLAUDE_SDK)
+      assert await handle.steer("unconsumed", [{"role": "user", "cid": "card-queued"}], ["card-queued"])
+      await _wait_native(self)
+      assert handle.claim_owner_card_end()
+      yield _success_result()
+
+    async def disconnect(self):
+      # The real SDK retires hooks and grace-drains stdin here. The CLI queue
+      # must already have been cancelled, not merely forgotten by Möbius.
+      assert len(_native_cancellations(self)) == 1
+      await super().disconnect()
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  result = await _run_turn("card-native-queue")
+  assert result["error"] is None
+  assert clients[0].disconnected
+  assert clients[0].interrupts == 0  # one combined native cancel, no extra cut
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdrawal_fails", [False, True])
+async def test_failed_native_withdrawal_reaps_before_sdk_eof_only_on_failure(monkeypatch, withdrawal_fails):
+  trace = []
+  monkeypatch.setattr(claude_sdk_runner, "_terminate_claude_processes",
+    lambda pgid, marker: trace.append("reap") or True)
+
+  class _Client(_NativeClient):
+    async def query(self, message):
+      await super().query(message)
+      if _native_cancellations(self):
+        trace.append("withdraw")
+        if withdrawal_fails:
+          raise OSError("transport cannot withdraw queued input")
+
+    async def receive_response(self):
+      handle = registry.get_handle("withdrawal-failure", RunnerKind.CLAUDE_SDK)
+      handle.set_process_group_id(4321)
+      assert await handle.steer("note", [{"role": "user", "cid": "unconsumed"}])
+      await _wait_native(self)
+      assert handle.claim_owner_card_end()
+      yield _success_result()
+
+    async def disconnect(self):
+      trace.append("disconnect")
+      await super().disconnect()
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  await _run_turn("withdrawal-failure")
+  assert clients[0].disconnected
+  assert trace == (["withdraw", "reap", "disconnect"] if withdrawal_fails
+                   else ["withdraw", "disconnect", "reap"])

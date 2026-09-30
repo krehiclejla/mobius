@@ -70,7 +70,7 @@ build swap.
 
 Möbius is meant to be self-hosted on a user-provisioned host — a managed platform (Railway/Render/Fly/PikaPods) or a raw VPS — so "apply a security update" splits into three tiers by who can even act:
 
-- **Image userspace** — the Python wheels, npm globals, apt packages, and vendored mini-app libs baked into the image. The agent owns these end-to-end: change the declared constraint (`Dockerfile` / `backend/requirements.txt` / `frontend/package.json`), regenerate the hashed Python lock, rebuild, recreate. Never `apt upgrade` / `pip install -U` a *running* container — that mutation is ephemeral and drifts the live container away from the reproducible image. `deploy-prod.sh` is the apply path. Full root is an honest default instance capability: the root entrypoint creates `mobius ALL=(root) NOPASSWD: ALL` before dropping privileges. `MOBIUS_AGENT_SUDO=0` is the coarse operator kill switch and ships with no sudoers rule. Changing either direction requires a clean recreation because an already-root agent could have installed persistent-in-container privilege paths.
+- **Image userspace** — the Python wheels, npm globals, apt packages, and vendored mini-app libs baked into the image. They change through the declared constraint (`Dockerfile` / `backend/requirements.txt` / `frontend/package.json`) and the hashed Python lock in an upstream release; official container replacement installs that release's image, so a local-only edit to these inputs is kept in the checkout but never reaches an official image; updates report it and never wait on it. A live install in a running container serves the current task and lasts until the container is replaced; never `apt upgrade` / `pip install -U` a running container, which drifts it away from the reproducible image. An owner building their own image applies it with `deploy-prod.sh`. Full root is an honest default instance capability: the root entrypoint creates `mobius ALL=(root) NOPASSWD: ALL` before dropping privileges. `MOBIUS_AGENT_SUDO=0` is the coarse operator kill switch and ships with no sudoers rule. Changing either direction requires a clean recreation because an already-root agent could have installed persistent-in-container privilege paths.
 - **Host OS userspace + the Docker engine** — outside every container; patched on the host (`unattended-upgrades` covers the OS packages; the engine is a separate host upgrade).
 - **Host kernel** — *not in the container*; it shares the host's and cannot be patched from inside. On a managed platform the operator patches+reboots the kernel underneath you (the safe default for non-devops owners); on a raw VPS it's the owner's job, via `unattended-upgrades` + livepatch + a scheduled reboot window.
 
@@ -138,8 +138,8 @@ stays in an isolated worktree while the old checkout remains served. Working
 edits are carried through as a transient commit and returned uncommitted.
 
 **Prepared updates swap at shutdown, or on their own image's boot.** An update
-an agent resolves on the isolated copy (a committed conflict, or blockers
-handed over with **Fix with an agent**) and every combined source-and-container
+an agent resolves on the isolated copy (a committed conflict, or a predicted
+overlap handed over with **Fix with an agent**) and every combined source-and-container
 update are *prepared*, not applied: the answer is committed on the reviewed
 release and recorded in `.platform-prepared-update.json`. The live checkout
 keeps serving its snapshot, and nothing edited afterwards enters the update.
@@ -1265,12 +1265,17 @@ queue. If the bounded window overflows, the explicit overflow marker and its
 cursor form one cut: omitted older notes remain owner-visible history but never
 surface later behind newer notes and invert causal order.
 
-A helper result that settles while its parent's turn runs travels the same
-way: a queued hidden carrier, steered by its cid, recorded delivered in the
-steer cut's own commit. Until that cut the result is owed. A turn that ends
-first runs the carrier as its own turn, whose completed Finalize records it;
-Stop drops the carrier, because the Delegation row still owes the result and
-the next turn's context carries it.
+A helper result that settles while a Codex parent's turn runs travels as a
+queued hidden carrier, steered by its cid and recorded delivered in the steer
+cut's own commit. Claude leaves routine helper results in their existing durable
+Delegation rows rather than interrupting its current command or putting a
+carrier ahead of an owner's immediate message. After the Claude turn settles,
+the ordinary activity continuation delivers the result; a stopped turn leaves
+it owed for the next owner turn. A Codex turn that ends before the steer runs
+the carrier as its next turn, whose completed Finalize records it. Until a cut
+or completed Finalize, the result is owed. Stop drops a queued carrier, because
+the Delegation row still owes the result and the next owner turn's context
+carries it.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly

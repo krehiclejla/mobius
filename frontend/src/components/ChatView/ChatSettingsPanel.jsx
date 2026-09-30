@@ -85,6 +85,7 @@ import {
 } from './providerSwitch.js'
 import {
   PROVIDER_AVAILABILITY_PHASE,
+  mobiusOutOfCredit,
   resolveProviderAvailability,
   visibleProviderModels,
 } from '../../lib/providerAvailability.js'
@@ -669,7 +670,11 @@ export default function ChatSettingsPanel({
                     <span>{m.label}</span>
                   </span>
                   <span className="csp-row__sub">
-                    {providerConfigured ? info.label : `${info.label} · Not connected`}
+                    {!providerConfigured
+                      ? `${info.label} · Not connected`
+                      : pid === 'mobius' && mobiusOutOfCredit(providerStatusQuery.data?.mobius)
+                        ? `${info.label} · No credit`
+                        : info.label}
                   </span>
                 </span>
                 <span className="csp-row__dot" />

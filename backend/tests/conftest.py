@@ -287,7 +287,7 @@ def fresh_db():
   # Content-addressed app bundles no longer overwrite app-<id>.js between
   # tests. Clear compiled too, otherwise the per-test id reset leaves the next
   # test seeing an earlier test's immutable artifact for the same numeric id.
-  for _sub in ("apps", "app-secrets", "app-runtime", "shared", "compiled", "cli-auth"):
+  for _sub in ("apps", "app-secrets", "app-runtime", "app-envs", "shared", "compiled", "cli-auth"):
     _shutil.rmtree(_os.path.join(_data_dir, _sub), ignore_errors=True)
 
   yield
@@ -371,3 +371,68 @@ def chat(db, owner_token):
   db.commit()
   db.refresh(c)
   return c
+
+
+# ── Parallel shards ──────────────────────────────────────────────────────
+# MOBIUS_TEST_SHARD=k/n runs one of n slices of the suite; CI runs the slices
+# as parallel jobs and combines their coverage. Whole files are assigned,
+# heaviest first, to the least-loaded slice by their recorded duration in
+# shard_weights.json; a file without a record weighs the median. A full run
+# with MOBIUS_TEST_RECORD_WEIGHTS=1 rewrites the record.
+import collections as _collections
+import json as _json
+import statistics as _statistics
+
+_SHARD_WEIGHTS = _Path(__file__).with_name("shard_weights.json")
+_recorded_weights: _collections.Counter = _collections.Counter()
+
+
+def _test_file(nodeid):
+  return nodeid.split("::", 1)[0]
+
+
+def _requested_shard():
+  spec = os.environ.get("MOBIUS_TEST_SHARD", "").strip()
+  if not spec:
+    return None
+  try:
+    index, total = (int(part) for part in spec.split("/"))
+  except ValueError:
+    index = total = 0
+  if not 1 <= index <= total:
+    raise pytest.UsageError(f"MOBIUS_TEST_SHARD must be k/n with 1 <= k <= n, not {spec!r}")
+  return index, total
+
+
+def pytest_collection_modifyitems(config, items):
+  shard = _requested_shard()
+  if shard is None:
+    return
+  index, total = shard
+  weights = _json.loads(_SHARD_WEIGHTS.read_text()) if _SHARD_WEIGHTS.exists() else {}
+  default = _statistics.median(weights.values()) if weights else 1.0
+  files = {_test_file(item.nodeid) for item in items}
+  loads = {slot: 0.0 for slot in range(1, total + 1)}
+  owner = {}
+  for path in sorted(files, key=lambda f: (-weights.get(f, default), f)):
+    slot = min(loads, key=lambda s: (loads[s], s))
+    owner[path] = slot
+    loads[slot] += weights.get(path, default)
+  keep = [item for item in items if owner[_test_file(item.nodeid)] == index]
+  if len(keep) != len(items):
+    config.hook.pytest_deselected(
+      items=[item for item in items if owner[_test_file(item.nodeid)] != index])
+    items[:] = keep
+
+
+def pytest_runtest_logreport(report):
+  if os.environ.get("MOBIUS_TEST_RECORD_WEIGHTS") == "1":
+    _recorded_weights[_test_file(report.nodeid)] += report.duration
+
+
+def pytest_sessionfinish(session):
+  # Only the controller sees every worker's reports.
+  if os.environ.get("MOBIUS_TEST_RECORD_WEIGHTS") != "1" or hasattr(session.config, "workerinput"):
+    return
+  record = {path: round(seconds, 1) for path, seconds in sorted(_recorded_weights.items())}
+  _SHARD_WEIGHTS.write_text(_json.dumps(record, indent=2) + "\n")

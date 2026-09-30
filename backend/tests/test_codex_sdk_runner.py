@@ -3140,6 +3140,23 @@ def test_upstream_stream_stall_explains_the_stop_and_keeps_the_detail():
   assert "No next token received for 60000ms" in message
 
 
+def test_mobius_gateway_out_of_credit_points_to_mobius_you():
+  # The gateway's 402 body; the same wording applies whenever a turn has
+  # nothing left to spend, before the first token or mid-answer.
+  error = (
+    "unexpected status 402 Payment Required: {\"error\":{\"message\":"
+    "\"not enough credits for the maximum request cost\",\"type\":"
+    "\"insufficient_credits\",\"code\":\"insufficient_credits\"}}"
+  )
+
+  from app.codex_events import MOBIUS_NO_CREDIT_MESSAGE
+
+  message = codex_sdk_runner._codex_user_error(error)
+
+  assert message == MOBIUS_NO_CREDIT_MESSAGE
+  assert "[Open Möbius · You](/shell/?app=identity)" in message
+
+
 def test_unknown_codex_error_stays_verbatim():
   error = "upstream returned 503"
   assert codex_sdk_runner._codex_user_error(error) == error
@@ -4433,6 +4450,9 @@ def test_run_codex_sdk_turn_controls_prompt_layers(monkeypatch, session_id):
     "FROZEN CONSTITUTION SNAPSHOT"
   )
   assert "$MOBIUS_GENERATED_DIR" in (
+    captured["thread_options"]["base_instructions"]
+  )
+  assert "Create downloadable deliverables only when the owner explicitly requests" in (
     captured["thread_options"]["base_instructions"]
   )
   assert captured["thread_options"]["developer_instructions"] == ""

@@ -20,14 +20,13 @@ import logging
 import os
 import re
 import signal
-import sys
 import weakref
 from datetime import timedelta
 from pathlib import Path
 
 from fastapi import HTTPException
 
-from app import auth, models, service_preload
+from app import app_python_env, auth, models, service_preload
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.config import get_settings
 from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES
@@ -117,6 +116,15 @@ def service_entry(app, service: dict) -> Path:
   return entry
 
 
+def service_python_env(app, entry: Path) -> Path | None:
+  """The accepted service's own Python env, None when it declares none."""
+  try:
+    return app_python_env.resolve_env(get_settings().data_dir, app.id, entry.parent)
+  except app_python_env.PythonEnvUnavailable as exc:
+    log.warning("App service %s cannot start: %s", app.slug, exc)
+    raise HTTPException(503, str(exc)) from exc
+
+
 def service_environment(app, owner, service: dict, *, public: bool) -> dict[str, str]:
   """The environment of one invocation; its APP_TOKEN's authority follows the caller.
 
@@ -201,12 +209,13 @@ def _response_headers(value, *, public: bool) -> dict[str, str]:
 
 
 async def _run_spawned(
-  entry: Path, environment: dict[str, str], request_bytes: bytes, timeout_seconds: float,
+  python: str, entry: Path, environment: dict[str, str], request_bytes: bytes,
+  timeout_seconds: float,
 ) -> tuple[bytes, bytes, int]:
   """Run one request in a fresh interpreter; return (stdout, stderr, exit code)."""
   try:
     spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-      sys.executable,
+      python,
       str(entry),
       stdin=asyncio.subprocess.PIPE,
       stdout=asyncio.subprocess.PIPE,
@@ -310,9 +319,14 @@ async def invoke_service(
   try:
     async with slot, _global_slots[lane]:
       entry = service_entry(app, service)
-      environment = service_environment(app, owner, service, public=public)
+      python_env = service_python_env(app, entry)
+      python = app_python_env.python_for(python_env)
+      # The preload host and its request children inherit this PATH too.
+      environment = app_python_env.activated_environment(
+        service_environment(app, owner, service, public=public), python_env,
+      )
       outcome = None
-      host = service_preload.ready_host(app, entry, environment)
+      host = service_preload.ready_host(app, python, entry, environment)
       if host is not None:
         try:
           outcome = await service_preload.run(
@@ -326,7 +340,9 @@ async def invoke_service(
         except OSError as exc:
           raise HTTPException(502, "App service failed before accepting its request.") from exc
       if outcome is None:
-        outcome = await _run_spawned(entry, environment, request_bytes, timeout_seconds)
+        outcome = await _run_spawned(
+          python, entry, environment, request_bytes, timeout_seconds,
+        )
       stdout, stderr, returncode = outcome
       if returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]

@@ -784,7 +784,11 @@ async def move_app_file(
       raise HTTPException(status_code=404, detail="Source not found.")
     if dst.exists():
       raise HTTPException(status_code=409, detail="Destination already exists.")
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src in dst.parents:
+      raise HTTPException(
+        status_code=400, detail="Cannot move a folder into itself.",
+      )
+    storage_io.make_parent_folders(dst)
     shutil.move(str(src), str(dst))
     # Carry the MIME sidecar(s) to the new path so the moved bytes keep their
     # stored type, and the old path keeps no stale sidecar.

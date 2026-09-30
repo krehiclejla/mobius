@@ -144,6 +144,7 @@ def _worker_paths(tmp_path: Path, monkeypatch):
   monkeypatch.setattr(host, "LOCK", state / "replace.lock")
   monkeypatch.setattr(host, "STATUS", state / "status.json")
   monkeypatch.setattr(host, "IMAGES", state / "images.json")
+  monkeypatch.setattr(host, "TRANSACTION", state / "transaction.json")
   data = tmp_path / "data"
   data.mkdir()
   config = {
@@ -377,7 +378,7 @@ def test_replacement_drains_then_rolls_back_after_cutover_error(tmp_path, monkey
 
   def compose(_config, *args, image=None, **_kwargs):
     order.append(f"compose:{image}")
-    if image == f"{host.IMAGE}:sha-{expected}":
+    if image == host.TARGET_TAG:
       raise RuntimeError("cutover failed")
 
   monkeypatch.setattr(host, "compose", compose)
@@ -390,7 +391,7 @@ def test_replacement_drains_then_rolls_back_after_cutover_error(tmp_path, monkey
   assert host.run() == 1
   assert order == [
     "drain",
-    f"compose:{host.IMAGE}:sha-{expected}",
+    f"compose:{host.TARGET_TAG}",
     f"compose:{host.ROLLBACK_TAG}",
   ]
   assert statuses[-1]["state"] == "rolled_back"
@@ -405,7 +406,11 @@ def test_success_reports_when_chat_handoff_receipt_cannot_be_retired(
   (inbox / "request.json").write_text(
     f'{{"version":1,"expected_sha":"{expected}"}}', encoding="utf-8",
   )
-  monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "old"))
+  # The running container holds the previous image until Compose replaces it.
+  replaced = []
+  monkeypatch.setattr(
+    host, "app_container", lambda _config: ("cid", "new" if replaced else "old"),
+  )
   monkeypatch.setattr(host, "require_pull_space", lambda _image: None)
   monkeypatch.setattr(host.subprocess, "run", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "inspect_image", lambda _image, template: (
@@ -414,7 +419,7 @@ def test_success_reports_when_chat_handoff_receipt_cannot_be_retired(
     "amd64" if "Architecture" in template else "new"
   ))
   monkeypatch.setattr(host, "request_drain", lambda *_args: None)
-  monkeypatch.setattr(host, "compose", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(host, "compose", lambda *_args, **_kwargs: replaced.append(1))
   monkeypatch.setattr(host, "wait_healthy", lambda *_args, **_kwargs: True)
   monkeypatch.setattr(host, "retain_images", lambda *_args: None)
   monkeypatch.setattr(host, "verify_served_generation", lambda *_args: None)
@@ -423,6 +428,7 @@ def test_success_reports_when_chat_handoff_receipt_cannot_be_retired(
     lambda _config, _cid, command, _operation, **_kwargs:
       command != "finalize-cutover",
   )
+  monkeypatch.setattr(host, "adopt_from_image", lambda _image: "not adopted: test")
   statuses = []
   monkeypatch.setattr(
     host, "write_status", lambda _config, **fields: statuses.append(fields) or fields,

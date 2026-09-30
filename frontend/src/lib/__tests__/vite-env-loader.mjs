@@ -25,6 +25,7 @@ const REACT_SHIM = new URL(
 // silently swap React out from under anything that later imports for real.
 const REACT_SHIMMED_MODULES = [
   '/components/AppIcon.jsx',
+  '/components/SettingsView/GithubConnection.jsx',
   '/components/Shell/useAppIntentNavigation.js',
   '/components/Shell/useShellUpdateController.js',
   '/components/Shell/useVisibleAppPresence.js',

@@ -10,6 +10,7 @@ import { clearExplicitOwnerSession } from '../../lib/explicitLogout.js'
 import { stopShellInstallPassPreparation } from '../../lib/shellInstallPass.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
+  mobiusOutOfCredit,
   PROVIDER_AVAILABILITY_PHASE,
   resolveProviderAvailability,
 } from '../../lib/providerAvailability.js'
@@ -24,6 +25,7 @@ import { modelEfforts, validEffort } from '../ui/modelEfforts.js'
 import ManageModelsModal from '../ChatView/ManageModelsModal.jsx'
 import PlatformUpdates from './PlatformUpdates.jsx'
 import ProviderUsage from './ProviderUsage.jsx'
+import GithubConnection from './GithubConnection.jsx'
 import {
   formatPlanStatus,
   formatTrialTimeLeft,
@@ -325,6 +327,7 @@ export default function SettingsView({
   const mobiusExpiryTime = Date.parse(mobiusExpiryRaw || '')
   const mobiusHasExpiry = Number.isFinite(mobiusExpiryTime)
   const mobiusExpired = mobiusHasExpiry && mobiusExpiryTime <= Date.now()
+  const mobiusNoCredit = mobiusOutOfCredit(providerStatusQuery.data?.mobius)
   // Live-probed CLI versions (null when the CLI isn't installed or
   // didn't respond). Read-only — updates happen via the agent, not here.
   const claudeVersion = settingsQuery.data?.claude_version
@@ -415,9 +418,9 @@ export default function SettingsView({
   const mobiusAllowance = providerAllowance('mobius', mobiusUsageQuery.data)
   const mobiusTrialSubtitle = mobiusAuthenticated
     ? (
-        mobiusExpired
-          ? 'Trial expired'
-          : (
+        mobiusNoCredit
+          ? 'No credit. Activate your trial or see your options in Möbius · You.'
+          : mobiusExpired ? 'Trial expired' : (
               typeof mobiusAllowance.usedPercent === 'number'
                 ? providerAllowanceSummary('mobius', mobiusAllowance)
                 : formatTrialTimeLeft(mobiusExpiryRaw) || 'Trial usage unavailable'
@@ -988,7 +991,7 @@ export default function SettingsView({
           ref={(node) => setSetupFocusRef('ai-providers', node)}
           tabIndex={-1}
         >
-          <h2 className="settings__section-title">AI providers</h2>
+          <h2 className="settings__section-title">Accounts</h2>
 
           {providerReady ? (
             <>
@@ -1070,9 +1073,9 @@ export default function SettingsView({
                     connected={mobiusAuthenticated}
                     subtitle={mobiusTrialSubtitle}
                     statusNode={(
-                      <StatusDot color={mobiusAuthenticated && !mobiusExpired ? '--green' : '--muted'}>
+                      <StatusDot color={mobiusAuthenticated && !mobiusExpired && !mobiusNoCredit ? '--green' : '--muted'}>
                         {mobiusAuthenticated
-                          ? (mobiusExpired ? 'Trial expired' : 'Trial active')
+                          ? (mobiusNoCredit ? 'No credit' : mobiusExpired ? 'Trial expired' : 'Trial active')
                           : 'Sign in from Möbius · You'}
                       </StatusDot>
                     )}
@@ -1081,102 +1084,7 @@ export default function SettingsView({
                     onToggleExpand={openMobiusYou}
                   />
                 )}
-
-                <ProviderRow
-                  name="Chat model"
-                  connected={hasConfiguredProvider}
-                  disabled={!hasConfiguredProvider}
-                  subtitle={hasConfiguredProvider
-                    ? 'Choose which models appear. New chats use your last pick.'
-                    : 'Connect an AI provider to choose chat models.'}
-                  statusNode={
-                    <span className="provider-row__status-text settings__last-model">
-                      {!hasConfiguredProvider ? 'No provider connected' : lastModelLabel ? (
-                        <>
-                          Last model: <span className="settings__standard-highlight">{lastModelLabel}</span>
-                        </>
-                      ) : 'No default yet'}
-                    </span>
-                  }
-                  actionLabel="Configure"
-                  expanded={false}
-                  onToggleExpand={() => setManageModelsOpen(true)}
-                />
               </div>
-
-              <div
-                className={
-                  `settings-agent-group${hasConfiguredProvider ? '' : ' settings-agent-group--disabled'}`
-                  + (attentionSection === 'background-agents' ? ' settings-setup-target' : '')
-                }
-                id="settings-background-agents"
-                ref={(node) => setSetupFocusRef('background-agents', node)}
-                tabIndex={-1}
-              >
-                <div className="settings-agent-group__head">
-                  <div className="settings-agent-group__title-row">
-                    <h3 className="settings__agent-title">Background agents</h3>
-                  </div>
-                  <p className="settings__subtext settings__subtext--tight">
-                    {hasConfiguredProvider
-                      ? 'Used for memory, reflection, and other automatic tasks. Tried in order.'
-                      : 'Connect an AI provider to configure automatic tasks.'}
-                  </p>
-                </div>
-                <div
-                  className={`settings-bg-list${backgroundCommitting ? ' settings-bg-list--committing' : ''}`}
-                >
-                  {effectiveBackgroundDraft.map((row, index) => (
-                    <BackgroundProviderRow
-                      key={row.provider}
-                      row={row}
-                      providerInfo={modelProviderInfo[row.provider]}
-                      index={index}
-                      models={modelsForProvider(row.provider)}
-                      dragging={backgroundDrag?.fromIndex === index}
-                      dropTarget={
-                        backgroundDrag?.toIndex === index
-                        && backgroundDrag?.fromIndex !== index
-                      }
-                      dragStyle={backgroundDragStyleForIndex(index)}
-                      reorderMode
-                      rowRef={(node) => {
-                        backgroundRowRefs.current[index] = node
-                      }}
-                      onModelChange={(model, effort) => setBackgroundProviderChoice(row.provider, {
-                        enabled: !!model,
-                        model: model || defaultBackgroundModel(row.provider),
-                        ...(effort ? { effort } : {}),
-                      })}
-                      onEffortChange={(effort) => setBackgroundProviderChoice(row.provider, { effort })}
-                      onMove={(delta) => {
-                        // Keyboard reorder is disabled while a pointer drag
-                        // is live, so the two reorder paths can't interleave
-                        // and mutate the list from under each other.
-                        if (backgroundDrag) return
-                        moveBackgroundProvider(index, index + delta)
-                      }}
-                      configuredProviders={configuredProviders}
-                      onReorderStart={startBackgroundReorder}
-                    />
-                  ))}
-                </div>
-                {backgroundError && (
-                  <Alert
-                    color="info"
-                    variant="soft"
-                    description={backgroundError}
-                  />
-                )}
-              </div>
-              {manageModelsOpen && (
-                <ManageModelsModal
-                  onClose={() => setManageModelsOpen(false)}
-                  providerOrder={modelProviderOrder}
-                  providerInfo={modelProviderInfo}
-                  configuredProviders={configuredProviders}
-                />
-              )}
             </>
           ) : providerError ? (
             // First-ever open with no persisted cache and the fetch
@@ -1204,7 +1112,116 @@ export default function SettingsView({
               Loading providers…
             </div>
           )}
+          <div className="settings__providers">
+            <GithubConnection
+              active={active}
+              focusRef={(node) => setSetupFocusRef('github', node)}
+              attention={attentionSection === 'github'}
+            />
+          </div>
         </section>
+
+        {providerReady && (
+          <section className="settings__section" aria-labelledby="settings-models-title">
+            <h2 className="settings__section-title" id="settings-models-title">AI models</h2>
+            <div className="settings__providers">
+              <ProviderRow
+                name="Chat model"
+                connected={hasConfiguredProvider}
+                disabled={!hasConfiguredProvider}
+                subtitle={hasConfiguredProvider
+                  ? 'Choose which models appear. New chats use your last pick.'
+                  : 'Connect an AI provider to choose chat models.'}
+                statusNode={
+                  <span className="provider-row__status-text settings__last-model">
+                    {!hasConfiguredProvider ? 'No provider connected' : lastModelLabel ? (
+                      <>
+                        Last model: <span className="settings__standard-highlight">{lastModelLabel}</span>
+                      </>
+                    ) : 'No default yet'}
+                  </span>
+                }
+                actionLabel="Configure"
+                expanded={false}
+                onToggleExpand={() => setManageModelsOpen(true)}
+              />
+            </div>
+
+            <div
+              className={
+                `settings-agent-group${hasConfiguredProvider ? '' : ' settings-agent-group--disabled'}`
+                + (attentionSection === 'background-agents' ? ' settings-setup-target' : '')
+              }
+              id="settings-background-agents"
+              ref={(node) => setSetupFocusRef('background-agents', node)}
+              tabIndex={-1}
+            >
+              <div className="settings-agent-group__head">
+                <div className="settings-agent-group__title-row">
+                  <h3 className="settings__agent-title">Background agents</h3>
+                </div>
+                <p className="settings__subtext settings__subtext--tight">
+                  {hasConfiguredProvider
+                    ? 'Used for memory, reflection, and other automatic tasks. Tried in order.'
+                    : 'Connect an AI provider to configure automatic tasks.'}
+                </p>
+              </div>
+              <div
+                className={`settings-bg-list${backgroundCommitting ? ' settings-bg-list--committing' : ''}`}
+              >
+                {effectiveBackgroundDraft.map((row, index) => (
+                  <BackgroundProviderRow
+                    key={row.provider}
+                    row={row}
+                    providerInfo={modelProviderInfo[row.provider]}
+                    index={index}
+                    models={modelsForProvider(row.provider)}
+                    dragging={backgroundDrag?.fromIndex === index}
+                    dropTarget={
+                      backgroundDrag?.toIndex === index
+                      && backgroundDrag?.fromIndex !== index
+                    }
+                    dragStyle={backgroundDragStyleForIndex(index)}
+                    reorderMode
+                    rowRef={(node) => {
+                      backgroundRowRefs.current[index] = node
+                    }}
+                    onModelChange={(model, effort) => setBackgroundProviderChoice(row.provider, {
+                      enabled: !!model,
+                      model: model || defaultBackgroundModel(row.provider),
+                      ...(effort ? { effort } : {}),
+                    })}
+                    onEffortChange={(effort) => setBackgroundProviderChoice(row.provider, { effort })}
+                    onMove={(delta) => {
+                      // Keyboard reorder is disabled while a pointer drag
+                      // is live, so the two reorder paths can't interleave
+                      // and mutate the list from under each other.
+                      if (backgroundDrag) return
+                      moveBackgroundProvider(index, index + delta)
+                    }}
+                    configuredProviders={configuredProviders}
+                    onReorderStart={startBackgroundReorder}
+                  />
+                ))}
+              </div>
+              {backgroundError && (
+                <Alert
+                  color="info"
+                  variant="soft"
+                  description={backgroundError}
+                />
+              )}
+            </div>
+            {manageModelsOpen && (
+              <ManageModelsModal
+                onClose={() => setManageModelsOpen(false)}
+                providerOrder={modelProviderOrder}
+                providerInfo={modelProviderInfo}
+                configuredProviders={configuredProviders}
+              />
+            )}
+          </section>
+        )}
 
         <section className="settings__section settings__section--compact settings__section--appearance">
           <div className="settings__appearance">
