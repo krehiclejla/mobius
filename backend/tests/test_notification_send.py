@@ -128,6 +128,10 @@ def test_tag_outside_the_short_safe_charset_is_rejected(client, auth, tag):
   {"body": "x" * 8001},
   {"icon": "https://tracker.example/pixel.png"},
   {"icon": "//tracker.example/pixel.png"},
+  # Browser URL parsing removes these controls, turning /<control>/ into //.
+  {"icon": "/\n/tracker.example/pixel.png"},
+  {"icon": "/\r/tracker.example/pixel.png"},
+  {"icon": "/\t/tracker.example/pixel.png"},
   {"target": "/shell/?app=1&x=" + "x" * 2048},
   {"actions": [{"action": f"a{i}", "title": "Go"} for i in range(5)]},
   {"actions": [{"action": "open", "title": "x" * 201}]},

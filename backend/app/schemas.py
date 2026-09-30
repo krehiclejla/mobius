@@ -882,6 +882,7 @@ class NotificationSendRequest(BaseModel):
   def require_same_origin_icon(cls, value: str | None) -> str | None:
     if value is not None and (
       not value.startswith("/") or value.startswith("//") or "\\" in value
+      or any(char in value for char in "\t\r\n")
     ):
       raise ValueError("icon must be a same-origin path such as /icons/icon-192.png")
     return value
