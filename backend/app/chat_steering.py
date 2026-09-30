@@ -7,10 +7,8 @@ from app.runner_registry import RunnerKind, registry
 def has_live_steerable_turn(chat_id: str, provider: str) -> bool:
   """Whether the current provider handle can accept an in-band message."""
   if provider == "claude":
-    return isinstance(
-      registry.get_handle(chat_id, RunnerKind.CLAUDE_SDK),
-      claude_sdk_runner.ActiveClaudeClient,
-    )
+    handle = registry.get_handle(chat_id, RunnerKind.CLAUDE_SDK)
+    return isinstance(handle, claude_sdk_runner.ActiveClaudeClient) and handle.is_steerable
   handle = registry.get_handle(chat_id, RunnerKind.CODEX_SDK)
   return (
     isinstance(handle, codex_sdk_runner.ActiveCodexTurn)

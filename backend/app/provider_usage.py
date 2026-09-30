@@ -97,7 +97,16 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 _provider_usage_cache: dict[tuple[str, str], _CachedProviderUsage] = {}
 _provider_usage_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_provider_usage_generation: dict[tuple[str, str], int] = {}
 _claude_reset_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def forget_provider_usage(provider_id: str, data_dir: str) -> None:
+  """Drop readings from the previous sign-in before this account is shown."""
+  key = _cache_key(provider_id, data_dir)
+  _provider_usage_generation[key] = _provider_usage_generation.get(key, 0) + 1
+  _provider_usage_cache.pop(key, None)
+  _last_reading_path(data_dir, provider_id).unlink(missing_ok=True)
 
 
 class ClaudeResetOfferChanged(RuntimeError):
@@ -1294,22 +1303,33 @@ async def read_provider_usage(
       prior = _restored_reading(provider_id, data_dir)
       if prior is not None:
         _provider_usage_cache[key] = prior
-    refusals = 0
-    try:
-      snapshot = await _provider_snapshot(provider_id, data_dir)
-      next_check_at = time.monotonic() + _PROVIDER_USAGE_FRESH_SECONDS
-    except ProviderUsageRefused as refused:
-      refusals = (prior.consecutive_refusals if prior else 0) + 1
-      backoff = refused.retry_after or min(
-        _PROVIDER_USAGE_REFUSED_BACKOFF_SECONDS * 2 ** (refusals - 1),
-        _PROVIDER_USAGE_STALE_SECONDS,
-      )
-      log.info(
-        "%s usage read rate-limited; next probe in %.0fs",
-        provider_id, backoff,
-      )
-      snapshot = _unavailable(_configured_plan_label(provider_id, data_dir))
-      next_check_at = time.monotonic() + backoff
+    # A sign-in can finish while an earlier account's read is in flight. Do
+    # not let that older response repopulate the cache after sign-in cleared it.
+    for attempt in range(2):
+      generation = _provider_usage_generation.get(key, 0)
+      refusals = 0
+      try:
+        snapshot = await _provider_snapshot(provider_id, data_dir)
+        next_check_at = time.monotonic() + _PROVIDER_USAGE_FRESH_SECONDS
+      except ProviderUsageRefused as refused:
+        refusals = (prior.consecutive_refusals if prior else 0) + 1
+        backoff = refused.retry_after or min(
+          _PROVIDER_USAGE_REFUSED_BACKOFF_SECONDS * 2 ** (refusals - 1),
+          _PROVIDER_USAGE_STALE_SECONDS,
+        )
+        log.info(
+          "%s usage read rate-limited; next probe in %.0fs",
+          provider_id, backoff,
+        )
+        snapshot = _unavailable(_configured_plan_label(provider_id, data_dir))
+        next_check_at = time.monotonic() + backoff
+      if generation == _provider_usage_generation.get(key, 0):
+        break
+      prior = None
+    else:
+      # A second sign-in during the retry is unusual; stay honest instead of
+      # assigning either in-flight account's reading to the new one.
+      return _unavailable(_configured_plan_label(provider_id, data_dir))
 
     now = time.monotonic()
     if snapshot.get("state") == "ready":

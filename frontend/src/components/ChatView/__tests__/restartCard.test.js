@@ -11,6 +11,10 @@ import {
   restartCardStatusLabel,
 } from '../restartCard.js'
 import QuestionCard from '../QuestionCard.jsx'
+import {
+  chatDetailCacheValue, shouldRefetchTranscriptForRuntime,
+} from '../../../lib/chatDetailCache.js'
+import { carryDurableBlockState } from '../streamPromotion.js'
 
 
 const action = {
@@ -201,4 +205,86 @@ test('closed Restart card explains the outcome without dead controls', () => {
   assert.match(html, /Nothing was restarted/)
   assert.doesNotMatch(html, /textarea/)
   assert.doesNotMatch(html, /qcard__opt/)
+})
+
+
+test('observed restart explains the hold without granting or revoking the offered action', () => {
+  const current = {
+    ...action, version: 2, cancel_option_id: undefined,
+    observation: { observed_at: '2025-01-01T12:00:00Z', continuation: 'restart_required' },
+  }
+  const html = renderToStaticMarkup(createElement(QuestionCard, {
+    chatId: 'chat', questionId: 'observed-question', platformAction: current,
+    questions: [{ ...questions[0], options: [{ id: 'restart-id', label: 'Restart now' }] }],
+    disabled: false,
+  }))
+  assert.match(html, /Möbius restarted/)
+  assert.match(html, /restored changes need another approved restart/)
+  assert.match(html, /Restart now will restart Möbius again/)
+  assert.match(html, /Restart again, or reply below/)
+  assert.match(html, />Restart now</)
+  assert.match(html, /textarea/)
+  assert.match(html, />Continue</)
+  assert.doesNotMatch(html, /qcard--answered/)
+  assert.equal(isDurableRestartOffer(current), true)
+})
+
+
+test('observed restart receipt survives a written response and retains its text', () => {
+  const prompt = questions[0].question
+  const html = renderToStaticMarkup(createElement(QuestionCard, {
+    chatId: 'chat', questionId: 'observed-response',
+    platformAction: {
+      ...action, version: 2, status: 'responded',
+      observation: { observed_at: '2025-01-01T12:00:00Z', continuation: 'cancelled' },
+    },
+    answeredMap: { [prompt]: 'Please check the restart status.' },
+    submittedOptions: {}, questions, disabled: true,
+  }))
+  assert.match(html, /Möbius restarted/)
+  assert.match(html, /no longer waiting to resume/)
+  assert.match(html, /Please check the restart status\./)
+  assert.doesNotMatch(html, /qcard__opt/)
+  assert.doesNotMatch(html, /Restart now will restart/)
+})
+
+
+test('observation distinguishes restoring work, waiting, and delivered continuation', () => {
+  for (const [continuation, copy] of [
+    ['restoring_edits', /while Möbius restores work/],
+    ['pending', /waiting to continue/],
+    ['delivered', /chat resumed to check/],
+  ]) {
+    assert.match(restartCardStatusDetail({
+      ...action, status: 'activated',
+      observation: { observed_at: '2025-01-01T12:00:00Z', continuation },
+    }), copy)
+  }
+})
+
+
+test('reopening a cached card refreshes missed restart receipts and hold changes', () => {
+  const detail = {
+    updated_at: '2025-01-01T11:55:00Z', messages: [], total: 0, offset: 0,
+    restart_observation_key: '[[],null]',
+  }
+  const cached = chatDetailCacheValue(detail)
+  const runtime = { ...detail, running: false }
+  assert.equal(shouldRefetchTranscriptForRuntime(cached, runtime), false)
+  for (const key of ['observed-restoring', 'observed-restart-required', 'observed-pending']) {
+    const changed = { ...runtime, restart_observation_key: key }
+    assert.equal(shouldRefetchTranscriptForRuntime(cached, changed), true)
+    const refreshed = chatDetailCacheValue({ ...detail, restart_observation_key: key })
+    assert.equal(shouldRefetchTranscriptForRuntime(refreshed, changed), false)
+  }
+  assert.equal(shouldRefetchTranscriptForRuntime({ ...cached, restartObservationKey: null }, runtime), true)
+})
+
+
+test('a replayed original question cannot erase its authoritative restart receipt', () => {
+  const old = { type: 'question', question_id: 'q', questions, platform_action: action }
+  const observed = { ...old, platform_action: { ...action, observation: {
+    observed_at: '2025-01-01T12:00:00Z', continuation: 'restart_required',
+  } } }
+  assert.deepEqual(carryDurableBlockState([old], [observed])[0], observed)
 })

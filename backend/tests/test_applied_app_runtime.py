@@ -1,5 +1,6 @@
 """Applied source files are immutable to editing and retained while in use."""
 
+import asyncio
 import fcntl
 import json
 import shutil
@@ -88,6 +89,40 @@ def test_runtime_pruning_waits_for_readers_then_keeps_current_and_previous(db, r
     pin.close()
   assert runtime.prune_runtime(row, previous_revision=revisions[-2]) == 2
   assert {path.name for path in runtime.runtime_parent(row.id).iterdir()} == set(revisions[-2:])
+
+
+@pytest.mark.asyncio
+async def test_async_runtime_pin_does_not_block_loop_and_closes_cancelled_attempts(db, monkeypatch):
+  row, _ = _legacy_app(db)
+  lock_dir = Path(get_settings().data_dir) / "run" / "app-runtime-readers"
+  lock_dir.mkdir(parents=True, exist_ok=True)
+  exclusive = (lock_dir / f"{row.id}.lock").open("a")
+  fcntl.flock(exclusive, fcntl.LOCK_EX)
+  attempts = []
+  original_flock = runtime.fcntl.flock
+
+  def track_attempt(handle, operation):
+    if operation == fcntl.LOCK_SH | fcntl.LOCK_NB:
+      attempts.append(handle)
+    return original_flock(handle, operation)
+
+  monkeypatch.setattr(runtime.fcntl, "flock", track_attempt)
+  task = asyncio.create_task(runtime.hold_runtime_async(row.id))
+  try:
+    await asyncio.wait_for(asyncio.sleep(0.12), timeout=0.5)
+    assert len(attempts) >= 2
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, timeout=0.5)
+    assert all(handle.closed for handle in attempts)
+  finally:
+    task.cancel()
+    exclusive.close()
+
+  pin = await asyncio.wait_for(runtime.hold_runtime_async(row.id), timeout=0.5)
+  assert not pin.closed
+  pin.close()
 
 
 def test_migration_preserves_deployed_ignored_static_but_pins_accepted_scripts(db):

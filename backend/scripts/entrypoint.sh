@@ -1058,35 +1058,34 @@ fi
 _start_platform_restart_poller
 
 # The probe polls the app's /api/health (127.0.0.1, never routed outside the
-# container) with a 90-second timeout (generous for slow first-boots with DB
-# migrations). It starts cron only after FastAPI lifespan has completed.
+# container) and starts cron only after FastAPI lifespan has completed. It
+# waits as long as boot takes: a slow boot (migrations, a busy host) must not
+# leave every app's scheduled jobs silently disabled until the next restart.
 #
 # pgrep self-match trap: we do NOT use `until ! pgrep -f uvicorn` or
 # similar — the probe waits on the outcome (/api/health 200), not on a
 # process name. See feedback_pgrep_self_match_in_monitor_loops.md.
 _health_url="http://127.0.0.1:${_public_port}/api/health"
 (
-  # Wait up to 90 seconds for /api/health to return 200.
-  for i in $(seq 1 90); do
-    if curl -sf "$_health_url" > /dev/null 2>&1; then
-      # Lifespan has completed, including app-cron supervision. Start cron now
-      # (as root; entries themselves execute as mobius).
-      if [ -f /data/run/app-cron-supervision-ready ]; then
-        cron
-        if command -v pgrep > /dev/null 2>&1; then
-          pgrep -x cron > /dev/null || echo "WARNING: cron daemon failed to start" >&2
-        fi
-      else
-        echo "WARNING: app cron supervision did not complete; cron remains disabled (fail closed)" >&2
-      fi
-      echo "Platform health probe: /api/health OK."
-      exit 0
-    fi
+  _waited=0
+  until curl -sf "$_health_url" > /dev/null 2>&1; do
     sleep 1
+    _waited=$((_waited + 1))
+    if [ "$_waited" -eq 90 ]; then
+      echo "Platform health probe: /api/health not ready after 90s; cron starts once it is." >&2
+    fi
   done
-  # 90 seconds elapsed without a 200 — uvicorn failed to start.
-  echo "Platform health probe: /api/health did not return 200 within 90s — boot failure." >&2
-  exit 1
+  # Lifespan has completed, including app-cron supervision. Start cron now
+  # (as root; entries themselves execute as mobius).
+  if [ -f /data/run/app-cron-supervision-ready ]; then
+    cron
+    if command -v pgrep > /dev/null 2>&1; then
+      pgrep -x cron > /dev/null || echo "WARNING: cron daemon failed to start" >&2
+    fi
+  else
+    echo "WARNING: app cron supervision did not complete; cron remains disabled (fail closed)" >&2
+  fi
+  echo "Platform health probe: /api/health OK."
 ) &
 
 # Make agent helper scripts callable by bare name. The Bash tool's shell

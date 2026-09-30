@@ -20,6 +20,20 @@ from app.config import get_settings
 from app.agent_activity import EMPTY_AGENT_ACTIVITY_BINDING
 
 
+def test_delivery_instruction_keeps_reports_in_chat_unless_a_file_is_requested(tmp_path):
+  directory = tmp_path / "deliverables" / "inbox"
+
+  instruction = gf.delivery_instruction(directory)
+
+  assert "Respond in chat by default, including reports, reviews, plans, and summaries." in instruction
+  assert "Create downloadable deliverables only when the owner explicitly requests" in instruction
+  assert "A request for a report or plan alone is not a request for an attachment" in instruction
+  assert "Do not also create a Markdown document or other downloadable copy" in instruction
+  assert f"When a deliverable is requested, save the finished file directly in {directory}." in instruction
+  assert "$MOBIUS_GENERATED_DIR" in instruction
+  assert "Keep temporary and source files outside it." in instruction
+
+
 def _write_row(db, chat, *, name, path, size=11, mime_type="application/pdf"):
   row = models.GeneratedFile(
     chat_id=chat.id, name=name, path=path, size=size, mime_type=mime_type,
@@ -62,6 +76,25 @@ def test_serve_generated_file_by_recorded_name(client, db, auth, chat):
   assert res.content == b"%PDF-1.4 fake"
   assert res.headers["content-disposition"] == 'attachment; filename="report.pdf"'
   assert res.headers["x-content-type-options"] == "nosniff"
+
+
+def test_serve_generated_file_from_valid_non_v4_chat(client, db, auth):
+  chat_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "generated-file-test-chat"))
+  created = client.post(
+    "/api/chats", json={"id": chat_id, "title": "Test chat"}, headers=auth,
+  )
+  assert created.status_code == 200
+  chat = db.get(models.Chat, chat_id)
+  stored_name = _stored_file(chat)
+  _write_row(db, chat, name="report.pdf", path=stored_name)
+
+  res = client.get(
+    f"/api/chats/{chat_id}/generated-files/report.pdf",
+    params={"token": _media_token(client, auth, chat_id)},
+  )
+
+  assert res.status_code == 200
+  assert res.content == b"%PDF-1.4 fake"
 
 
 def test_safe_generated_file_preview_opens_inline(client, db, auth, chat):

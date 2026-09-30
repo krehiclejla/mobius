@@ -63,12 +63,11 @@ def _install_source_apply(monkeypatch):
   monkeypatch.setattr(dc.platform_update, "prepare_platform_update", apply)
 
 
-def _install_reviewed_image_plan(monkeypatch, blockers=None):
+def _install_reviewed_image_plan(monkeypatch):
   monkeypatch.setattr(
     dc.platform_update, "reviewed_container_rebuild_plan",
     lambda **plan: {
       **plan, "activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]},
-      "blockers": blockers or [],
     },
   )
 
@@ -248,7 +247,6 @@ async def test_reviewed_rebuild_uses_exact_plan_target_and_digest(monkeypatch):
         "level": "image_rebuild", "required_actions": ["image_rebuild"], "deployment": "railway",
         "reasons": [], "guidance": [],
       },
-      "blockers": [],
     },
   )
 
@@ -298,7 +296,6 @@ async def test_reviewed_immutable_plan_does_not_reconsult_moving_ghcr_main(
         "level": "image_rebuild", "required_actions": ["image_rebuild"], "deployment": "railway",
         "reasons": [], "guidance": [],
       },
-      "blockers": [],
     },
   )
 
@@ -779,14 +776,14 @@ async def test_reviewed_rebuild_selects_managed_handoff_and_checks_source_off_ev
   monkeypatch.setattr(dc, "get_settings", lambda: settings)
   _install_source_apply(monkeypatch)
   request_thread = threading.get_ident()
-  blocker_threads = []
+  review_threads = []
 
-  def blockers(*_args, **_kwargs):
-    blocker_threads.append(threading.get_ident())
-    return {"activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]}, "blockers": []}
+  def review(*_args, **_kwargs):
+    review_threads.append(threading.get_ident())
+    return {"activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]}}
 
   monkeypatch.setattr(
-    dc.platform_update, "reviewed_container_rebuild_plan", blockers,
+    dc.platform_update, "reviewed_container_rebuild_plan", review,
   )
   calls = []
 
@@ -823,8 +820,8 @@ async def test_reviewed_rebuild_selects_managed_handoff_and_checks_source_off_ev
   assert status["deployment"] == "railway"
   assert status["state"] == "queued"
   # Once before preparing and once as the final check before the handoff.
-  assert len(blocker_threads) == 2
-  assert all(thread_id != request_thread for thread_id in blocker_threads)
+  assert len(review_threads) == 2
+  assert all(thread_id != request_thread for thread_id in review_threads)
   assert calls == [
     ("POST", "prepare", {
       "expected_sha": "a" * 40, "expected_digest": _TEST_DIGEST,
@@ -1193,7 +1190,7 @@ async def test_retired_runtime_overlay_helper_cannot_replace_current_image(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [
-  "update_plan_stale", "external_activation_required", "local_runtime_changes",
+  "update_plan_stale", "external_activation_required",
 ])
 async def test_self_hosted_revalidates_full_review_after_controller_readiness(
   tmp_path, monkeypatch, failure,
@@ -1210,8 +1207,8 @@ async def test_self_hosted_revalidates_full_review_after_controller_readiness(
     status = await read_status()
     readiness_reads.append(True)
     # A slow controller read can outlast edits even after Apply's own second
-    # validation. The final check must include identity, external actions and
-    # preservation, not just a second list of image blockers.
+    # validation. The final check must include identity and external actions,
+    # not just the image requirement.
     if len(readiness_reads) == 2:
       source_changed = True
     return status
@@ -1227,9 +1224,6 @@ async def test_self_hosted_revalidates_full_review_after_controller_readiness(
       "activation": dc.platform_activation.classify_activation(
         paths, deployment="self_hosted",
       ),
-      "blockers": ["Dockerfile"] if (
-        source_changed and failure == "local_runtime_changes"
-      ) else [],
     }
 
   async def apply(**_plan):
@@ -1308,22 +1302,6 @@ def test_prepare_path_requires_matching_root_owned_operation(tmp_path, monkeypat
     control / "inbox" / f"ready-{operation}"
   with pytest.raises(dc.DeploymentControlError):
     dc.replacement_ready_path("b" * 32)
-
-
-@pytest.mark.asyncio
-async def test_reviewed_local_image_blocker_precedes_any_source_apply(monkeypatch):
-  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
-  _install_reviewed_image_plan(monkeypatch, blockers=["Dockerfile"])
-
-  async def must_not_apply(*args, **kwargs):
-    raise AssertionError("source changed before image preservation was checked")
-
-  monkeypatch.setattr(dc.platform_update, "prepare_platform_update", must_not_apply)
-  with pytest.raises(dc.DeploymentControlError, match="local image inputs"):
-    await dc.request_reviewed_rebuild(
-      db=None, plan_id="a" * 64, current_sha="1" * 40,
-      target_sha="2" * 40, image_digest=None,
-    )
 
 
 @pytest.mark.asyncio
@@ -1411,7 +1389,7 @@ async def test_managed_update_prepares_before_cutover_and_keeps_its_failures(mon
   calls = []
   def verify(**plan):
     calls.append(("verify", plan["current_sha"]))
-    return {"activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]}, "blockers": []}
+    return {"activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]}}
   monkeypatch.setattr(dc.platform_update, "reviewed_container_rebuild_plan", verify)
   async def status():
     return {"supported": True, "state": "idle"}
@@ -1444,7 +1422,7 @@ async def test_managed_update_refuses_a_stale_final_check_and_stays_prepared(mon
     reviews.append(plan["current_sha"])
     if len(reviews) == 2:
       raise dc.platform_update.PlatformUpdateError("update_plan_stale")
-    return {"activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]}, "blockers": []}
+    return {"activation": {"level": "image_rebuild", "required_actions": ["image_rebuild"]}}
   monkeypatch.setattr(dc.platform_update, "reviewed_container_rebuild_plan", verify)
   async def cutover(sha, digest, *, final_check):
     final_check()
@@ -1470,7 +1448,7 @@ async def test_mixed_activation_cannot_dispatch_replacement(monkeypatch, deploym
     paths = ['Dockerfile']
     if not change_after_apply or 'apply' in calls:
       paths.append(path)
-    return {'activation': dc.platform_activation.classify_activation(paths, deployment=deployment), 'blockers': []}
+    return {'activation': dc.platform_activation.classify_activation(paths, deployment=deployment)}
   async def ready():
     return {'supported': True, 'state': 'idle'}
   async def apply(**plan):
@@ -1492,9 +1470,12 @@ async def test_mixed_activation_cannot_dispatch_replacement(monkeypatch, deploym
 
 @pytest.mark.asyncio
 async def test_python_dependency_replacement_stops_before_source_apply(monkeypatch):
+  """An image without the boot transaction cannot hand the swap to the
+  target image, so it still refuses source that needs new packages."""
   monkeypatch.setattr(
     dc.platform_activation, "deployment_kind", lambda: "self_hosted",
   )
+  monkeypatch.setattr(dc.platform_update, "image_activates_updates", lambda: False)
   monkeypatch.setattr(
     dc.platform_update,
     "reviewed_container_rebuild_plan",
@@ -1502,7 +1483,6 @@ async def test_python_dependency_replacement_stops_before_source_apply(monkeypat
       "activation": dc.platform_activation.classify_activation(
         ["backend/requirements.lock"], deployment="self_hosted",
       ),
-      "blockers": [],
     },
   )
 
@@ -1540,7 +1520,6 @@ async def test_existing_python_drift_does_not_block_image_replacement(
       "incoming_activation": dc.platform_activation.classify_activation(
         incoming_paths, deployment="self_hosted",
       ),
-      "blockers": [],
     },
   )
 
@@ -1585,7 +1564,6 @@ async def test_compatible_deployment_source_does_not_block_reviewed_replacement(
       'activation': dc.platform_activation.classify_activation(
         ['Dockerfile', path], deployment=deployment,
       ),
-      'blockers': [],
     }
 
   async def ready():
@@ -1813,7 +1791,7 @@ async def test_package_updates_wait_for_an_image_that_runs_the_boot_transaction(
   monkeypatch.setattr(
     dc.platform_update, "reviewed_container_rebuild_plan",
     lambda **plan: {
-      **plan, "blockers": [],
+      **plan,
       "activation": {
         "level": "image_rebuild", "required_actions": ["image_rebuild"],
         "reasons": [{"code": "python_dependencies"}],

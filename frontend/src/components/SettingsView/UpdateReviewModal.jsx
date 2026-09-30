@@ -18,7 +18,7 @@ const UPDATE_PHASE_LABELS = {
   finalizing: 'Finishing the update…',
 }
 
-function blockingPathLabel(path) {
+function localImagePathLabel(path) {
   if (path === 'Dockerfile') return 'Tools and versions included with Möbius'
   if (path.startsWith('backend/scripts/seed-skills/')) return 'Built-in skill template — not the installed skill'
   if (['backend/requirements.txt', 'backend/requirements.lock'].includes(path)) {
@@ -103,11 +103,11 @@ export default function UpdateReviewModal({
   const hasResult = ['conflict', 'rolled_back'].includes(resultState)
   const hasPlan = !!(preview?.plan_id && preview?.current_sha && preview?.target_sha)
   const actionable = preview?.actionable
-  const containerBlockers = preview?.blocking_paths?.length > 0
+  const localImagePaths = preview?.local_image_paths || []
   // Predicted with the same merge Apply runs: an agent merges these instead
   // of Apply stopping on them.
   const overlaps = !finish && preview?.conflict_paths?.length > 0
-  const needsAgent = containerBlockers || overlaps
+  const needsAgent = overlaps
   // The review proved there is nothing to apply. A leftover rolled_back flag
   // must not turn this into a "needs repair" offer — that is the contradictory
   // "already complete + agent repair" state. Show a single Done instead.
@@ -154,16 +154,12 @@ export default function UpdateReviewModal({
                 : <>
                   <section className="urm__overview">
                     <h3>{repairReason ? 'This update needs help' : finish ? 'Make the installed update active' : 'Update Möbius'}</h3>
-                    <p>{containerBlockers
-                      ? 'This update would remove changes made to how Möbius runs.'
-                      : overlaps
+                    <p>{overlaps
                       ? 'Some of your local changes overlap this update.'
                       : repairReason || (finish ? 'Finish setting up the installed update.'
                       : 'Install this reviewed update while keeping your changes. If anything overlaps, Möbius pauses and asks you to resolve it.')}</p>
                     <h3>What to expect</h3>
-                    <p>{containerBlockers
-                      ? 'Möbius will keep running as it is. An agent can compare these changes and prepare an official or custom update that keeps the behavior you need.'
-                      : overlaps
+                    <p>{overlaps
                       ? 'Möbius will keep running as it is. An agent merges the overlapping files on a separate copy, checks the result, and finishes the update.'
                       : repairReason
                       ? 'Open a chat with the update details included. Möbius will check what’s needed and help finish the update, asking before any restart.'
@@ -172,22 +168,17 @@ export default function UpdateReviewModal({
                       : needsRestart
                         ? 'The update is prepared now. A separate restart makes it active, so you can keep working and combine more updates first.'
                         : 'The interface is rebuilt or changes take effect when next used. No server restart is needed.'}</p>
+                    {localImagePaths.length > 0 && !repairReason && <p>Your changes to how Möbius itself runs stay saved, but the official system doesn’t run them. Afterwards, ask Möbius to set up anything you still need another way.</p>}
                     {rebuildUpdate && !repairReason && <p>If the updated system does not pass its checks, Möbius tries to restore the previous system image. Your chats, apps, data, and newly installed source stay in place, so that combination may still need attention.</p>}
                   </section>
                   <details className="urm__technical">
                     <summary>Technical details{summary.fileCount ? ` · ${summary.fileCount} files` : ''}</summary>
                     <p>Reviewed version <code className="urm__sha">{target}</code> · {activation && deploymentKindLabel(activation)}</p>
                     {activation && <p>{platformActivationLabel(activation)}</p>}
-                    {containerBlockers && <>
-                      <h3>Local system changes to keep</h3>
-                      <p>These files differ from the reviewed update. Replacing the running system now would remove what they do.</p>
-                      <ul>{preview.blocking_paths.map(path => <li key={path}><strong>{blockingPathLabel(path)}</strong><br /><code>{path}</code></li>)}</ul>
-                      {preview?.blocking_diff && <section>
-                        <h3>Exact local difference</h3>
-                        <UnifiedDiff diff={preview.blocking_diff}
-                          summaryOverrides={preview.blocking_paths.map(path => ({ path, status: 'M', insertions: null, deletions: null }))}
-                          diffTruncated={!!preview.blocking_diff_truncated} />
-                      </section>}
+                    {localImagePaths.length > 0 && <>
+                      <h3>Local system changes that won’t run</h3>
+                      <p>These files keep your changes, but the official system for this update is built without them.</p>
+                      <ul>{localImagePaths.map(path => <li key={path}><strong>{localImagePathLabel(path)}</strong><br /><code>{path}</code></li>)}</ul>
                     </>}
                     {overlaps && <>
                       <h3>Local changes that overlap</h3>

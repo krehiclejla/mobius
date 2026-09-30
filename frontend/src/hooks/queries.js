@@ -99,7 +99,10 @@ function useProviderUsageQuery(provider, { enabled = true } = {}) {
     queryKey: providerUsageKey(provider),
     queryFn: () => fetchProviderUsage(provider),
     enabled: enabled && Boolean(provider),
-    staleTime: 60_000,
+    // A new chat or a return to Möbius must check the provider again. The
+    // server coalesces probes, so this does not poll the rate-limited service.
+    staleTime: 0,
+    refetchOnWindowFocus: true,
     retry: 0,
   })
 }
@@ -514,6 +517,9 @@ export const settingsQueries = {
     keyFor: providerUsageKey,
     fetch: fetchProviderUsage,
     useQuery: useProviderUsageQuery,
+    reset: (queryClient, provider) => queryClient.resetQueries({
+      queryKey: provider ? providerUsageKey(provider) : providerUsageRootKey,
+    }),
     invalidate: (queryClient, provider) => queryClient.invalidateQueries({
       queryKey: provider ? providerUsageKey(provider) : providerUsageRootKey,
     }),

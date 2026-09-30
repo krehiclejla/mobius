@@ -1335,7 +1335,7 @@ class ChatEventSink:
     both providers.
 
     Called by the live provider handle after steering delivery is acknowledged:
-    Claude at its interrupt boundary, Codex when ``turn.steer()`` returns.
+    Claude at its root input replay, Codex when ``turn.steer()`` returns.
     Both run on the one FastAPI event loop, so the cut is serialized with this
     sink's ``publish()`` snapshots. The pre-steer assistant text (A1) becomes
     its own trailing assistant message, the steered user message (Q2) is

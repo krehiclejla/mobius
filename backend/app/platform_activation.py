@@ -122,10 +122,12 @@ _RULES = (
   _Rule(
     "host_operator_tooling",
     ActivationLevel.LIVE,
-    "Compatible host-helper source changed for new installs or a later refresh.",
+    "Compatible host-helper source changed. Launcher installs adopt the new "
+    "worker after the next replacement; fixed helpers on a later refresh.",
     exact=(
       "scripts/install-rebuild-helper.sh",
       "scripts/mobius-rebuild-host.py",
+      "scripts/mobius-rebuild-launcher.py",
     ),
     deployment="self_hosted",
   ),

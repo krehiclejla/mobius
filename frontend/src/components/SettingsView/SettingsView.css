@@ -256,7 +256,8 @@
 }
 
 .settings__section:focus,
-.settings-agent-group:focus {
+.settings-agent-group:focus,
+.settings-github:focus {
   outline: none;
 }
 
@@ -501,3 +502,15 @@
 
 /* Keep full action labels intact without changing the shared provider layout. */
 .settings .provider-row__action { white-space: nowrap; }
+
+/* GitHub account row: the only style its shared provider panel lacks. */
+.settings-github__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.settings-github__check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }

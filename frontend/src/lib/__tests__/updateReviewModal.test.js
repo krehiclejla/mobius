@@ -162,22 +162,17 @@ test('asking for help names one ordinary chat and explains the restart boundary'
   assert.doesNotMatch(modal + repair, /repair chat|recovery chat|help prepare it/)
 })
 
-test('local container blockers explain lost behavior and stop before mutation', () => {
-  const repair = read('../../components/SettingsView/UpdateRepairAction.jsx')
-  assert.match(modal, /This update would remove changes made to how Möbius runs/)
-  assert.match(modal, /Möbius will keep running as it is/)
-  assert.match(modal, /official or custom update/)
-  assert.match(modal, /Local system changes to keep/)
-  assert.match(modal, /blockingPathLabel\(path\)/)
-  assert.match(modal, /diff=\{preview\.blocking_diff\}/)
-  assert.doesNotMatch(modal, /sourceOnly|Prepare update/)
-  assert.match(modal, /label="Fix with an agent"/)
-  assert.match(repair, /label = 'Ask Möbius'/)
+test('local image changes are reported, never a reason to stop the update', () => {
+  assert.match(modal, /const localImagePaths = preview\?\.local_image_paths \|\| \[\]/)
+  assert.match(modal, /Local system changes that won’t run/)
+  assert.match(modal, /localImagePathLabel\(path\)/)
+  assert.match(modal, /stay saved, but the official system doesn’t run them/)
+  assert.doesNotMatch(modal, /blocking_paths|blocking_diff|containerBlockers/)
 })
 
 test('predicted overlaps hand the update to an agent instead of Apply', () => {
   assert.match(modal, /const overlaps = !finish && preview\?\.conflict_paths\?\.length > 0/)
-  assert.match(modal, /const needsAgent = containerBlockers \|\| overlaps/)
+  assert.match(modal, /const needsAgent = overlaps/)
   assert.match(modal, /needsAgent && hasPlan \? <button[^>]*onClick=\{handleFixWithAgent\}/)
   assert.match(modal, /An agent merges the overlapping files on a separate copy/)
 })

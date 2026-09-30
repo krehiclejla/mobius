@@ -131,20 +131,42 @@ def test_blank_project_starts_without_chat_and_has_confined_files(
   assert not any(p.startswith("artifacts/") for p in recursive_paths)
 
 
-def test_project_path_name_longer_than_the_filesystem_allows_is_rejected(
+def test_project_paths_beneath_a_file_are_rejected_not_a_server_error(
   client, auth,
 ):
   project = client.post(
     "/api/projects", headers=auth,
-    json={"name": "Long names", "template_id": "blank"},
+    json={"name": "Nested paths", "template_id": "blank"},
   ).json()
-  response = client.put(
-    f"/api/projects/{project['id']}/file?path=notes/{'a' * 300}.md",
-    headers=auth, json={"content": "x", "expected_revision": None},
+  base = f"/api/projects/{project['id']}"
+  for name in ("a.txt", "b.txt"):
+    saved = client.put(
+      f"{base}/file?path={name}", headers=auth,
+      json={"content": name, "expected_revision": None},
+    )
+    assert saved.status_code == 200, saved.text
+
+  attempts = (
+    client.put(
+      f"{base}/file?path=a.txt/child.txt", headers=auth,
+      json={"content": "x", "expected_revision": None},
+    ),
+    client.put(
+      f"{base}/file-bytes?path=a.txt/deep/child.bin",
+      headers={**auth, "If-None-Match": "*"}, content=b"x",
+    ),
+    client.post(f"{base}/folder", headers=auth, json={"path": "a.txt/sub"}),
+    client.post(
+      f"{base}/move", headers=auth,
+      json={"from_path": "b.txt", "to_path": "a.txt/sub/b.txt"},
+    ),
   )
-  assert response.status_code == 400, response.text
-  listing = client.get(f"/api/projects/{project['id']}/files", headers=auth).json()
-  assert listing["entries"] == []
+  for response in attempts:
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "parent_is_file"
+
+  assert client.get(f"{base}/file?path=a.txt", headers=auth).json()["content"] == "a.txt"
+  assert client.get(f"{base}/file?path=b.txt", headers=auth).json()["content"] == "b.txt"
 
 
 def test_project_files_reserve_git_metadata_from_browse_and_mutation(
@@ -1401,3 +1423,19 @@ def test_unavailable_page_catalog_does_not_hide_native_apps(client, auth, db, st
   assert listed.status_code == 200
   assert listed.json()["artifacts"] == []
   assert [row["id"] for row in listed.json()["apps"]] == [str(source_app.id)]
+
+
+def test_project_path_name_longer_than_the_filesystem_allows_is_rejected(
+  client, auth,
+):
+  project = client.post(
+    "/api/projects", headers=auth,
+    json={"name": "Long names", "template_id": "blank"},
+  ).json()
+  response = client.put(
+    f"/api/projects/{project['id']}/file?path=notes/{'a' * 300}.md",
+    headers=auth, json={"content": "x", "expected_revision": None},
+  )
+  assert response.status_code == 400, response.text
+  listing = client.get(f"/api/projects/{project['id']}/files", headers=auth).json()
+  assert listing["entries"] == []
