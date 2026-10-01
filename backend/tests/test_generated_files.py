@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 import os
@@ -78,6 +79,44 @@ def test_serve_generated_file_by_recorded_name(client, db, auth, chat):
   assert res.headers["x-content-type-options"] == "nosniff"
 
 
+def test_final_generated_image_preview_checks_content_on_existing_route(client, db, auth, chat):
+  content = b"viewed-image"
+  stored = _stored_file(chat, name="frozen", content=content)
+  _write_row(db, chat, name="image_1.png", path=stored, mime_type="image/png")
+  url = f"/api/chats/{chat.id}/generated-files/image_1.png"
+  token = _media_token(client, auth, chat.id)
+  digest = hashlib.sha256(content).hexdigest()
+  matched = client.get(url, params={"token": token, "preview": True, "expected_sha256": digest})
+  assert matched.status_code == 200
+  assert matched.content == content
+  assert matched.headers["content-disposition"] == 'inline; filename="image_1.png"'
+  assert matched.headers["cache-control"] == "private, no-store"
+
+  changed = client.get(url, params={"token": token, "preview": True, "expected_sha256": "0" * 64})
+  assert changed.status_code == 404
+  (gf.stored_dir(get_settings().data_dir, chat.id) / stored).write_bytes(b"replacement")
+  assert client.get(
+    url, params={"token": token, "preview": True, "expected_sha256": digest},
+  ).status_code == 404
+  malformed = client.get(url, params={"token": token, "preview": True, "expected_sha256": "wrong"})
+  assert malformed.status_code == 400
+  assert client.get(f"/api/chats/{chat.id}/viewed-generated-images/old-tool", params={"token": token}).status_code == 404
+
+
+def test_viewed_image_digest_is_bound_to_exact_chat_inbox(tmp_path):
+  chat_id = "chat-123"
+  inbox = gf.output_dir(str(tmp_path), chat_id, create=True)
+  image = inbox / "image.png"
+  image.write_bytes(b"viewed")
+  expected = hashlib.sha256(b"viewed").hexdigest()
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) == expected
+  assert gf.viewed_inbox_sha256(str(tmp_path), "other", str(image)) is None
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(inbox / "../image.png")) is None
+  image.write_bytes(b"overwritten")
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) != expected
+  image.unlink()
+  image.symlink_to(tmp_path / "outside.png")
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) is None
 def test_serve_generated_file_from_valid_non_v4_chat(client, db, auth):
   chat_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "generated-file-test-chat"))
   created = client.post(
@@ -125,6 +164,23 @@ def test_unsafe_generated_file_preview_still_downloads(client, db, auth, chat):
 
   assert res.status_code == 200
   assert res.headers["content-disposition"] == 'attachment; filename="drawing.svg"'
+
+
+def test_markdown_generated_file_remains_download_only(client, db, auth, chat):
+  stored_name = _stored_file(chat, name="stored.md", content=b"# Review\n")
+  _write_row(
+    db, chat, name="review.md", path=stored_name,
+    mime_type="text/markdown",
+  )
+
+  res = client.get(
+    f"/api/chats/{chat.id}/generated-files/review.md",
+    params={"token": _media_token(client, auth, chat.id), "preview": True},
+  )
+
+  assert res.status_code == 200
+  assert res.headers["content-disposition"] == 'attachment; filename="review.md"'
+  assert res.headers["x-content-type-options"] == "nosniff"
 
 
 def test_preview_policy_keeps_active_images_out_of_inline_documents():
@@ -310,6 +366,10 @@ def test_inbox_capture_is_immutable_across_same_name_regeneration(db, chat):
     "report.pdf", "report_1.pdf",
   ]
   assert all(file["previewable"] is True for file in block["files"])
+  assert [file["sha256"] for file in block["files"]] == [
+    hashlib.sha256(content).hexdigest()
+    for content in (b"first report", b"second report")
+  ]
   rows = db.query(models.GeneratedFile).filter_by(chat_id=chat.id).all()
   assert len(rows) == 2
   assert rows[0].path != rows[1].path
@@ -324,6 +384,10 @@ def test_inbox_capture_is_immutable_across_same_name_regeneration(db, chat):
   ]
   assert [file["name"] for file in file_blocks[0]["files"]] == [
     "report.pdf", "report_1.pdf",
+  ]
+  assert [file["sha256"] for file in file_blocks[0]["files"]] == [
+    hashlib.sha256(content).hexdigest()
+    for content in (b"first report", b"second report")
   ]
 
 

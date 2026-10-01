@@ -389,20 +389,53 @@ def test_supervised_recovery_does_not_interrupt_an_owned_consumer(client, chat, 
 @pytest.mark.parametrize("proc_exit_error", [None, FileNotFoundError, ProcessLookupError])
 def test_timeout_kills_consumer_descendants_not_only_parent(tmp_path, monkeypatch, proc_exit_error):
   import os
+  import uuid
   pid_file = tmp_path / "child.pid"
+  # Unix sockets have a short kernel path limit; pytest's worker tmp_path may
+  # be too deep. The unique socket carries only a test readiness signal.
+  ready_socket = Path(f"/tmp/mobius-secure-{os.getpid()}-{uuid.uuid4().hex[:12]}.sock")
   program = (
-    "import json,sys,subprocess,time,pathlib; json.load(sys.stdin); "
+    "import json,sys,subprocess,time,pathlib,socket; json.load(sys.stdin); "
     "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(60)"
+    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+    "ready=socket.socket(socket.AF_UNIX); ready.connect(sys.argv[2]); "
+    "ready.sendall(b'1'); ready.close(); time.sleep(60)"
   )
-  monkeypatch.setattr(saved_secure_inputs, "CONSUMER_TIMEOUT_SECONDS", 0.2)
   values = {"api_key": "stdin-only"}
-  code = asyncio.run(saved_secure_inputs._run_consumer({
-    "command": [sys.executable, "-c", program, str(pid_file)], "cwd": str(tmp_path),
-  }, values, "chat"))
+
+  async def exercise():
+    ready = asyncio.Event()
+    async def acknowledge(reader, writer):
+      await reader.readexactly(1)
+      ready.set()
+      writer.close()
+      await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(acknowledge, path=str(ready_socket))
+    real_wait_for = asyncio.wait_for
+    async def timeout_after_child_started(awaitable, timeout):
+      communication = asyncio.create_task(awaitable)
+      try:
+        await real_wait_for(ready.wait(), 5)
+      finally:
+        communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
+      raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", timeout_after_child_started)
+    try:
+      return await saved_secure_inputs._run_consumer({
+        "command": [sys.executable, "-c", program, str(pid_file), str(ready_socket)],
+        "cwd": str(tmp_path),
+      }, values, "chat")
+    finally:
+      server.close()
+      await server.wait_closed()
+      ready_socket.unlink(missing_ok=True)
+
+  code = asyncio.run(exercise())
   assert code == 124 and values == {}
   child_pid = int(pid_file.read_text())
-  from pathlib import Path
   import time
 
   if proc_exit_error is not None:

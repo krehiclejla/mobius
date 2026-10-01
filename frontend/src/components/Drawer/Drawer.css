@@ -1039,3 +1039,49 @@
      accent halos elsewhere (composer focus, --pwa-btn--install). */
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
+
+/* ── Recents / Archived tabs ──────────────────────── */
+.drawer__tabs {
+  gap: 2px;
+  padding: 0 6px;
+}
+
+.drawer__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.drawer__tab[aria-selected="true"] {
+  color: var(--text);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .drawer__tab[aria-selected="false"]:hover { color: var(--text); }
+}
+
+.drawer__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.drawer__tab-separator {
+  color: var(--border);
+  user-select: none;
+}
+
+.drawer__list-caption {
+  margin: 6px 12px 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}

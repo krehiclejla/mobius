@@ -13,6 +13,141 @@ import pytest
 from app import platform_tools
 
 
+@pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])
+def test_helpers_are_builtin_without_subagents_app(monkeypatch, top_level, coordination):
+  monkeypatch.delenv("MOBIUS_SUBAGENT_HELPER", raising=False)
+  monkeypatch.setenv("MOBIUS_RUN_TOKEN", "run" if top_level else "")
+  monkeypatch.setenv("MOBIUS_COORDINATION_ENABLED", "1" if coordination else "0")
+  control = _control_module()
+  monkeypatch.setattr(control, "_app_tool_listings", lambda: [])
+  names = platform_tools.expected_control_tool_names(
+    top_level=top_level, coordination_enabled=coordination,
+  )
+  configured = platform_tools.codex_turn_mcp_config(
+    None, control_enabled=True, top_level=top_level,
+    coordination_enabled=coordination,
+  )["mcp_servers"]["mobius_control"]["tools"]
+  listed = control._dispatch_message({
+    "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+  })["result"]["tools"]
+  assert tuple(configured) == names == tuple(tool["name"] for tool in listed)
+  assert set(platform_tools.HELPER_TOOL_NAMES) <= set(names)
+  assert "Delegate to helper agents with spawn_agent" in control._initialize_result({})["instructions"]
+  assert "checkpoint_chat" in names and "claim_agent_work" in names
+  assert ("list_agent_peers" in names) is (not top_level or coordination)
+
+
+def test_spawn_defaults_to_actual_calling_turn_and_no_app_owner(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "parent")
+  monkeypatch.setenv("MOBIUS_AGENT_PROVIDER", "codex")
+  monkeypatch.setenv("MOBIUS_AGENT_MODEL", "gpt-current")
+  monkeypatch.setenv("MOBIUS_AGENT_EFFORT", "high")
+  calls = []
+  def api(method, path, body=None):
+    if path.endswith("/capabilities"):
+      return {"connections": {"codex": {"configured": True}},
+              "models": {"codex": [{"id": "gpt-current", "name": "Current"}]},
+              "defaults": {"codex": "other"}}
+    calls.append((method, path, body))
+    return {"id": "child", "task_key": "review"}
+  monkeypatch.setattr(control, "_agent_api_call", api)
+  result = control._call_tool({"name": "spawn_agent", "arguments": {
+    "name": "review", "task": "Review",
+  }})
+  assert result["isError"] is False
+  assert calls[0][2] == {
+    "app_id": None, "parent_chat_id": "parent", "task_key": "review",
+    "prompt": "Review", "provider": "codex", "model": "gpt-current",
+    "effort": "high", "scope": "write", "notify_parent_on_complete": True,
+  }
+
+
+def test_explicit_app_preference_overrides_turn_without_routing_provider(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("MOBIUS_AGENT_PROVIDER", "codex")
+  monkeypatch.setenv("MOBIUS_AGENT_MODEL", "current")
+  monkeypatch.setenv("MOBIUS_AGENT_EFFORT", "medium")
+  monkeypatch.setattr(control, "_agent_api_call", lambda *args: {
+    "connections": {"codex": {"configured": True}},
+    "config": {"providers": {"codex": {"enabled": True,
+               "default_model": "configured", "default_effort": "high"}}},
+    "models": {"codex": [{"id": "configured", "name": "Configured"}]},
+  })
+  assert control._helper_selection({}) == ("codex", "configured", "high")
+  assert control._helper_selection({"model": "Configured", "effort": "low"}) == (
+    "codex", "configured", "low")
+
+
+def test_paused_preference_refuses_implicit_calling_provider_but_explicit_override_works(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("MOBIUS_AGENT_EFFORT", "medium")
+  monkeypatch.setenv("MOBIUS_AGENT_PROVIDER", "codex")
+  monkeypatch.setenv("MOBIUS_AGENT_MODEL", "current")
+  monkeypatch.setattr(control, "_agent_api_call", lambda *args: {
+    "connections": {"codex": {"configured": True},
+                    "claude": {"configured": True}},
+    "config": {"providers": {"codex": {"enabled": False}}},
+    "models": {"codex": [{"id": "current"}],
+               "claude": [{"id": "sonnet"}]},
+    "defaults": {"claude": "sonnet"},
+  })
+  with pytest.raises(RuntimeError, match="paused"):
+    control._helper_selection({})
+  assert control._helper_selection({"provider": "codex"}) == (
+    "codex", "current", "medium")
+  assert control._helper_selection({"provider": "claude"}) == (
+    "claude", "sonnet", None)
+
+
+def test_shared_discovery_does_not_import_backend_dependencies():
+  source = platform_tools._control_script()
+  result = subprocess.run([
+    sys.executable, "-S", "-c",
+    "import runpy, sys; runpy.run_path(sys.argv[1], run_name='control_probe'); "
+    "assert 'app' not in sys.modules; assert 'sqlalchemy' not in sys.modules",
+    source,
+  ], capture_output=True, text=True, check=False)
+  assert result.returncode == 0, result.stderr
+
+
+def test_spawn_forwards_an_explicit_goal_task_without_guessing(
+  monkeypatch,
+):
+  monkeypatch.setenv("MOBIUS_AGENT_PROVIDER", "codex")
+  monkeypatch.setenv("MOBIUS_AGENT_MODEL", "current")
+  monkeypatch.setenv("CHAT_ID", "parent")
+  control = _control_module()
+  sent = []
+  def api(method, path, body=None):
+    if path.endswith("/capabilities"):
+      return {"connections": {"codex": {"configured": True}},
+              "models": {"codex": [{"id": "current"}]}}
+    sent.append((method, path, body))
+    return {"id": "child", "task_key": "review"}
+  monkeypatch.setattr(control, "_agent_api_call", api)
+  arguments = {
+    "name": "review", "task": "Review",
+  }
+  control._call_spawn_agent({**arguments, "plan_task": " verify "})
+  assert sent[-1][2]["plan_task"] == "verify"
+  control._call_spawn_agent(arguments)
+  assert "plan_task" not in sent[-1][2]
+  for invalid in ("", "  ", 7, None, "x" * 129):
+    with pytest.raises(ValueError, match="plan_task"):
+      control._call_spawn_agent({**arguments, "plan_task": invalid})
+  schema = control._TOOL_DEFINITIONS["spawn_agent"]["inputSchema"]
+  assert schema["properties"]["plan_task"]["maxLength"] == 128
+
+
+def test_claude_pointer_does_not_replace_missing_helpers_with_a_provider_cli():
+  text = (Path(__file__).resolve().parents[1] / "scripts/seed-skills/claude.md").read_text()
+  assert "current tool list" in text
+  assert "continue locally and sequentially" in text
+  assert "launch a provider CLI as a substitute" in text
+  assert "claude -p" not in text
+
+
 def test_control_server_configs_share_one_script_and_no_secret_arguments():
   claude = platform_tools.claude_control_servers(enabled=True)
   codex = platform_tools.codex_turn_mcp_config(None, control_enabled=True)
@@ -30,9 +165,9 @@ def test_control_server_configs_share_one_script_and_no_secret_arguments():
   assert set(codex_server["env_vars"]) == {
     "API_BASE_URL", "AGENT_TOKEN", "CHAT_ID", "MOBIUS_RUN_TOKEN",
     "MOBIUS_COORDINATION_ENABLED",
-    # Non-secret helper context: the agent's provider (spawn_agent default),
-    # its delegation, and the Subagents app helper.
-    "MOBIUS_AGENT_PROVIDER", "MOBIUS_DELEGATION_ID", "MOBIUS_SUBAGENT_HELPER",
+    # Non-secret calling-turn selection and delegation identity.
+    "MOBIUS_AGENT_PROVIDER", "MOBIUS_AGENT_MODEL", "MOBIUS_AGENT_EFFORT",
+    "MOBIUS_DELEGATION_ID",
     # Non-secret capture context for the screenshot tool.
     "VIEWPORT_WIDTH", "VIEWPORT_HEIGHT", "VIEWPORT_PIXEL_RATIO",
     "AGENT_BROWSER_SESSION",
@@ -344,9 +479,13 @@ def test_constitution_routes_each_agent_network_to_its_owner():
     Path(__file__).resolve().parents[2] / "skill" / "core.md"
   ).read_text(encoding="utf-8")
 
-  # Helpers are Möbius-owned; built-in provider helper tools are off.
-  assert "`spawn_agent`" in core
-  assert "built-in helper tools" in core and "switched off" in core
+  # Delegation is platform-owned even with no installed apps. Native provider
+  # helpers and peer messaging remain distinct authority paths.
+  assert "built-in `spawn_agent`" in core
+  assert "no app installation is required" in core
+  assert "`delegation` skill" in core
+  assert "do not substitute a provider CLI" in core
+  assert "built-in helper tools" in " ".join(core.split()) and "switched off" in core
   assert "other Möbius chats" in core
   assert core.index("`list_agent_peers`") < core.index("`send_agent_message`")
   assert "ordinary chat-message API" in core
@@ -1082,3 +1221,36 @@ def test_restart_guidance_registers_each_chat_without_duplicating_the_executor()
   assert "Every chat that still owes activation and verification calls" in maintenance
   assert "even if another chat already has a Restart card" in maintenance
   assert "not duplicate restart\n   executors" in maintenance
+
+
+def test_legacy_preference_and_alias_remain_explicit_overrides(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("MOBIUS_AGENT_PROVIDER", "codex")
+  monkeypatch.setenv("MOBIUS_AGENT_MODEL", "caller")
+  monkeypatch.setenv("MOBIUS_AGENT_EFFORT", "medium")
+  capability = {
+    "connections": {"codex": {"configured": True}},
+    "config": {"enabled": True, "default": "configured"},
+    "models": {"codex": [{"id": "configured", "name": "Configured"}]},
+    "aliases": {"codex": {"configured": ["reviewer"]}},
+  }
+  monkeypatch.setattr(control, "_agent_api_call", lambda *a: capability)
+  assert control._helper_selection({}) == ("codex", "configured", "medium")
+  assert control._helper_selection({"model": "reviewer"}) == ("codex", "configured", "medium")
+  capability["config"]["enabled"] = False
+  with pytest.raises(RuntimeError, match="paused"):
+    control._helper_selection({})
+  assert control._helper_selection({"provider": "codex"}) == ("codex", "configured", "medium")
+
+
+def test_builtin_delegation_guidance_is_available_without_an_app():
+  root = Path(__file__).resolve().parents[1] / "scripts/seed-skills"
+  text = (root / "delegation.md").read_text()
+  assert "installing Subagents is optional" in text
+  assert "calling turn" in text
+  assert "Never poll" in text
+  assert "provider CLI" in text
+  assert "no `access` selector" in text
+  assert "State read-only limits in the task" in text
+  assert "read-only children" not in text
+  assert "complete `delegation`" in (root / "claude.md").read_text()

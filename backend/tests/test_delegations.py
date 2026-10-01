@@ -12,7 +12,8 @@ import pytest
 
 from app import auth, models
 from app.chat_writer import (
-  AppendPending, Barrier, FinishRun, PromotePending, StartTurn, get_writer,
+  AppendPending, Barrier, FinishRun, PromotePending, ResolvePark, StartTurn,
+  await_ack, get_writer,
 )
 from app.codex_sdk_runner import _codex_config_overrides
 from app.delegations import (
@@ -21,7 +22,8 @@ from app.delegations import (
   delegation_execution_token,
   derived_status,
   ensure_delegation_started,
-  limit_resume_app_id,
+  interrupt_legacy_read_helpers,
+  limit_resume_delegation,
   mark_cancelled,
   parent_root_run_id,
   policy_for_chat,
@@ -46,29 +48,105 @@ def _parent_with_run(client, owner_token, db):
   return chat_id
 
 
-@pytest.mark.parametrize("scope", ["read", "write"])
-def test_child_policy_allows_only_explicit_owner_approved_protected_access(
-  scope,
+def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
+  client, owner_token, db,
 ):
+  owner_auth = {"Authorization": f"Bearer {owner_token}"}
+  app_id = create_local_app(client, owner_auth, name="Subagents")["id"]
+  parent_id = _parent_with_run(client, owner_token, db)
+  states = (
+    (None, None), ("running", None),
+    ("parked", "restart"), ("resume_pending", "restart"),
+    ("parked", "usage_limit"), ("parked", "storage"),
+    ("parked", "model_capacity"), ("parked_notified", "usage_limit"),
+    ("completed", None),
+  )
+  for index, (status, park_reason) in enumerate(states):
+    child_id = f"legacy-child-{index}"
+    db.add(models.Chat(
+      id=child_id, title="Legacy task", provider="codex",
+      created_by_app_id=app_id, auto_resume_on_restart=True,
+      messages=[{"role": "user", "content": f"inspect {index}"}],
+    ))
+    db.add(models.Delegation(
+      id=f"legacy-{index}", app_id=app_id, parent_chat_id=parent_id,
+      parent_root_run_id="parent-root", task_key=f"legacy-{index}",
+      child_chat_id=child_id, provider="codex", scope="read", cwd="/data",
+      startup_prompt=f"inspect {index}",
+      prompt_sha256=hashlib.sha256(f"inspect {index}".encode()).hexdigest(),
+      notify_parent_on_complete=True,
+    ))
+    if status is not None:
+      db.add(make_goal_run(db,
+        id=f"legacy-run-{index}", root_run_id=f"legacy-run-{index}",
+        chat_id=child_id, status=status, provider="codex",
+        park_reason=park_reason,
+      ))
+  db.commit()
+
+  count, parks = interrupt_legacy_read_helpers(db)
+  assert count == 8
+  assert set(parks) == {
+    ("legacy-child-2", "legacy-run-2"),
+    ("legacy-child-3", "legacy-run-3"),
+    ("legacy-child-4", "legacy-run-4"),
+    ("legacy-child-5", "legacy-run-5"),
+    ("legacy-child-6", "legacy-run-6"),
+  }
+  for chat_id, run_token in parks:
+    asyncio.run(await_ack(get_writer().submit(ResolvePark(
+      chat_id=chat_id, run_token=run_token,
+    ))))
+  from app.chat import reconcile_startup_chats
+  reconciled = reconcile_startup_chats(db)
+  assert "legacy-child-1" not in reconciled.manual
+  db.expire_all()
+  for index, (status, _park_reason) in enumerate(states):
+    row = db.get(models.Delegation, f"legacy-{index}")
+    child = db.get(models.Chat, f"legacy-child-{index}")
+    assert row.scope == "read" and row.startup_prompt == f"inspect {index}"
+    assert child.messages[0] == {"role": "user", "content": f"inspect {index}"}
+    if status != "running":
+      assert len(child.messages) == 1
+    if status == "completed":
+      assert row.interrupted_at is None
+      assert derived_status(db, row)[0] == "completed"
+    else:
+      assert row.interrupted_at is not None
+      assert child.auto_resume_on_restart is False
+      assert derived_status(db, row)[0] == "interrupted"
+      assert len(db.query(models.ChatRun).filter_by(chat_id=child.id).all()) == (
+        0 if status is None else 1
+      )
+      if status in {"parked", "resume_pending"}:
+        expected = "interrupted" if _park_reason == "restart" else "parked_notified"
+        assert db.get(models.ChatRun, f"legacy-run-{index}").status == expected
+      if status == "running":
+        assert db.get(models.ChatRun, f"legacy-run-{index}").status == "interrupted"
+        blocks = child.messages[-1].get("blocks") or []
+        assert any("single-mode cutover" in block.get("message", "") for block in blocks)
+        assert not any(block.get("resumable") for block in blocks)
+      with pytest.raises(RuntimeError, match="cannot resume"):
+        policy_for_chat(db, child.id)
+  assert interrupt_legacy_read_helpers(db) == (0, [])
+
+
+def test_child_policy_allows_only_explicit_owner_approved_protected_access():
   policy = RunPolicy(
     delegation_id="protected-access",
     app_id=1,
     provider="codex",
     model=None,
     effort=None,
-    scope=scope,
     cwd="/data/cli-auth",
   ).system_prompt
 
   assert "/data/cli-auth and /data/.secret-key as protected by default" in policy
   assert "exact owner-approved operation" in policy
-  assert "return the missing approval or scope to the parent" in policy
+  assert "return the missing approval to the parent" in policy
   assert "minimize the paths and bytes inspected" in policy
   assert "Never read or write /data/cli-auth" not in policy
-  if scope == "read":
-    assert "This task is READ-ONLY" in policy
-  else:
-    assert "You may edit only within the requested working tree" in policy
+  assert "You may edit only within the requested working tree" in policy
 
 
 def test_delegation_inherits_owner_tools_with_run_bound_delegation_identity(
@@ -83,7 +161,7 @@ def test_delegation_inherits_owner_tools_with_run_bound_delegation_identity(
   db.add(models.Delegation(
     id="read-policy", app_id=app_id, parent_chat_id="parent",
     parent_root_run_id="parent-root", task_key="read", child_chat_id="read-child",
-    provider="codex", model=None, effort=None, scope="read", cwd="/data/platform",
+    provider="codex", model=None, effort=None, scope="write", cwd="/data/platform",
     prompt_sha256=hashlib.sha256(b"read").hexdigest(),
   ))
   db.add(make_goal_run(db,
@@ -101,7 +179,7 @@ def test_delegation_inherits_owner_tools_with_run_bound_delegation_identity(
   )
 
   token = delegation_execution_token(
-    db, RunPolicy(scope="read", **base), run_id="physical-child-run",
+    db, RunPolicy(**base), run_id="physical-child-run",
   )
   claims = auth.decode_access_token(token)
   assert claims is not None
@@ -134,7 +212,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
     id="resume-delegation", app_id=app_id,
     parent_chat_id="resume-parent", parent_root_run_id="resume-root",
     task_key="resume", child_chat_id="resume-child", provider="claude",
-    model="claude-opus-4-8", effort="low", scope="read", cwd="/data",
+    model="claude-opus-4-8", effort="low", scope="write", cwd="/data",
     prompt_sha256=hashlib.sha256(b"resume").hexdigest(),
   ))
   db.add(make_goal_run(db,
@@ -143,17 +221,17 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   ))
   db.commit()
 
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
-  ) == app_id
+  ).app_id == app_id
   db.get(models.ChatRun, "resume-park").status = "parked_notified"
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
-  ) == app_id
-  assert limit_resume_app_id(
+  ).app_id == app_id
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id + 1,
   ) is None
@@ -161,7 +239,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   delegation = db.get(models.Delegation, "resume-delegation")
   delegation.cancelled_at = datetime.now(UTC).replace(tzinfo=None)
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
   ) is None
@@ -171,7 +249,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   app = db.get(models.App, app_id)
   app.deleted_at = datetime.now(UTC).replace(tzinfo=None)
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
   ) is None
@@ -183,7 +261,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
     status="running", provider="claude", initiated_by_app_id=app_id,
   ))
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
   ) is None
@@ -205,7 +283,7 @@ def test_explicit_retry_uses_the_exact_owned_limit_park(
     id="retry-delegation", app_id=app_id,
     parent_chat_id="retry-parent", parent_root_run_id="retry-root",
     task_key="retry", child_chat_id="retry-child", provider="claude",
-    model="claude-opus-4-8", effort="low", scope="read", cwd="/data",
+    model="claude-opus-4-8", effort="low", scope="write", cwd="/data",
     prompt_sha256=hashlib.sha256(b"retry").hexdigest(),
   )
   db.add(row)
@@ -316,7 +394,7 @@ def test_submit_is_idempotent_per_parent_root_and_task_key(
     "task_key": "audit-restart",
     "prompt": "Audit restart recovery.",
     "provider": "codex",
-    "scope": "read",
+    "scope": "write",
     "cwd": "/data/platform",
   }
 
@@ -402,6 +480,58 @@ def test_submit_is_idempotent_per_parent_root_and_task_key(
   assert retained_inline_owner.notify_parent_on_complete is False
 
 
+def test_single_mode_submit_accepts_old_write_but_never_upgrades_old_read(
+  client, owner_token, db, monkeypatch,
+):
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  app_id = create_local_app(client, auth, name="Subagents")["id"]
+  parent_id = _parent_with_run(client, owner_token, db)
+  starts = []
+
+  async def fake_start(**kwargs):
+    starts.append(kwargs)
+    return True
+
+  monkeypatch.setattr(
+    "app.routes.delegations.start_programmatic_chat_turn", fake_start,
+  )
+  body = {
+    "app_id": app_id, "parent_chat_id": parent_id,
+    "task_key": "inspect", "prompt": "Inspect the task.",
+    "provider": "codex",
+  }
+  created = client.post("/api/delegations", json=body, headers=auth)
+  assert created.status_code == 201, created.text
+  assert created.json()["scope"] == "write"
+  attached = client.post("/api/delegations", json={
+    **body, "scope": "write",
+  }, headers=auth)
+  assert attached.status_code == 201 and attached.json()["attached"]
+  rejected = client.post("/api/delegations", json={
+    **body, "scope": "read",
+  }, headers=auth)
+  assert rejected.status_code == 422
+  assert len(starts) == 2
+
+  row = db.get(models.Delegation, created.json()["id"])
+  from app.app_services import request_actor
+  from app.deps import Principal
+  actor = Principal(
+    owner=db.query(models.Owner).one(), app_id=None,
+    delegation_id=row.id,
+  )
+  assert request_actor(db, actor)["access"] == "write"
+  row.scope = "read"
+  row.interrupted_at = datetime.now(UTC).replace(tzinfo=None)
+  db.commit()
+  assert request_actor(db, actor)["access"] == "read"
+  legacy_attach = client.post("/api/delegations", json=body, headers=auth)
+  assert legacy_attach.status_code == 201, legacy_attach.text
+  assert legacy_attach.json()["id"] == row.id
+  assert legacy_attach.json()["status"] == "interrupted"
+  assert len(starts) == 2
+
+
 def test_goal_identity_is_the_delegation_idempotency_parent(db, chat):
   db.add(make_goal_run(db,
     id="goal-physical", root_run_id="logical-before-restart",
@@ -429,7 +559,7 @@ def test_submit_records_the_plan_task_and_refuses_an_unknown_one(
   body = {
     "app_id": app_id, "parent_chat_id": parent_chat_id,
     "task_key": "review-round-two", "prompt": "Review round two.",
-    "provider": "codex", "scope": "read",
+    "provider": "codex", "scope": "write",
   }
   refused = client.post(
     "/api/delegations", json={**body, "plan_task": "r2"}, headers=auth,
@@ -467,7 +597,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
     "task_key": "bounded-review",
     "prompt": "Review only.",
     "provider": "claude",
-    "scope": "read",
+    "scope": "write",
     "cwd": "/data",
   }
   created = client.post("/api/delegations", json=body, headers=owner_auth)
@@ -514,19 +644,17 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   assert nested.status_code == 201, nested.text
   nested_policy = policy_for_chat(db, nested.json()["child_chat_id"])
   assert nested_policy is not None and nested_policy.depth == 2
-  escalated = client.post("/api/delegations", json={
+  sibling = client.post("/api/delegations", json={
     **body,
     "parent_chat_id": child_id,
-    "task_key": "nested-write",
-    "prompt": "Try to write.",
+    "task_key": "nested-edit",
+    "prompt": "Make one bounded edit.",
     "scope": "write",
   }, headers=child_auth)
-  assert escalated.status_code == 403
-  assert "read-only" in escalated.json()["detail"]
+  assert sibling.status_code == 201, sibling.text
 
   # Ownership may continue through as many useful local levels as the work
-  # needs. Every bearer still owns only its direct children, and a read-only
-  # owner still cannot create a write-capable descendant.
+  # needs. Every bearer still owns only its direct children.
   nested_parent = nested.json()["child_chat_id"]
   for depth in (3, 4):
     db.add(make_goal_run(db,
@@ -601,7 +729,7 @@ def test_delegation_listing_exposes_run_usage_without_loading_result(
     "task_key": "usage-visible",
     "prompt": "Review only.",
     "provider": "codex",
-    "scope": "read",
+    "scope": "write",
   }, headers=owner_auth).json()
   db.add(make_goal_run(db,
     id="usage-run", root_run_id="usage-run",
@@ -628,29 +756,27 @@ def test_delegation_listing_exposes_run_usage_without_loading_result(
   }
 
 
-@pytest.mark.parametrize("scope", ["read", "write"])
-def test_a_helper_starting_fresh_after_earlier_turns_keeps_its_task(
-  client, owner_token, db, monkeypatch, scope,
+def test_helper_without_resumable_session_needs_parent_review(
+  client, owner_token, db, monkeypatch,
 ):
   """A helper whose first turn ended before any session was recorded (a
   restart, a failed start) resumes in a fresh provider session. That session
-  must receive the helper's history, task first, not only the continuation;
-  a write helper is never replayed automatically."""
+  must not replay prior trusted work without parent review."""
   from app import chat as chat_mod, schemas
   from app.broadcast import create_broadcast
 
   task = "TASK_SENTINEL: audit the three Reflection runs"
   continuation = "Resume the interrupted owner work after the planned server restart."
   app = models.App(
-    slug=f"test-fresh-helper-{scope}",
-    source_dir=f"/tmp/mobius-tests/test-fresh-helper-{scope}",
+    slug="test-fresh-helper",
+    source_dir="/tmp/mobius-tests/test-fresh-helper",
     name="Subagents", description="", jsx_source="",
   )
   db.add(app)
   db.flush()
-  parent = models.Chat(id=f"parent-{scope}", title="Parent", messages=[])
+  parent = models.Chat(id="parent", title="Parent", messages=[])
   child = models.Chat(
-    id=f"child-{scope}", title="Child", provider="claude",
+    id="child", title="Child", provider="claude",
     created_by_app_id=app.id, session_id=None,
     messages=[
       {"role": "user", "content": task},
@@ -660,13 +786,13 @@ def test_a_helper_starting_fresh_after_earlier_turns_keeps_its_task(
   db.add_all((parent, child))
   db.flush()
   db.add(models.Delegation(
-    id=f"delegation-{scope}", app_id=app.id, parent_chat_id=parent.id,
-    parent_root_run_id="parent-root", task_key=f"fresh-{scope}",
+    id="delegation", app_id=app.id, parent_chat_id=parent.id,
+    parent_root_run_id="parent-root", task_key="fresh",
     child_chat_id=child.id, provider="claude", model=None, effort=None,
-    scope=scope, cwd="/data",
+    scope="write", cwd="/data",
     prompt_sha256=hashlib.sha256(task.encode()).hexdigest(),
   ))
-  run_token = f"fresh-helper-{scope}"
+  run_token = "fresh-helper"
   db.add(make_goal_run(db,
     id=run_token, root_run_id=run_token, chat_id=child.id,
     status="running", provider="claude", provider_execution_admitted=False,
@@ -697,18 +823,12 @@ def test_a_helper_starting_fresh_after_earlier_turns_keeps_its_task(
   ))
 
   db.expire_all()
-  if scope == "write":
-    assert prompts == []
-    final = db.get(models.Chat, child.id).messages[-1]
-    assert "DELEGATION_WRITE_REVIEW_REQUIRED" in str(final)
-    return
-  (prompt,) = prompts
-  assert prompt.index("TASK_SENTINEL") < prompt.index(
-    "PARTIAL_WORK_SENTINEL"
-  ) < prompt.index(continuation)
+  assert prompts == []
+  final = db.get(models.Chat, child.id).messages[-1]
+  assert "DELEGATION_WRITE_REVIEW_REQUIRED" in str(final)
 
 
-def test_child_policy_is_integrity_checked_and_write_loss_needs_review(db):
+def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   app = models.App(
     slug="test-delegations-116",
     source_dir="/tmp/mobius-tests/test-delegations-116",
@@ -746,7 +866,6 @@ def test_child_policy_is_integrity_checked_and_write_loss_needs_review(db):
 
   policy = policy_for_chat(db, child.id)
   assert policy is not None
-  assert policy.allow_session_reseed is False
   # Helpers delegate through Möbius, never provider-native helper tools.
   assert "spawn_agent" in policy.system_prompt
   assert "provider-native" not in policy.system_prompt
@@ -755,7 +874,7 @@ def test_child_policy_is_integrity_checked_and_write_loss_needs_review(db):
     policy.system_prompt
   )
   assert "exact owner-approved operation" in policy.system_prompt
-  assert "return the missing approval or scope to the parent" in (
+  assert "return the missing approval to the parent" in (
     policy.system_prompt
   )
   assert "Never read or write /data/cli-auth" not in policy.system_prompt
@@ -914,7 +1033,7 @@ def _seed_delegation(
     provider="claude",
     model="claude-sonnet-4-6",
     effort="high",
-    scope="read",
+    scope="write",
     cwd="/data/platform",
     prompt_sha256=hashlib.sha256(b"Do the bounded task.").hexdigest(),
     notify_parent_on_complete=notify,
@@ -2623,6 +2742,28 @@ def test_legacy_committed_carrier_keeps_its_exact_restart_recovery(
   assert attempts[0]["run_token"] == run_token
   db.expire_all()
   assert db.get(models.Chat, parent_id).messages == [carrier]
+
+  # The same exact orphan must not survive cutover if this parent is itself
+  # a retired read helper; no parent wake can ever drive that chat again.
+  db.add(models.Chat(id="grandparent-legacy-recovery", title="Grandparent", messages=[]))
+  db.add(models.Delegation(
+    id="retired-parent-legacy-recovery", app_id=row.app_id,
+    parent_chat_id="grandparent-legacy-recovery", parent_root_run_id="grand-root",
+    task_key="retired-parent", child_chat_id=parent_id,
+    provider="claude", scope="read", cwd="/data",
+    interrupted_at=now_naive_utc(), prompt_sha256=hashlib.sha256(b"old task").hexdigest(),
+  ))
+  db.commit()
+  assert delegations_mod.safe_parent_wake_startup_writer_orphan(
+    db, parent, db.get(models.ChatRun, run_token),
+  ) is False
+  assert delegations_mod.safe_parent_activity_startup_writer_orphan(
+    db, parent, db.get(models.ChatRun, run_token),
+  ) is False
+  from app.chat import reconcile_startup_chats
+  assert parent_id not in reconcile_startup_chats(db).manual
+  db.expire_all()
+  assert db.get(models.ChatRun, run_token).status == "interrupted"
 
 
 def test_cancelling_an_owner_settles_descendants_before_the_parent(db):

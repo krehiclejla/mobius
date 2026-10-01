@@ -98,6 +98,11 @@ def test_production_startup_plan_has_explicit_unique_order():
   assert names.index("start chat writer") < names.index("fix forward chat media")
   assert names.index("start chat writer") < names.index("reconcile startup chats")
   assert names.index("freeze legacy app runtimes") < names.index("reconcile startup chats")
+  assert names.index("start chat writer") < names.index(
+    "interrupt legacy read helpers"
+  ) < names.index("reconcile startup chats")
+  cutover = next(task for task in startup.DATABASE_STARTUP_TASKS if task.name == "interrupt legacy read helpers")
+  assert cutover.database_failure_reason == "legacy_helper_cutover_incomplete"
   assert names.index("freeze legacy app runtimes") < names.index("reconcile app cron supervision")
   assert names.index("initialize push") < names.index("notify reconciled chats")
   assert names.index("install bootstrap apps") < names.index(

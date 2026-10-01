@@ -224,6 +224,78 @@ async function setup(
   )
 }
 
+for (const mode of ['single', 'panes']) {
+  for (const outcome of ['success', 'error', 'ordinary']) {
+    test(`provider callback provenance controls stale reload precedence (${mode}, ${outcome})`, async ({ page }) => {
+      await setup(page, { width: 1512, height: 911 })
+      // Chrome exists only for a genuinely tiled workspace. Merely setting
+      // viewMode='panes' on one leaf still paints a full-bleed Settings tab.
+      let callbackWorkspace = paneModel.setViewMode(
+        paneModel.seedFromFlatTabs([
+          { kind: 'chat', id: NAV_CHATS[0].id },
+          ...(mode === 'panes' ? [{ kind: 'chat', id: NAV_CHATS[1].id }] : []),
+        ]),
+        mode,
+      )
+      if (mode === 'panes') {
+        callbackWorkspace = paneModel.moveTab(
+          callbackWorkspace, `chat:${NAV_CHATS[1].id}`,
+          { root: true, edge: 'right' },
+        )
+        callbackWorkspace = paneModel.focusPane(callbackWorkspace, 'p0')
+        expect(Object.keys(callbackWorkspace.panes)).toHaveLength(2)
+      }
+      await page.evaluate(([key, blob, chatId]) => {
+        localStorage.setItem(key, blob)
+        sessionStorage.setItem('shell-reload', JSON.stringify({
+          activeView: 'chat', activeChatId: chatId, destinationClaimed: true,
+        }))
+      }, [
+        paneModel.STORAGE_KEY,
+        paneModel.serializeWorkspace(callbackWorkspace),
+        NAV_CHATS[0].id,
+      ])
+
+      const query = outcome === 'success'
+        ? 'section=ai-providers&mobius_enroll_return=1'
+        : outcome === 'error'
+          ? 'section=ai-providers&mobius_enroll_error=1'
+          : 'section=ai-providers'
+      if (outcome === 'ordinary') {
+        await page.goto(`${BASE}/settings?${query}`, { waitUntil: 'domcontentloaded' })
+      } else {
+        let callbacks = 0
+        await page.route('**/api/auth/provider/mobius/callback**', route => {
+          callbacks += 1
+          return route.fulfill({ status: 303, headers: { location: `/settings?${query}` }, body: '' })
+        })
+        await page.goto(`${BASE}/api/auth/provider/mobius/callback?code=mock&state=mock`, {
+          waitUntil: 'domcontentloaded',
+        })
+        expect(callbacks).toBe(1)
+      }
+
+      if (outcome === 'ordinary') {
+        await expect(page.locator('.settings')).not.toBeVisible()
+        await expect(page.locator(`[data-chat-id="${NAV_CHATS[0].id}"][data-chat-surface="painted"]`)).toBeVisible()
+      } else {
+        await expect(page.locator('.settings')).toBeVisible()
+        await expect(page.locator('#settings-ai-providers')).toBeFocused()
+        if (mode === 'panes') {
+          await expect(page.locator('.workspace__chrome')).toBeVisible()
+          await expect(page.locator('.shell__settings-view[role="tabpanel"]')).toBeVisible()
+          await expect(page.locator(`[data-chat-id="${NAV_CHATS[1].id}"][data-chat-surface="painted"]`)).toBeVisible()
+        } else {
+          await expect(page.locator('.workspace__chrome')).not.toBeVisible()
+          const overlay = page.locator('.shell__settings-view.shell__view--active')
+          await expect(overlay).toBeVisible()
+          await expect(overlay).not.toHaveAttribute('role', 'tabpanel')
+        }
+      }
+    })
+  }
+}
+
 for (const width of [412, 1512]) {
   test(`the message composer has an unambiguous accessible name at ${width}px`, async ({ page }) => {
     await setup(page, { width, height: 915 })

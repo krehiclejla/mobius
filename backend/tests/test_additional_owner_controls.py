@@ -67,7 +67,7 @@ def controls(db, owner_token, tmp_path):
 
   delegated = delegation_execution_token(db, RunPolicy(
     delegation_id="owner-controls-delegation", app_id=app.id,
-    provider="codex", model=None, effort=None, scope="write", cwd="/data",
+    provider="codex", model=None, effort=None, cwd="/data",
   ), run_id="owner-controls-child-run")
   assert delegated is not None
   top_level = auth.create_agent_token(

@@ -32,7 +32,6 @@ import functools
 import logging
 import os
 import shutil
-import tempfile
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -41,6 +40,7 @@ from typing import Any, Callable
 
 from app import generated_files
 from app.codex_sdk_contract import (
+  app_server_exit_code,
   app_server_pid,
   control_client,
   install_approval_handler,
@@ -95,7 +95,11 @@ from app.usage_metrics import (
   normalize_codex_usage,
 )
 from app.runner_registry import RunnerKind, registry
-from app.memory_observability import record_memory_checkpoint_once
+from app.memory_observability import (
+  cgroup_oom_kill_count,
+  process_was_oom_killed,
+  record_memory_checkpoint_once,
+)
 
 log = logging.getLogger("moebius.chat")
 
@@ -163,54 +167,9 @@ def _codex_config_overrides() -> list[str]:
   return overrides
 
 
-# Landlock rights for a read Delegation's app-server. Everything may be read
-# and executed; only the writable roots below may change, and ``/dev`` keeps
-# the device writes a shell needs (/dev/null, PTYs).
-_READ_ONLY_RIGHTS = "read-file,read-dir,execute"
-_WRITABLE_RIGHTS = (
-  "execute,write-file,read-file,read-dir,remove-dir,remove-file,make-char,"
-  "make-dir,make-reg,make-sock,make-fifo,make-sym,refer,truncate"
-)
-
-
-class CodexReadConfinementUnavailable(RuntimeError):
-  """A read Delegation cannot be confined, so it must not start."""
-
-
-def _landlock_read_only_prefix(writable_roots: list[str]) -> list[str]:
-  """Return a ``setpriv`` prefix that makes the whole app-server read-only.
-
-  Codex's own read-only sandbox needs bubblewrap, whose user namespace the
-  Docker default seccomp profile blocks, and Codex 0.156+ refuses its legacy
-  Landlock backend because a command confined that way could still drive the
-  unconfined app-server through its control sockets (openai/codex#45984).
-  Confining the app-server process itself removes that escape: Landlock is
-  inherited by every tool command and MCP child and can never be lifted, so
-  there is no unconfined process left to reach. Landlock is unprivileged and
-  allowed by the default seccomp profile, so no container change is needed.
-  """
-  setpriv = shutil.which("setpriv")
-  if not setpriv:
-    raise CodexReadConfinementUnavailable(
-      "setpriv is unavailable, so a read Delegation cannot be kept read-only"
-    )
-  args = [
-    setpriv,
-    "--landlock-access", "fs",
-    "--landlock-rule", f"path-beneath:{_READ_ONLY_RIGHTS}:/",
-    "--landlock-rule", "path-beneath:read-file,write-file,truncate:/dev",
-  ]
-  for root in writable_roots:
-    if os.path.isdir(root):
-      args += ["--landlock-rule", f"path-beneath:{_WRITABLE_RIGHTS}:{root}"]
-  return [*args, "--"]
-
-
 def _codex_app_server_launch_args(
   codex_bin: str | None,
   config_overrides: list[str],
-  *,
-  read_only_writable_roots: list[str] | None = None,
 ) -> list[str] | None:
   """Build an app-server command isolated in its own Unix session.
 
@@ -229,15 +188,8 @@ def _codex_app_server_launch_args(
   """
   setsid_bin = shutil.which("setsid")
   if not codex_bin or not setsid_bin:
-    if read_only_writable_roots is not None:
-      raise CodexReadConfinementUnavailable(
-        "the Codex app-server cannot be launched confined on this host"
-      )
     return None
-  args = [setsid_bin]
-  if read_only_writable_roots is not None:
-    args += _landlock_read_only_prefix(read_only_writable_roots)
-  args.append(codex_bin)
+  args = [setsid_bin, codex_bin]
   for override in config_overrides:
     args.extend(["--config", override])
   args.extend(["app-server", "--listen", "stdio://"])
@@ -374,7 +326,10 @@ async def _enter_codex_context_owned(
 
 
 @contextlib.asynccontextmanager
-async def _codex_client_scope(codex_context, helper_host_key, sdk, config):
+async def _codex_client_scope(
+  codex_context, helper_host_key, sdk, config,
+  *, oom_kills_before: int | None, observe_exit: Callable[[bool], None],
+):
   """Yield ``(client, entry_cancel, helper_host)`` for one turn.
 
   Without a host key the turn owns a private app-server exactly as before.
@@ -384,14 +339,24 @@ async def _codex_client_scope(codex_context, helper_host_key, sdk, config):
   if helper_host_key is None:
     codex, entry_cancel = await _enter_codex_context_owned(codex_context)
     async with _EnteredCodexContext(codex_context, codex) as codex:
-      yield codex, entry_cancel, None
+      try:
+        yield codex, entry_cancel, None
+      finally:
+        # SDK close can SIGKILL and discard _proc. Observe the original
+        # process outcome before cleanup can manufacture different evidence.
+        observe_exit(process_was_oom_killed(
+          app_server_exit_code(codex), oom_kills_before=oom_kills_before,
+        ))
     return
   from app import helper_hosts
   async with helper_hosts.MANAGER.lease(
     helper_host_key,
     lambda: helper_hosts.CodexHelperHost(helper_host_key, sdk=sdk, config=config),
   ) as host:
-    yield host.client, None, host
+    try:
+      yield host.client, None, host
+    finally:
+      observe_exit(host.exit_evidence.was_oom_killed(oom_kills_before))
 
 
 class _EnteredCodexContext:
@@ -1573,20 +1538,10 @@ async def _run_codex_sdk_turn(
   config_overrides.extend(
     get_provider(provider_id, data_dir=runtime_data_dir).codex_config_overrides()
   )
-  # A read Delegation may write only Codex's own state, its deliverable
-  # directory, and scratch space; the rest of /data stays read-only.
+  # Keep the app-server in its own process group for turn-end cleanup.
   launch_args = _codex_app_server_launch_args(
     codex_bin,
     config_overrides,
-    read_only_writable_roots=(
-      [
-        env["CODEX_HOME"],
-        str(generated_dir),
-        env.get("TMPDIR") or tempfile.gettempdir(),
-      ]
-      if delegated and run_policy.scope == "read"
-      else None
-    ),
   )
   config_kwargs: dict[str, Any] = dict(
     codex_bin=codex_bin,
@@ -1715,9 +1670,17 @@ async def _run_codex_sdk_turn(
       "error": None,
     }
 
+  oom_kills_before = cgroup_oom_kill_count()
+  process_oom_killed = False
+
+  def observe_process_exit(oom_killed: bool) -> None:
+    nonlocal process_oom_killed
+    process_oom_killed = oom_killed
+
   try:
     async with _codex_client_scope(
       codex_context, helper_host_key, sdk, config,
+      oom_kills_before=oom_kills_before, observe_exit=observe_process_exit,
     ) as (codex, entry_cancel, helper_host):
       goal_client = control_client(codex) if session_id and retire_native_goal else None
       record_memory_checkpoint_once(
@@ -1788,10 +1751,8 @@ async def _run_codex_sdk_turn(
       )
 
       # Codex's own filesystem-restricted policies need bubblewrap, whose user
-      # namespace the Docker default seccomp profile blocks. Every Codex run
-      # therefore turns Codex's sandbox off; a read Delegation is instead kept
-      # read-only by the Landlock wrapper around its whole app-server
-      # (_landlock_read_only_prefix).
+      # namespace the Docker default seccomp profile blocks. Möbius's
+      # trusted helpers use the ordinary full-access provider setting.
       _sandbox = sdk["Sandbox"].full_access
       # Upgrade existing native goals before resume: Möbius now owns intent
       # and schedules exactly one provider turn per admitted attempt. Clearing
@@ -1856,7 +1817,7 @@ async def _run_codex_sdk_turn(
         # silent to the user, not to operators. A genuine resume ERROR still
         # raises upstream and surfaces; only this "different thread returned"
         # case (a lost session) reseeds.
-        if delegated and not run_policy.allow_session_reseed:
+        if delegated:
           from app.delegations import REVIEW_REQUIRED_MARKER
           return {
             "session_id": current_session_id,
@@ -2155,6 +2116,14 @@ async def _run_codex_sdk_turn(
             for event in _tool_completed_events(
               item, sdk, streamed_command_output=streamed_command_output,
             ):
+              image_view_cls = sdk.get("ImageViewThreadItem")
+              if image_view_cls is not None and isinstance(item, image_view_cls):
+                # Bind the completed view to its bytes without retaining a
+                # copy. An empty value prevents later same-name substitution.
+                event["viewed_image_sha256"] = await asyncio.to_thread(
+                  generated_files.viewed_inbox_sha256,
+                  runtime_data_dir, chat_id, getattr(item, "path", ""),
+                ) or ""
               _stamp_tool_use_id(event, item)
               bc.publish(event)
           # Also record child links here (idempotent) in case receiver_thread_ids
@@ -2341,6 +2310,7 @@ async def _run_codex_sdk_turn(
         "session_id": current_session_id,
         "cost_usd": None,
         "error": _TRANSPORT_DEATH_MESSAGE,
+        "oom_killed": process_oom_killed,
       })
     return with_usage({
       "session_id": current_session_id,

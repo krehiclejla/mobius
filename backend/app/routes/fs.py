@@ -43,7 +43,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from app import models
 from app.config import get_settings
 from app.deps import get_owner_or_app_with_filesystem_access, reject_cross_site
-from app.path_utils import validate_path_within_base
+from app.path_utils import has_overlong_segment, validate_path_within_base
 
 router = APIRouter(prefix="/api/fs", tags=["fs"])
 
@@ -186,6 +186,10 @@ def _resolve(path: str, root: Path) -> Path:
   if path and "\x00" in path:
     raise HTTPException(status_code=400, detail="Invalid path.")
   rel = (path or "").lstrip("/")
+  # A component past the 255-byte filesystem limit makes every later stat
+  # raise ENAMETOOLONG; no such file can exist, so refuse it up front.
+  if has_overlong_segment(rel):
+    raise HTTPException(status_code=400, detail="A path name is too long.")
   return validate_path_within_base(rel, root)
 
 
@@ -218,7 +222,12 @@ def _entry(child: Path, rel_prefix: str) -> dict | None:
   if is_dir:
     # A cheap probe so the UI can badge git repos + decide whether to call
     # /git, without a recursive walk.
-    entry["is_git_repo"] = (child / ".git").exists()
+    # An unreadable directory (e.g. a root-owned 0700 one) cannot be probed;
+    # it is simply not badged rather than failing the whole listing.
+    try:
+      entry["is_git_repo"] = (child / ".git").exists()
+    except OSError:
+      entry["is_git_repo"] = False
   else:
     mime, _ = mimetypes.guess_type(child.name)
     entry["mime_type"] = mime

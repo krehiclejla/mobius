@@ -50,7 +50,7 @@ def _normalize_subagent_status(status: str | None) -> str:
 # the durable transcript: `resumable` drives the one-tap Resume affordance
 # (MsgContent), and `pause` is the single descriptor
 # `chat_event_sink._pause_note` builds
-# — {kind: 'restart'|'rate_limit'|'usage_limit', resets_at?} — that
+# — {kind: 'restart'|'rate_limit'|'usage_limit', resets_at?, check_at?} — that
 # ErrorCard reads to render the calm "Paused" family or the live "resets at …"
 # limit card. Folding the whole classification into `pause` keeps this
 # whitelist at TWO keys no matter how many pause facts exist, so it never grows
@@ -908,6 +908,10 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     if blk is None:
       return False
     blk["status"] = "done"
+    if "viewed_image_sha256" in event and blk.get("tool") == "ViewImage":
+      digest = event["viewed_image_sha256"]
+      if isinstance(digest, str):
+        blk["viewed_image_sha256"] = digest
     return True
 
   if event_type == "skill_loaded":
@@ -975,6 +979,8 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
       "mime_type": event.get("mime_type"),
       "previewable": event.get("previewable") is True,
     }
+    if isinstance(event.get("sha256"), str):
+      entry["sha256"] = event["sha256"]
     target = next((
       block for block in reversed(assistant_blocks)
       if block.get("type") == "generated_files"

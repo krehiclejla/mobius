@@ -250,6 +250,73 @@ def test_reconcile_run_updates_appends_terminal_snapshot_after_core_update(db):
   assert reconcile_run_updates(db) == 0
 
 
+def test_reconcile_run_updates_repairs_missing_latest_snapshot_only(db):
+  _, run = _chat_run(db)
+  db.query(models.ChatRunUpdate).filter(
+    models.ChatRunUpdate.chat_run_id == run.id
+  ).delete()
+  db.commit()
+
+  assert reconcile_run_updates(db) == 1
+  assert db.query(models.ChatRunUpdate).filter(
+    models.ChatRunUpdate.chat_run_id == run.id
+  ).count() == 1
+  assert reconcile_run_updates(db) == 0
+
+
+def test_reconcile_run_updates_uses_latest_not_older_matching_snapshot(db):
+  _, run = _chat_run(db)
+  db.add(models.ChatRunUpdate(
+    chat_id=run.chat_id, chat_run_id=run.id, provider=run.provider,
+    status="interrupted", started_at=run.started_at, ended_at=run.ended_at,
+    observed_at=datetime(2026, 7, 22, 10, 1, 0),
+  ))
+  db.commit()
+
+  assert reconcile_run_updates(db) == 1
+  latest = db.query(models.ChatRunUpdate).order_by(
+    models.ChatRunUpdate.id.desc()
+  ).first()
+  assert latest.status == "running"
+  assert reconcile_run_updates(db) == 0
+
+
+def test_reconcile_run_updates_preserves_null_and_python_datetime_equality(db):
+  _, run = _chat_run(db)
+  # SQLite compares these stored timestamp strings as distinct, but the ORM
+  # converts both to the same Python datetime. Reconciliation must not append.
+  db.execute(text(
+    "UPDATE chat_run_updates SET started_at = '2026-07-22 10:00:00' "
+    "WHERE chat_run_id = :id"
+  ), {"id": run.id})
+  db.commit()
+  assert reconcile_run_updates(db) == 0
+
+  db.execute(text(
+    "UPDATE chat_runs SET started_at = NULL, ended_at = NULL WHERE id = :id"
+  ), {"id": run.id})
+  db.execute(text(
+    "UPDATE chat_run_updates SET started_at = NULL, ended_at = NULL "
+    "WHERE chat_run_id = :id"
+  ), {"id": run.id})
+  db.commit()
+  assert reconcile_run_updates(db) == 0
+
+
+def test_reconcile_run_updates_repairs_beyond_one_stream_batch(db):
+  _chat_run(db)
+  db.execute(text(
+    "INSERT INTO chat_runs (id, chat_id, provider, status, started_at) "
+    "VALUES (:id, 'chat-life', 'codex', 'completed', "
+    "'2026-07-22 10:00:00.000000')"
+  ), [{"id": f"missing-{index}"} for index in range(600)])
+  db.commit()
+
+  assert reconcile_run_updates(db) == 600
+  assert db.query(models.ChatRunUpdate).count() == 601
+  assert reconcile_run_updates(db) == 0
+
+
 def test_chat_run_delete_emits_tombstone_with_foreign_keys_enabled(db):
   _, run = _chat_run(db)
   db.execute(text("PRAGMA foreign_keys=ON"))

@@ -248,7 +248,8 @@ def _candidate_rows(db: Session, tokens: list[str]):
   """Return candidate normalized documents through the dialect's light seam."""
   columns = (
     "d.chat_id, d.msg_idx, d.ts, d.role, d.text, chat.title, "
-    "CAST(COALESCE(chat.activity_at, chat.updated_at) AS TEXT)"
+    "CAST(COALESCE(chat.activity_at, chat.updated_at) AS TEXT), "
+    "chat.archived_at IS NOT NULL"
   )
   if _database_dialect(db) == "sqlite":
     return db.execute(
@@ -316,12 +317,15 @@ def _rank_results(rows, tokens: list[str], limit: int) -> list[dict]:
     if len(top_results) > limit:
       heapq.heappop(top_results)
 
-  for chat_id, msg_idx, timestamp, role, doc_text, title, active_text in rows:
+  for (
+    chat_id, msg_idx, timestamp, role, doc_text, title, active_text, archived,
+  ) in rows:
     if current is None or current["id"] != chat_id:
       finish(current)
       current = {
         "id": chat_id,
         "title": title,
+        "archived": bool(archived),
         "last_active": active_text or "",
         "match_count": 0,
         "best_prose": None,
@@ -359,6 +363,8 @@ def _rank_results(rows, tokens: list[str], limit: int) -> list[dict]:
       "snippet": snippet,
       "anchor_key": anchor_key,
       "last_active": _iso_timestamp(result["last_active"]),
+      # Archived chats stay findable; the shell labels them.
+      "archived": result["archived"],
     })
   return output
 

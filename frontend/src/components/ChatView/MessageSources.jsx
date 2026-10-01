@@ -1,8 +1,7 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useId, useRef } from 'react'
 import { ChevronDown } from '@openai/apps-sdk-ui/components/Icon'
-import { apiFetch, jsonOrThrow } from '../../api/client.js'
+import useMessageSources from './hooks/useMessageSources.js'
 import {
-  messageSources,
   sourceDisplayLabels,
   sourceFaviconDiscoveryUrl,
   sourceFaviconUrl,
@@ -18,90 +17,31 @@ function sourceMark(host) {
   return displayHost.match(/[a-z0-9]/i)?.[0]?.toUpperCase() || '•'
 }
 
-export function messageSourcesUrl(chatId, messageIndex) {
-  return `/chats/${encodeURIComponent(chatId)}/message-sources`
-    + `?message_index=${encodeURIComponent(messageIndex)}`
-}
-
 // Web references that informed an answer. Historical chat payloads carry only
-// sourceRef; the link metadata is read when this disclosure first opens.
+// source indices; the link metadata is read when this disclosure first opens.
 // A just-completed live answer already has the same bounded metadata in its
 // tool blocks, so it can expand without an unnecessary round trip.
 export default function MessageSources({
-  blocks,
   chatId,
-  sourceRef = null,
+  groups,
+  refs,
   disclosureKey,
 }) {
-  const inlineSources = useMemo(() => messageSources(blocks), [blocks])
-  const remoteMessageIndex = Number.isInteger(sourceRef?.message_index)
-    ? sourceRef.message_index
-    : null
-  const count = Number.isInteger(sourceRef?.count) && sourceRef.count > 0
-    ? sourceRef.count
-    : inlineSources.length
   const [open, setOpen] = useDisclosureState(chatId, disclosureKey)
-  const [loadedSources, setLoadedSources] = useState(
-    () => inlineSources.length > 0 ? inlineSources : null,
-  )
-  const [loadError, setLoadError] = useState(false)
-  const [loadAttempt, setLoadAttempt] = useState(0)
+  const { sources, hasSources, count, failed, complete, retry } = useMessageSources({
+    chatId,
+    groups,
+    refs,
+    open,
+  })
   const toggleRef = useRef(null)
   const bodyRef = useRef(null)
   const bodyId = useId()
-  const remoteKey = remoteMessageIndex == null
-    ? ''
-    : `${chatId}:${remoteMessageIndex}`
-
-  useEffect(() => {
-    setLoadedSources(inlineSources.length > 0 ? inlineSources : null)
-    setLoadError(false)
-  }, [inlineSources, remoteKey])
-
-  useEffect(() => {
-    if (!open || loadedSources !== null || loadError
-        || remoteMessageIndex == null) return undefined
-    const controller = new AbortController()
-    let current = true
-    apiFetch(messageSourcesUrl(chatId, remoteMessageIndex), {
-      signal: controller.signal,
-    })
-      .then(response => jsonOrThrow(response, 'References failed to load'))
-      .then(data => {
-        if (!current) return
-        setLoadedSources(messageSources([{
-          type: 'tool',
-          sources: Array.isArray(data.sources) ? data.sources : [],
-        }]))
-      })
-      .catch(error => {
-        if (!current || error?.name === 'AbortError') return
-        setLoadError(true)
-      })
-    return () => {
-      current = false
-      controller.abort()
-    }
-  }, [
-    chatId,
-    loadAttempt,
-    loadError,
-    loadedSources,
-    open,
-    remoteKey,
-    remoteMessageIndex,
-  ])
-
-  if (count === 0) return null
-  const sources = loadedSources || []
+  if (!hasSources) return null
   const labels = sourceDisplayLabels(sources)
   const toggle = () => {
     preserveTogglePosition(toggleRef.current, bodyRef.current)
     setOpen(value => !value)
-  }
-  const retry = () => {
-    setLoadError(false)
-    setLoadAttempt(value => value + 1)
   }
 
   return (
@@ -115,7 +55,7 @@ export default function MessageSources({
         aria-controls={bodyId}
       >
         <span className="chat__sources-label">References</span>
-        <span className="chat__sources-count">{count}</span>
+        {count !== null && <span className="chat__sources-count">{count}</span>}
         <ChevronDown
           className="chat__sources-chevron"
           width={16}
@@ -129,22 +69,22 @@ export default function MessageSources({
         className="chat__sources-body"
         hidden={!open}
       >
-        {open && loadedSources === null && !loadError && (
+        {open && !complete && !failed && (
           <span className="chat__sources-status" role="status" aria-live="polite">
             Loading references…
           </span>
         )}
-        {open && loadError && (
+        {open && failed && (
           <div className="chat__lazy-status">
             <span className="chat__sources-status" role="status" aria-live="polite">
-              References unavailable.
+              Some references could not load.
             </span>
             <button type="button" className="chat__lazy-retry" onClick={retry}>
               Retry
             </button>
           </div>
         )}
-        {open && loadedSources !== null && (
+        {open && sources.length > 0 && (
           <ul className="chat__sources-list" aria-label="References for this answer">
             {sources.map((source, index) => {
               const label = labels[index]

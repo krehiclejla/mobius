@@ -155,7 +155,7 @@ test('a tool before the continuation text fails closed', () => {
 })
 
 
-test('multiple sealed text blocks fail closed instead of crossing activity', () => {
+test('multiple sealed text blocks are never joined across activity', () => {
   const sealed = {
     role: 'assistant',
     content: 'First\n\nSecond',
@@ -168,6 +168,130 @@ test('multiple sealed text blocks fail closed instead of crossing activity', () 
   const continuation = assistant('First\n\nSecond plus more')
 
   assert.equal(projectSteerContinuationMessage(sealed, continuation), continuation)
+})
+
+
+test('a repeated steer trims only the exact terminal text section', () => {
+  const sealed = {
+    role: 'assistant',
+    content: 'Earlier answer\n\nLatest section',
+    blocks: [
+      { type: 'text', content: 'Earlier answer' },
+      { type: 'tool', tool: 'Bash', status: 'done', output: 'ok' },
+      { type: 'text', content: 'Latest section' },
+    ],
+  }
+  const thinking = { type: 'thinking', content: 'Continuing' }
+  const tool = { type: 'tool', tool: 'Bash', status: 'done', output: 'next' }
+  const later = { type: 'text', content: 'Later result' }
+  const continuation = {
+    role: 'assistant',
+    content: 'Latest section continues.\n\nLater result',
+    blocks: [
+      thinking,
+      { type: 'text', content: 'Latest section continues.', source_text_offset: 4 },
+      tool,
+      later,
+    ],
+  }
+  const before = JSON.stringify({ sealed, continuation })
+
+  const projected = projectSteerContinuationMessage(sealed, continuation)
+
+  assert.equal(projected.blocks[1].content, ' continues.')
+  assert.equal(projected.blocks[1].source_text_offset, 4 + 'Latest section'.length)
+  assert.equal(projected.blocks[0], thinking)
+  assert.equal(projected.blocks[2], tool)
+  assert.equal(projected.blocks[3], later)
+  assert.equal(JSON.stringify({ sealed, continuation }), before,
+    'stored messages and activity are never rewritten')
+})
+
+
+test('a chain of multi-section replies continues from each raw terminal section', () => {
+  const first = assistant('First section')
+  const second = assistant('First section continued.\n\nSecond section', {
+    blocks: [
+      { type: 'text', content: 'First section continued.' },
+      { type: 'text', content: 'Second section' },
+    ],
+  })
+  const third = assistant('Second section continued.\n\nThird section', {
+    blocks: [
+      { type: 'text', content: 'Second section continued.' },
+      { type: 'text', content: 'Third section' },
+    ],
+  })
+
+  const displayed = projectSettledSteerContinuations([
+    first, steer('one'), second, steer('two'), third,
+  ])
+
+  assert.equal(displayed[2].blocks[0].content, ' continued.')
+  assert.equal(displayed[2].blocks[1], second.blocks[1])
+  assert.equal(displayed[4].blocks[0].content, ' continued.')
+  assert.equal(displayed[4].blocks[1], third.blocks[1])
+})
+
+
+test('a terminal-section replay hides live partials but reveals divergence and settled short text', () => {
+  const sealed = assistant('Earlier\n\nLatest section', {
+    blocks: [
+      { type: 'text', content: 'Earlier' },
+      { type: 'text', content: 'Latest section' },
+    ],
+  })
+  const partial = assistant('Latest')
+  const mismatch = assistant('Latest change')
+  const earlier = assistant('Earlier continued')
+
+  assert.equal(projectSteerContinuationMessage(sealed, partial, { active: true }).blocks[0].content, '')
+  assert.equal(projectSteerContinuationMessage(sealed, partial), partial)
+  assert.equal(projectSteerContinuationMessage(sealed, mismatch, { active: true }), mismatch)
+  assert.equal(projectSteerContinuationMessage(sealed, earlier), earlier)
+})
+
+
+test('terminal-section replay preserves unsafe Markdown instead of hiding real formatting', () => {
+  const sealed = assistant('Earlier\n\n**Plan', {
+    blocks: [
+      { type: 'text', content: 'Earlier' },
+      { type: 'text', content: '**Plan' },
+    ],
+  })
+  const continuation = assistant('**Planned** maintenance')
+
+  assert.equal(projectSteerContinuationMessage(sealed, continuation), continuation)
+})
+
+
+test('a sealed tool or question boundary prevents reaching back to earlier text', () => {
+  for (const boundary of [
+    { type: 'tool', tool: 'Bash', status: 'done', output: 'ok' },
+    { type: 'question', question: 'Choose one' },
+    { type: 'text', content: '' },
+  ]) {
+    const sealed = assistant('Answer', {
+      blocks: [{ type: 'text', content: 'Answer' }, boundary],
+    })
+    const continuation = assistant('Answer continued.')
+
+    assert.equal(projectSteerContinuationMessage(sealed, continuation), continuation)
+  }
+})
+
+
+test('trailing thinking remains neutral when selecting the terminal text section', () => {
+  const sealed = assistant('Earlier\n\nLatest section', {
+    blocks: [
+      { type: 'text', content: 'Earlier' },
+      { type: 'text', content: 'Latest section' },
+      { type: 'thinking', content: 'Replanning' },
+    ],
+  })
+
+  assert.equal(projectSteerContinuationMessage(sealed,
+    assistant('Latest section continued.')).blocks[0].content, ' continued.')
 })
 
 

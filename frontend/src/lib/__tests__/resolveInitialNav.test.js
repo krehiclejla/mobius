@@ -111,6 +111,25 @@ test('precedence: shellReload beats deepLink beats returnView beats restored', (
   assert.equal(resolveInitialNav(onlyRestored).appId, 2) // restored wins
 })
 
+test('OAuth Settings callback alone overrides shellReload, but ordinary shell deep links do not', () => {
+  const shellReload = { activeView: 'chat', activeChatId: 'reloaded', destinationClaimed: true }
+  const callback = resolveInitialNav({
+    shellReload,
+    deepLink: { view: 'settings', section: 'ai-providers', providerReturn: true },
+    storedChatId: 'home',
+  })
+  assert.equal(callback.view, 'settings')
+  assert.equal(callback.section, 'ai-providers')
+  assert.equal(callback.chatId, 'home')
+  assert.equal(callback.seedHome, true)
+  assert.equal(resolveInitialNav({
+    shellReload, deepLink: { view: 'settings', section: 'ai-providers' },
+  }).chatId, 'reloaded')
+  assert.equal(resolveInitialNav({
+    shellReload, deepLink: { view: 'canvas', appId: 56 },
+  }).chatId, 'reloaded')
+})
+
 test('canvas chatId falls back to stored home chat when the source carries none', () => {
   const r = resolveInitialNav({ deepLink: { view: 'canvas', appId: 56 }, storedChatId: null })
   assert.equal(r.chatId, null)

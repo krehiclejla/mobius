@@ -930,6 +930,16 @@ test('a promoted assistant still resolves its live transcript-position alias', (
   assert.equal(scrollEl.scrollTop, 960)
 })
 
+test('a retained live display row still resolves its durable assistant source id', () => {
+  const row = { offsetTop: 1000 }
+  const scrollEl = {
+    scrollHeight: 2000, scrollTop: 500, clientHeight: 700,
+    querySelector: selector => selector === '[data-source-key="run:assistant:1"]' ? row : null,
+  }
+  applyMode(scrollEl, { kind: 'ANCHOR_AT', key: 'run:assistant:1', offset: 40 })
+  assert.equal(scrollEl.scrollTop, 960)
+})
+
 test('anchor reapply fires when scrollTop was clamped short but the target is now reachable', () => {
   // target = 1000 - 40 = 960; maxScrollTop = 2000 - 700 = 1300 ≥ 960 reachable;
   // scrollTop 500 < 960 → clamped short.

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import app.memory_observability as memory_observability
 from app.memory_observability import (
   _process_identity,
@@ -12,6 +14,32 @@ from app.memory_observability import (
   process_memory_snapshot,
   record_memory_checkpoint_once,
 )
+
+
+@pytest.mark.parametrize("exit_code, before, after, expected", [
+  (-9, 100, 101, True),
+  (-9, 100, 100, False),
+  (-9, 100, 0, False),
+  (-9, None, 101, False),
+  (-9, 100, None, False),
+  (1, 100, 101, False),
+  (-15, 100, 101, False),
+  (None, 100, 101, False),
+])
+def test_oom_evidence_requires_process_kill_and_current_attempt_counter_increase(
+  monkeypatch, exit_code, before, after, expected,
+):
+  monkeypatch.setattr(memory_observability, "cgroup_oom_kill_count", lambda: after)
+  assert memory_observability.process_was_oom_killed(
+    exit_code, oom_kills_before=before,
+  ) is expected
+
+
+def test_oom_counter_backlog_is_not_reused_by_subsequent_attempts(monkeypatch):
+  monkeypatch.setattr(memory_observability, "cgroup_oom_kill_count", lambda: 103)
+  assert memory_observability.process_was_oom_killed(-9, oom_kills_before=100)
+  for _ in range(3):
+    assert not memory_observability.process_was_oom_killed(-9, oom_kills_before=103)
 
 
 def test_process_identity_uses_command_ownership_not_generic_host_name():

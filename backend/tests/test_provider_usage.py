@@ -711,8 +711,13 @@ async def test_codex_usage_ignores_saturated_default_executor(
   monkeypatch, tmp_path,
 ):
   from app import provider_usage
+  from app import file_cache
 
   calls = []
+  monkeypatch.setattr(
+    file_cache, 'reclaim_provider_cache_sync',
+    lambda _: calls.append(('cache_advice', threading.current_thread().name)),
+  )
 
   class FakeLimits:
     def model_dump(self, **_kwargs):
@@ -780,7 +785,7 @@ async def test_codex_usage_ignores_saturated_default_executor(
     )
     assert result["plan_label"] == "Plus plan"
     assert {name for name, _thread in calls} >= {
-      "start", "initialize", "account_read", "request", "close",
+      "start", "initialize", "account_read", "request", "close", "cache_advice",
     }
     assert all(
       thread.startswith("mobius-codex-usage") for _name, thread in calls

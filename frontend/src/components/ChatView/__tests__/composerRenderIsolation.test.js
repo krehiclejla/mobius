@@ -9,15 +9,15 @@ const composerOwner = readFileSync(
   'utf8',
 )
 const activeSurface = readFileSync(
-  new URL('../ActiveAssistantSurface.jsx', import.meta.url),
+  new URL('../AssistantReply.jsx', import.meta.url),
   'utf8',
 )
 
 test('composer edits cannot recreate the active assistant payload', () => {
-  assert.match(activeSurface, /export default memo\(ActiveAssistantSurface\)/)
+  assert.match(activeSurface, /export default memo\(AssistantReply\)/)
   assert.match(activeSurface, /const msg = useMemo\(/)
   assert.match(activeSurface, /streamItemsToAssistantPayload\(streamItems/)
-  assert.match(chatView, /<ActiveAssistantSurface/)
+  assert.match(chatView, /<AssistantReply/)
   assert.match(
     chatView,
     /useMemo\(\(\) => deriveActiveAssistantSelection\(/,

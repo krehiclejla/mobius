@@ -438,6 +438,21 @@ def _reconcile_startup_chats(context: StartupContext) -> None:
     raise
 
 
+async def _interrupt_legacy_read_helpers(context: StartupContext) -> None:
+  """Settle old read-only work before chat and helper recovery can run."""
+  from app.delegations import interrupt_legacy_read_helpers
+  from app.chat_writer import ResolvePark, await_ack, get_writer
+
+  with SessionLocal() as db:
+    count, parks = interrupt_legacy_read_helpers(db)
+  for chat_id, run_token in parks:
+    await await_ack(get_writer().submit(ResolvePark(
+      chat_id=chat_id, run_token=run_token,
+    )))
+  if count:
+    context.logger.info("interrupted %d legacy read helper(s)", count)
+
+
 def _reconcile_agent_lifecycle(context: StartupContext) -> None:
   from app.agent_lifecycle import reconcile_run_updates
 
@@ -691,6 +706,11 @@ DATABASE_STARTUP_TASKS = (
   ),
   StartupTask("read restart authorization", _read_restart_authorization),
   StartupTask("freeze legacy app runtimes", _freeze_legacy_app_runtimes),
+  StartupTask(
+    "interrupt legacy read helpers",
+    _interrupt_legacy_read_helpers,
+    database_failure_reason="legacy_helper_cutover_incomplete",
+  ),
   StartupTask(
     "reconcile startup chats",
     _reconcile_startup_chats,

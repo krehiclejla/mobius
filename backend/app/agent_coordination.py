@@ -311,6 +311,8 @@ def _scope_membership(
 def _delegation_status(
   row: models.Delegation, run: Any | None,
 ) -> str:
+  if row.interrupted_at is not None:
+    return "interrupted"
   if row.cancelled_at is not None:
     return "cancelled"
   if run is None:

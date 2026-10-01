@@ -21,7 +21,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 
 from app import models, providers
@@ -289,34 +289,44 @@ def reconcile_run_updates(db) -> int:
     .group_by(update.chat_run_id)
     .subquery()
   )
+  run = models.ChatRun
+  fields = ("chat_id", "provider", "status", "started_at", "ended_at")
   rows = (
-    db.query(models.ChatRun, update)
+    db.query(
+      run.id,
+      *(getattr(run, field) for field in fields),
+      *(getattr(update, field) for field in fields),
+    )
     .outerjoin(latest, latest.c.chat_run_id == models.ChatRun.id)
     .outerjoin(update, update.id == latest.c.update_id)
-    .all()
+    .filter(or_(
+      update.id.is_(None),
+      *(getattr(run, field).is_distinct_from(getattr(update, field))
+        for field in fields),
+    ))
+    .yield_per(512)
   )
-  stale = [
-    run for run, snapshot in rows
-    if (
-      snapshot is None
-      or snapshot.chat_id != run.chat_id
-      or snapshot.provider != run.provider
-      or snapshot.status != run.status
-      or snapshot.started_at != run.started_at
-      or snapshot.ended_at != run.ended_at
-    )
-  ]
   observed_at = now_naive_utc()
-  for run in stale:
+  stale = 0
+  for row in rows:
+    run_id, *values = row
+    current = values[:len(fields)]
+    snapshot = values[len(fields):]
+    # SQLite may store two textual representations of one datetime. SQL is
+    # deliberately an overinclusive prefilter; keep the original Python
+    # DateTime equality before appending an irreversible cursor snapshot.
+    if current == snapshot:
+      continue
     db.add(update(
-      chat_id=run.chat_id,
-      chat_run_id=run.id,
-      provider=run.provider,
-      status=run.status,
-      started_at=run.started_at,
-      ended_at=run.ended_at,
+      chat_id=current[0],
+      chat_run_id=run_id,
+      provider=current[1],
+      status=current[2],
+      started_at=current[3],
+      ended_at=current[4],
       observed_at=observed_at,
     ))
+    stale += 1
   if stale:
     db.commit()
-  return len(stale)
+  return stale

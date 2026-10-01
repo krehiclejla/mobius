@@ -268,7 +268,7 @@ export default function ProjectWorkspace({
                     {chats.map(chat => (
                       <button key={chat.id} type="button" className="project-chats__row" onClick={() => onOpenChat?.(chat)}>
                         <MessageSquare width={16} height={16} aria-hidden="true" />
-                        <span><strong>{chat.title || 'New chat'}</strong>{!chat.has_messages && <small>Empty</small>}</span>
+                        <span><strong>{chat.title || 'New chat'}</strong>{!chat.has_messages && <small>Empty</small>}{chat.archived_at && <small>Archived</small>}</span>
                       </button>
                     ))}
                   </div>

@@ -1,8 +1,8 @@
 """Per-provider quota/availability signal for unattended provider selection.
 
 Written only inside the ``chat_writer`` actor (the single serialized persistence
-owner): a turn that parks on a usage/rate limit records the provider's reset
-time, and an explicit provider-success acknowledgement clears only a limit no
+owner): a turn that parks on a usage/rate limit records a bounded retry
+check, and an explicit provider-success acknowledgement clears only a limit no
 newer than that run.
 Read by
 ``background_agents.resolve_background_provider`` to skip a provider that is
@@ -16,12 +16,12 @@ from datetime import UTC, datetime
 from app.models import ProviderAvailability
 from app.timeutil import now_naive_utc
 
-# Park reasons that carry a provider reset time.
+# Park reasons that suppress selection until a bounded retry check.
 LIMIT_REASONS = ("usage_limit", "rate_limit")
 
 
 def provider_within_quota(db, provider: str) -> bool:
-  """True unless ``provider`` is currently usage/rate-limited past its reset."""
+  """Whether quota observations permit another selection, not proof of quota."""
   if not provider:
     return True
   row = db.get(ProviderAvailability, provider)
@@ -33,10 +33,11 @@ def provider_within_quota(db, provider: str) -> bool:
 def mark_provider_limited(
   db, provider: str | None, until: datetime | None, reason: str,
 ) -> None:
-  """Record a usage/rate limit with its reset time (monotonic max).
+  """Record a usage/rate limit with its bounded retry time (monotonic max).
 
-  A shorter window never shortens a longer live limit — the latest known reset
-  wins so a stale short window can't declare a still-limited provider healthy.
+  A shorter window never shortens a longer live cooldown. The caller supplies
+  a bounded retry deadline, not a possibly unbounded provider-reported reset.
+  Passing it permits another attempt; it does not prove restored quota.
   ``reason`` is stored for observability (which limit type parked the provider).
   """
   if not provider or reason not in LIMIT_REASONS or until is None:

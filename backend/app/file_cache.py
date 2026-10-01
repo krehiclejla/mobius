@@ -213,12 +213,18 @@ def settled_tool_paths() -> tuple[Path, ...]:
   return tuple(paths)
 
 
+def reclaim_provider_cache_sync(provider: str) -> None:
+  """Best-effort post-exit advice for callers already on a worker thread."""
+  try:
+    reclaim_file_cache(provider_tool_paths(provider), skip_mapped=False)
+  except Exception:
+    log.debug('provider file cache advice failed', exc_info=True)
+
+
 async def reclaim_provider_cache(provider: str) -> None:
   """Optional post-exit work must not block the event loop or mask a result."""
   try:
-    await asyncio.to_thread(
-      reclaim_file_cache, provider_tool_paths(provider), skip_mapped=False,
-    )
+    await asyncio.to_thread(reclaim_provider_cache_sync, provider)
   except Exception:
     log.debug('provider file cache advice failed', exc_info=True)
 

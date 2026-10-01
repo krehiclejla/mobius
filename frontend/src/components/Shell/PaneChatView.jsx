@@ -53,6 +53,8 @@ function PaneChatView({
   onDisplayReady,
   onChatBoundaryError,
   focusPendingQuestion = false,
+  archived = false,
+  setChatArchived,
 }) {
   const appArtifactsQuery = chatAppArtifactQueries.detail.useQuery(chatId, {
     enabled: !newChatSession || newChatSession.materialized,
@@ -135,6 +137,10 @@ function PaneChatView({
 
   useEffect(() => () => displayReadyCancelRef.current(), [])
 
+  const handleRestoreArchived = useCallback(() => {
+    void setChatArchived?.(chatId, false)
+  }, [chatId, setChatArchived])
+
   return (
     <ErrorBoundary
       key={chatId}
@@ -170,6 +176,8 @@ function PaneChatView({
         onComposerRequestHandled={onComposerRequestHandled}
         onDisplayReady={onDisplayReady ? handleDisplayReady : null}
         focusPendingQuestion={focusPendingQuestion}
+        archived={archived}
+        onRestoreArchived={setChatArchived ? handleRestoreArchived : undefined}
       />
     </ErrorBoundary>
   )

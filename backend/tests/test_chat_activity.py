@@ -51,7 +51,7 @@ def _helper(
     provider="claude",
     model="claude-sonnet-4-6",
     effort="high",
-    scope="read",
+    scope="write",
     cwd="/data/platform",
     prompt_sha256=hashlib.sha256(suffix.encode()).hexdigest(),
     notify_parent_on_complete=notify,

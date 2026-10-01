@@ -1,7 +1,9 @@
 /* Resolve image-view tool results without handing their base64 payload to the generic text renderer. */
 
 const CHAT_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/(uploads|media)\/([^/]+)$/
+const GENERATED_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/deliverables\/inbox\/([^/]+)$/
 const TMP_IMAGE_PATH = /^\/tmp\/(.+)$/
+const SCRATCH_IMAGE_PATH = /^\/data\/agent-scratch\/([^/]+)\/(.+)$/
 const INLINE_IMAGE_TYPES = new Set([
   'image/png',
   'image/jpeg',
@@ -56,10 +58,49 @@ export function temporaryImageReference(input, chatId) {
   }
 }
 
+/** A viewed deliverable previews through its final same-turn attachment.
+ * Only fingerprinted views can claim a content-matched preview. */
+export function generatedInboxImageName(input, chatId) {
+  if (!chatId) return null
+  const match = imagePathFromInput(input).match(GENERATED_IMAGE_PATH)
+  return match?.[1] === chatId ? match[2] : null
+}
+
+export function generatedImageReference(input, chatId, {
+  files = [], viewedDigest, completed = false,
+} = {}) {
+  if (!completed) return null
+  const name = generatedInboxImageName(input, chatId)
+  if (!name) return null
+  if (typeof viewedDigest !== 'string' || !/^[a-f0-9]{64}$/.test(viewedDigest)) return null
+  const file = files.find(candidate => (
+    candidate?.previewable === true
+    && INLINE_IMAGE_TYPES.has(candidate.mime_type)
+    && (candidate.sha256 === viewedDigest
+      || (candidate.sha256 == null && candidate.name === name))
+  ))
+  if (!file) return null
+  return {
+    kind: 'generated', chatId, collection: 'generated-files', filename: file.name,
+    expectedSha256: viewedDigest,
+  }
+}
+
+/** Agent scratch is per-chat and expires; this previews its current file only. */
+export function scratchImageReference(input, chatId) {
+  if (!chatId) return null
+  const match = imagePathFromInput(input).match(SCRATCH_IMAGE_PATH)
+  if (!match || match[1] !== chatId) return null
+  return { kind: 'scratch', chatId, filename: match[2] }
+}
+
 /** References that can render through an existing protected route without
  * loading the image tool's much larger base64 sidecar. */
-export function servedImageReference(input, chatId) {
-  return chatImageReference(input) || temporaryImageReference(input, chatId)
+export function servedImageReference(input, chatId, generated = {}) {
+  return chatImageReference(input)
+    || temporaryImageReference(input, chatId)
+    || scratchImageReference(input, chatId)
+    || generatedImageReference(input, chatId, generated)
 }
 
 /** Fallback for image tools that viewed a path outside chat media. This work
@@ -89,6 +130,6 @@ export function inlineImageReference(output) {
   }
 }
 
-export function toolImageReference(input, output, chatId) {
-  return servedImageReference(input, chatId) || inlineImageReference(output)
+export function toolImageReference(input, output, chatId, generated = {}) {
+  return servedImageReference(input, chatId, generated) || inlineImageReference(output)
 }

@@ -108,14 +108,6 @@ test('toolGroupPastSummary: first-seen dedupe, lowercased continuations, raw nam
   )
 })
 
-test('collapsed label — LIVE mixed stretch keeps the progressive running-first rollup', () => {
-  const entries = [
-    e(tool({ tool: 'Read', status: 'done' })),
-    e(tool({ tool: 'Bash', status: 'running' })),
-  ]
-  assert.equal(activityCollapsedLabel(entries, { live: true }), 'Running a command · Reading a file')
-})
-
 test('a running tool keeps progressive copy outside the trailing live stretch', () => {
   const entries = [
     e(tool({ tool: 'Read', status: 'done' })),

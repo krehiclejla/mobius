@@ -228,6 +228,11 @@ changes. A contribution that changes the contract must name the affected
 invariant and justify the change; replacing a behavioral guard with a narrower
 implementation-name check is not equivalent coverage.
 
+Keep one canonical copy of each regression case. When consolidating tests,
+compare their setup and assertions, not just their names. Give distinct Python
+cases unique names: a later definition silently replaces an earlier one before
+pytest can collect it.
+
 **Chat scroll contract.** Before changing `ChatView`, read `ARCHITECTURE.md`
 "Chat scroll + steer contract" and run the send/spacer browser specs. The first
 visible user message always pins. A later direct, queued, promoted, or steered

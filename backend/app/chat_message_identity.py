@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+import re
+
+
+def assistant_message_run_id(message_id: object) -> str | None:
+  """Read physical ownership from an exact root or valid sink segment id.
+
+  Only the reserved positive ASCII segment suffix inherits a root. Malformed
+  suffixes remain exact identities; id-less legacy rows have no run identity.
+  Placement callers retain their event-specific position and fallback rules.
+  """
+  if not isinstance(message_id, str):
+    return None
+  return re.sub(r":assistant:[1-9][0-9]*$", "", message_id)
+
 
 def assistant_message_index(messages: list, message: dict) -> int:
   """Locate the assistant row owned by ``message``.

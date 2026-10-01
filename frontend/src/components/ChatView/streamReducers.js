@@ -594,6 +594,7 @@ export function attachGeneratedFile(prev, event) {
     mime_type: event.mime_type,
     previewable: event.previewable === true,
   }
+  if (typeof event.sha256 === 'string') entry.sha256 = event.sha256
   const i = prev.findLastIndex(it => it.type === 'generated_files')
   if (i < 0) return [...prev, { type: 'generated_files', files: [entry] }]
   const block = prev[i]

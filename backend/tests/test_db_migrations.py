@@ -28,6 +28,19 @@ PREVIOUS_RELEASE_SCHEMA = (
 )
 
 
+def test_legacy_helper_interruption_column_upgrades_idempotently(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'legacy-helper.db'}")
+  models.Base.metadata.create_all(eng)
+  with eng.begin() as conn:
+    conn.execute(text("ALTER TABLE delegations DROP COLUMN interrupted_at"))
+
+  migrations._add_legacy_helper_interruption(eng)
+  migrations._add_legacy_helper_interruption(eng)
+
+  columns = {column["name"] for column in inspect(eng).get_columns("delegations")}
+  assert "interrupted_at" in columns
+
+
 def test_autopilot_block_upgrade_preserves_legacy_pause_intent(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'autopilot-upgrade.db'}")
   models.Base.metadata.create_all(eng)
@@ -1649,7 +1662,8 @@ def test_run_migrations_adds_read_at_and_backfills_notifications(tmp_path):
     ))
     conn.execute(text(
       "INSERT INTO notifications (id, owner_id, source_type, title, sent_at) "
-      "VALUES ('n-legacy', 1, 'agent', 'Old', '2026-01-02 03:04:05')"
+      "VALUES ('n-legacy', 1, 'agent', 'Old', '2026-01-02 03:04:05'), "
+      "('n-legacy-2', 1, 'app', 'Older', '2026-01-01 00:00:00')"
     ))
     conn.commit()
 
@@ -1659,11 +1673,17 @@ def test_run_migrations_adds_read_at_and_backfills_notifications(tmp_path):
   inspector = inspect(eng)
   cols = {c["name"] for c in inspector.get_columns("notifications")}
   assert "read_at" in cols
+  assert "seen_at" in cols
   with eng.connect() as conn:
-    read_at = conn.execute(text(
-      "SELECT read_at FROM notifications WHERE id = 'n-legacy'"
-    )).scalar_one()
-  assert str(read_at) == "2026-01-02 03:04:05"
+    history = conn.execute(text(
+      "SELECT id, source_type, title, sent_at, read_at, seen_at "
+      "FROM notifications ORDER BY id"
+    )).all()
+  assert [(row.id, row.source_type, row.title, str(row.sent_at), str(row.read_at), str(row.seen_at))
+          for row in history] == [
+    ("n-legacy", "agent", "Old", "2026-01-02 03:04:05", "2026-01-02 03:04:05", "2026-01-02 03:04:05"),
+    ("n-legacy-2", "app", "Older", "2026-01-01 00:00:00", "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+  ]
 def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'migration-ledger.db'}")
   with eng.begin() as conn:
@@ -1756,8 +1776,36 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0071_delegation_result_identity",
     "0072_owner_timezone",
     "0073_schedule_provenance",
+    "0074_chat_owned_delegations",
+    "0075_notification_seen_at",
+    "0076_legacy_helper_interruption",
+    "0077_chat_archive",
   ]
   assert second == first
+
+
+def test_notification_seen_migration_preserves_current_unread_history(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'notification-seen.db'}")
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE TABLE notifications (id VARCHAR(64) PRIMARY KEY, sent_at DATETIME, "
+      "read_at DATETIME NULL)"
+    ))
+    conn.execute(text(
+      "INSERT INTO notifications (id, sent_at, read_at) VALUES "
+      "('unread', '2026-09-30 09:00:00', NULL), "
+      "('read', '2026-09-30 08:00:00', '2026-09-30 08:15:00')"
+    ))
+  migrations._add_notification_seen_at(eng)
+  migrations._add_notification_seen_at(eng)
+  with eng.connect() as conn:
+    rows = conn.execute(text(
+      "SELECT id, sent_at, read_at, seen_at FROM notifications ORDER BY id"
+    )).all()
+  assert [(r.id, str(r.read_at), str(r.seen_at)) for r in rows] == [
+    ("read", "2026-09-30 08:15:00", "2026-09-30 08:00:00"),
+    ("unread", "None", "2026-09-30 09:00:00"),
+  ]
 
 
 def test_chat_retention_repair_reclaims_broken_workflow_graph(

@@ -16,14 +16,21 @@ export default function ToolImageResult({ reference, preview }) {
   }
 
   return (
-    <ImagePreviewButton
-      src={current.src}
-      alt={alt}
-      buttonClassName="chat__tool-image-button"
-      imageClassName="chat__tool-image"
-      intrinsicWidth={current.width}
-      intrinsicHeight={current.height}
-      imageLoading="eager"
-    />
+    <>
+      <ImagePreviewButton
+        src={current.src}
+        alt={alt}
+        buttonClassName="chat__tool-image-button"
+        imageClassName="chat__tool-image"
+        intrinsicWidth={current.width}
+        intrinsicHeight={current.height}
+        imageLoading="eager"
+      />
+      {reference.kind === 'scratch' && (
+        <span className="chat__tool-image-status">
+          Temporary preview · current file may change or expire
+        </span>
+      )}
+    </>
   )
 }

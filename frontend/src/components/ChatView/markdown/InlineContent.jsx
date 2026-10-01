@@ -1,5 +1,4 @@
-import { useState, useEffect } from 'react'
-import { createPortal } from 'react-dom'
+import { useState, useEffect, useRef } from 'react'
 import DOMPurify from 'dompurify'
 import { getToken, isEphemeralAuth, BASE, apiFetch } from '../../../api/client.js'
 import { mediaTokenParam } from '../../../api/mediaToken.js'
@@ -10,6 +9,7 @@ import {
   previewSrcForChatMedia,
 } from './mediaImageSource.js'
 import ImageLightbox from './ImageLightbox.jsx'
+import ChatPanePortal from '../ChatPanePortal.jsx'
 import { projectFileDownloadTarget, fetchProjectFileDownload } from './projectFileDownload.js'
 import { useHistoryDismiss } from '../../../hooks/useHistoryDismiss.jsx'
 import { captureLayoutSpace, clientLengthToLayout } from '../../../lib/layoutSpace.js'
@@ -258,6 +258,7 @@ export function ExpandableImage({
   mediaDimensions,
 }) {
   const [open, setOpen] = useState(false)
+  const buttonRef = useRef(null)
   const [resolvedSrc, setResolvedSrc] = useState(null)
   const historyDismiss = useHistoryDismiss(() => setOpen(false))
 
@@ -327,6 +328,7 @@ export function ExpandableImage({
   return (
     <>
       <button
+        ref={buttonRef}
         type="button"
         className="md-image-frame"
         style={imageVars || undefined}
@@ -351,10 +353,9 @@ export function ExpandableImage({
           />
         )}
       </button>
-      {!onOpen && open && resolvedSrc && createPortal(
-        <ImageLightbox src={resolvedSrc} alt={alt} onClose={historyDismiss.close} />,
-        document.body,
-      )}
+      {!onOpen && open && resolvedSrc && <ChatPanePortal anchorRef={buttonRef}>
+        <ImageLightbox src={resolvedSrc} alt={alt} onClose={historyDismiss.close} />
+      </ChatPanePortal>}
     </>
   )
 }

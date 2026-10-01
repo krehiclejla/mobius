@@ -91,7 +91,8 @@ import ProgressRail from './ProgressRail.jsx'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
 import WaitingChip from './WaitingChip.jsx'
-import ActiveAssistantSurface from './ActiveAssistantSurface.jsx'
+import AssistantReply from './AssistantReply.jsx'
+import ArchivedChatNotice from './ArchivedChatNotice.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
 import {
   chatChangesActionIsCurrent,
@@ -105,7 +106,7 @@ import MsgContent from './MsgContent.jsx'
 import MessageMetaRow from './MessageMetaRow.jsx'
 import ActivityLineHeader from './ActivityLineHeader.jsx'
 import { messageCopyText } from './messageCopy.js'
-import { formatResetTime } from './resetTime.js'
+import { formatResetTime, isProviderLimitPause, pauseTiming } from './resetTime.js'
 import { isResourcePause } from './waitingPresentation.js'
 import { limitRecoveryCredit } from './limitRecoveryCredit.js'
 import {
@@ -141,7 +142,6 @@ import {
   updateChatRuntimeCache,
 } from './chatRuntimeCache.js'
 import {
-  assistantAnchorKey,
   chatCacheEntryState,
   chatDetailCacheValue,
   chatSnapshotMatchesRuntime,
@@ -188,7 +188,9 @@ import {
   commitAssistantPromotion,
   deriveActiveAssistantSelection,
 } from './activeAssistantSelection.js'
+import { assistantReplyGroups } from './assistantReplies.js'
 import {
+  assistantReplyRoot,
   projectSettledSteerContinuations,
   sealedAssistantBeforeSteer,
 } from './steerContinuity.js'
@@ -378,6 +380,9 @@ export default function ChatView({
   onInternalNav,
   onMessageStart,
   onOwnerActivity,
+  // True while this chat is filed under Archived; the notice offers Restore.
+  archived = false,
+  onRestoreArchived,
   onVoiceListeningChange,
   showPicker = true,
   embedded = false,
@@ -1036,6 +1041,10 @@ export default function ChatView({
   const hadMessagesRef = useRef((cached?.messages?.length ?? 0) > 0)
   const promotedRef = useRef(false)
   const activeAssistantDataKeyRef = useRef(null)
+  // A sealed row keeps the display identity it first painted under. Hidden
+  // cuts grow its reply surface instead of remounting the earlier paragraph.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- Reset the identity cache when this pane changes chat.
+  const assistantDisplayKeys = useMemo(() => new Map(), [chatId])
   // Current promotion is owned by the stream's durable assistant id. This
   // sticky mount bridge is the id-less rolling-data fallback: its captured ts
   // may identify the kept DB partial until markBridged() retires the gate.
@@ -1540,7 +1549,7 @@ export default function ChatView({
         running: !!data.running,
         activeAssistantMessageId: data.active_assistant_message_id || null,
         pendingQuestionId: data.pending_question_id || null,
-        pendingLimitResume: !!tailResumableBlock(msgs)?.pause?.resets_at,
+        pendingLimitResume: isProviderLimitPause(tailResumableBlock(msgs)?.pause),
       }
       // Stream retirement and the authoritative replacement must be one
       // commit, not two paints separated by the detail request.
@@ -3305,7 +3314,7 @@ export default function ChatView({
       clearComposerFilesForSend()
       if (inputRef.current) {
         resetComposerTextarea(inputRef.current)
-        // Drop the multi-line `.chat__pill--tall` class so send/mic
+        // Drop the multi-line `data-composer-tall` attribute so send/mic
         // re-center vertically. Without this, the pill stays in
         // flex-end alignment after a send-from-tall and the freshly
         // empty textarea renders pinned to the bottom — text appears
@@ -3601,7 +3610,7 @@ export default function ChatView({
     clearComposerFilesForSend()
     if (inputRef.current) {
       resetComposerTextarea(inputRef.current)
-      // Drop the multi-line `.chat__pill--tall` class — see queue-path
+      // Drop the multi-line `data-composer-tall` attribute — see queue-path
       // comment above for the full rationale.
     }
     setSending(true)
@@ -5372,14 +5381,27 @@ export default function ChatView({
     ))
     if (localIndex < 0) return
     const renderIndex = ownerMessageBatch(messages, localIndex)?.start ?? localIndex
-    const canonicalKey = messageKey(messages[renderIndex], offset + renderIndex)
-    const row = [...(scrollRef.current?.querySelectorAll('.chat__msg[data-key]') || [])]
-      .find(element => element.dataset.key === canonicalKey)
+    let canonicalKey = messageKey(messages[renderIndex], offset + renderIndex)
+    const sourceRows = [...(scrollRef.current?.querySelectorAll('.chat__msg[data-key]') || [])]
+    let row = sourceRows
+      .find(element => element.dataset.key === canonicalKey || element.dataset.sourceKey === canonicalKey)
     if (!canonicalKey || !row) return
+    canonicalKey = row.dataset.key
 
     searchRevealCleanupRef.current()
+    let highlight = highlightSearchTerms(row, searchReveal.terms)
+    // Exact hidden replay may extend an earlier text surface. Keep the saved
+    // source identity, but reveal the rendered words rather than its empty row.
+    if (!highlight.firstRange && row.dataset.textOwnerKey) {
+      const owner = sourceRows.find(element => element.dataset.key === row.dataset.textOwnerKey)
+      if (owner) {
+        highlight.clear()
+        row = owner
+        canonicalKey = row.dataset.key
+        highlight = highlightSearchTerms(row, searchReveal.terms)
+      }
+    }
     row.classList.add('chat__msg--search-reveal')
-    const highlight = highlightSearchTerms(row, searchReveal.terms)
     row.focus({ preventScroll: true })
     if (!revealAnchor(canonicalKey, 96, highlight.firstRange)) {
       row.classList.remove('chat__msg--search-reveal')
@@ -5520,7 +5542,12 @@ export default function ChatView({
   // then just looks stopped. Detect the tail resumable block so the offscreen
   // nudge + SR status can name the recovery. A pause is terminal (the turn has
   // ended), so it only ever lives in `messages`, never in a live stream item.
-  const pendingResumeBlock = tailResumableBlock(messages)
+  const recoveryMessages = useMemo(() => supersedeResumedPauseBlocks(messages, {
+    running: serverRunning && !hasPendingQuestion,
+    activeAssistantMessageId,
+    streamAssistantMessageId,
+  }), [messages, serverRunning, hasPendingQuestion, activeAssistantMessageId, streamAssistantMessageId])
+  const pendingResumeBlock = tailResumableBlock(recoveryMessages)
   const resourcePause = isResourcePause(pendingResumeBlock)
     ? pendingResumeBlock
     : null
@@ -5531,7 +5558,8 @@ export default function ChatView({
     && !hasPendingQuestion
     && !resourcePause
     && !modelCapacityPause
-  const pendingLimitResetAt = pendingResumeBlock?.pause?.resets_at || null
+  const { checkAt: pendingLimitCheckAt, resetAt: pendingLimitResetAt } = pauseTiming(pendingResumeBlock?.pause)
+  const pendingLimitPark = isProviderLimitPause(pendingResumeBlock?.pause)
   // New parks preserve the provider that actually enforced the limit. Older
   // cards predate that fact, so fall back to the chat's current provider.
   const pendingLimitProvider = pendingResumeBlock?.pause?.provider
@@ -5539,24 +5567,24 @@ export default function ChatView({
     || null
   const pendingLimitUsageQuery = settingsQueries.providerUsage.useQuery(
     pendingLimitProvider,
-    { enabled: Boolean(pendingLimitResetAt && pendingLimitProvider) },
+    { enabled: Boolean(pendingLimitPark && pendingLimitProvider) },
   )
   const pendingLimitRecoveryCredit = limitRecoveryCredit(
     pendingLimitProvider,
     pendingLimitUsageQuery.data,
   )
   useEffect(() => {
-    if (!embedded || !autoResumeEnabled || !pendingLimitResetAt) {
-      if (!pendingLimitResetAt) armedEmbeddedResetRef.current = null
+    if (!embedded || !autoResumeEnabled || !pendingLimitPark || !pendingLimitCheckAt) {
+      if (!pendingLimitCheckAt) armedEmbeddedResetRef.current = null
       return
     }
-    if (armedEmbeddedResetRef.current === pendingLimitResetAt) return
-    armedEmbeddedResetRef.current = pendingLimitResetAt
+    if (armedEmbeddedResetRef.current === pendingLimitCheckAt) return
+    armedEmbeddedResetRef.current = pendingLimitCheckAt
     // Arm the parent protocol once per durable park, before the automatic run
     // exists. If both system events are missed, the stream-open authoritative
     // idle handshake can still complete this new turn exactly once.
     onExternalRunEventRef.current?.('auto_resume_waiting')
-  }, [autoResumeEnabled, embedded, pendingLimitResetAt])
+  }, [autoResumeEnabled, embedded, pendingLimitPark, pendingLimitCheckAt])
   const handleEmbeddedRunEvent = useCallback((event) => {
     if (
       !embedded
@@ -5581,15 +5609,15 @@ export default function ChatView({
   useSystemEventStream(handleEmbeddedRunEvent, {
     enabled: !!(
       embedded
-      && ((autoResumeEnabled && pendingLimitResetAt) || embeddedRunActive)
+      && ((autoResumeEnabled && pendingLimitPark && pendingLimitCheckAt) || embeddedRunActive)
     ),
     onOpen: handleEmbeddedStreamOpen,
   })
-  const limitResetElapsed = resetDeadlineState(pendingLimitResetAt).elapsed
+  const limitResetElapsed = resetDeadlineState(pendingLimitCheckAt).elapsed
   const showAutoResumeControl = !!(
     !embedded
     && chatInfo !== null
-    && pendingLimitResetAt
+    && pendingLimitPark && pendingLimitCheckAt
     // Once enabled, keep the persistent policy cancellable even if the
     // viewer's clock passes the advertised reset before the server resumes.
     && (!limitResetElapsed || autoResumeEnabled)
@@ -5601,7 +5629,7 @@ export default function ChatView({
     let cancelled = false
     const schedule = () => {
       if (cancelled) return
-      const delayMs = resetDeadlineDelay(pendingLimitResetAt)
+      const delayMs = resetDeadlineDelay(pendingLimitCheckAt)
       if (delayMs === null) return
       timer = setTimeout(() => {
         setLimitResetClockTick(tick => tick + 1)
@@ -5615,7 +5643,7 @@ export default function ChatView({
       cancelled = true
       if (timer !== null) clearTimeout(timer)
     }
-  }, [clearAutoResumeError, pendingLimitResetAt])
+  }, [clearAutoResumeError, pendingLimitCheckAt])
 
   // Visibility of either card is a pure viewport question — an
   // IntersectionObserver rooted at the scroll container is the signal, no
@@ -5698,6 +5726,8 @@ export default function ChatView({
     activeSteerContinuationIndex,
   )
   useLayoutEffect(() => {
+    const sourceId = activeMirrorMsg?.id || streamAssistantMessageId || activeAssistantMessageId
+    if (showActiveAssistantSurface && sourceId) assistantDisplayKeys.set(sourceId, streamingDataKey)
     if (!turnActive) {
       activeAssistantDataKeyRef.current = null
       return
@@ -5712,7 +5742,7 @@ export default function ChatView({
           : null,
       }
     }
-  }, [turnActive, showActiveAssistantSurface, streamingDataKey, activeMirrorMsg, activeMirrorMsgIdx])
+  }, [turnActive, showActiveAssistantSurface, streamingDataKey, activeMirrorMsg, activeMirrorMsgIdx, streamAssistantMessageId, activeAssistantMessageId, assistantDisplayKeys])
 
   // Polite aria-live status: announced once per state transition, not per
   // token. Visually hidden via the sr-only utility in ChatView.css.
@@ -5727,23 +5757,23 @@ export default function ChatView({
         ? 'Waiting for storage headroom. This chat will resume automatically.'
         : 'Waiting for memory to settle. This chat will resume automatically.'
     }
-    if (pendingResumeBlock.pause?.resets_at) {
-      if (modelCapacityPause) {
-        const label = formatResetTime(pendingResumeBlock.pause.resets_at)
-        return label
-          ? `Selected model is busy. Retrying ${label}.`
-          : 'Selected model is busy. Retrying automatically shortly.'
-      }
-      const label = formatResetTime(pendingResumeBlock.pause.resets_at)
-      if (autoResumeEnabled) {
-        return label
-          ? `Usage limit reached. Queued to continue ${label}.`
-          : 'Usage limit reached. Queued to continue automatically.'
-      }
-      if (limitResetElapsed) return 'Usage is available again. Continue available.'
+    if (modelCapacityPause) {
+      const label = formatResetTime(pendingLimitCheckAt)
       return label
-        ? `Usage limit reached. Usage resets ${label}. Automatic continuation available.`
-        : 'Usage limit reached. Automatic continuation available.'
+        ? `Selected model is busy. Retrying ${label}.`
+        : 'Selected model is busy. Retrying automatically shortly.'
+    }
+    if (pendingLimitPark) {
+      const label = formatResetTime(pendingLimitCheckAt)
+      const resetLabel = formatResetTime(pendingLimitResetAt)
+      const providerReset = resetLabel
+        ? `Provider reports the limit resets ${resetLabel}.`
+        : 'Provider reset time unknown.'
+      if (autoResumeEnabled) {
+        return `Provider limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation enabled.`
+      }
+      if (limitResetElapsed) return `Ready to retry; availability is not confirmed. ${providerReset}`
+      return `Provider limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation available.`
     }
     if (pendingResumeBlock.pause?.kind === 'restart' && !pendingResumeBlock.pause.manual) {
       return 'Response paused for restart. Möbius will continue automatically.'
@@ -5830,9 +5860,10 @@ export default function ChatView({
   const draftGoal = draftGoalObjective(input)
   const displayedMessages = useMemo(
     () => projectSettledSteerContinuations(
-      supersedeResumedPauseBlocks(messages),
+      recoveryMessages,
+      { preserveHidden: true },
     ),
-    [messages],
+    [recoveryMessages],
   )
   const peerTimeline = usePeerTimeline(
     chatId,
@@ -5841,6 +5872,12 @@ export default function ChatView({
     streamItems,
     showActiveAssistantSurface ? activeMirrorMsgIdx : -1,
   )
+  const replyGroups = useMemo(() => assistantReplyGroups(
+    showActiveAssistantSurface && activeMirrorMsgIdx < 0
+      ? [...peerTimeline.messages, { role: 'assistant', id: streamAssistantMessageId || activeAssistantMessageId || streamingDataKey, blocks: [] }]
+      : peerTimeline.messages,
+    { offset, slots: peerTimeline.slots, activeIndex: showActiveAssistantSurface ? (activeMirrorMsgIdx >= 0 ? activeMirrorMsgIdx : messages.length) : -1, activeKey: streamingDataKey, displayKeys: assistantDisplayKeys },
+  ), [peerTimeline.messages, peerTimeline.slots, offset, showActiveAssistantSurface, activeMirrorMsgIdx, streamingDataKey, streamAssistantMessageId, activeAssistantMessageId, messages.length, assistantDisplayKeys])
   // Activity projection is a transcript-source commit too: peer rows may
   // arrive after the first reveal without changing message count. Keep all
   // source handoffs in the controller's same pre-paint transaction.
@@ -5874,50 +5911,55 @@ export default function ChatView({
   // A DB refresh may commit the steer before its cut reaches this socket.
   // Keep the identity-owned active row in its transcript slot through that
   // handoff; moving it to the tail would paint the owner message above it.
-  const activeAssistantSurface = showActiveAssistantSurface ? (
-    <ActiveAssistantSurface
-      key={streamingDataKey}
-      activeMirrorMsg={projectedActiveMirrorMsg}
-      activityMessageId={activeAssistantMessageId}
-      activitySourceBlocks={activeMirrorMsg?.blocks}
-      useDbActivePayload={useDbActivePayload}
-      hasLivePayload={hasLiveAssistantPayload}
-      streamItems={streamItems}
-      dataKey={streamingDataKey}
+  const renderAssistantReply = group => {
+    if (!group) return null
+    const activeIndex = showActiveAssistantSurface
+      ? group.rows.findIndex(row => row.index === (activeMirrorMsgIdx >= 0 ? activeMirrorMsgIdx : messages.length))
+      : -1
+    const active = activeIndex >= 0
+    const replyRoot = assistantReplyRoot(group.rows[0].message)
+    const continuingRun = !!(turnActive && replyRoot && replyRoot
+      === assistantReplyRoot({ role: 'assistant', id: activeAssistantMessageId || streamAssistantMessageId }))
+    const tail = group.rows.at(-1)
+    const last = active || group.lastVisibleIndex === lastVisibleMessageIndex
+    return <AssistantReply
+      key={group.rows[0].key}
+      replyGroup={group}
+      activeRowIndex={activeIndex}
+      activeMirrorMsg={active ? projectedActiveMirrorMsg : tail.message}
+      activitySourceBlocks={active ? activeMirrorMsg?.blocks : tail.message.blocks}
+      useDbActivePayload={active ? useDbActivePayload : true}
+      hasLivePayload={active && hasLiveAssistantPayload}
+      streamItems={active ? streamItems : null}
       chatId={chatId}
-      onAnswer={doSendSilent}
-      onPrepareAnswer={prepareQuestionSubmission}
-      onCancelAnswer={cancelQuestionSubmission}
-      onResume={activeAssistantIsStreaming ? undefined : handleResume}
+      onQuestionAnswer={doSendSilent}
+      onQuestionSubmitIntent={prepareQuestionSubmission}
+      onQuestionSubmitCancel={cancelQuestionSubmission}
+      onResume={activeAssistantIsStreaming && active ? undefined : handleResume}
       resumeState={resumeState}
       onInternalNav={internalNav}
-      autoResumeEnabled={autoResumeEnabled}
-      autoResumeAvailable={showAutoResumeControl}
-      autoResumeSaving={autoResumeSaving}
-      autoResumeError={
-        autoResumeErrorSource === 'card' ? autoResumeError : ''
-      }
-      onAutoResumeChange={handleAutoResumeChange}
-      limitResetElapsed={limitResetElapsed}
-      recoveryCredit={pendingLimitRecoveryCredit}
+      autoResumeEnabled={last && autoResumeEnabled}
+      autoResumeAvailable={last && showAutoResumeControl}
+      autoResumeSaving={last && autoResumeSaving}
+      autoResumeError={last && autoResumeErrorSource === 'card' ? autoResumeError : ''}
+      onAutoResumeChange={last ? handleAutoResumeChange : undefined}
+      limitResetElapsed={last && limitResetElapsed}
+      recoveryCredit={last ? pendingLimitRecoveryCredit : null}
+      continuationWait={last ? continuationWait : null}
       submissionBlocked={providerSwitching}
       liveQuestionId={answerableQuestionId}
-      // Same publication channel as the durable rows above: while the
-      // turn is live THIS surface owns the pending question card, so
-      // the offscreen observer follows the handoff automatically.
       pendingQuestionRef={pendingQuestionRef}
       resumeCardRef={resumeCardRef}
-      // Liveness for the ACTIVE surface follows the TURN, not the
-      // payload source: when a richer DB partial wins source selection
-      // (useDbActivePayload, e.g. through the reconnect catch-up
-      // window) the turn is still running, and its trailing activity
-      // must keep the in-progress face — shimmer, progressive tense,
-      // ", in progress" — instead of settling early. Source selection
-      // still gates resume/question routing above (review 2026-07-17).
-      isStreaming={activeAssistantIsStreaming || turnActive}
-      sealedSteerAssistant={sealedSteerAssistant}
+      isStreaming={continuingRun || (active && activeAssistantIsStreaming)}
+      isLastMsg={last}
+      suppressedQuestionKeys={showActiveAssistantSurface ? streamItemQuestionKeys : null}
+      sealedSteerAssistant={active ? sealedSteerAssistant : sealedAssistantBeforeSteer(messages, group.start)}
     />
-  ) : null
+  }
+  const appendedReply = replyGroups.get(messages.length)
+  const activeAssistantSurface = activeMirrorMsgIdx < 0 && appendedReply?.start === messages.length
+    ? renderAssistantReply(appendedReply) : null
+
 
   return (
     <div
@@ -6077,6 +6119,9 @@ export default function ChatView({
         <ul className="chat__list" style={{ minHeight: 0 }}>
           {displayedMessages.flatMap((msg, i) => {
             const peerRows = <PeerTimelineRows key={`peer-slot-${msg.cid || msg.id || msg.ts || i}`} notes={peerTimeline.slots.get(i)} chatId={chatId} onInternalNav={internalNav} />
+            const replyGroup = replyGroups.get(i)
+            if (replyGroup) return i === replyGroup.start
+              ? [peerRows, renderAssistantReply(replyGroup)] : []
             const projectedMsg = peerTimeline.messages[i] || msg
             if (projectedMsg.hidden) return [peerRows]
             const ownerBatch = ownerMessageBatch(displayedMessages, i)
@@ -6088,50 +6133,9 @@ export default function ChatView({
               : projectedMsg
             const continuationMarker = isContinuationMessage(msg)
             const renderedEndIndex = ownerBatch?.end ?? i
-            const isLastMsg = renderedEndIndex === lastVisibleMessageIndex
-            // DB and stream payloads occupy the same identity-owned row,
-            // including when a committed steer already follows that row.
-            if (i === activeMirrorMsgIdx
-                && msg.role === 'assistant'
-                && showActiveAssistantSurface) {
-              return [peerRows, activeAssistantSurface]
-            }
-            // A question is answerable while the runner is parked on it,
-            // waiting for the answer. The runner BLOCKS the turn on the
-            // AskUserQuestion future until it is answered, so an unanswered
-            // question that is still the TAIL of the last assistant message
-            // means the runner is parked right there — nothing follows it
-            // until the answer arrives.
-            //
-            // That invariant is fully DURABLE: it reads only the persisted
-            // message blocks, so it survives a reload AND Möbius's
-            // kill-on-question `done` (the SSE closes the moment a question
-            // fires, but the runner keeps waiting). It must NOT gate on the
-            // live stream: `isStreaming` flips false on that `done`, which
-            // would leave the card disabled forever. `liveQuestionId`, when
-            // the live stream handed it to us, is an extra precision filter;
-            // after a reload we may never have seen it, and then the
-            // tail-unanswered invariant stands on its own.
-            //
-            // MsgContent enforces the "tail block" half (the question is the
-            // LAST block). Recovery may insert an interruption note before a
-            // still-open question, but once the turn truly moves on and any
-            // block follows the question, that older card becomes transcript
-            // history. Double-submit is prevented by QuestionCard's own
-            // `submitted` state + doSendSilent's synchronous sendingRef flip.
-            //
-            // isLastMsg + liveQuestionId are passed as stable scalars so
-            // MsgContent's memo can skip non-last messages on every streaming
-            // tick. The inline-arrow form (isQuestionAnswerable) created a
-            // fresh function identity every render and defeated memo entirely.
-            // Stable per-message DOM key for the scroll state machine.
-            // data-key is queried by applyMode when restoring an
-            // ANCHOR_AT mode. msg.id (server-assigned UUID) is ideal;
-            // fall back to role+ts which is also stable across renders.
+            // Assistant replies have already been handled above. Owner and
+            // product rows retain their existing scroll and metadata identity.
             const dataKey = messageKey(msg, offset + i)
-            const anchorKey = msg.role === 'assistant'
-              ? assistantAnchorKey(offset + i)
-              : null
             // User rows key + pin on the stable cid so the optimistic→confirm
             // display-ts update never remounts the row (which would drop the
             // pin target mid-swap). data-ts stays for the revealed metadata row.
@@ -6146,7 +6150,6 @@ export default function ChatView({
               tabIndex={-1}
               ref={renderedEndIndex === lastUserIdx ? setLastUserMsgRef : null}
               data-key={dataKey}
-              data-anchor-key={anchorKey === dataKey ? undefined : anchorKey}
               data-cid={userCid || undefined}
               data-ts={ownerUserMessage && renderedMsg.ts ? String(renderedMsg.ts) : undefined}
               onClick={hasMessageMeta
@@ -6157,36 +6160,7 @@ export default function ChatView({
                 msg={renderedMsg}
                 chatId={chatId}
                 messageKey={dataKey}
-                onQuestionAnswer={doSendSilent}
-                onQuestionSubmitIntent={prepareQuestionSubmission}
-                onQuestionSubmitCancel={cancelQuestionSubmission}
-                onResume={handleResume}
-                resumeState={resumeState}
-                continuationWait={isLastMsg ? continuationWait : null}
                 onInternalNav={internalNav}
-                autoResumeEnabled={
-                  isLastMsg && autoResumeEnabled
-                }
-                autoResumeAvailable={
-                  isLastMsg && showAutoResumeControl
-                }
-                autoResumeSaving={isLastMsg && autoResumeSaving}
-                autoResumeError={
-                  isLastMsg && autoResumeErrorSource === 'card'
-                    ? autoResumeError
-                    : ''
-                }
-                onAutoResumeChange={
-                  isLastMsg ? handleAutoResumeChange : undefined
-                }
-                limitResetElapsed={isLastMsg && limitResetElapsed}
-                recoveryCredit={isLastMsg ? pendingLimitRecoveryCredit : null}
-                submissionBlocked={providerSwitching}
-                isLastMsg={isLastMsg}
-                liveQuestionId={answerableQuestionId}
-                suppressedQuestionKeys={streamItemQuestionKeys}
-                pendingQuestionRef={pendingQuestionRef}
-                resumeCardRef={resumeCardRef}
               />
               <MessageMetaRow
                 timestamp={ownerUserMessage ? renderedMsg.ts : null}
@@ -6305,19 +6279,17 @@ export default function ChatView({
                         activateOnTouchEnd: true,
                       })}
                     >
-                      {pendingResumeBlock?.pause?.resets_at
+                      {pendingLimitPark
                         ? autoResumeEnabled
                           ? (() => {
-                              const label = formatResetTime(
-                                pendingResumeBlock.pause.resets_at,
-                              )
+                              const label = formatResetTime(pendingLimitCheckAt)
                               return label
-                                ? `Queued to continue ${label}`
-                                : 'Queued to continue automatically'
+                                ? `Queued to retry ${label}`
+                                : 'Queued to retry automatically'
                             })()
                           : limitResetElapsed
-                            ? 'Usage available — tap to continue'
-                            : 'Usage limit reached — continuation available'
+                            ? 'Ready to retry — availability unconfirmed'
+                            : 'Provider limit reached — continuation available'
                         : pendingResumeBlock?.pause?.kind === 'restart' && !pendingResumeBlock.pause.manual
                           ? 'Paused for restart — continuing automatically'
                           : 'Turn paused — tap to resume'}
@@ -6356,6 +6328,9 @@ export default function ChatView({
             resourcePause={resourcePause}
             onCancel={handleCancelWait}
           />
+        )}
+        {archived && !provisionalNewChat && (
+          <ArchivedChatNotice onRestore={onRestoreArchived} />
         )}
         <ConnectionStatus
           error={connectionError}

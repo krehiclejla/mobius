@@ -118,7 +118,7 @@ def _network_fixture(db):
       id="scout-delegation", app_id=1, parent_chat_id=chats["root"].id,
       parent_root_run_id="shared-goal", task_key="scout",
       child_chat_id=chats["scout"].id, provider="claude",
-      model="claude-opus-4-8", effort="high", scope="read", cwd="/data",
+      model="claude-opus-4-8", effort="high", scope="write", cwd="/data",
       prompt_sha256="scout-sha",
     ),
     models.Delegation(
@@ -132,7 +132,7 @@ def _network_fixture(db):
       id="nested-delegation", app_id=1, parent_chat_id=chats["scout"].id,
       parent_root_run_id="scout-run", task_key="nested-verifier",
       child_chat_id=chats["nested"].id, provider="claude",
-      model="claude-opus-4-8", effort="high", scope="read", cwd="/data",
+      model="claude-opus-4-8", effort="high", scope="write", cwd="/data",
       prompt_sha256="nested-sha",
     ),
     models.Delegation(
@@ -1430,7 +1430,6 @@ def test_delegated_children_derive_project_scope_without_becoming_project_chats(
     provider="codex",
     model="gpt-5.6-sol",
     effort="high",
-    scope="read",
     cwd="/data",
   ))
   assert attached is False

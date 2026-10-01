@@ -265,6 +265,7 @@
   field-sizing: content;
   max-height: 180px;
   overflow-y: auto;
+  overscroll-behavior-y: auto;
   resize: none;
   box-sizing: border-box;
   transition: border-color .15s, box-shadow .15s;

@@ -1,10 +1,14 @@
+// Normalize to a bare UTC wall-clock string so values from different sources
+// compare consistently: optimistic client stamps are ISO-with-`Z`, while the
+// server serializes naive-UTC without a suffix. Both denote UTC, so dropping a
+// trailing `Z`/`+00:00` lets a plain lexicographic compare order them right
+// even when a refetch has replaced only one kind (chats OR apps).
+function normalizedStamp(value) {
+  return (value || '').replace(/(?:Z|\+00:00)$/, '')
+}
+
 function pinnedAt(item) {
-  // Normalize to a bare UTC wall-clock string so values from different sources
-  // compare consistently: optimistic client stamps are ISO-with-`Z`, while the
-  // server serializes naive-UTC without a suffix. Both denote UTC, so dropping a
-  // trailing `Z`/`+00:00` lets a plain lexicographic compare order them right
-  // even when a refetch has replaced only one kind (chats OR apps).
-  return (item?.pinned_at || '').replace(/(?:Z|\+00:00)$/, '')
+  return normalizedStamp(item?.pinned_at)
 }
 
 function pinnedAtMillis(item) {
@@ -94,7 +98,8 @@ export function projectPendingDrawerPins(
  * Pinned chats, apps, and projects share one stable section ordered
  * oldest-pin-first, so a
  * new pin appends at the bottom and manual drag-to-reorder owns the rest.
- * Unpinned chats and apps share one newest-first Recents section. Projects and
+ * Unpinned chats and apps share one newest-first Recents section; archived
+ * chats leave both for the Archived section, newest archive first. Projects and
  * built artifacts join only after an explicit open; file changes and rebuilds
  * alone never manufacture recency. An artifact row is its own destination and
  * carries no project belonging; the composite id only addresses it.
@@ -103,9 +108,17 @@ export function projectPendingDrawerPins(
  * open. The searchable apps grid keeps its own stable ordering.
  */
 export function buildDrawerSections(chats = [], apps = [], projects = []) {
-  const chatRows = chats
-    .filter(chat => chat.has_messages)
-    .slice()
+  const conversationRows = chats.filter(chat => chat.has_messages)
+  // Archived chats leave Pinned and Recents for their own section, most
+  // recently archived first. The server clears a pin when it archives.
+  const archived = conversationRows
+    .filter(chat => chat.archived_at)
+    .sort((a, b) => (
+      normalizedStamp(b.archived_at).localeCompare(normalizedStamp(a.archived_at))
+    ))
+    .map(item => ({ kind: 'chat', item }))
+  const chatRows = conversationRows
+    .filter(chat => !chat.archived_at)
     .sort((a, b) => (
       ((b.activity_at || b.updated_at) || '')
         .localeCompare((a.activity_at || a.updated_at) || '')
@@ -163,6 +176,7 @@ export function buildDrawerSections(chats = [], apps = [], projects = []) {
   return {
     pinned,
     recents,
+    archived,
     apps: appRows,
   }
 }

@@ -77,6 +77,10 @@
     "0070_delegation_goal_task": "bc020ab06061b2ba7290e0c1da86a9f8af3146b7d098bc6f1f66dca841213950",
     "0071_delegation_result_identity": "a5ac91b3aa4a68e716974d490a3a0e714f1b855bbf3be84c7f7ac76b19ccbb1e",
     "0072_owner_timezone": "3fdd3767a3ec08629abc90de5c95052c468d0129a1840e37dacc936799bb9d04",
-    "0073_schedule_provenance": "e9a91a2bcacdcf4d8a3985b452abda1b3c8a4c45d7a071ae26802f32dfb4c49d"
+    "0073_schedule_provenance": "e9a91a2bcacdcf4d8a3985b452abda1b3c8a4c45d7a071ae26802f32dfb4c49d",
+    "0074_chat_owned_delegations": "700aa7f416b64c93180638964089d6b17eceb0659c2c7372a7f1a5252aff4438",
+    "0075_notification_seen_at": "127060b297085cfb0c4f1953533da06031a7ccd9aebcaf9487ba605e1e4c9c92",
+    "0076_legacy_helper_interruption": "b25cbf7974f6b75387f4e1fb8b896e6bd29fb163a1e19a890a0637ece558b1eb",
+    "0077_chat_archive": "764ce51985533ff56149c3501f4c87b0308cfaf6e3c91dad400573c9cddb9e95"
   }
 }

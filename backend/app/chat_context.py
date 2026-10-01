@@ -23,6 +23,27 @@ from app.goal_commands import (
   is_goal_continue,
   is_goal_command as _is_goal_command,
 )
+def recent_chat_digest_order(db: Session) -> list[str]:
+  """Chat ids whose digests new sessions may see, most recent activity first.
+
+  Deleted chats are gone and archived chats are filed away; neither belongs in
+  another session's picture of current work. An archived chat's note stays
+  readable by its Location for anyone who needs it.
+  """
+  from sqlalchemy import func
+
+  return [
+    row[0]
+    for row in db.query(models.Chat.id).filter(
+      models.Chat.deleted_at.is_(None),
+      models.Chat.archived_at.is_(None),
+    ).order_by(
+      func.coalesce(models.Chat.activity_at, models.Chat.updated_at).desc(),
+      models.Chat.id.desc(),
+    ).all()
+  ]
+
+
 def _human_elapsed(seconds: float | None) -> str | None:
   """Human 'N ago' for the gap since the user's previous message.
 

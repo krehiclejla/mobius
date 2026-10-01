@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 import json
+from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -38,14 +40,15 @@ _TASK_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class DelegationSubmit(BaseModel):
-  app_id: int = Field(gt=0)
+  app_id: int | None = Field(default=None, gt=0)
   parent_chat_id: str = Field(min_length=1, max_length=64)
   task_key: str = Field(min_length=1, max_length=128)
   prompt: str = Field(min_length=1, max_length=200_000)
   provider: str
   model: str | None = Field(default=None, max_length=256)
   effort: str | None = Field(default=None, max_length=32)
-  scope: str
+  # An older app may send this field. Reject read, never silently promote it.
+  scope: Literal["write"] | None = None
   cwd: str | None = Field(default=None, max_length=1024)
   # The parent Goal plan task this helper works on; omitted means the plan's
   # single running task, if there is exactly one.
@@ -79,13 +82,6 @@ class DelegationSubmit(BaseModel):
       raise ValueError("unknown provider")
     return value
 
-  @field_validator("scope")
-  @classmethod
-  def _valid_scope(cls, value: str) -> str:
-    if value not in ("read", "write"):
-      raise ValueError("scope must be read or write")
-    return value
-
 
 def _require_submitter(
   db: Session, principal: Principal, body: DelegationSubmit,
@@ -111,15 +107,14 @@ def _require_submitter(
   parent = db.query(models.Delegation).filter(
     models.Delegation.id == principal.delegation_id,
     models.Delegation.child_chat_id == body.parent_chat_id,
-    models.Delegation.app_id == body.app_id,
+    models.Delegation.cancelled_at.is_(None),
   ).first()
   if parent is None:
     raise HTTPException(status_code=403, detail="Delegated work must stay under its parent child chat.")
-  if parent.scope == "read" and body.scope != "read":
-    raise HTTPException(
-      status_code=403,
-      detail="A read-only delegated owner cannot create write-capable children.",
-    )
+  if body.app_id is not None and body.app_id != parent.app_id:
+    raise HTTPException(status_code=403, detail="Delegated work must keep its parent app owner.")
+  if parent.scope != "write" or parent.interrupted_at is not None:
+    raise HTTPException(status_code=409, detail="Legacy helper cannot delegate new work.")
   return parent
 
 
@@ -154,7 +149,8 @@ async def submit_or_attach(
   db: Session = Depends(get_db),
 ):
   """Create once per (parent logical run, task key), otherwise attach."""
-  _require_submitter(db, principal, body)
+  parent_delegation = _require_submitter(db, principal, body)
+  owner_app_id = parent_delegation.app_id if parent_delegation else body.app_id
   parent = get_active_chat_or_404(db, body.parent_chat_id)
   root_id = parent_root_run_id(db, parent.id, require_active=True)
   if root_id is None:
@@ -162,12 +158,24 @@ async def submit_or_attach(
       status_code=409,
       detail="Delegation requires an active parent chat run.",
     )
-  app = db.query(models.App).filter(
-    models.App.id == body.app_id,
-    models.App.deleted_at.is_(None),
-  ).first()
-  if app is None:
-    raise HTTPException(status_code=404, detail="Delegation owner app not found.")
+  # Existing immutable work keeps its original owner across a platform upgrade.
+  # Omission means core ownership only for a new task, not reassignment of a
+  # historical app-owned child. The same live-app gate still applies below.
+  if body.app_id is None and parent_delegation is None:
+    previous = db.query(models.Delegation).filter(
+      models.Delegation.parent_chat_id == parent.id,
+      models.Delegation.parent_root_run_id == root_id,
+      models.Delegation.task_key == body.task_key,
+    ).first()
+    if previous is not None:
+      owner_app_id = previous.app_id
+  if owner_app_id is not None:
+    app = db.query(models.App).filter(
+      models.App.id == owner_app_id,
+      models.App.deleted_at.is_(None),
+    ).first()
+    if app is None:
+      raise HTTPException(status_code=404, detail="Delegation owner app not found.")
   if body.model and providers._model_belongs_to_other_provider(
     body.model, body.provider,
   ):
@@ -192,28 +200,39 @@ async def submit_or_attach(
     raise HTTPException(status_code=422, detail=str(exc)) from exc
 
   from app import chat_queue
-  async with (
-    chat_queue.get_transition_lock(f"app-lifecycle:{body.app_id}"),
-    chat_queue.get_transition_lock(parent.id),
-  ):
+  async with AsyncExitStack() as admission:
+    if owner_app_id is not None:
+      await admission.enter_async_context(
+        chat_queue.get_transition_lock(f"app-lifecycle:{owner_app_id}")
+      )
+    await admission.enter_async_context(chat_queue.get_transition_lock(parent.id))
     # App/chat deletion uses these same gates. End the authentication/read
     # snapshot and re-establish every admission fact under the locks so a
     # child cannot start after either owner has begun tombstoning.
     db.rollback()
-    app = db.query(models.App).filter(
-      models.App.id == body.app_id,
-      models.App.deleted_at.is_(None),
-    ).first()
-    if app is None:
-      raise HTTPException(
-        status_code=404, detail="Delegation owner app not found.",
-      )
+    _require_submitter(db, principal, body)
+    if owner_app_id is not None:
+      app = db.query(models.App).filter(
+        models.App.id == owner_app_id,
+        models.App.deleted_at.is_(None),
+      ).first()
+      if app is None:
+        raise HTTPException(
+          status_code=404, detail="Delegation owner app not found.",
+        )
     parent = get_active_chat_or_404(db, body.parent_chat_id)
-    root_id = parent_root_run_id(db, parent.id, require_active=True)
-    if root_id is None:
+    current_root_id = parent_root_run_id(db, parent.id, require_active=True)
+    if current_root_id is None:
       raise HTTPException(
         status_code=409,
         detail="Delegation requires an active parent chat run.",
+      )
+    # Ownership and its lifecycle lock were selected for this logical root.
+    # Never carry them into a newer run that began while admission waited.
+    if current_root_id != root_id:
+      raise HTTPException(
+        status_code=409,
+        detail="The parent chat run changed during delegation admission.",
       )
     existing = db.query(models.Delegation).filter(
       models.Delegation.parent_root_run_id == root_id,
@@ -235,7 +254,7 @@ async def submit_or_attach(
     except GoalPlanError as exc:
       raise HTTPException(status_code=422, detail=str(exc)) from exc
     intent = DelegationIntent(
-      app_id=body.app_id,
+      app_id=owner_app_id,
       parent_chat_id=parent.id,
       parent_root_run_id=root_id,
       task_key=body.task_key,
@@ -244,7 +263,6 @@ async def submit_or_attach(
       provider=body.provider,
       model=selection["model"],
       effort=selection.get("effort"),
-      scope=body.scope,
       cwd=cwd,
       notify_parent_on_complete=body.notify_parent_on_complete,
     )
@@ -281,23 +299,34 @@ async def delegation_capabilities(
   principal: Principal = Depends(get_delegation_principal),
   db: Session = Depends(get_db),
 ):
-  """Read-only Subagents configuration for a confined delegated owner."""
-  if principal.delegation_id is None or principal.chat_id is None:
-    raise HTTPException(status_code=403, detail="Delegated child token required.")
-  delegation = db.query(models.Delegation).filter(
-    models.Delegation.id == principal.delegation_id,
-    models.Delegation.child_chat_id == principal.chat_id,
-  ).first()
-  if delegation is None:
-    raise HTTPException(status_code=403, detail="Delegation token is stale.")
+  """Read-only helper preferences and registry, confined to the caller.
+
+  A live Subagents installation is optional configuration, not delegation
+  authority. Genuine app-owned children still require their live owner app.
+  """
+  if principal.delegation_id is not None:
+    delegation = db.query(models.Delegation).filter(
+      models.Delegation.id == principal.delegation_id,
+      models.Delegation.child_chat_id == principal.chat_id,
+    ).first()
+    if delegation is None:
+      raise HTTPException(status_code=403, detail="Delegation token is stale.")
+    if delegation.app_id is not None:
+      owner_app = db.query(models.App).filter(
+        models.App.id == delegation.app_id,
+        models.App.deleted_at.is_(None),
+      ).first()
+      if owner_app is None:
+        raise HTTPException(status_code=403, detail="Delegation owner app is unavailable.")
+  elif principal.scope != "owner" or principal.app_id is not None:
+    raise HTTPException(status_code=403, detail="Owner agent or delegated child required.")
   app = db.query(models.App).filter(
-    models.App.id == delegation.app_id,
-    models.App.deleted_at.is_(None),
+    models.App.slug == "subagents", models.App.deleted_at.is_(None),
   ).first()
-  if app is None:
-    raise HTTPException(status_code=403, detail="Delegation owner app is unavailable.")
 
   def read_json(name: str) -> dict:
+    if app is None:
+      return {}
     path = Path(get_settings().data_dir) / "apps" / str(app.id) / name
     try:
       value = json.loads(path.read_text(encoding="utf-8"))
@@ -321,12 +350,25 @@ async def delegation_capabilities(
     ]
     for provider_id, entries in registry.items()
   }
+  aliases: dict[str, dict[str, list[str]]] = {}
+  if app is not None and app.source_dir:
+    try:
+      catalog = json.loads((Path(app.source_dir) / "models.json").read_text(encoding="utf-8"))
+      for provider_id, spec in (catalog.get("providers") or {}).items():
+        aliases[provider_id] = {
+          row["id"]: row.get("aliases", [])
+          for row in spec.get("models", []) if isinstance(row, dict) and row.get("id")
+        }
+    except (OSError, ValueError, AttributeError, TypeError):
+      pass
   return {
-    "app_id": app.id,
+    "app_id": app.id if app is not None else None,
     "config": read_json("config.json"),
     "runtime": read_json("status.json"),
     "connections": connections,
     "models": models_by_provider,
+    "aliases": aliases,
+    "defaults": providers.DEFAULT_MODELS,
   }
 
 
@@ -498,6 +540,8 @@ async def message_delegation(
   status, _, _ = derived_status(db, row, load_result=False)
   if status == "cancelled":
     raise HTTPException(status_code=409, detail="This helper was stopped.")
+  if status == "interrupted" or row.scope != "write":
+    raise HTTPException(status_code=409, detail="This helper cannot resume; start a new helper.")
   if status in ACTIVE_DELEGATION_STATUSES:
     raise HTTPException(
       status_code=409,
@@ -508,8 +552,8 @@ async def message_delegation(
   async with chat_queue.get_transition_lock(row.child_chat_id):
     db.rollback()
     row = _row_for_principal(db, delegation_id, principal)
-    if row.cancelled_at is not None:
-      raise HTTPException(status_code=409, detail="This helper was stopped.")
+    if row.cancelled_at is not None or row.interrupted_at is not None or row.scope != "write":
+      raise HTTPException(status_code=409, detail="This helper cannot resume; start a new helper.")
     row.notify_parent_on_complete = True
     db.commit()
     started = await start_programmatic_chat_turn(

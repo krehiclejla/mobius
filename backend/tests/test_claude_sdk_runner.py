@@ -1334,6 +1334,7 @@ async def _run_claude_stop_outcome(
   monkeypatch, mode: str, *, owned: bool,
   stop_reason: str | None = "interrupt",
   terminal_reason: str | None = None,
+  exit_code: int | None = None,
 ):
   """Run one fake response stream, with an owner Stop in flight when `owned`.
 
@@ -1342,9 +1343,12 @@ async def _run_claude_stop_outcome(
   so the stream resumes once the client has seen the interrupt and the Stop
   task is collected after the turn resolves `_finished`.
   """
+  process_exit_code = exit_code if exit_code is not None else (
+    1 if mode == "process_failure" else -15
+  )
   process_error = ProcessError(
-    f"Command failed with exit code {'1' if mode == 'process_failure' else '-15'}",
-    exit_code=1 if mode == "process_failure" else -15,
+    f"Command failed with exit code {process_exit_code}",
+    exit_code=process_exit_code,
     stderr="Check stderr output for details",
   )
   stops: list[asyncio.Task] = []
@@ -1533,6 +1537,28 @@ async def test_unrequested_claude_process_exit_stays_an_error(monkeypatch):
 
   assert "Command failed with exit code -15" in result["error"]
   assert result.get("terminal_status") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code, before, after, owned, expected", [
+  (-9, 3, 4, False, True),
+  (-9, 4, 4, False, False),
+  (-15, 3, 4, False, False),
+  (1, 3, 4, False, False),
+  (-9, None, 4, False, False),
+  (-9, 3, 4, True, False),
+])
+async def test_claude_oom_requires_unrequested_process_kill_in_this_attempt(
+  monkeypatch, exit_code, before, after, owned, expected,
+):
+  monkeypatch.setattr(claude_sdk_runner, "cgroup_oom_kill_count", lambda: before)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: after)
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "process_error", owned=owned, exit_code=exit_code,
+  )
+  assert bool(result.get("oom_killed")) is expected
+  if not owned:
+    assert f"exit code {exit_code}" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -2784,13 +2810,14 @@ async def test_delegated_claude_keeps_parent_tools_without_hidden_budget(
   monkeypatch.setattr(claude_sdk_runner, "ClaudeAgentOptions", capture_options)
   _install_fake_client(monkeypatch)
 
-  policy = SimpleNamespace(scope="read")
+  policy = SimpleNamespace()
   await _run_turn(
     "delegated-tools", bc=_Bus(), prompt="review", cwd="/data",
     run_policy=policy,
   )
 
   kwargs = captured["kwargs"]
+  assert kwargs["permission_mode"] == "acceptEdits"
   assert "max_budget_usd" not in kwargs
   assert "agents" not in kwargs
   disallowed = set(kwargs["disallowed_tools"])

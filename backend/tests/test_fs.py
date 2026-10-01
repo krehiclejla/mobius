@@ -1,5 +1,6 @@
 """Tests for the owner filesystem + git oversight API (routes/fs.py)."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -92,6 +93,31 @@ def test_write_denied_and_traversal(client, auth, fsroot):
 def test_tree_traversal_rejected(client, auth, fsroot):
   r = client.get("/api/fs/tree", params={"path": "../../etc"}, headers=auth)
   assert r.status_code == 400
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any directory")
+def test_tree_lists_past_an_unreadable_directory(client, auth, fsroot):
+  """One directory the server cannot enter must not fail the whole listing."""
+  _, work, _ = fsroot
+  locked = work / "locked"
+  locked.mkdir()
+  (work / "visible.txt").write_text("x")
+  locked.chmod(0)
+  try:
+    r = client.get("/api/fs/tree", params={"path": "fstest"}, headers=auth)
+  finally:
+    locked.chmod(0o700)
+  assert r.status_code == 200, r.text
+  entries = {e["name"]: e for e in r.json()["entries"]}
+  assert entries["locked"]["is_git_repo"] is False
+  assert "visible.txt" in entries
+
+
+@pytest.mark.parametrize("route", ["tree", "read", "du", "git"])
+def test_overlong_path_name_is_a_client_error(client, auth, fsroot, route):
+  r = client.get(f"/api/fs/{route}", params={"path": "a" * 300}, headers=auth)
+  assert r.status_code == 400
+  assert r.json()["detail"] == "A path name is too long."
 
 
 def test_git_status(client, auth, fsroot):

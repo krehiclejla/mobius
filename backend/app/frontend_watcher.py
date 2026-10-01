@@ -432,6 +432,21 @@ def _complete_build(d: Path) -> bool:
   )
 
 
+def _reclaim_node_probe_cache(env: dict[str, str] | None = None) -> None:
+  """Release the executable pages a short Node probe leaves behind.
+
+  Build cleanup precedes publication's safety checker. Advise only Node here,
+  not the dependency tree again; another process's mapped pages stay safe.
+  Optional cache work must never change a probe's result or rejection.
+  """
+  try:
+    node = shutil.which("node", path=os.pathsep.join(os.get_exec_path(env)))
+    if node:
+      reclaim_file_cache((Path(node).resolve(),), skip_mapped=False)
+  except Exception:
+    log.debug("Node probe cache cleanup failed", exc_info=True)
+
+
 def _validate_built_globals(d: Path) -> None:
   """Reject a complete-looking bundle with undeclared runtime identifiers.
 
@@ -462,6 +477,8 @@ def _validate_built_globals(d: Path) -> None:
     raise _BuiltGlobalValidationError(
       f"frontend global checker could not run: {exc}"
     ) from exc
+  finally:
+    _reclaim_node_probe_cache()
   if result.returncode != 0:
     detail = _tail(result.stdout) or (
       f"frontend global checker exited {result.returncode}"
@@ -612,6 +629,8 @@ def _current_node_compile_cache_dir(
   except (OSError, subprocess.SubprocessError) as exc:
     log.warning("could not identify current Node compile cache: %s", exc)
     return None
+  finally:
+    _reclaim_node_probe_cache(env)
   if result.returncode != 0 or not result.stdout.strip():
     log.warning(
       "could not identify current Node compile cache (exit %s): %s",

@@ -48,7 +48,9 @@ def test_result_carries_reveal_anchor_of_matching_message(db):
   )
   hit = next(r for r in chat_search.search(db, "wombat") if r["id"] == c.id)
   assert hit["anchor_key"] == "user-1001"
-  assert set(hit) == {"id", "title", "snippet", "anchor_key", "last_active"}
+  assert set(hit) == {
+    "id", "title", "snippet", "anchor_key", "last_active", "archived",
+  }
 
 
 def test_result_carries_iso_last_active_timestamp(db):
@@ -382,8 +384,8 @@ def test_long_matching_chat_cannot_crowd_other_chats_out_before_grouping(db):
 
 def test_streaming_ranker_keeps_complete_recent_top_k_when_newest_arrives_last():
   rows = iter((
-    ("chat-a", 0, 1, "user", "one lynx", "A", "2026-08-01"),
-    ("chat-b", 0, 2, "user", "lynx lynx lynx", "B", "2026-08-02"),
+    ("chat-a", 0, 1, "user", "one lynx", "A", "2026-08-01", False),
+    ("chat-b", 0, 2, "user", "lynx lynx lynx", "B", "2026-08-02", False),
   ))
 
   results = chat_search._rank_results(rows, ["lynx"], limit=1)
@@ -396,11 +398,11 @@ def test_recent_match_outranks_old_chat_that_repeats_the_query():
     (
       "old-verbose", 0, 1, "user",
       "new chat drawer new chat drawer new chat drawer",
-      "Old verbose discussion", "2026-08-01",
+      "Old verbose discussion", "2026-08-01", False,
     ),
     (
       "recent-report", -1, None, None, "Missing new chat in web drawer",
-      "Missing new chat in web drawer", "2026-08-28",
+      "Missing new chat in web drawer", "2026-08-28", False,
     ),
   ))
 

@@ -18,6 +18,22 @@ export const MAX_SOURCE_TITLE_CHARS = 300
 export const MAX_SOURCE_SNIPPET_CHARS = 700
 const MAX_SOURCE_ROWS_SCANNED = 512
 
+export function messageSourcesUrl(chatId, messageIndex) {
+  return `/chats/${encodeURIComponent(chatId)}/message-sources`
+    + `?message_index=${encodeURIComponent(messageIndex)}`
+}
+
+/** Each page is independently bounded by messageSources; joining a reply
+ * must not silently apply one physical message's limit to all its sources. */
+export function combineMessageSources(pages) {
+  const sources = new Map()
+  for (const page of pages) for (const source of page) {
+    const existing = sources.get(source.url)
+    sources.set(source.url, existing ? enrichMessageSource(existing, source) : source)
+  }
+  return [...sources.values()]
+}
+
 // Only complete http(s) URLs may reach an href. URL() rejects superficially
 // plausible but unusable values such as `https://` and hosts with whitespace;
 // checking the parsed protocol rejects javascript:/data:/mailto:.

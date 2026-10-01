@@ -9,7 +9,7 @@ import {
   consumeMenuClick,
   finishMenuPress,
 } from './menuPointerOwnership.js'
-import { Pin, PinFilled } from '@openai/apps-sdk-ui/components/Icon'
+import { Archive, Pin, PinFilled, Unarchive } from '@openai/apps-sdk-ui/components/Icon'
 import { placeContextMenu } from '../../lib/contextMenuGeometry.js'
 import useContextMenuOutsideDismiss from '../../hooks/useContextMenuOutsideDismiss.js'
 import { captureLayoutSpace, clientPointToLayout } from '../../lib/layoutSpace.js'
@@ -23,6 +23,9 @@ export default function DrawerItemActionMenu({
   itemKind,
   itemName,
   pinned,
+  // Chats only: archived chats offer Restore in place of Pin, since a pin
+  // promises to keep something in view and archiving files it away.
+  archived = false,
   canInstall,
   canShare,
   projectActionLabel,
@@ -32,6 +35,7 @@ export default function DrawerItemActionMenu({
   restoreFocusRef,
   onClose,
   onPin,
+  onArchive,
   onCopy,
   onRename,
   onInstall,
@@ -286,17 +290,33 @@ export default function DrawerItemActionMenu({
         ) : (
           <>
             <div className="drawer__item-action-items">
-              <button
-                type="button"
-                role="menuitem"
-                className="drawer__item-action-item drawer__item-action-item--icon"
-                onClick={() => run(onPin)}
-              >
-                {pinned
-                  ? <Pin width={15} height={15} aria-hidden="true" />
-                  : <PinFilled width={15} height={15} aria-hidden="true" />}
-                <span>{pinned ? 'Unpin' : 'Pin'}</span>
-              </button>
+              {!archived && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="drawer__item-action-item drawer__item-action-item--icon"
+                  onClick={() => run(onPin)}
+                >
+                  {pinned
+                    ? <Pin width={15} height={15} aria-hidden="true" />
+                    : <PinFilled width={15} height={15} aria-hidden="true" />}
+                  <span>{pinned ? 'Unpin' : 'Pin'}</span>
+                </button>
+              )}
+              {onArchive && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="drawer__item-action-item drawer__item-action-item--icon"
+                  // The row moves sections, so focus cannot return to it.
+                  onClick={() => run(onArchive, { restoreFocus: false })}
+                >
+                  {archived
+                    ? <Unarchive width={15} height={15} aria-hidden="true" />
+                    : <Archive width={15} height={15} aria-hidden="true" />}
+                  <span>{archived ? 'Restore' : 'Archive'}</span>
+                </button>
+              )}
               <button
                 type="button"
                 role="menuitem"

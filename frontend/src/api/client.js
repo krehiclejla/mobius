@@ -801,6 +801,15 @@ export const api = {
     // Chats and apps share one pinned section, so its order is one transaction
     // even though the rows live in two resource tables.
     reorderPinned: pinnedOrderMutation,
+    // Archiving files a chat under Archived without touching its history or
+    // work; restoring returns it to Recents. Both answer the persisted
+    // `{ archived_at, pinned_at }` so the drawer can settle its rows.
+    archive: (chatId) => listAffectingMutation(
+      'chats', `/chats/${encodeURIComponent(chatId)}/archive`, { method: 'POST' },
+    ),
+    unarchive: (chatId) => listAffectingMutation(
+      'chats', `/chats/${encodeURIComponent(chatId)}/unarchive`, { method: 'POST' },
+    ),
     remove: (chatId) => listAffectingMutation(
       'chats', `/chats/${chatId}`, { method: 'DELETE' },
     ),
@@ -1375,19 +1384,38 @@ export const api = {
     ),
   },
   notifications: {
-    // Cursor pagination: `before` is the last row id of the previous page.
-    list: ({ before, limit } = {}) => {
+    // Carry the last row's sort key so paging survives its deletion elsewhere.
+    list: ({ before, beforeAt, limit } = {}) => {
       const params = new URLSearchParams()
       if (before) params.set('before', String(before))
+      if (beforeAt) params.set('before_at', String(beforeAt))
       if (limit) params.set('limit', String(limit))
       const qs = params.toString()
       return apiFetch(`/notifications${qs ? `?${qs}` : ''}`)
     },
     unreadCount: () => apiFetch('/notifications/unread-count'),
-    // Seen-on-open: idempotent bulk mark-read (clears the bell badge).
-    readAll: () => apiFetch('/notifications/read-all', { method: 'POST' }),
-    // Owner action from the preview: remove all stored notifications.
-    clearAll: () => apiFetch('/notifications', { method: 'DELETE' }),
+    newCount: () => apiFetch('/notifications/new-count'),
+    // Opening acknowledges arrivals, but reading an item stays explicit.
+    seenAll: async () => jsonOrThrow(
+      await apiFetch('/notifications/seen-all', { method: 'POST' }),
+      'Could not acknowledge notifications:',
+    ),
+    readAll: async () => jsonOrThrow(
+      await apiFetch('/notifications/read-all', { method: 'POST' }),
+      'Could not mark notifications read:',
+    ),
+    read: async (notificationId) => jsonOrThrow(
+      await apiFetch(
+        `/notifications/${encodeURIComponent(notificationId)}/read`,
+        { method: 'POST' },
+      ),
+      'Could not mark notification read:',
+    ),
+    // Owner action from the preview: clear ordinary history, retaining active Undo receipts.
+    clearAll: async () => jsonOrThrow(
+      await apiFetch('/notifications', { method: 'DELETE' }),
+      'Could not clear notifications:',
+    ),
     // Per-item dismissal is limited by the server to ordinary notifications.
     dismiss: async (notificationId) => jsonOrThrow(
       await apiFetch(

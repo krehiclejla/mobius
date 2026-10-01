@@ -17,12 +17,18 @@ const { default: MsgContent } = await vite.ssrLoadModule(
 const {
   attachmentIsGalleryImage,
   generatedFileCanPreview,
+  generatedFileIsMarkdown,
+  generatedFileIsPdf,
+  documentAttachmentIdentity,
 } = await vite.ssrLoadModule(
   '/src/components/ChatView/Attachments.jsx',
 )
+const { default: DocumentAttachment, markdownCardExcerpt } = await vite.ssrLoadModule(
+  '/src/components/ChatView/DocumentAttachment.jsx',
+)
 
-const { default: ActiveAssistantSurface } = await vite.ssrLoadModule(
-  '/src/components/ChatView/ActiveAssistantSurface.jsx',
+const { default: AssistantReply } = await vite.ssrLoadModule(
+  '/src/components/ChatView/AssistantReply.jsx',
 )
 
 after(() => vite.close())
@@ -36,6 +42,7 @@ const generatedMessage = {
       name: 'report.pdf',
       size: 700,
       mime_type: 'application/pdf',
+      previewable: true,
     }],
   }],
 }
@@ -117,6 +124,141 @@ test('only browser-safe generated documents open as previews', () => {
   assert.equal(attachmentIsGalleryImage({
     kind: 'generated', mime_type: 'image/svg+xml', previewable: false,
   }), false)
+  assert.equal(generatedFileIsMarkdown({
+    kind: 'generated', mime_type: 'text/markdown', previewable: false,
+  }), true)
+  assert.equal(generatedFileIsMarkdown({
+    kind: 'generated', mime_type: 'text/html', previewable: false,
+  }), false)
+  assert.equal(generatedFileIsPdf({
+    kind: 'generated', mime_type: 'application/pdf', previewable: true,
+  }), true)
+  assert.equal(generatedFileIsPdf({
+    kind: 'generated', mime_type: 'application/pdf', previewable: false,
+  }), false)
+})
+
+test('document reader state is isolated by chat and captured attachment bytes', () => {
+  const file = { name: 'report.md', sha256: 'a'.repeat(64) }
+  const original = documentAttachmentIdentity(file, 'chat-one')
+  assert.notEqual(original, documentAttachmentIdentity(file, 'chat-two'))
+  assert.notEqual(original, documentAttachmentIdentity({ ...file, sha256: 'b'.repeat(64) }, 'chat-one'))
+})
+
+test('generated Markdown offers a content-preview card and Download without changing raw-file policy', () => {
+  const markdownMessage = {
+    ...generatedMessage,
+    blocks: [{ type: 'generated_files', files: [{
+      name: 'review.md', size: 51709, mime_type: 'text/markdown', previewable: false,
+    }] }],
+  }
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: markdownMessage,
+    chatId: 'chat-generated-file',
+    isLastMsg: true,
+    isStreaming: false,
+  }))
+
+  assert.match(html, /chat__document-card-paper/)
+  assert.match(html, /aria-label="Expand review\.md preview"/)
+  assert.match(html, /<button[^>]+aria-label="Download review\.md"/)
+  assert.doesNotMatch(html, /preview=true/)
+})
+
+test('generated PDF offers a first-page preview card and Download', () => {
+  const html = renderGeneratedMessage(false)
+  assert.match(html, /chat__document-card-pdf/)
+  assert.match(html, /aria-label="Expand report\.pdf preview"/)
+  assert.match(html, /<button[^>]+aria-label="Download report\.pdf"/)
+  assert.doesNotMatch(html, /target="_blank"/)
+})
+
+test('document cards enlarge in chat without losing the original download', () => {
+  const file = { name: 'report.pdf', size: 700, mime_type: 'application/pdf' }
+  const props = {
+    file, chatId: 'chat-generated-file',
+    onToggle() {},
+  }
+  const closed = renderToStaticMarkup(createElement(DocumentAttachment, { ...props, expanded: false }))
+  const open = renderToStaticMarkup(createElement(DocumentAttachment, { ...props, expanded: true }))
+
+  assert.match(closed, /chat__document-card-pdf/)
+  assert.doesNotMatch(closed, /<iframe/)
+  assert.match(closed, /aria-label="Download report\.pdf"/)
+  assert.match(open, /chat__document-card--expanded/)
+  assert.match(open, />Collapse<\/button>/)
+  assert.match(open, /Loading PDF preview/)
+  assert.doesNotMatch(open, /Continue in chat/)
+  assert.match(open, />Download<\/button>/)
+})
+
+test('expanded Markdown joins the shared nested-scroll reader', () => {
+  const file = { name: 'review.md', size: 700, mime_type: 'text/markdown' }
+  const html = renderToStaticMarkup(createElement(DocumentAttachment, {
+    file, chatId: 'chat-generated-file', expanded: true, onToggle() {},
+  }))
+  assert.match(html, /class="chat__document-card-reader" data-chat-scroll-region/)
+})
+
+test('Markdown card shows a readable excerpt of the actual report', () => {
+  assert.deepEqual(markdownCardExcerpt('# Review title\n\n## Summary\n**A real finding** with [context](https://example.com).'), {
+    title: 'Review title',
+    body: 'A real finding with context.',
+  })
+})
+
+test('generated files appear before a terminal question card in saved chats', () => {
+  const previousWindow = globalThis.window
+  globalThis.window = { location: { href: 'http://localhost/shell/' } }
+  try {
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: {
+        role: 'assistant', content: '', blocks: [
+          { type: 'text', content: 'Compare these formats.' },
+          { type: 'question', question_id: 'which-format', questions: [{
+            question: 'Which format feels best?', options: [],
+          }] },
+          { type: 'generated_files', files: [{
+            name: 'review.md', size: 1000, mime_type: 'text/markdown',
+          }] },
+        ],
+      },
+      chatId: 'chat-generated-file', isLastMsg: true, isStreaming: false,
+    }))
+
+    assert.ok(html.indexOf('Compare these formats.') < html.indexOf('review.md'))
+    assert.ok(html.indexOf('review.md') < html.indexOf('Which format feels best?'))
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  }
+})
+
+test('generated files stay after later prose when a question is not terminal', () => {
+  const previousWindow = globalThis.window
+  globalThis.window = { location: { href: 'http://localhost/shell/' } }
+  try {
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: {
+        role: 'assistant', content: '', blocks: [
+          { type: 'question', question_id: 'first-question', questions: [{
+            question: 'Earlier question?', options: [],
+          }] },
+          { type: 'text', content: 'Here is the later report.' },
+          { type: 'generated_files', files: [{
+            name: 'review.md', size: 1000, mime_type: 'text/markdown',
+          }] },
+        ],
+      },
+      chatId: 'chat-generated-file', isLastMsg: true, isStreaming: false,
+    }))
+
+    assert.ok(html.indexOf('Earlier question?') < html.indexOf('Here is the later report.'))
+    assert.ok(html.indexOf('Here is the later report.') < html.indexOf('review.md'))
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  }
 })
 
 for (const isStreaming of [true, false]) {
@@ -126,7 +268,8 @@ for (const isStreaming of [true, false]) {
       type: 'tool', tool: 'PeerMessage', tool_use_id: 'peer-review',
       status: 'done', input: '', output: '',
     }
-    const html = renderToStaticMarkup(createElement(ActiveAssistantSurface, {
+    const html = renderToStaticMarkup(createElement(AssistantReply, {
+      replyGroup: { rows: [{ message: generatedMessage, key: 'assistant-file', anchorKey: 'assistant-file', notes: [] }] },
       activeMirrorMsg: { ...generatedMessage, blocks: [peer, ...rawBlocks] },
       activitySourceBlocks: rawBlocks,
       useDbActivePayload: false,
@@ -134,7 +277,7 @@ for (const isStreaming of [true, false]) {
       streamItems: [{
         type: 'tool', tool: 'Bash', tool_use_id: 'tool-pdf', status: 'done',
       }],
-      chatId: 'chat-generated-file', dataKey: 'assistant-file', isStreaming,
+      chatId: 'chat-generated-file', isStreaming,
     }))
     assert.match(html, /Exchang(?:ing|ed) messages/i)
     assert.equal(html.includes('chat__attach-file'), !isStreaming)

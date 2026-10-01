@@ -21,6 +21,7 @@ import AppActivityCard from './AppActivityCard.jsx'
 import PeerMessageCard from './PeerMessageCard.jsx'
 import ToolImageResult from './ToolImageResult.jsx'
 import {
+  generatedInboxImageName,
   servedImageReference,
   toolImageReference,
 } from './toolImageResult.js'
@@ -31,6 +32,8 @@ import {
 import { useToolImagePreview } from './useToolImagePreview.js'
 import ToolEditPreview from './ToolEditPreview.jsx'
 import { toolEditPreview } from './toolEditPreview.js'
+
+const EMPTY_GENERATED_FILES = []
 
 // Render an already-formatted tool result (see toolResultFormat.js) so shell
 // output reads as a terminal (stdout / stderr / exit code) and a structured
@@ -92,7 +95,10 @@ function ToolResult({ r }) {
   )
 }
 
-function GenericToolBlock({ t, chatId, compact = false, disclosureKey }) {
+function GenericToolBlock({
+  t, chatId, generatedFiles = EMPTY_GENERATED_FILES,
+  generatedCapturePending = false, compact = false, disclosureKey,
+}) {
   // Collapsed until tapped — nothing produces a pre-opened tool block anymore
   // (the last producer, the legacy compaction path, renders as CompactionCard;
   // a legacy persisted `defaultOpen` field is ignored and renders collapsed
@@ -147,9 +153,14 @@ function GenericToolBlock({ t, chatId, compact = false, disclosureKey }) {
     () => (wantsPreparation && !failed ? toolEditPreview(t.edit_preview) : null),
     [failed, t.edit_preview, wantsPreparation],
   )
+  const generatedImage = useMemo(() => ({
+    files: generatedFiles,
+    viewedDigest: t.viewed_image_sha256,
+    completed: t.status === 'done',
+  }), [generatedFiles, t.viewed_image_sha256, t.tool, t.status])
   const servedImage = useMemo(() => (
-    isImageTool ? servedImageReference(t.input, chatId) : null
-  ), [isImageTool, t.input, chatId])
+    isImageTool ? servedImageReference(t.input, chatId, generatedImage) : null
+  ), [isImageTool, t.input, chatId, generatedImage])
   // `t.sources` is NOT rendered here: the turn's sources surface once at the
   // end of the message (MessageSources), where they belong to the answer
   // rather than to the one search that found them. They deliberately do not
@@ -253,8 +264,8 @@ function GenericToolBlock({ t, chatId, compact = false, disclosureKey }) {
     || !!t.output_truncated
     || (t.status !== 'running' && shownOutput === '')
   const imageReference = useMemo(
-    () => (isImageTool ? toolImageReference(t.input, shownOutput, chatId) : null),
-    [isImageTool, shownOutput, t.input, chatId],
+    () => (isImageTool ? toolImageReference(t.input, shownOutput, chatId, generatedImage) : null),
+    [isImageTool, shownOutput, t.input, chatId, generatedImage],
   )
   const r = useMemo(
     () => (hasOutput && !isImageTool
@@ -586,7 +597,9 @@ function GenericToolBlock({ t, chatId, compact = false, disclosureKey }) {
                 : isImageTool && !showLazyStatus
                   ? (
                     <span className="chat__tool-image-status" role="status">
-                      Image preview unavailable
+                      {generatedCapturePending && generatedInboxImageName(t.input, chatId)
+                        ? 'Preview appears after the turn if the image is saved'
+                        : 'Image preview unavailable'}
                     </span>
                   )
                   : r && <ToolResult r={r} />}
@@ -641,6 +654,8 @@ export default function ToolBlock({
   compact = false,
   disclosureKey,
   onInternalNav,
+  generatedFiles = EMPTY_GENERATED_FILES,
+  generatedCapturePending = false,
 }) {
   if (effectiveToolName(t) === 'AppActivity') {
     return (
@@ -679,6 +694,8 @@ export default function ToolBlock({
       chatId={chatId}
       compact={compact}
       disclosureKey={disclosureKey}
+      generatedFiles={generatedFiles}
+      generatedCapturePending={generatedCapturePending}
     />
   )
 }

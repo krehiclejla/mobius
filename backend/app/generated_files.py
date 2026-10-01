@@ -10,6 +10,7 @@ boundary.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import mimetypes
 import os
@@ -28,7 +29,14 @@ INLINE_PREVIEW_MIME_TYPES = frozenset({
   "image/gif",
   "image/jpeg",
   "image/png",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
   "video/mp4",
+})
+
+VIEWED_RASTER_MIME_TYPES = frozenset({
+  "image/avif", "image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp",
 })
 
 
@@ -172,11 +180,13 @@ def _freeze_file(data_dir: str, chat_id: str, name: str) -> dict | None:
       destination_fd, "wb", closefd=False,
     ) as dst:
       remaining = MAX_RECORDED_BYTES + 1
+      digest = hashlib.sha256()
       while remaining > 0:
         chunk = src.read(min(1024 * 1024, remaining))
         if not chunk:
           break
         dst.write(chunk)
+        digest.update(chunk)
         remaining -= len(chunk)
     final = os.fstat(source_fd)
     copied = os.fstat(destination_fd)
@@ -197,6 +207,7 @@ def _freeze_file(data_dir: str, chat_id: str, name: str) -> dict | None:
       "path": stored_name,
       "size": final.st_size,
       "mime_type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+      "sha256": digest.hexdigest(),
       "_source_identity": (final.st_dev, final.st_ino, final.st_mtime_ns, final.st_size),
     }
   except OSError:
@@ -264,15 +275,77 @@ def open_stored_file(
   data_dir: str, chat_id: str, stored_name: str,
 ) -> tuple[int, os.stat_result]:
   """Open one immutable file relative to a held, symlink-free store handle."""
-  if Path(stored_name).name != stored_name or stored_name in {".", ".."}:
+  return _open_deliverable_file(data_dir, chat_id, "files", stored_name)
+
+
+def open_inbox_file(
+  data_dir: str, chat_id: str, name: str,
+) -> tuple[int, os.stat_result]:
+  """Open a live flat-inbox file without following provider-controlled links."""
+  return _open_deliverable_file(data_dir, chat_id, "inbox", name)
+
+
+def sha256_open_file(file_fd: int, opened: os.stat_result) -> str | None:
+  """Hash a held regular file, rejecting oversized or changing content."""
+  if opened.st_size > MAX_RECORDED_BYTES:
+    return None
+  digest = hashlib.sha256()
+  try:
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    remaining = MAX_RECORDED_BYTES + 1
+    while remaining > 0:
+      chunk = os.read(file_fd, min(1024 * 1024, remaining))
+      if not chunk:
+        break
+      digest.update(chunk)
+      remaining -= len(chunk)
+    final = os.fstat(file_fd)
+    if (
+      remaining == 0
+      or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+      != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns)
+      or final.st_size != MAX_RECORDED_BYTES + 1 - remaining
+    ):
+      return None
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+  except OSError:
+    return None
+
+
+def viewed_inbox_sha256(data_dir: str, chat_id: str, path: str) -> str | None:
+  """Fingerprint only a raster file in this chat's flat deliverables inbox."""
+  if not isinstance(path, str):
+    return None
+  source = Path(path)
+  if (
+    source.parent != _chat_root(data_dir, chat_id) / "inbox"
+    or source.name in {"", ".", ".."}
+    or mimetypes.guess_type(source.name)[0] not in VIEWED_RASTER_MIME_TYPES
+  ):
+    return None
+  try:
+    file_fd, opened = open_inbox_file(data_dir, chat_id, source.name)
+  except OSError:
+    return None
+  try:
+    return sha256_open_file(file_fd, opened)
+  finally:
+    os.close(file_fd)
+
+
+def _open_deliverable_file(
+  data_dir: str, chat_id: str, collection: str, name: str,
+) -> tuple[int, os.stat_result]:
+  if Path(name).name != name or name in {".", ".."}:
     raise OSError("invalid generated-file path")
   directory_fd = _open_directory(
-    _chat_root(data_dir, chat_id) / "files", create=False,
+    _chat_root(data_dir, chat_id) / collection, create=False,
   )
   file_fd = None
   try:
     file_fd = os.open(
-      stored_name,
+      name,
       os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
       dir_fd=directory_fd,
     )

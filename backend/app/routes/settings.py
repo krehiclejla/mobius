@@ -183,6 +183,10 @@ def _cli_version(cmd: str) -> str | None:
   except (subprocess.SubprocessError, OSError) as exc:
     logger.warning("%s --version failed: %s", cmd, exc)
     return None
+  finally:
+    # This synchronous route already runs on a worker, outside turn teardown.
+    from app.file_cache import reclaim_provider_cache_sync
+    reclaim_provider_cache_sync(cmd)
   if result.returncode != 0:
     return None
   first_line = result.stdout.strip().splitlines()

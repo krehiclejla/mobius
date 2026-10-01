@@ -1,5 +1,6 @@
 /* Presentation shared by active handoffs and settled wait history. */
 import { formatDateTime, formatTime } from '../../lib/dateTimeFormat.js'
+import { pauseTiming } from './resetTime.js'
 
 export function waitConditionLabel(description) {
   // Sentence-case the instruction, not case-sensitive project names or refs.
@@ -44,7 +45,7 @@ export function isResourcePause(block) {
 
 export function resourcePausePresentation(block) {
   const kind = block?.pause?.kind
-  const next = clockLabel(block?.pause?.resets_at)
+  const next = clockLabel(pauseTiming(block?.pause).checkAt)
   const storage = kind === 'storage'
   return {
     summary: storage

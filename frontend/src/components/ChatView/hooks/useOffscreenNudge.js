@@ -42,7 +42,7 @@ export function isIntersectionOffscreen(entry) {
 export function useNudgeTargetRef() {
   const [element, setElement] = useState(null)
   // Stable identity: this ref is passed as a prop across memoized component
-  // boundaries (MsgContent, ActiveAssistantSurface), which compare by identity.
+  // boundaries (MsgContent, AssistantReply), which compare by identity.
   const ref = useCallback(node => setElement(node ?? null), [])
   return [element, ref]
 }

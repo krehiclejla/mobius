@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   ownerInputChangeFromEvent,
   reconcileChatRenameGuards,
+  withChatArchive,
   withChatListRowPatch,
   withChatOwnerActivity,
   withChatOwnerInput,
@@ -198,4 +199,24 @@ test('a scoped row refresh replaces, adds, and drops only the requested chats', 
     { id: 'fresh', title: 'created server-side' },
   ])
   assert.equal(next[0], rows[0])
+})
+
+test('generic activity cannot restore an archived chat without accepted owner input', () => {
+  const archived = [{ ...rows[1], archived_at: '2026-09-28T08:00:00' }]
+  const next = withChatOwnerActivity(archived, 'b', '2026-09-29T10:00:00Z')
+  assert.equal(next[0].archived_at, archived[0].archived_at)
+  assert.equal(next[0].activity_at, '2026-09-29T10:00:00Z')
+})
+
+test('archive projection applies committed archive and pin stamps in place', () => {
+  const pinned = [rows[0], { ...rows[1], pinned_at: '2026-09-01T08:00:00' }]
+  const archived = withChatArchive(pinned, 'b', {
+    archivedAt: '2026-09-29T08:00:00', pinnedAt: null,
+  })
+  assert.equal(archived[0], pinned[0])
+  assert.equal(archived[1].archived_at, '2026-09-29T08:00:00')
+  assert.equal(archived[1].pinned_at, null)
+
+  const restored = withChatArchive(archived, 'b', { archivedAt: null, pinnedAt: null })
+  assert.equal(restored[1].archived_at, null)
 })

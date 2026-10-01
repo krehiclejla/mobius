@@ -145,3 +145,32 @@ test('rapid pending pins receive distinct append ranks', () => {
   assert.equal(first, '2026-09-12T12:00:00.000Z')
   assert.equal(second, '2026-09-12T12:00:00.001Z')
 })
+
+test('archived chats leave Pinned and Recents for Archived, newest archive first', () => {
+  const active = { id: 'active', has_messages: true, activity_at: '2026-09-29T09:00:00' }
+  const olderArchive = {
+    id: 'older', has_messages: true, activity_at: '2026-09-29T10:00:00',
+    archived_at: '2026-09-20T08:00:00',
+  }
+  const newerArchive = {
+    id: 'newer', has_messages: true, activity_at: '2026-09-01T10:00:00',
+    archived_at: '2026-09-28T08:00:00Z',
+  }
+  const staleArchivedPin = {
+    id: 'stale-pin', has_messages: true, pinned_at: '2026-09-02T08:00:00',
+    archived_at: '2026-09-10T08:00:00',
+  }
+
+  const result = buildDrawerSections(
+    [active, olderArchive, newerArchive, staleArchivedPin], [], [],
+  )
+
+  assert.deepEqual(result.pinned, [])
+  assert.deepEqual(result.recents.map(row => row.item.id), ['active'])
+  assert.deepEqual(result.archived.map(row => row.item.id), ['newer', 'older', 'stale-pin'])
+})
+
+test('an empty archive is an empty Archived section', () => {
+  const result = buildDrawerSections([{ id: 'a', has_messages: true }], [], [])
+  assert.deepEqual(result.archived, [])
+})

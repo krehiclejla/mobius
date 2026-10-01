@@ -480,7 +480,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 | `AgentContextInspector.jsx` | "What the agent knows" sheet — renders `GET /api/chats/{id}/agent-context`; opened from the `+` popover |
 | `MsgContent.jsx` | Per-message rendering: markdown, tool blocks, attachments |
 | `ToolBlock.jsx` | Collapsible tool-execution block with status |
-| `StreamingMessage.jsx` | The live, in-progress assistant message, incl. the collapsed reasoning disclosure for `thinking` stream events (Claude `thinking_delta` and Codex reasoning deltas publish the identical provider-agnostic event via each runner's `_thinking_event()`); the block is promoted and persisted (`streamPromotion.js` + `events.py`) and re-rendered post-turn by `MsgContent.jsx`, so it is durable, not stream-only |
+| `AssistantReply.jsx` | Owns one logical reply across hidden committed steers: selects live/saved source rows, retains their keyed anchors and activity, renders their blocks through `MsgContent.jsx`, and places one lazy References disclosure after the reply |
 | `QuestionCard.jsx` | AskUserQuestion UI (gates the turn) |
 | `QueuedMessages.jsx` | Tray of messages queued while a turn streams |
 | `CompactionCard.jsx` | Compaction summary affordance |
@@ -992,14 +992,24 @@ and attaches their rule ids to new diagnostic chats. The Playwright lock-in spec
   cross a later visible turn or a different explicit id.
 - **R6a — Exact steer replay is one continuous answer.** A committed steer stamps
   every inserted owner row with durable `steered: true` provenance. That marker,
-  not transcript adjacency or fuzzy content overlap, is the sole authority for
-  joining presentation across the boundary. When the first post-steer text block
-  starts with the complete sealed pre-steer text exactly, the repeated raw prefix
-  remains stored but only its unseen suffix renders below the owner row. While the
+  not transcript adjacency or fuzzy content overlap, authorizes replay projection
+  across the boundary. Explicit differing run identities always fail closed.
+  When the first post-steer text block starts with the complete terminal sealed
+  text section exactly, the repeated raw prefix remains stored but only its unseen
+  suffix renders below a visible owner row. A platform-hidden steer within the
+  same explicit run instead forms one presentation reply: across an empty seam,
+  exact replay extends the original Markdown text surface without a false paragraph
+  break. Thoughts, tools, cards, or positioned timeline activity at the seam prevent
+  text fusion and keep their original chronological place. Each physical row,
+  key, anchor, source block index and raw transcript remains addressable. Reply
+  References render once at the final visible segment, combining per-message
+  bounded metadata lazily, deduplicating URLs, and retaining successfully read
+  pages when another fails. Real owner messages and different runs never share
+  this footer. While the
   turn is active, a growing new text block that is itself still an exact prefix of
   the sealed text stays provisionally hidden; the first mismatch immediately
   reveals the complete accumulated block. A settled shorter response, an ordinary
-  send, multiple sealed text blocks, a tool/question/error before the continuation,
+  send, an ambiguous sealed text section, a tool/question/error before the continuation,
   or a cut inside an open Markdown/container construct all fail closed and render
   the post-steer response intact. A plain-text cut may split a word at any
   Unicode grapheme boundary, but never splits a character reference. Literal
@@ -1459,7 +1469,7 @@ owned by the saved owner-input route and writer transaction described below.
 The answer POST is intercepted before normal send handling in `backend/app/routes/chats_stream.py:send_message` whenever `body.answers` is truthy. The shared bridge registers the pending owner before save-before-broadcast can expose its card, so the route checks that exact owner immediately; after a process restart it instead recovers from the durable question block. For a live provider question, the route checks `question_id` identity when supplied, persists the answer FIRST through the writer actor's `AnswerQuestion`, then `questions.claim_if(chat_id, pending)` before resolving the future. That ordering is load-bearing: a concurrent Stop can cancel and pop the pending entry while the answer write awaits its ack, and resolving a cancelled/superseded future would feed the answer to the wrong SDK call. On success the route publishes `answers_applied` and returns `status:"answer_delivered"` plus `answer_turn:"same"`, which `useStreamConnection.js:sendMessage` treats as terminal for the POST without reconnecting the SSE. Durable-question recovery instead returns `status:"started"` plus `answer_turn:"new"`. The dedicated `answer_turn` field owns frontend row/bridge semantics; the status fallback exists only for rolling compatibility with older backends. A stale/missing pending question returns `410` rather than falling through and sending the answer as a new user turn.
 **Question settlement invariant:** live stream items, a persisted partial, and the settled transcript are alternate sources for one active assistant row. An in-process answer resumes that same row; the live-to-durable handoff preserves the question, its answer, and all pre/post-answer thinking, tool, and text blocks in event order without hiding, duplicating, or reordering them. Only a recovered answer with `answer_turn:"new"` creates a separate hidden continuation. Unknown future modes fail closed to a separate boundary so an existing question row is never overwritten.
 
-Three frontend gates must stay aligned. `StreamingMessage.jsx` renders live question events with `QuestionCard` and NO disabled prop (the runner is paused while `sending`/`isStreaming` can still be true); `QuestionCard.jsx` does accept a `disabled` prop, but only `MsgContent.jsx` passes it, for non-answerable persisted cards. `ChatView.jsx:doSendSilent` allows submissions carrying `resolvedAnswers` through both `sendingRef` and `isStreamingRef`, uses `sendSilentInFlightRef` as the synchronous double-submit guard, optimistically patches message + stream question answers, and sends a hidden message with `answers` + `question_id`. Persistence identity lives in `chat_writer.py`: `apply_answers_to_last_question()` writes by exact `question_id` when present, and both the live-snapshot and final-merge paths carry existing answers forward by `events.question_block_key()` so later streaming snapshots don't wipe them. Do not key answer carry by block position, do not resolve the pending future before the writer ack, and do not make live cards inherit global send/stream disabled state.
+Three frontend gates must stay aligned. `AssistantReply.jsx` renders live and saved question blocks through `MsgContent.jsx`, which passes `QuestionCard` a `disabled` prop based on durable question identity and answerability—not global streaming state (the runner is paused while `sending`/`isStreaming` can still be true). `ChatView.jsx:doSendSilent` allows submissions carrying `resolvedAnswers` through both `sendingRef` and `isStreamingRef`, uses `sendSilentInFlightRef` as the synchronous double-submit guard, optimistically patches message + stream question answers, and sends a hidden message with `answers` + `question_id`. Persistence identity lives in `chat_writer.py`: `apply_answers_to_last_question()` writes by exact `question_id` when present, and both the live-snapshot and final-merge paths carry existing answers forward by `events.question_block_key()` so later streaming snapshots don't wipe them. Do not key answer carry by block position, do not resolve the pending future before the writer ack, and do not make live cards inherit global send/stream disabled state.
 
 ### Saved owner-input pauses
 

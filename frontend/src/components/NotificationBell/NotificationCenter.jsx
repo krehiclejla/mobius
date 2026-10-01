@@ -31,12 +31,12 @@ const NotificationCenter = forwardRef(function NotificationCenter(
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [updateNoticeSeen, setUpdateNoticeSeen] = useState(false)
   const {
-    state: { open, unreadCount },
-    actions: { toggle, close, clearAll, dismiss, reconcile, onCreated },
+    state: { open, unreadCount, newCount },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
     meta: { rootRef, bellRef },
   } = useNotificationCenter(queryClient)
   const updateNoticeActive = updateAvailable && typeof onUpdateNow === 'function'
-  const visibleUnreadCount = unreadCount + (
+  const visibleNewCount = newCount + (
     updateNoticeActive && !updateNoticeSeen ? 1 : 0
   )
 
@@ -110,7 +110,7 @@ const NotificationCenter = forwardRef(function NotificationCenter(
       />
       <NotificationBell
         buttonRef={bellRef}
-        unreadCount={visibleUnreadCount}
+        newCount={visibleNewCount}
         active={open}
         onClick={toggleNotifications}
       />
@@ -120,6 +120,9 @@ const NotificationCenter = forwardRef(function NotificationCenter(
           onOpenTarget={openTarget}
           onClearAll={clearAll}
           onDismiss={dismiss}
+          onMarkRead={markRead}
+          onMarkAllRead={markAllRead}
+          unreadCount={unreadCount}
           onRecoveryAction={onRecoveryAction}
           updateAvailable={updateNoticeActive}
           onUpdateNow={applyUpdate}

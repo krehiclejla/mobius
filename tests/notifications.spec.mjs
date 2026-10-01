@@ -37,27 +37,49 @@ function notifRows(now = Date.now()) {
   ]
 }
 
-async function mockNotifications(page, { rows = notifRows(), unreadCount } = {}) {
+async function mockNotifications(page, { rows = notifRows(), unreadCount, newCount } = {}) {
   const state = {
     rows,
     unreadCount,
+    newCount,
+    seenAllCalls: 0,
     readAllCalls: 0,
     deleteCalls: 0,
     get unread() {
       return this.unreadCount ?? this.rows.filter(row => row.read_at == null).length
     },
+    get newArrivals() {
+      return this.newCount ?? this.rows.filter(row => row.seen_at == null).length
+    },
   }
   await page.route(/\/api\/notifications\/unread-count$/, route => route.fulfill({
     status: 200, contentType: 'application/json', body: JSON.stringify({ count: state.unread }),
   }))
+  await page.route(/\/api\/notifications\/new-count$/, route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ count: state.newArrivals }),
+  }))
+  await page.route(/\/api\/notifications\/seen-all$/, route => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    const updated = state.newArrivals
+    const stamp = new Date().toISOString()
+    state.rows = state.rows.map(row => (
+      row.seen_at == null ? { ...row, seen_at: stamp } : row
+    ))
+    state.newCount = 0
+    state.seenAllCalls += 1
+    return route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ updated }),
+    })
+  })
   await page.route(/\/api\/notifications\/read-all$/, route => {
     if (route.request().method() !== 'POST') return route.fallback()
     const updated = state.unread
     const stamp = new Date().toISOString()
     state.rows = state.rows.map(row => (
-      row.read_at == null ? { ...row, read_at: stamp } : row
+      row.read_at == null ? { ...row, read_at: stamp, seen_at: stamp } : row
     ))
     state.unreadCount = 0
+    state.newCount = 0
     state.readAllCalls += 1
     return route.fulfill({
       status: 200, contentType: 'application/json', body: JSON.stringify({ updated }),
@@ -69,6 +91,7 @@ async function mockNotifications(page, { rows = notifRows(), unreadCount } = {})
       const deleted = state.rows.length
       state.rows = []
       state.unreadCount = 0
+      state.newCount = 0
       return route.fulfill({
         status: 200, contentType: 'application/json', body: JSON.stringify({ deleted }),
       })
@@ -109,17 +132,22 @@ async function openPreview(page) {
   await expect(page.locator('.notifications')).toBeVisible()
 }
 
-test('bell opens a bounded preview and seen-on-open clears its badge', async ({ page }) => {
+test('bell acknowledges new arrivals without marking notifications read', async ({ page }) => {
   const state = await mockNotifications(page)
   await setup(page)
   const bell = page.locator('.notification-bell')
   await expect(page.locator('.notification-bell__badge')).toHaveText('2')
-  await expect(bell).toHaveAccessibleName('Notifications, 2 unread')
+  await expect(bell).toHaveAccessibleName('Notifications, 2 new')
 
   await openPreview(page)
   await expect(page.locator('.notifications__row-title').first()).toHaveText('Agent finished your task')
-  await expect.poll(() => state.readAllCalls).toBeGreaterThan(0)
+  await expect.poll(() => state.seenAllCalls).toBe(1)
   await expect(page.locator('.notification-bell__badge')).toHaveCount(0)
+  expect(state.unread).toBe(2)
+  expect(state.readAllCalls).toBe(0)
+  await page.getByRole('button', { name: 'Mark all as read' }).click()
+  await expect.poll(() => state.readAllCalls).toBe(1)
+  expect(state.unread).toBe(0)
   await expect(bell).toHaveAttribute('aria-expanded', 'true')
 
   await expect(page.locator('.notifications__close')).toHaveCount(0)
@@ -135,6 +163,13 @@ test('clear all immediately removes the preview rows and badge', async ({ page }
 
   await expect(page.locator('.notifications__row')).toHaveCount(2)
   await page.getByRole('button', { name: 'Clear all' }).click()
+  await expect(page.getByRole('group', { name: 'Confirm clear notifications' })).toBeVisible()
+  expect(state.deleteCalls).toBe(0)
+  await page.getByRole('button', { name: 'Keep' }).click()
+  expect(state.deleteCalls).toBe(0)
+  await expect(page.locator('.notifications__row')).toHaveCount(2)
+  await page.getByRole('button', { name: 'Clear all' }).click()
+  await page.getByRole('button', { name: 'Clear history' }).click()
   await expect.poll(() => state.deleteCalls).toBe(1)
   await expect(page.locator('.notifications__row')).toHaveCount(0)
   await expect(page.locator('.notifications__empty')).toBeVisible()
@@ -177,7 +212,7 @@ test('valid targets navigate; hostile targets remain inert', async ({ page }) =>
 })
 
 test('phone header preserves the 44px bell and widest badge without collisions', async ({ page, context }) => {
-  await mockNotifications(page, { unreadCount: 120 })
+  await mockNotifications(page, { newCount: 120 })
   await setup(page)
   const bell = page.locator('.notification-bell')
   const badge = page.locator('.notification-bell__badge')

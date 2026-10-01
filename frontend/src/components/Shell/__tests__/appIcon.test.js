@@ -51,6 +51,14 @@ test('installed app chrome sizes the canonical icon reference from AppOut', () =
   assert.equal(appIconUrl(null), null)
 })
 
+test('a guide icon can use authenticated image data without a size query', () => {
+  const icon = 'data:image/png;base64,aGVsbG8='
+  const { result } = renderHook(AppIcon, {
+    item: { slug: 'notes', icon_url: icon }, label: 'Notes', size: null,
+  })
+  assert.equal(iconImages(result.current)[0].props.src, icon)
+})
+
 test('an app update keeps painted artwork until its replacement loads', () => {
   const oldApp = { id: 42, icon_url: '/api/apps/42/icon?v=old' }
   const nextApp = { id: 42, icon_url: '/api/apps/42/icon?v=next' }

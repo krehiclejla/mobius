@@ -34,6 +34,9 @@ export default function NotificationsView({
   onOpenTarget,
   onClearAll,
   onDismiss,
+  onMarkRead,
+  onMarkAllRead,
+  unreadCount = 0,
   onRecoveryAction,
   updateAvailable = false,
   onUpdateNow,
@@ -50,7 +53,10 @@ export default function NotificationsView({
   const contentRef = useRef(null)
   const paginationRef = useRef(null)
   const [isClearing, setIsClearing] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
   const [clearError, setClearError] = useState(false)
+  const [isMarkingAll, setIsMarkingAll] = useState(false)
+  const [markAllError, setMarkAllError] = useState(false)
   const [dismissState, setDismissState] = useState({})
   const [recoveryState, setRecoveryState] = useState({})
 
@@ -61,6 +67,10 @@ export default function NotificationsView({
     setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 60_000)
     return () => window.clearInterval(timer)
+  }, [active])
+
+  useEffect(() => {
+    if (!active) setConfirmClear(false)
   }, [active])
 
   useEffect(() => {
@@ -77,11 +87,12 @@ export default function NotificationsView({
   }, [active, fetchNextPage, hasNextPage, isFetchNextPageError, isFetchingNextPage])
 
   const handleClearAll = async () => {
-    if (!rows.length || isClearing) return
+    if (!rows.length || isClearing || !confirmClear) return
     setIsClearing(true)
     setClearError(false)
     try {
       await onClearAll()
+      setConfirmClear(false)
     } catch {
       setClearError(true)
     } finally {
@@ -117,6 +128,19 @@ export default function NotificationsView({
     }
   }
 
+  const handleMarkAllRead = async () => {
+    if (!unreadCount || isMarkingAll || !onMarkAllRead) return
+    setIsMarkingAll(true)
+    setMarkAllError(false)
+    try {
+      await onMarkAllRead()
+    } catch {
+      setMarkAllError(true)
+    } finally {
+      setIsMarkingAll(false)
+    }
+  }
+
   return (
     <section
       id="notification-preview"
@@ -127,18 +151,46 @@ export default function NotificationsView({
         <h2 id="notification-preview-title" className="notifications__title">
           Notifications
         </h2>
-        {rows.length > 0 && (
-          <button
-            type="button"
-            className="notifications__clear"
-            onClick={handleClearAll}
-            disabled={isClearing}
-          >
-            {isClearing ? 'Clearing…' : 'Clear all'}
-          </button>
-        )}
+        <span className="notifications__header-actions">
+          {unreadCount > 0 && (
+            <button
+              type="button"
+              className="notifications__mark-all"
+              onClick={handleMarkAllRead}
+              disabled={isMarkingAll}
+            >
+              {isMarkingAll ? 'Marking…' : 'Mark all as read'}
+            </button>
+          )}
+          {rows.length > 0 && !confirmClear && (
+            <button
+              type="button"
+              className="notifications__clear"
+              onClick={() => { setConfirmClear(true); setClearError(false) }}
+              disabled={isClearing}
+            >
+              Clear all
+            </button>
+          )}
+        </span>
       </div>
       <div className="notifications__content" ref={contentRef}>
+        {confirmClear && (
+          <div className="notifications__clear-confirm" role="group" aria-label="Confirm clear notifications">
+            <div className="notifications__clear-confirm-copy">
+              <strong>Clear history?</strong>
+              <span>Active Undo stays; the rest is deleted.</span>
+            </div>
+            <div className="notifications__clear-confirm-actions">
+              <button type="button" onClick={() => setConfirmClear(false)} disabled={isClearing}>
+                Keep
+              </button>
+              <button type="button" className="notifications__clear-confirm-danger" onClick={handleClearAll} disabled={isClearing}>
+                {isClearing ? 'Clearing…' : 'Clear history'}
+              </button>
+            </div>
+          </div>
+        )}
         {isLoading && (
           <p className="notifications__hint" role="status">Loading…</p>
         )}
@@ -150,6 +202,11 @@ export default function NotificationsView({
         {clearError && (
           <p className="notifications__hint notifications__hint--error" role="alert">
             Couldn’t clear notifications. Try again when you’re online.
+          </p>
+        )}
+        {markAllError && (
+          <p className="notifications__hint notifications__hint--error" role="alert">
+            Couldn’t mark notifications read. Try again when you’re online.
           </p>
         )}
         {!isLoading && !isError && rows.length === 0 && !updateAvailable && (
@@ -214,7 +271,10 @@ export default function NotificationsView({
                 </span>
                 <span className="notifications__row-main">
                   <span className="notifications__row-head">
-                    <span className="notifications__row-title">{n.title}</span>
+                    <span className="notifications__row-title">
+                      {!n.read_at && <span className="notifications__unread-dot" aria-label="Unread" />}
+                      {n.title}
+                    </span>
                     <time
                       className="notifications__row-time"
                       dateTime={n.sent_at}
@@ -257,7 +317,7 @@ export default function NotificationsView({
               </>
             )
             return (
-              <li key={n.id} className="notifications__row-item">
+              <li key={n.id} className={`notifications__row-item${!n.read_at ? ' notifications__row-item--unread' : ''}`}>
                 <div className="notifications__row-shell">
                   {nav && !recovery ? (
                     <button
@@ -276,6 +336,7 @@ export default function NotificationsView({
                             event.currentTarget,
                           )
                         ) return
+                        if (!n.read_at && onMarkRead) void onMarkRead(n.id).catch(() => {})
                         onOpenTarget?.(nav)
                       }}
                     >

@@ -165,6 +165,9 @@ function GlobalSearchResult({
         )}
       </span>
       <span className="global-search__result-meta">
+        {result.archived && (
+          <span className="global-search__archived-tag">Archived</span>
+        )}
         <span className="global-search__match-kind">
           {row.recent ? 'Recent' : (result.anchor_key ? 'Conversation' : 'Title')}
         </span>

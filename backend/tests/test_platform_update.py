@@ -5668,6 +5668,25 @@ def test_a_reverted_image_update_with_nothing_new_sets_nothing_aside(clone_env):
   ).stdout.strip()
 
 
+def test_set_aside_work_is_not_pruned_after_five_reverts(clone_env):
+  """A later rollback must never delete an earlier recovery point."""
+  _origin, platform = clone_env
+  saved = {}
+  for number in range(7):
+    commit = _local_commit(
+      platform, edits={"backend/app/draft.py": f"revision = {number}\n"},
+    )
+    saved[pu._keep_set_aside(platform, commit)] = commit
+
+  assert len(saved) == 7
+  assert {
+    ref: _git(platform, "rev-parse", ref).stdout.strip()
+    for ref in _git(
+      platform, "for-each-ref", "--format=%(refname)", pu._SET_ASIDE_PREFIX,
+    ).stdout.split()
+  } == saved
+
+
 def test_a_boot_refuses_a_checkout_it_cannot_place_for_any_update(clone_env):
   """Restart-only or not, an unexplained checkout under a live swap is never
   served: the boot cannot tell which source it would be running."""
@@ -6230,3 +6249,12 @@ def test_a_shallow_clone_judges_packages_by_the_recorded_release(clone_env, monk
   _record_image_inputs(platform, image_lock)
   with pytest.raises(pu.BootTransactionError, match="newer release"):
     pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_accepted_working_edit_replay_is_not_pending_when_head_equals_prepared(clone_env):
+  """Uncommitted restoration can leave HEAD equal to the prepared update;
+  its accepted replay must still win over the unstarted-swap check."""
+  _origin, platform = clone_env
+  head = _served_sha(platform)
+  record = {"prepared": head, "replayed": head, "late": None, "late_committed": None}
+  assert pu._swap_position(platform, record, head) == "replayed"

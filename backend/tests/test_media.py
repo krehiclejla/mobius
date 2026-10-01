@@ -1,30 +1,16 @@
-import json
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
 
 import app.routes.media as media_routes
-from app.config import get_settings
+from app.config import agent_scratch_root, get_settings
 
 
 def _write_chat_image(chat_id: str, subdir: str, filename: str, data: bytes) -> None:
   directory = Path(get_settings().data_dir) / "chats" / chat_id / subdir
   directory.mkdir(parents=True, exist_ok=True)
   (directory / filename).write_bytes(data)
-
-
-def _record_tmp_view(db, chat, path: str, *, tool: str = "ViewImage", key: str = "path") -> None:
-  """Store an agent tool block that looked at ``path`` in this chat."""
-  chat.messages = [*(chat.messages or []), {
-    "role": "assistant",
-    "blocks": [{
-      "type": "tool", "tool": tool, "input": json.dumps({key: path}),
-      "output": "", "status": "done",
-    }],
-  }]
-  db.add(chat)
-  db.commit()
 
 
 def _media_token(client, auth, chat_id: str) -> str:
@@ -175,10 +161,9 @@ def test_serve_chat_media_rejects_directory(client, auth, chat):
 
 
 def test_serve_agent_tmp_image_with_chat_scoped_token(
-  client, auth, chat, db, tmp_path, monkeypatch,
+  client, auth, chat, tmp_path, monkeypatch,
 ):
   monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  _record_tmp_view(db, chat, "/tmp/renders/preview.png")
   source = tmp_path / "renders" / "preview.png"
   source.parent.mkdir()
   source.write_bytes(b"temporary-image-bytes")
@@ -195,10 +180,9 @@ def test_serve_agent_tmp_image_with_chat_scoped_token(
 
 
 def test_serve_agent_tmp_image_rejects_non_images(
-  client, auth, chat, db, tmp_path, monkeypatch,
+  client, auth, chat, tmp_path, monkeypatch,
 ):
   monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  _record_tmp_view(db, chat, "/tmp/not-an-image.txt", tool="Read", key="file_path")
   source = tmp_path / "not-an-image.txt"
   source.write_text("private temporary text", encoding="utf-8")
 
@@ -211,10 +195,9 @@ def test_serve_agent_tmp_image_rejects_non_images(
 
 
 def test_serve_agent_tmp_image_rejects_symlink_escape(
-  client, auth, chat, db, tmp_path, monkeypatch,
+  client, auth, chat, tmp_path, monkeypatch,
 ):
   monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  _record_tmp_view(db, chat, "/tmp/outside.png")
   link = tmp_path / "outside.png"
   link.symlink_to("/etc/hosts")
 
@@ -224,6 +207,63 @@ def test_serve_agent_tmp_image_rejects_symlink_escape(
   )
 
   assert response.status_code == 400
+
+
+def test_serve_agent_scratch_image_from_same_chat_with_media_token(
+  client, auth, chat,
+):
+  source = agent_scratch_root() / chat.id / "renders" / "preview one.png"
+  source.parent.mkdir(parents=True, exist_ok=True)
+  source.write_bytes(b"current-scratch-image")
+
+  response = client.get(
+    f"/api/chats/{chat.id}/scratch-images/renders/preview%20one.png",
+    params={"token": _media_token(client, auth, chat.id)},
+  )
+
+  assert response.status_code == 200
+  assert response.content == b"current-scratch-image"
+  assert response.headers["content-type"] == "image/png"
+  assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_serve_agent_scratch_image_rejects_other_chat_token(client, auth, chat):
+  from uuid import uuid4
+
+  other_chat_id = str(uuid4())
+  source = agent_scratch_root() / other_chat_id / "private.png"
+  source.parent.mkdir(parents=True, exist_ok=True)
+  source.write_bytes(b"other-chat-image")
+
+  response = client.get(
+    f"/api/chats/{other_chat_id}/scratch-images/private.png",
+    params={"token": _media_token(client, auth, chat.id)},
+  )
+
+  assert response.status_code == 403
+
+
+def test_serve_agent_scratch_image_rejects_non_raster_and_escape(
+  client, auth, chat, tmp_path,
+):
+  scratch = agent_scratch_root() / chat.id
+  scratch.mkdir(parents=True, exist_ok=True)
+  (scratch / "private.txt").write_text("not an image", encoding="utf-8")
+  outside = tmp_path / "outside.png"
+  outside.write_bytes(b"outside")
+  (scratch / "escape.png").symlink_to(outside)
+
+  non_raster = client.get(
+    f"/api/chats/{chat.id}/scratch-images/private.txt",
+    headers=auth,
+  )
+  escape = client.get(
+    f"/api/chats/{chat.id}/scratch-images/escape.png",
+    headers=auth,
+  )
+
+  assert non_raster.status_code == 415
+  assert escape.status_code == 400
 
 
 def test_serve_media_rejects_non_uuid_chat_id(client, auth):
@@ -249,33 +289,3 @@ def test_old_generated_route_is_not_available(client, auth, chat):
     headers=auth,
   )
   assert response.status_code == 404
-
-
-def test_serve_agent_tmp_image_only_for_images_this_chat_viewed(
-  client, auth, chat, db, tmp_path, monkeypatch,
-):
-  """/tmp is shared by every chat and agent. A chat-scoped media token (which
-  an app's embedded chat also receives) must not read other chats' temporary
-  images by guessing their names."""
-  from app import models
-
-  monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  (tmp_path / "shots").mkdir()
-  (tmp_path / "shots" / "private.png").write_bytes(b"another-chats-screenshot")
-  (tmp_path / "shots" / "mine.png").write_bytes(b"this-chats-image")
-  other = models.Chat(id="0b6b1c2e-6f0e-4d7a-9c2d-5f1f3c9e7a11", title="other", messages=[])
-  db.add(other)
-  db.commit()
-  _record_tmp_view(db, other, "/tmp/shots/private.png")
-  _record_tmp_view(db, chat, "/tmp/shots/mine.png")
-  token = {"token": _media_token(client, auth, chat.id)}
-
-  # Unviewed by this chat: not found, whether or not the file exists.
-  for guess in ("shots/private.png", "shots/absent.png"):
-    response = client.get(f"/api/chats/{chat.id}/tmp-images/{guess}", params=token)
-    assert response.status_code == 404
-  # The image this chat's agent viewed still renders, even via a dotted path.
-  for path in ("shots/mine.png", "shots/../shots/mine.png"):
-    response = client.get(f"/api/chats/{chat.id}/tmp-images/{path}", params=token)
-    assert response.status_code == 200
-    assert response.content == b"this-chats-image"

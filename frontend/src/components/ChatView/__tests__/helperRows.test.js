@@ -104,6 +104,17 @@ test('a finished helper keeps its row with its engine and how long it took', () 
   assert.match(html, /12s/)
 })
 
+test('a cutover-interrupted helper visibly keeps its conversation', () => {
+  const html = renderWithModels(React.createElement(HelperResultCard, {
+    chatId: 'chat',
+    event: { ...working, id: 'delegation:d1:interrupted', status: 'interrupted',
+             delegation_id: 'd1', provider: 'codex', model: 'gpt-6-luna' },
+  }))
+  assert.match(html, /GPT-6-Luna · Interrupted/)
+  assert.match(html, /aria-label="audit-login: [^"]*Open its conversation"/)
+  assert.doesNotMatch(html, /chat__subagent--running/)
+})
+
 test('a group with working helpers says so instead of claiming they need attention', () => {
   const html = renderWithModels(React.createElement(HelperResultGroupCard, {
     chatId: 'chat',

@@ -864,7 +864,7 @@ def test_chat_list_projects_summaries_without_hydrating_transcripts(
     if "FROM chats" in statement:
       drawer_selects.append((statement, parameters))
 
-  schema_migrations._add_chat_drawer_covering_index(db.get_bind())
+  schema_migrations._add_chat_archive(db.get_bind())
   event.listen(models.Chat, "load", on_load)
   event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
   try:
@@ -889,8 +889,8 @@ def test_chat_list_projects_summaries_without_hydrating_transcripts(
   plan = db.connection().exec_driver_sql(
     f"EXPLAIN QUERY PLAN {drawer_query}", drawer_parameters,
   ).fetchall()
-  assert any("COVERING INDEX ix_chats_drawer" in row[-1] for row in plan), (
-    "every drawer column must come from ix_chats_drawer; SQLite stores the "
+  assert any("COVERING INDEX ix_chats_drawer_v2" in row[-1] for row in plan), (
+    "every drawer column must come from ix_chats_drawer_v2; SQLite stores the "
     "transcript inline, so reading the chat row walks its whole history"
   )
 
@@ -1041,22 +1041,6 @@ def test_send_requires_explicit_model_before_any_durable_side_effect(
   assert db.query(models.ChatRun).filter(
     models.ChatRun.chat_id == chat.id,
   ).count() == 0
-
-
-def test_goal_clear_text_command_is_retired_before_queueing(
-  client, auth, chat, db,
-):
-  response = client.post(
-    f"/api/chats/{chat.id}/messages",
-    json={"content": "/goal clear"},
-    headers=auth,
-  )
-
-  assert response.status_code == 409, response.text
-  assert response.json()["detail"]["code"] == "goal_clear_retired"
-  db.refresh(chat)
-  assert chat.messages == []
-  assert chat.pending_messages == []
 
 
 def test_fresh_send_response_includes_stored_user_message(

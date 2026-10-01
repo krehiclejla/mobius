@@ -322,7 +322,7 @@ def test_core_prompt_distinguishes_durable_delegation_and_owner_led_contribution
 
   assert "An in-turn fleet dies with the turn" in normalized
   assert "durable background delegation may outlive the turn" in normalized
-  assert "installed capability explicitly owns that lifecycle" in normalized
+  assert "durable platform or installed capability owns that lifecycle" in normalized
   assert "Contribution preparation is owner-initiated" in normalized
   assert "leave local changes local without adding an approval card" in normalized
   assert "offer once through the clarifying-question tool" not in core

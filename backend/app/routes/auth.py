@@ -291,6 +291,16 @@ def setup(
   )
   db.add(owner)
   try:
+    # The emptiness check above and this insert are separate statements, so
+    # two concurrent first-boot requests with different usernames could both
+    # pass it and leave two owners — a silent second account with full owner
+    # authority. Flushing takes SQLite's single write lock for the rest of
+    # this transaction, so the count below sees any owner committed before
+    # it, and a concurrent setup waits and then sees this one.
+    db.flush()
+    if db.query(models.Owner).count() != 1:
+      db.rollback()
+      raise HTTPException(status_code=400, detail="Already configured.")
     db.commit()
   except IntegrityError:
     db.rollback()
@@ -1286,7 +1296,10 @@ async def _complete_mobius_enrollment(
     db.rollback()
     return _mobius_enroll_error_redirect()
   db.commit()
-  return RedirectResponse(url="/settings?section=ai-providers", status_code=303)
+  return RedirectResponse(
+    url="/settings?section=ai-providers&mobius_enroll_return=1",
+    status_code=303,
+  )
 
 
 @router.get("/mobius/login/start")

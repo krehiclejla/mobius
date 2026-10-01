@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import Text, cast, func, literal_column, or_, text
+from sqlalchemy import Text, cast, literal_column, or_, text
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -73,6 +73,7 @@ from app.chat_context import (
   _last_user_message_elapsed,
   _latest_compaction_brief,
   _strip_report_html,
+  recent_chat_digest_order,
 )
 from app.chat_logging import (
   get_chat_log_handler,
@@ -80,7 +81,6 @@ from app.chat_logging import (
   safe_commit as _safe_commit,
 )
 from app.goal_commands import goal_request_for_agent, is_goal_continue
-from app.memory_observability import claim_oom_kill
 from app.chat_writer import (
   AcknowledgeProviderSuccess,
   AdmitProviderExecution,
@@ -480,6 +480,9 @@ def programmatic_start_blocker(
   are not owner intent: they append to ``pending_messages``, which the answer,
   park resume, or owner's manual Resume promotes at the legitimate boundary.
   """
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat_id):
+    return True
   from app.platform_restart import (
     ACTIVATION_WAIT_KIND,
     activation_barrier_wait_id,
@@ -823,6 +826,8 @@ def reconcile_startup_chats(
     if registry.is_alive(chat.id):
       continue
     try:
+      from app.delegations import retired_delegation_for_chat
+      retired_helper = retired_delegation_for_chat(db, chat.id)
       queued = len(chat.pending_messages or [])
       running_runs = (
         db.query(models.ChatRun)
@@ -871,13 +876,10 @@ def reconcile_startup_chats(
         and msg.get("_initiated_by_app_id") is not None
         for msg in pending
       )
-      delegated_restart_app_id = None
-      if (
-        restart_run is not None
-        and restart_run.initiated_by_app_id is not None
-      ):
-        from app.delegations import restart_resume_app_id
-        delegated_restart_app_id = restart_resume_app_id(
+      delegated_restart = None
+      if restart_run is not None:
+        from app.delegations import restart_resume_delegation
+        delegated_restart = restart_resume_delegation(
           db,
           child_chat_id=chat.id,
           run_token=restart_run.id,
@@ -887,8 +889,13 @@ def reconcile_startup_chats(
       restart_identity_owned = bool(
         restart_run is not None
         and (
-          restart_run.initiated_by_app_id is None
-          or delegated_restart_app_id == restart_run.initiated_by_app_id
+          (
+            restart_run.initiated_by_app_id is None
+            and not db.query(models.Delegation.id).filter(
+              models.Delegation.child_chat_id == chat.id,
+            ).first()
+          )
+          or delegated_restart is not None
         )
       )
       restart_question_wait = bool(
@@ -905,7 +912,11 @@ def reconcile_startup_chats(
       )
       from app.chat_transcript import materialized_messages
       msgs = materialized_messages(chat)
-      note = "This turn was paused when Möbius restarted."
+      note = (
+        "This legacy helper was interrupted during the single-mode cutover. "
+        "Its transcript is preserved; start a new helper to rerun the task."
+        if retired_helper else "This turn was paused when Möbius restarted."
+      )
       if queued:
         # The queue is PRESERVED across the restart (it is NOT cleared
         # below); it drains on the next send. Tell the user it is still
@@ -921,8 +932,8 @@ def reconcile_startup_chats(
       # block["message"]. Matching that shape makes the synthetic note
       # render identically to a live provider error. `resumable` marks the
       # note for the one-tap Resume affordance (MsgContent renders a Resume
-      # button on a resumable interrupt note); every interrupted turn — crash
-      # or drain-gated restart — is resumable via a fresh "continue" send.
+      # button on a resumable interrupt note); ordinary interrupted turns
+      # are resumable via a fresh "continue" send, but retired helpers are not.
       # `pause.kind='restart'` marks this as a benign restart pause (not a
       # failure) so the card renders in the calm "Paused" family rather than
       # the danger-red error styling — a restart is a maintenance event, not
@@ -931,7 +942,10 @@ def reconcile_startup_chats(
       restart_pause = {"kind": "restart"}
       if not restart_eligible:
         restart_pause["manual"] = True
-      err_block = {**_pause_note(note, kind="restart"), "pause": restart_pause}
+      err_block = {
+        **_pause_note(note, kind="restart", resumable=not retired_helper),
+        "pause": restart_pause,
+      }
       live_id = (
         chat.live_assistant.get("id")
         if isinstance(chat.live_assistant, dict) else None
@@ -990,7 +1004,14 @@ def reconcile_startup_chats(
           and blocks[idx].get("type") == "error"
           and blocks[idx].get("message") == PAUSED_FOR_RESTART_MESSAGE
         ), None)
-        if paused_idx is not None:
+        if retired_helper:
+          # The old task is retired, not paused. Keep the earlier transcript
+          # but leave no Resume affordance or promise of automatic continuation.
+          if paused_idx is not None:
+            blocks[paused_idx] = err_block
+          else:
+            blocks.append(err_block)
+        elif paused_idx is not None:
           # Normalize both historical orderings around an open question. The
           # drain marker belongs immediately BEFORE a trailing unanswered
           # question so the card remains the tail affordance; in that shape it
@@ -1102,7 +1123,7 @@ def reconcile_startup_chats(
         # Keep it distinct from a generic crash/manual Resume so startup does
         # not send the false "tap to resume" notification.
         restart_waiting.append(chat.id)
-      else:
+      elif not retired_helper:
         manual.append(chat.id)
     except Exception:
       db.rollback()
@@ -1371,7 +1392,7 @@ def _nonempty_pending_queues(db: Session) -> list:
   that column for every chat walks every transcript; on a cold page cache that
   blocked the event loop for 20-40 s. The partial index
   ``ix_chats_pending_queue`` (migration 0069) lists only non-empty queues.
-  Without ANALYZE statistics SQLite prefers ``ix_chats_drawer``'s
+  Without ANALYZE statistics SQLite prefers ``ix_chats_drawer_v2``'s
   ``deleted_at`` equality and reads every row anyway, so the plan is pinned
   with INDEXED BY. Other databases store large values out of line.
   """
@@ -1813,13 +1834,13 @@ async def prepare_restart_intents(
   return list(prepared or [])
 
 
-# One-shot notify copy for a limit park whose reset time has arrived
-# (design §2.4 step "at parked_until, push-notify").
-LIMIT_RESET_NOTIFY_TITLE = "Your limit has reset"
-LIMIT_RESET_NOTIFY_BODY = "Your limit has reset."
+# A due retry is not proof that the provider's quota has reset, especially
+# after a bounded or fallback check. Notification remains at-most-once.
+LIMIT_RETRY_NOTIFY_TITLE = "Your paused chat is ready to retry"
+LIMIT_RETRY_NOTIFY_BODY = "The retry check is due. The provider may still be limited."
 CONTINUATION_SWEEP_BATCH_SIZE = 100
 # Start due provider-limit continuations gradually. Unrelated live work must
-# not delay an opted-in chat after its reset, but a bad/early reset timestamp
+# not delay an opted-in chat after its retry check, but a bad/early timestamp
 # also must not launch a whole parked batch in one burst.
 LIMIT_AUTO_RESUME_STAGGER_SECS = 30.0
 # Planned restarts restore work that was already concurrent, but relaunching a
@@ -1931,6 +1952,9 @@ def _auto_resume_recovery(
   """
   if chat is None or physical is None:
     return None
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat.id):
+    return None
   control = physical.continuation_json
   messages = list(chat.messages or [])
   source = messages[-1] if messages else None
@@ -1977,6 +2001,11 @@ def _auto_resume_recovery(
     or (physical.root_run_id or physical.id) != (park.root_run_id or park.id)
   ):
     return None
+  from app.delegations import delegation_recovery_allowed
+  if not delegation_recovery_allowed(
+    db, child_chat_id=chat.id, initiated_by_app_id=park.initiated_by_app_id,
+  ):
+    return None
   if reason == "model_capacity" and _model_capacity_retry_exhausted(db, park):
     return None
   payload = recover_start_continuation(
@@ -2012,16 +2041,19 @@ def _auto_resume_recovery(
       return None
     return park, payload
 
-  if park.initiated_by_app_id is not None:
-    from app.delegations import limit_resume_successor_app_id
-    delegation_app_id = limit_resume_successor_app_id(
+  delegated = db.query(models.Delegation.id).filter(
+    models.Delegation.child_chat_id == chat.id,
+  ).first() is not None
+  if park.initiated_by_app_id is not None or delegated:
+    from app.delegations import limit_resume_successor_delegation
+    delegation_owner = limit_resume_successor_delegation(
       db,
       child_chat_id=chat.id,
       parked_run_token=park.id,
       successor_run_token=physical.id,
       initiated_by_app_id=park.initiated_by_app_id,
     )
-    if delegation_app_id != park.initiated_by_app_id:
+    if delegation_owner is None:
       return None
   else:
     if (
@@ -2137,6 +2169,9 @@ async def _auto_resume_chat(
             chat = check_db.query(models.Chat).filter(
               models.Chat.id == chat_id,
             ).first()
+            from app.delegations import retired_delegation_for_chat
+            if retired_delegation_for_chat(check_db, chat_id):
+              return False
             pending = (
               list(chat.pending_messages or []) if chat is not None else []
             )
@@ -2160,10 +2195,10 @@ async def _auto_resume_chat(
               park is not None
               and park.park_reason in AUTO_RETRY_PARK_REASONS
             )
-            delegation_resume_app_id = None
+            delegation_resume = None
             if park is not None and not restart_park and not auto_retry_park:
-              from app.delegations import limit_resume_app_id
-              delegation_resume_app_id = limit_resume_app_id(
+              from app.delegations import limit_resume_delegation
+              delegation_resume = limit_resume_delegation(
                 check_db,
                 child_chat_id=chat_id,
                 run_token=park.id,
@@ -2181,14 +2216,20 @@ async def _auto_resume_chat(
                 and bool(park.restart_nonce)
                 and accepted_nonce == park.restart_nonce
               )
+            from app.delegations import delegation_recovery_allowed
+            delegated_authorized = park is not None and delegation_recovery_allowed(
+              check_db, child_chat_id=chat_id,
+              initiated_by_app_id=park.initiated_by_app_id,
+            )
             policy_enabled = chat is not None and (
               _park_continues_automatically(chat, park)
-              or delegation_resume_app_id is not None
+              or delegation_resume is not None
             )
             if (
               chat is None
               or chat.deleted_at is not None
               or not policy_enabled
+              or not delegated_authorized
               or not restart_authorized
               or _has_unanswered_question(chat)
               or park is None
@@ -2200,7 +2241,7 @@ async def _auto_resume_chat(
                 park.initiated_by_app_id is not None
                 and not restart_park
                 and not auto_retry_park
-                and delegation_resume_app_id is None
+                and delegation_resume is None
               )
               or latest_id != park.id
               or any(
@@ -2222,7 +2263,7 @@ async def _auto_resume_chat(
               # follow-ups acquire their own attribution only after it finishes.
               park.initiated_by_app_id
               if restart_park or auto_retry_park
-              else delegation_resume_app_id
+              else (delegation_resume.app_id if delegation_resume is not None else None)
             )
           if not mark_starting(chat_id):
             return False
@@ -2302,8 +2343,8 @@ async def sweep_reset_parks(
 
   A due park is a `chat_runs` row whose
   ``status`` is ``parked`` or ``resume_pending`` and whose
-  `parked_until` has passed. Provider limits use their reset time; a planned
-  restart is parked by the drain itself with a due time of now. Each pass
+  `parked_until` has passed. Provider limits use a bounded retry/check time;
+  a planned restart is parked by the drain itself with a due time of now. Each pass
   processes a bounded oldest-first batch so a large backlog cannot monopolize
   the event loop or produce an unbounded burst of database work. For each row:
 
@@ -2453,6 +2494,9 @@ async def sweep_reset_parks(
     notification_requests.append((chat_id, run.park_reason == "restart"))
 
   def auto_resume_rejection(chat, run) -> str | None:
+    from app.delegations import retired_delegation_for_chat
+    if retired_delegation_for_chat(db, run.chat_id):
+      return "legacy helper interrupted"
     pending = list(chat.pending_messages or []) if chat is not None else []
     app_work_queued = any(
       isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
@@ -2460,12 +2504,17 @@ async def sweep_reset_parks(
     )
     if chat is None or chat.deleted_at is not None:
       return "chat unavailable"
+    from app.delegations import delegation_recovery_allowed
+    if not delegation_recovery_allowed(
+      db, child_chat_id=run.chat_id, initiated_by_app_id=run.initiated_by_app_id,
+    ):
+      return "delegation no longer owns recovery"
     restart_park = run.park_reason == "restart"
     auto_retry_park = run.park_reason in AUTO_RETRY_PARK_REASONS
-    delegation_resume_app_id = None
+    delegation_resume = None
     if not restart_park and not auto_retry_park:
-      from app.delegations import limit_resume_app_id
-      delegation_resume_app_id = limit_resume_app_id(
+      from app.delegations import limit_resume_delegation
+      delegation_resume = limit_resume_delegation(
         db,
         child_chat_id=run.chat_id,
         run_token=run.id,
@@ -2477,7 +2526,7 @@ async def sweep_reset_parks(
       run.initiated_by_app_id is not None
       and not restart_park
       and not auto_retry_park
-      and delegation_resume_app_id is None
+      and delegation_resume is None
     ):
       return "app-attributed work"
     if _has_unanswered_question(chat):
@@ -2486,7 +2535,7 @@ async def sweep_reset_parks(
       return "busy-model retry exhausted"
     policy_enabled = (
       _park_continues_automatically(chat, run)
-      or delegation_resume_app_id is not None
+      or delegation_resume is not None
     )
     if not policy_enabled:
       return "policy disabled"
@@ -2655,12 +2704,12 @@ async def sweep_reset_parks(
               notification_db,
               owner_id,
               title=(
-                "Möbius restarted" if restarted else LIMIT_RESET_NOTIFY_TITLE
+                "Möbius restarted" if restarted else LIMIT_RETRY_NOTIFY_TITLE
               ),
               body=(
                 "Your paused turn is ready."
                 if restarted
-                else LIMIT_RESET_NOTIFY_BODY
+                else LIMIT_RETRY_NOTIFY_BODY
               ),
               source_type="system",
               source_id=chat_id,
@@ -3605,6 +3654,13 @@ _RESET_RELATIVE_RE = re.compile(
 _RESET_ISO_RE = re.compile(
   r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?"
 )
+_RESET_DATED_CLOCK_RE = re.compile(
+  r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+"
+  r"(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\s+"
+  r"(\d{1,2}):(\d{2})\s*(am|pm)\b",
+  re.IGNORECASE,
+)
+_RESET_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 # Clock form: "resets 1:40am", "try again at 3pm", "resets at 14:30". Minutes
 # or an am/pm suffix is REQUIRED so a bare number (e.g. the "429" in a status
 # line) can never read as a clock time.
@@ -3648,8 +3704,8 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
   """Lenient reset-time parse from a provider limit-error string.
 
   Tries, in order: a relative duration ("resets in 2 hours"), an ISO
-  timestamp, and a clock time ("resets 1:40am" — read as UTC and rolled to
-  the NEXT occurrence, since the strings carry no date). Returns naive UTC,
+  timestamp, a dated clock, and a bare clock time ("resets 1:40am" — read as
+  UTC and rolled to the NEXT occurrence). Returns naive UTC,
   or None when nothing parses — the caller applies the 30-minute fallback.
   A clock time without a timezone is genuinely ambiguous; UTC keeps the
   server-side math consistent and the clamp bounds the damage (design
@@ -3673,6 +3729,17 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
     parsed = _coerce_reset_datetime(match.group(0))
     if parsed is not None:
       return parsed
+  match = _RESET_DATED_CLOCK_RE.search(text)
+  if match:
+    month = _RESET_MONTHS.index(match.group(1)[:3].lower()) + 1
+    hour = int(match.group(4)) % 12 + (12 if match.group(6).lower() == "pm" else 0)
+    try:
+      candidate = datetime(int(match.group(3) or now.year), month, int(match.group(2)), hour, int(match.group(5)))
+      if match.group(3) is None and candidate <= now:
+        candidate = candidate.replace(year=candidate.year + 1)
+      return candidate
+    except ValueError:
+      pass
   match = _RESET_CLOCK_RE.search(text)
   if match:
     if match.group(1) is not None:
@@ -3728,31 +3795,39 @@ MEMORY_KILL_MESSAGE = (
 )
 
 
+@dataclass(frozen=True)
+class LimitParkTiming:
+  """Provider evidence and our bounded retry schedule are different facts."""
+
+  check_at: datetime
+  reason: str
+  resets_at: datetime | None = None
+
+
 def _limit_park_fields(
   runner_result: dict,
   error_text: str | None,
   now: datetime | None = None,
-) -> tuple[datetime, str]:
-  """Compute (parked_until, park_reason) for a limit-killed turn.
+) -> LimitParkTiming:
+  """Keep the reported reset separate from the bounded continuation time.
 
   Precedence: the structured reset time the runner captured
   (`rate_limit_resets_at`, from the SDK's RateLimitEvent) → lenient text
-  parse of the error string → 30-minute re-check fallback. The result is
-  clamped to [now+60s, now+7d] so a bad parse can neither park in the past
-  nor beyond any real provider window. NEVER raises — a parse failure must
-  still park (design §2.4), so the whole computation degrades to the
+  parse of the error string. Unknown stays unknown in the transcript. Only
+  the retry time uses the 30-minute fallback and [now+60s, now+7d] clamp,
+  preventing an instant retry storm or an unbounded park. NEVER raises — a
+  parse failure must still park (design §2.4), so computation degrades to the
   fallback on any error.
   """
   if now is None:
     now = datetime.now(UTC).replace(tzinfo=None)
   try:
-    target = _coerce_reset_datetime(
+    resets_at = _coerce_reset_datetime(
       (runner_result or {}).get("rate_limit_resets_at")
     )
-    if target is None:
-      target = _parse_reset_text(error_text or "", now)
-    if target is None:
-      target = now + PARK_FALLBACK_DELAY
+    if resets_at is None:
+      resets_at = _parse_reset_text(error_text or "", now)
+    target = resets_at if resets_at is not None else now + PARK_FALLBACK_DELAY
     target = max(now + _PARK_MIN_DELAY, min(target, now + _PARK_MAX_DELAY))
     low = (error_text or "").lower()
     if any(m in low for m in ("usage limit", "usage_limit", "weekly limit",
@@ -3760,12 +3835,12 @@ def _limit_park_fields(
       reason = "usage_limit"
     else:
       reason = "rate_limit"
-    return target, reason
+    return LimitParkTiming(target, reason, resets_at)
   except Exception:
     _get_logger().warning(
       "limit-park reset parse failed; using fallback", exc_info=True,
     )
-    return now + PARK_FALLBACK_DELAY, "rate_limit"
+    return LimitParkTiming(now + PARK_FALLBACK_DELAY, "rate_limit")
 
 
 def _park_event(
@@ -3774,22 +3849,21 @@ def _park_event(
   park_reason: str,
   *,
   provider_id: str | None = None,
+  resets_at: datetime | None = None,
 ) -> dict:
   """The enriched error event a limit kill publishes through the sink.
 
-  Maps the DB park fields into the block's single `pause` descriptor
-  (`kind` = `park_reason`, `resets_at` = the reset time) — whitelisted through
-  events.process_event onto the persisted block — so the transcript card
-  renders live as "Rate limit — resets at … · Resume now". `resets_at` is
-  serialized as EXPLICIT-UTC ISO: a naive isoformat would be parsed as local
-  time by the client's `new Date()` and shift the displayed reset by the
-  viewer's UTC offset. The raw (parked_until, park_reason) still flow
-  separately to the DB ChatRun row via _complete_turn/ParkRun.
+  `check_at` is the bounded due time stored on ChatRun; optional `resets_at`
+  preserves provider evidence independently in the persisted transcript.
+  Resource/model waits have a check but no provider reset. Both timestamps
+  are explicit UTC so the browser does not interpret naive ISO as local time.
+  The sweep needs only the due time and never claims quota has reset.
   """
   return _pause_note(
     message,
     kind=park_reason,
-    resets_at=parked_until.replace(tzinfo=UTC).isoformat(),
+    check_at=parked_until.replace(tzinfo=UTC).isoformat(),
+    resets_at=resets_at.replace(tzinfo=UTC).isoformat() if resets_at is not None else None,
     provider=provider_id,
   )
 
@@ -3845,6 +3919,10 @@ def _park_exit(
   synthetic message: the persisted block IS the parked card, so it must
   exist.
 
+  Memory recovery requires the runner's attempt-correlated ``oom_killed``
+  evidence. A generic failure cannot claim another process's cgroup kill;
+  explicit request-size rejections remain terminal even if memory is low.
+
   A planned restart is already the authoritative terminal outcome by the time
   the provider exits: ``drain_all_for_restart`` publishes the resumable pause
   before interrupting the handle and records the chat in
@@ -3854,6 +3932,23 @@ def _park_exit(
   `_complete_turn` kwargs for the limit disposition.
   """
   if getattr(sink, "chat_id", None) in _restart_draining_chats:
+    return {"parked": False}
+  if (
+    (runner_result or {}).get("api_error_status") == 413
+    or any(marker in (error_text or "").lower() for marker in (
+      "request body is too large", "request body too large",
+      "request entity too large", "payload too large",
+    ))
+  ):
+    sink.publish({
+      "type": "error",
+      "message": (
+        f"{error_text or 'The provider rejected an oversized request.'}\n\n"
+        "This request is too large to send. Compact the conversation or "
+        "reduce its attachments, or continue in a new chat using your saved "
+        "files. Retrying it unchanged will not help."
+      ),
+    })
     return {"parked": False}
   if runner_result is not None:
     limit = _is_limit_terminal(runner_result)
@@ -3894,7 +3989,7 @@ def _park_exit(
       "parked_until": parked_until,
       "park_reason": "model_capacity",
     }
-  if not limit and failed and claim_oom_kill():
+  if not limit and failed and (runner_result or {}).get("oom_killed"):
     parked_until = datetime.now(UTC).replace(tzinfo=None) + _PARK_MIN_DELAY
     park_reason = "memory"
     sink.publish(
@@ -3935,20 +4030,20 @@ def _park_exit(
         "message": "The turn failed unexpectedly. Please try again.",
       })
     return {"parked": False}
-  parked_until, park_reason = _limit_park_fields(
+  timing = _limit_park_fields(
     runner_result or {}, error_text
   )
   message = error_text or (
-    "The provider's rate limit was reached; this turn is paused until the "
-    "limit resets."
+    "The provider's rate limit was reached; this turn is paused for a retry."
   )
   sink.publish(_park_event(
-    message, parked_until, park_reason, provider_id=provider_id,
+    message, timing.check_at, timing.reason, provider_id=provider_id,
+    resets_at=timing.resets_at,
   ))
   return {
     "parked": True,
-    "parked_until": parked_until,
-    "park_reason": park_reason,
+    "parked_until": timing.check_at,
+    "park_reason": timing.reason,
   }
 
 
@@ -4186,11 +4281,12 @@ async def _complete_turn(
     # drops into the markerless-queue state that self-heals on the user's
     # next send (chats_stream's stale-pending drain). The limit error itself
     # was already published + persisted by the call site before finalize
-    # (with the park fields, so it renders as the live "resets at …" card).
+    # (with the distinct provider reset and retry/check times).
     if parked_until is None:
       # Direct/legacy callers that didn't parse a target still park with the
       # fallback re-check — a limit exit must never skip the park silently.
-      parked_until, park_reason = _limit_park_fields({}, None)
+      timing = _limit_park_fields({}, None)
+      parked_until, park_reason = timing.check_at, timing.reason
     try:
       # Park under the SAME bounded terminal lock the drain uses, so a racing
       # stale-pending self-heal drain / append can't interleave with the
@@ -4227,7 +4323,7 @@ async def _complete_turn(
         "limit-park ParkRun did not persist chat_id=%s "
         "(reconciliation will repair)", chat_id, exc_info=True,
       )
-      # The call site already published the parked card ("resets at …")
+      # The call site already published the parked retry card
       # BEFORE this park was durable. The park did NOT land, so the sweep
       # will never fire for it — degrade the card honestly: this follow-up
       # error coalesces onto the same tail block and, per the latest-wins
@@ -4236,7 +4332,7 @@ async def _complete_turn(
       # fire-and-forget PersistError (finalize already ran) — best-effort,
       # and boot reconcile repairs the marker either way.
       sink.publish(_pause_note(
-        "Rate limited — the reset reminder could not be scheduled. "
+        "Rate limited — the retry reminder could not be scheduled. "
         "Send a message or tap Resume to continue.",
       ))
       bc.publish({"type": "done"})
@@ -4875,7 +4971,7 @@ def _build_provider_skills_block(
 def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
   """The shared helper host a delegated turn runs in, or None for its own process.
 
-  One host per parent chat and setup (provider, access scope, working
+  One host per parent chat and setup (provider, working
   directory, connected services), so helpers of different chats or setups
   never share a process, environment, or permissions. See helper_hosts.
   """
@@ -4906,7 +5002,6 @@ def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
   return helper_hosts.HostKey(
     parent_chat_id=row[0],
     provider_id=provider_id,
-    scope=run_policy.scope,
     cwd=run_policy.cwd,
     setup=helper_hosts.setup_digest(connectors, model),
   )
@@ -5122,15 +5217,7 @@ async def _run_chat_impl_with_db(
   startup_context = ""
   if not session_id and run_policy is None:
     # `build_memory_block` is pure; the activity emit + envelope live here.
-    ordered_chat_ids = [
-      row[0]
-      for row in db.query(models.Chat.id).filter(
-        models.Chat.deleted_at.is_(None),
-      ).order_by(
-        func.coalesce(models.Chat.activity_at, models.Chat.updated_at).desc(),
-        models.Chat.id.desc(),
-      ).all()
-    ]
+    ordered_chat_ids = recent_chat_digest_order(db)
     block = memory.build_memory_block(
       settings.data_dir,
       ordered_chat_ids=ordered_chat_ids,
@@ -5383,7 +5470,6 @@ async def _run_chat_impl_with_db(
       "MOBIUS_SUBAGENT_DEPTH": str(run_policy.depth),
       "MOBIUS_DELEGATION_ID": run_policy.delegation_id,
       "MOBIUS_SUBAGENT_PROVIDER": run_policy.provider,
-      "MOBIUS_SUBAGENT_HELPER": "/data/apps/subagents/subagents.py",
     })
   # Overrides any inherited TMPDIR from _safe_keys: agent scratch belongs on
   # the bounded data volume, never the container's unbounded overlay. TMP and
@@ -5433,6 +5519,11 @@ async def _run_chat_impl_with_db(
       settings.data_dir, chat_overrides, provider=provider_id,
     )
   )
+
+  # Helpers inherit this admission's resolved selection, not mutable global
+  # preferences or another turn using the same provider host.
+  base_env["MOBIUS_AGENT_MODEL"] = str(agent_settings.get("model") or "")
+  base_env["MOBIUS_AGENT_EFFORT"] = str(agent_settings.get("effort") or "")
 
   # Snapshot-on-first-send: if the chat has no per-chat choices yet, freeze the
   # current explicit model/effort onto the row so subsequent turns in THIS
@@ -5560,11 +5651,8 @@ async def _run_chat_impl_with_db(
   if startup_context:
     system_prompt = f"{system_prompt}\n\n{startup_context}"
 
-  # A delegated helper's task exists only in its own transcript. A helper that
-  # starts a fresh provider session after earlier turns (its first turn ended
-  # before the provider named a session, or it never started) would otherwise
-  # receive only this turn's input — a restart continuation or a follow-up —
-  # and work without its task. Such a session is seeded with that history.
+  # A trusted delegated task may already have changed state. If it has history
+  # but no resumable provider session, refuse replay for parent review.
   fresh_delegated_session = (
     run_policy is not None and not session_id and len(messages) > 1
   )
@@ -5577,7 +5665,7 @@ async def _run_chat_impl_with_db(
     if (
       (session_id or fresh_delegated_session)
       and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
-      and (run_policy is None or run_policy.allow_session_reseed)
+      and run_policy is None
     )
     else None
   )
@@ -5669,13 +5757,10 @@ async def _run_chat_impl_with_db(
   )
 
   if fresh_delegated_session:
-    if not run_policy.allow_session_reseed:
-      return await _refuse_delegated_write_replay(
-        bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
-        provider_id=provider_id, agent_activity_binding=agent_activity_binding,
-      )
-    if resumed_context_fallback:
-      user_message = f"{resumed_context_fallback}\n\n{user_message}"
+    return await _refuse_delegated_write_replay(
+      bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
+      provider_id=provider_id, agent_activity_binding=agent_activity_binding,
+    )
 
   # SDK dispatch: route both Claude and Codex through their official
   # Agent SDK runners.
@@ -5857,7 +5942,7 @@ async def _run_chat_impl_with_db(
     if helper_host_key is None and session_id and not _resumable(
       session_id, cwd, sdk_env.get("CLAUDE_CONFIG_DIR")
     ):
-      if run_policy is not None and not run_policy.allow_session_reseed:
+      if run_policy is not None:
         return await _refuse_delegated_write_replay(
           bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
           provider_id=provider_id,
@@ -5914,7 +5999,6 @@ async def _run_chat_impl_with_db(
           skills_enabled=_skills_enabled(settings.data_dir),
           run_policy=run_policy,
           connector_plan=connector_turn_plan,
-          resumed_context=resumed_context_fallback,
           helper_host_key=helper_host_key,
           data_dir=settings.data_dir,
         )

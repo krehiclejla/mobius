@@ -38,7 +38,6 @@ def _authorization_context(db):
     provider="codex",
     model=None,
     effort=None,
-    scope="write",
     cwd="/data",
   )
   db.add(models.Delegation(
@@ -51,7 +50,7 @@ def _authorization_context(db):
     provider=policy.provider,
     model=policy.model,
     effort=policy.effort,
-    scope=policy.scope,
+    scope="write",
     cwd=policy.cwd,
     prompt_sha256=hashlib.sha256(b"recovery boundary").hexdigest(),
   ))

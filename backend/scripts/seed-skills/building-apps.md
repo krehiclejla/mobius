@@ -270,9 +270,11 @@ manifest, layered by how always-on they are:
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
   app's own authority (`backend/app/app_tools.py`). Only the platform reaches
   `tools/`: HTTP calls to the service there get 404, so `call` is trustworthy. Helpers get the tools too:
-  the request's `actor` has `delegated: true` for a helper and
-  `access: "read"` for a read-only one, so refuse any change for a read-only
-  caller. Tool calls run on their own concurrency lane that is NOT serialized
+  the request's `actor` has `delegated: true` for a helper. Current helpers
+  use one trusted mode and report `access: "write"`; `"read"` remains only as
+  a defensive value for a retired or orphaned delegated identity, not a
+  selectable read-only sandbox. Validate inputs and authority for every tool.
+  Tool calls run on their own concurrency lane that is NOT serialized
   per app (unlike a service's private/public requests), so several — from this
   chat, other chats, or helpers — can reach the service at once; a tool that
   writes must do its own file or database locking. Keep tools few.

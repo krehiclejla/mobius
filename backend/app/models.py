@@ -291,6 +291,11 @@ class Chat(Base):
   # column DESC (newest pin at top of pinned group). PATCH
   # /api/chats/{id} accepts `pinned: bool` to toggle.
   pinned_at = Column(DateTime, nullable=True, default=None)
+  # Owner filing: NOT NULL = archived. An archived chat is a complete, live
+  # chat (history, runs, waits, helpers all untouched) that the drawer lists
+  # under Archived instead of Recents and startup continuity skips. Unlike
+  # deleted_at it never expires. See app.chat_archive for every transition.
+  archived_at = Column(DateTime, nullable=True, default=None)
   # App that created this chat, when it was opened through the
   # app-attributed chat contract (design §1) rather than by the owner
   # in the shell. NULL = an ordinary owner chat. Set, this chat is
@@ -457,12 +462,12 @@ class ChatRun(Base):
   ended_at = Column(DateTime, nullable=True, default=None)
   # Provider rate/usage-limit parking (design §2.4). When a turn dies on a
   # provider limit, the run is PARKED instead of just cleared: `status` moves
-  # to "parked", `parked_until` holds the reset time (naive UTC, matching every
+  # to "parked", `parked_until` holds the bounded retry/check time (naive UTC, matching every
   # other DateTime here), and `park_reason` a short label ("rate_limit" /
   # "usage_limit" / …). Planned restarts also use this row with
   # park_reason="restart" and a due time of now. No separate state enum is
   # needed. The liveness checks read it via
-  # `chat._parked_until_for_chat`; the periodic reset sweep notifies once at
+  # `chat._parked_until_for_chat`; the periodic retry sweep notifies once at
   # `parked_until`; auto-resume may pass through the retryable
   # "resume_pending" state before the row becomes terminal. Null on every
   # non-parked run and on rows created before this column existed.
@@ -498,7 +503,7 @@ class ChatFailureActivity(Base):
 class Delegation(Base):
   """Immutable control plane for one durable delegated task.
 
-  The child conversation is an ordinary hidden app-owned ``Chat`` and its
+  The child conversation is an ordinary hidden ``Chat`` and its
   physical execution state remains authoritative in ``ChatRun``. This row
   stores the immutable intent/policy needed to attach retries, constrain the
   SDK runner, and relate the child back to its parent logical run. Ordinary
@@ -515,7 +520,9 @@ class Delegation(Base):
   )
 
   id = Column(String(64), primary_key=True)
-  app_id = Column(Integer, ForeignKey("apps.id"), nullable=False, index=True)
+  # Ordinary agent delegation is parent-chat-owned. Apps may still own their
+  # separately submitted work, whose lifecycle retains app deletion guards.
+  app_id = Column(Integer, ForeignKey("apps.id"), nullable=True, index=True)
   parent_chat_id = Column(
     String(64), ForeignKey("chats.id"), nullable=False, index=True
   )
@@ -543,6 +550,8 @@ class Delegation(Base):
   startup_prompt = Column(Text, nullable=True, default=None)
   created_at = Column(DateTime, nullable=False, default=lambda: now_naive_utc())
   cancelled_at = Column(DateTime, nullable=True, default=None)
+  # Unfinished legacy read helpers stay in history but cannot resume as trusted work.
+  interrupted_at = Column(DateTime, nullable=True, default=None)
   # Opt-in: the parent explicitly waits for this result and may receive one
   # non-message activity checkpoint after the child settles. Off by default so
   # pre-existing rows and pure-poll submitters never get a surprise turn.
@@ -721,10 +730,11 @@ class ChatSessionLink(Base):
 class ProviderAvailability(Base):
   """Per-provider quota/availability signal for background provider selection.
 
-  One row per provider. ``limited_until`` (naive UTC, matching
-  ``ChatRun.parked_until``) is set when a turn on that provider parks on a
-  usage/rate limit, using the provider's parsed reset time; the provider is
-  "within quota" again once ``now >= limited_until``.
+  One row per provider. ``limited_until`` (naive UTC) is set when a turn on
+  that provider parks on a usage/rate limit. It uses the bounded
+  ``ChatRun.parked_until`` retry check, never an unbounded reported reset.
+  Passing this deadline permits
+  selection again; only a successful call proves restored availability.
   ``unavailable_reason`` records which limit parked it (``usage_limit`` /
   ``rate_limit``) for observability.
 
@@ -1713,10 +1723,12 @@ class Notification(Base):
   actions = Column(JSON, nullable=True)
   sent_at = Column(DateTime, default=lambda: datetime.now(UTC))
   clicked_at = Column(DateTime, nullable=True)
-  # Seen via the in-app notification preview (bulk-stamped by read-all).
+  # Explicitly marked read in the notification panel (individually or in bulk).
   # Distinct from clicked_at, which records a tap on the OS push itself —
   # bulk-marking THAT would fabricate click data.
   read_at = Column(DateTime, nullable=True)
+  # Opening the panel acknowledges an arrival without marking its row read.
+  seen_at = Column(DateTime, nullable=True)
 
 
 class ToolOutput(Base):

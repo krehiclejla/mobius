@@ -39,7 +39,7 @@ def _switch(provider, model="future-model", effort="medium"):
 def _delegation(provider):
   return DelegationSubmit(
     app_id=1, parent_chat_id="chat", task_key="task.one",
-    prompt="Review the source", provider=provider, scope="read",
+    prompt="Review the source", provider=provider,
   )
 
 

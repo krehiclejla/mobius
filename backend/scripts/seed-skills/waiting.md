@@ -68,7 +68,7 @@ commit's checks to finish.
   user with the same `gh` auth you have, but it does not inherit the live
   turn's short-lived `AGENT_TOKEN`, `API_BASE_URL`, or other process-local
   environment. Do not query the live application database directly; use the
-  stable owning interface or a purpose-built read-only helper instead.
+  stable owning interface or a purpose-built read-only API instead.
 - `interval_secs` / `--interval` (default 300, min 60): match it to how fast
   the state actually changes; something that takes ten minutes does not need
   a check every minute.
