@@ -95,7 +95,7 @@ test.describe('Input behavior', () => {
     await input.evaluate(el => {
       el.value = ''
       el.style.height = '280px'
-      el.closest('.chat__pill')?.classList.add('chat__pill--tall')
+      el.closest('.chat__pill')?.setAttribute('data-composer-tall', '')
     })
     await expect(input).toHaveCSS('height', '280px')
 
@@ -108,7 +108,7 @@ test.describe('Input behavior', () => {
     })
     await expect(input).toHaveCSS('height', '280px')
     await expect.poll(() => input.evaluate(
-      el => el.closest('.chat__pill')?.classList.contains('chat__pill--tall') || false,
+      el => el.closest('.chat__pill')?.hasAttribute('data-composer-tall') || false,
     )).toBe(true)
 
     await page.evaluate(() => {
@@ -120,20 +120,20 @@ test.describe('Input behavior', () => {
     })
     await expect.poll(() => input.evaluate(el => ({
       collapsed: el.getBoundingClientRect().height < 60,
-      tall: el.closest('.chat__pill')?.classList.contains('chat__pill--tall') || false,
+      tall: el.closest('.chat__pill')?.hasAttribute('data-composer-tall') || false,
     }))).toEqual({ collapsed: true, tall: false })
 
     // The bfcache/pageshow trigger owns the same reconciliation contract.
     await input.evaluate(el => {
       el.style.height = '280px'
-      el.closest('.chat__pill')?.classList.add('chat__pill--tall')
+      el.closest('.chat__pill')?.setAttribute('data-composer-tall', '')
     })
     await page.evaluate(() => {
       window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))
     })
     await expect.poll(() => input.evaluate(el => ({
       collapsed: el.getBoundingClientRect().height < 60,
-      tall: el.closest('.chat__pill')?.classList.contains('chat__pill--tall') || false,
+      tall: el.closest('.chat__pill')?.hasAttribute('data-composer-tall') || false,
     }))).toEqual({ collapsed: true, tall: false })
   })
 

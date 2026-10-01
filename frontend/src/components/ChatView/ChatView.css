@@ -51,18 +51,17 @@
    ║      be32e58 after two iterations adding overcomplicated   ║
    ║      multi-layer glows.)                                   ║
    ║                                                            ║
-   ║   7. `.chat__pill--tall` toggles when textarea height > 45 ║
+   ║   7. `data-composer-tall` marks heights above 45px.        ║
    ║      (not 30, not 50). 31 ≈ single line, 55 ≈ two lines,   ║
    ║      45 sits safely between. Earlier 30-threshold fired    ║
    ║      on every keystroke and yanked send/mic to the bottom. ║
    ║      Tall state anchors send/stop/mic to flex-end so the   ║
    ║      action stays near the cursor.                         ║
    ║                                                            ║
-   ║   8. `.chat__pill--with-attach .chat__input-line` always   ║
-   ║      uses align-items: flex-end. When chips are present    ║
-   ║      and the user types multi-line, the cursor must stay   ║
-   ║      pinned at the visible bottom of the pill — pure       ║
-   ║      `--tall` alignment alone missed the chips case.       ║
+   ║   8. Attachments add room above the text row, not a new   ║
+   ║      alignment policy. Single-line text stays centered;    ║
+   ║      The measured tall state bottom-aligns text and its   ║
+   ║      action, with or without attachment chips.             ║
    ║                                                            ║
    ║   9. Attach cards are UNIFORM 96×96 squares (image and     ║
    ║      file alike). Tray uses `align-items: center` so a     ║
@@ -2460,11 +2459,11 @@
 
 /* Multi-line: pill grows downward and the send/mic anchor to the
    bottom-right so the action stays near the cursor. */
-.chat__pill--tall { align-items: flex-end; }
-.chat__pill--tall .chat__send,
-.chat__pill--tall .chat__stop,
-.chat__pill--tall .chat__steer,
-.chat__pill--tall .chat__mic { align-self: flex-end; }
+[data-composer-tall] { align-items: flex-end; }
+[data-composer-tall] .chat__send,
+[data-composer-tall] .chat__stop,
+[data-composer-tall] .chat__steer,
+[data-composer-tall] .chat__mic { align-self: flex-end; }
 
 /* Focus halo — exact restore of the be32e58 rule that was on the
    old `.chat__form`: a single 3px translucent-accent ring around
@@ -3139,7 +3138,7 @@
 /* Inner row inside the pill containing the textarea + send/mic.
    Default: center-aligned so a single line of text + the mic icon
    read as vertically centered in the pill. When the textarea grows
-   multi-line, `.chat__pill--tall` flips to flex-end so the buttons
+   multi-line, `[data-composer-tall]` flips to flex-end so the buttons
    stay anchored at the bottom-right while the textarea expands up. */
 .chat__input-line {
   flex: 1;
@@ -3148,7 +3147,7 @@
   align-items: center;
   gap: 2px;
 }
-.chat__pill--tall .chat__input-line {
+[data-composer-tall] .chat__input-line {
   align-items: flex-end;
 }
 
@@ -3199,13 +3198,10 @@
     + var(--composer-stack-chrome)
   );
 }
-/* When chips are attached the pill is in column layout and the
-   input-line sits BELOW the chip tray. Anchor send/mic to the
-   bottom of input-line regardless of textarea height so they don't
-   drift upward as the user types multiple lines. */
+/* Keep the text row's alignment independent of the attachment tray;
+   data-composer-tall already anchors multi-line actions at the bottom of the row. */
 .chat__pill--with-attach .chat__input-line {
   min-height: 38px;
-  align-items: flex-end;
 }
 
 /* `align-items: center` keeps the row from stretching a shorter

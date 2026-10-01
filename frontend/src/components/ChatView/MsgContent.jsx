@@ -562,7 +562,7 @@ function MsgContentInner({
                   : undefined}
               >
                 {resumeState?.pending ? 'Resuming…' : resumeState?.unavailable ? 'Reconnecting…' : parked
-                  ? limitResetElapsed ? 'Continue now' : (recoveryCredit?.actionLabel || 'Try now')
+                  ? limitResetElapsed ? 'Try now' : (recoveryCredit?.actionLabel || 'Try now')
                   : 'Resume'}
               </button>
             )}

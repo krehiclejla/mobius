@@ -1128,8 +1128,9 @@ class ParkRun(_Command):
   The identity-keyed sibling of `FinishRun` for the limit exit: instead of
   closing the run's `chat_runs` row "completed", the row moves to
   ``status="parked"`` carrying `parked_until` (the due time,
-  naive UTC) and `park_reason`. Provider limits use their parsed reset time;
-  a successfully drained planned restart uses ``park_reason="restart"`` and
+  naive UTC) and `park_reason`. Provider limits use a bounded retry/check time;
+  the same deadline bounds background-provider suppression.
+  A successfully drained planned restart uses ``park_reason="restart"`` and
   a due time of now. That parked row IS the durable continuation signal; no
   separate state enum exists. Same ownership discipline as
   FinishRun: a dying run superseded by a fresh turn still closes its OWN row
@@ -5217,8 +5218,8 @@ class ChatWriterActor:
           cmd.restart_nonce if cmd.park_reason == "restart" else None
         )
         parked = True
-        # Record the provider's reset time so background selection skips it
-        # until it recovers (the single serialized quota-signal write point).
+        # Suppress background selection until the bounded retry check, not an
+        # untrusted reported reset that could exclude a provider indefinitely.
         if run.park_reason in ("usage_limit", "rate_limit"):
           from app.provider_availability import mark_provider_limited
           from app.models import Chat as _Chat

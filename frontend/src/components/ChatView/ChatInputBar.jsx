@@ -22,7 +22,7 @@
  * ║   CONTRACTS — small but load-bearing                             ║
  * ║                                                                  ║
  * ║   1. AUTOSIZE THRESHOLD                                          ║
- * ║      Shared textarea sizing toggles `chat__pill--tall` when     ║
+ * ║      Textarea sizing toggles `data-composer-tall` when           ║
  * ║      height > 45px. NOT 30 (single-line is ~31, fires every      ║
  * ║      keystroke), NOT 50 (lags two-line typing). 45 sits          ║
  * ║      safely between single-line and two-line. See ChatView.css   ║
@@ -126,7 +126,7 @@ import {
 } from './markdownClipboard.js'
 import {
   textareaUsesNativeSizing,
-  syncComposerTallClass,
+  syncComposerTallState,
 } from './composerTextareaSizing.js'
 import {
   focusComposerElement,
@@ -682,7 +682,7 @@ export default function ChatInputBar({
       const borderSize = Array.isArray(entry?.borderBoxSize)
         ? entry.borderBoxSize[0]?.blockSize
         : entry?.borderBoxSize?.blockSize
-      syncComposerTallClass(textarea, borderSize ?? textarea.offsetHeight)
+      syncComposerTallState(textarea, borderSize ?? textarea.offsetHeight)
     })
     observer.observe(textarea)
     return () => observer.disconnect()

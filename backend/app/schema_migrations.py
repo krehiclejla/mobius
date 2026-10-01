@@ -5552,6 +5552,67 @@ def _record_schedule_provenance(eng) -> None:
     os.replace(tmp, target)
 
 
+def _allow_chat_owned_delegations(eng) -> None:
+  """Allow core helpers without inventing an installed app.
+
+  Preserve every legacy column/row/index/trigger. SQLite cannot drop NOT NULL
+  in place; creating the replacement before dropping the original avoids
+  retargeting incoming foreign keys to a temporary table name.
+  """
+  import re
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "delegations" not in inspector.get_table_names():
+    return
+  column = next(c for c in inspector.get_columns("delegations") if c["name"] == "app_id")
+  if column["nullable"]:
+    return
+  if eng.dialect.name != "sqlite":
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE delegations ALTER COLUMN app_id DROP NOT NULL"))
+    return
+  raw = eng.raw_connection()
+  cursor = raw.cursor()
+  foreign_keys = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+  try:
+    cursor.execute("PRAGMA foreign_keys=OFF")
+    cursor.execute("BEGIN IMMEDIATE")
+    original = cursor.execute(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='delegations'"
+    ).fetchone()[0]
+    changed, count = re.subn(
+      r'("app_id"|\bapp_id\b)(\s+INTEGER)\s+NOT\s+NULL',
+      r'\1\2', original, flags=re.IGNORECASE,
+    )
+    if count != 1:
+      raise RuntimeError("Cannot identify delegation app ownership column")
+    objects = cursor.execute(
+      "SELECT sql FROM sqlite_master WHERE tbl_name='delegations' "
+      "AND type IN ('index','trigger') AND sql IS NOT NULL"
+    ).fetchall()
+    columns = [r[1] for r in cursor.execute("PRAGMA table_info(delegations)")]
+    names = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+    cursor.execute(
+      "CREATE TABLE delegations__core_0074 (" + changed.partition("(")[2]
+    )
+    cursor.execute(
+      f"INSERT INTO delegations__core_0074 ({names}) SELECT {names} FROM delegations"
+    )
+    cursor.execute("DROP TABLE delegations")
+    cursor.execute("ALTER TABLE delegations__core_0074 RENAME TO delegations")
+    for (sql,) in objects:
+      cursor.execute(sql)
+    raw.commit()
+  except BaseException:
+    raw.rollback()
+    raise
+  finally:
+    cursor.execute(f"PRAGMA foreign_keys={int(foreign_keys)}")
+    cursor.close()
+    raw.close()
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5635,6 +5696,7 @@ _SCHEMA_MIGRATIONS = (
   ("0071_delegation_result_identity", _add_delegation_result_identity),
   ("0072_owner_timezone", _add_owner_timezone),
   ("0073_schedule_provenance", _record_schedule_provenance),
+  ("0074_chat_owned_delegations", _allow_chat_owned_delegations),
 )
 
 

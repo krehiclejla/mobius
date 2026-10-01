@@ -457,12 +457,12 @@ class ChatRun(Base):
   ended_at = Column(DateTime, nullable=True, default=None)
   # Provider rate/usage-limit parking (design §2.4). When a turn dies on a
   # provider limit, the run is PARKED instead of just cleared: `status` moves
-  # to "parked", `parked_until` holds the reset time (naive UTC, matching every
+  # to "parked", `parked_until` holds the bounded retry/check time (naive UTC, matching every
   # other DateTime here), and `park_reason` a short label ("rate_limit" /
   # "usage_limit" / …). Planned restarts also use this row with
   # park_reason="restart" and a due time of now. No separate state enum is
   # needed. The liveness checks read it via
-  # `chat._parked_until_for_chat`; the periodic reset sweep notifies once at
+  # `chat._parked_until_for_chat`; the periodic retry sweep notifies once at
   # `parked_until`; auto-resume may pass through the retryable
   # "resume_pending" state before the row becomes terminal. Null on every
   # non-parked run and on rows created before this column existed.
@@ -498,7 +498,7 @@ class ChatFailureActivity(Base):
 class Delegation(Base):
   """Immutable control plane for one durable delegated task.
 
-  The child conversation is an ordinary hidden app-owned ``Chat`` and its
+  The child conversation is an ordinary hidden ``Chat`` and its
   physical execution state remains authoritative in ``ChatRun``. This row
   stores the immutable intent/policy needed to attach retries, constrain the
   SDK runner, and relate the child back to its parent logical run. Ordinary
@@ -515,7 +515,9 @@ class Delegation(Base):
   )
 
   id = Column(String(64), primary_key=True)
-  app_id = Column(Integer, ForeignKey("apps.id"), nullable=False, index=True)
+  # Ordinary agent delegation is parent-chat-owned. Apps may still own their
+  # separately submitted work, whose lifecycle retains app deletion guards.
+  app_id = Column(Integer, ForeignKey("apps.id"), nullable=True, index=True)
   parent_chat_id = Column(
     String(64), ForeignKey("chats.id"), nullable=False, index=True
   )
@@ -721,10 +723,11 @@ class ChatSessionLink(Base):
 class ProviderAvailability(Base):
   """Per-provider quota/availability signal for background provider selection.
 
-  One row per provider. ``limited_until`` (naive UTC, matching
-  ``ChatRun.parked_until``) is set when a turn on that provider parks on a
-  usage/rate limit, using the provider's parsed reset time; the provider is
-  "within quota" again once ``now >= limited_until``.
+  One row per provider. ``limited_until`` (naive UTC) is set when a turn on
+  that provider parks on a usage/rate limit. It uses the bounded
+  ``ChatRun.parked_until`` retry check, never an unbounded reported reset.
+  Passing this deadline permits
+  selection again; only a successful call proves restored availability.
   ``unavailable_reason`` records which limit parked it (``usage_limit`` /
   ``rate_limit``) for observability.
 

@@ -14,6 +14,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import pwd
 import re
@@ -70,6 +71,7 @@ COMMUNITY_BASE_URL = os.environ.get(
 MAX_BODY = 2_000_000
 MAX_INFERENCE_BODY = 16_000_000
 MAX_CONTRIBUTION_BODY = 3_000_000
+log = logging.getLogger("mobius.identity_broker")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$")
 INSTANCE_RE = re.compile(r"^mob_[A-Za-z0-9_-]{3,160}$")
 MANAGED_INSTANCE_RE = re.compile(r"^mob_[A-Za-z0-9_-]{3,80}$")
@@ -1241,6 +1243,13 @@ class Broker:
     return self.client.send(request, stream=True)
 
 
+class RequestBodyTooLarge(ValueError):
+  def __init__(self, length: int, maximum: int):
+    super().__init__("request body is too large")
+    self.length = length
+    self.maximum = maximum
+
+
 class _Handler(BaseHTTPRequestHandler):
   # Closing the connection delimits streamed bodies without requiring this
   # tiny broker to implement HTTP/1.1 chunk framing itself.
@@ -1264,8 +1273,10 @@ class _Handler(BaseHTTPRequestHandler):
       length = int(self.headers.get("content-length", "0"))
     except ValueError as exc:
       raise ValueError("invalid content length") from exc
-    if length < 0 or length > maximum:
-      raise ValueError("request body is too large")
+    if length < 0:
+      raise ValueError("invalid content length")
+    if length > maximum:
+      raise RequestBodyTooLarge(length, maximum)
     return self.rfile.read(length)
 
   def _handle(self) -> None:
@@ -1312,6 +1323,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, broker.standalone_search(request))
         return
       body = self._body(maximum=body_limit)
+      received_bytes = len(body)
       web_tool_flattened = False
       bare_run_is_web = False
       if method == "POST" and path == "/v1/responses":
@@ -1325,6 +1337,12 @@ class _Handler(BaseHTTPRequestHandler):
         allow_private_routes=is_unix,
       )
       try:
+        if path == "/v1/responses" and upstream.status_code == 413:
+          log.warning(
+            "Inference request rejected: origin=upstream status=413 "
+            "received_bytes=%d forwarded_bytes=%d",
+            received_bytes, len(body),
+          )
         self.send_response(upstream.status_code)
         excluded = {
           "connection", "content-length", "content-encoding", "transfer-encoding"
@@ -1349,6 +1367,18 @@ class _Handler(BaseHTTPRequestHandler):
       self._json(404, {"error": "broker route not found"})
     except PermissionError as exc:
       self._json(401, {"error": str(exc)})
+    except RequestBodyTooLarge as exc:
+      log.warning(
+        "Request rejected: origin=local_broker status=413 "
+        "declared_bytes=%d limit_bytes=%d", exc.length, exc.maximum,
+      )
+      self._json(413, {
+        "error": "request body is too large",
+        "code": "request_body_too_large",
+        "origin": "local_broker",
+        "request_bytes": exc.length,
+        "limit_bytes": exc.maximum,
+      })
     except ValueError as exc:
       self._json(400, {"error": str(exc)})
     except httpx.HTTPStatusError as exc:

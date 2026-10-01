@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import tempfile
@@ -421,6 +422,36 @@ def _codex_agent_text(stdout: bytes) -> str:
   return "".join(parts)
 
 
+def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
+  """Classify a rejected synthesis without exposing raw provider output."""
+  errors: list[str] = []
+  for line in stdout.decode("utf-8", "replace").splitlines():
+    try:
+      event = json.loads(line)
+    except ValueError:
+      continue
+    if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
+      continue
+    error = event.get("error", event)
+    if isinstance(error, dict):
+      errors.extend(
+        value for key in ("code", "message")
+        if isinstance(value := error.get(key), str)
+      )
+  # Older CLI versions report their terminal failure only on stderr. Match
+  # known refusals, but never return or log arbitrary text from that stream.
+  text = "\n".join(errors) if errors else stderr.decode("utf-8", "replace")
+  if re.search(
+    r"request body is too large|request_body_too_large|"
+    r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
+  ):
+    return (
+      "The provider rejected the compaction request as too large. "
+      "Your existing conversation is unchanged."
+    )
+  return "The incoming provider could not compact the chat."
+
+
 async def _run_codex_summarize_turn(
   prompt: str,
   *,
@@ -510,11 +541,12 @@ async def _run_codex_summarize_turn(
         f"{_RECEIVE_TIMEOUT_SECS:.0f}s."
       )
     if proc.returncode:
-      tail = " ".join(stderr.decode("utf-8", "replace").split())[-300:]
-      log.warning("Codex compaction failed rc=%s: %s", proc.returncode, tail)
-      raise CompactionError(
-        "The incoming Codex agent could not compact the chat."
+      message = _codex_compaction_failure(stdout, stderr)
+      log.warning(
+        "Codex compaction failed rc=%s prompt_bytes=%d: %s",
+        proc.returncode, len(prompt.encode("utf-8")), message,
       )
+      raise CompactionError(message)
     return _codex_agent_text(stdout)
 
 

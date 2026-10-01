@@ -138,7 +138,7 @@ def continuation_protocol_source(
   prompts = {
     "manual": "Resume the interrupted owner work from its saved state.",
     "restart": "Resume the interrupted owner work after the planned server restart.",
-    "usage_limit": "Resume the interrupted owner work now that provider usage is available.",
+    "usage_limit": "Resume the interrupted owner work after a provider-limit check. Provider availability is not yet confirmed.",
     "memory": "Resume the interrupted owner work now that memory pressure has cleared.",
     "storage": "Resume the interrupted owner work now that storage pressure has cleared.",
     "model_capacity": "Resume the interrupted owner work now that the selected model may be available.",

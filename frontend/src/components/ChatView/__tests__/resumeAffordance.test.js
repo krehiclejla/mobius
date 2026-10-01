@@ -185,10 +185,10 @@ test('ChatView routes both offscreen attention nudges through the controller', (
     'the nudge shows only when the resume card is offscreen')
   assert.match(chatView, /Turn paused — tap to resume/,
     'the non-park nudge copy names the pause')
-  assert.match(chatView, /Queued to continue/,
+  assert.match(chatView, /Queued to retry/,
     'an automatic park nudge names the queued outcome')
-  assert.match(chatView, /Usage available — tap to continue/,
-    'an elapsed manual park names its now-available action')
+  assert.match(chatView, /Ready to retry — availability unconfirmed/,
+    'an elapsed manual park offers a retry without claiming restored quota')
   assert.match(
     openingTagWithClass(chatView, 'chat__question-nudge'),
     /revealPendingQuestion\(pendingQuestionEl\)/,
@@ -319,10 +319,10 @@ test('both attention nudges observe a node published by the card, not a lookup',
 test('ariaStatus announces the recovery state instead of "Response ready."', () => {
   assert.match(chatView, /Turn paused — Resume available\./,
     'a paused turn announces the recovery state, not readiness')
-  assert.match(chatView, /Usage limit reached\. Queued to continue \$\{label\}\./,
-    'an automatic park announces the queued state')
-  assert.match(chatView, /Usage is available again\. Continue available\./,
-    'an elapsed manual park announces the available action')
+  assert.match(chatView, /Next retry check \$\{label\}\./,
+    'an automatic park announces the bounded retry check')
+  assert.match(chatView, /Ready to retry; availability is not confirmed\./,
+    'an elapsed manual park announces a retry, not restored quota')
   assert.match(chatView, /resumeStatus\s*\n?\s*\?\?/,
     'the recovery status takes precedence over the "Response ready." fallback')
 })

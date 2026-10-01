@@ -1449,3 +1449,76 @@ def test_unix_handler_rejects_identity_queries_and_forwards_feedback_mutations()
     server.server_close()
     thread.join(timeout=2)
     shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("upstream_status", [200, 413])
+def test_inference_body_ceiling_distinguishes_local_and_upstream_rejection(
+  monkeypatch, caplog, upstream_status,
+):
+  monkeypatch.setattr(broker_module, "MAX_INFERENCE_BODY", 64)
+  seen = []
+  upstream_body = b'{"error":"upstream fixture refusal"}'
+
+  class FakeBroker:
+    def proxy(self, *, body, **_kwargs):
+      seen.append(body)
+      return httpx.Response(
+        upstream_status,
+        headers={"Content-Type": "application/json"},
+        stream=httpx.ByteStream(upstream_body),
+      )
+
+  server = broker_module._TcpServer(("127.0.0.1", 0), broker_module._Handler)
+  server.broker = FakeBroker()
+  server.is_unix = False
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  try:
+    with httpx.Client(base_url=f"http://127.0.0.1:{server.server_address[1]}") as client:
+      # The exact ceiling is accepted, not an off-by-one rejection.
+      payload = b'{"private_fixture":"do-not-log"}'.ljust(63)
+      assert len(payload) == 63
+      response = client.post("/v1/responses", content=payload + b' ')
+      assert response.status_code == upstream_status
+      assert response.content == upstream_body
+      assert seen == [payload + b' ']
+      if upstream_status == 413:
+        assert "origin=upstream status=413 received_bytes=64 forwarded_bytes=64" in caplog.text
+      response = client.post("/v1/responses", content=payload + b'  ')
+      assert response.status_code == 413
+      assert response.json() == {
+        "error": "request body is too large",
+        "code": "request_body_too_large",
+        "origin": "local_broker",
+        "request_bytes": 65,
+        "limit_bytes": 64,
+      }
+      assert len(seen) == 1
+      assert "origin=local_broker status=413 declared_bytes=65 limit_bytes=64" in caplog.text
+      assert "do-not-log" not in caplog.text
+  finally:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+def test_oversized_body_is_rejected_before_reading_payload():
+  class UnreadableBody:
+    def read(self, _length):
+      pytest.fail("oversized body must not be read")
+
+  handler = object.__new__(broker_module._Handler)
+  handler.headers = {"content-length": "65"}
+  handler.rfile = UnreadableBody()
+  with pytest.raises(broker_module.RequestBodyTooLarge) as caught:
+    handler._body(maximum=64)
+  assert (caught.value.length, caught.value.maximum) == (65, 64)
+
+
+@pytest.mark.parametrize("length", ["-1", "not-a-number"])
+def test_malformed_body_length_is_not_classified_as_oversized(length):
+  handler = object.__new__(broker_module._Handler)
+  handler.headers = {"content-length": length}
+  with pytest.raises(ValueError, match="invalid content length") as caught:
+    handler._body(maximum=64)
+  assert not isinstance(caught.value, broker_module.RequestBodyTooLarge)

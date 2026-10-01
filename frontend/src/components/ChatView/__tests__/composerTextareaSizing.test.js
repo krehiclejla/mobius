@@ -7,20 +7,19 @@ import {
   reconcileComposerTextarea,
   resetComposerTextarea,
   resizeComposerTextarea,
-  syncComposerTallClass,
+  syncComposerTallState,
 } from '../composerTextareaSizing.js'
 
 function textareaStub({ value = '', scrollHeight = 31, tall = false } = {}) {
-  const classes = new Set(tall ? ['chat__pill--tall'] : [])
+  const attributes = new Set(tall ? ['data-composer-tall'] : [])
   const pill = {
-    classList: {
-      toggle(name, enabled) {
-        if (enabled) classes.add(name)
-        else classes.delete(name)
-      },
-      remove(name) { classes.delete(name) },
-      contains(name) { return classes.has(name) },
+    className: 'chat__pill',
+    toggleAttribute(name, enabled) {
+      if (enabled) attributes.add(name)
+      else attributes.delete(name)
     },
+    removeAttribute(name) { attributes.delete(name) },
+    hasAttribute(name) { return attributes.has(name) },
   }
   return {
     textarea: {
@@ -41,7 +40,7 @@ test('foreground reconciliation collapses an empty textarea with stale tall geom
 
   assert.equal(resizeComposerTextarea(textarea), 0)
   assert.equal(textarea.style.height, 'auto')
-  assert.equal(pill.classList.contains('chat__pill--tall'), false)
+  assert.equal(pill.hasAttribute('data-composer-tall'), false)
 })
 
 test('textarea sizing caps multi-line content and retains the tall alignment', () => {
@@ -49,7 +48,7 @@ test('textarea sizing caps multi-line content and retains the tall alignment', (
 
   assert.equal(resizeComposerTextarea(textarea), 280)
   assert.equal(textarea.style.height, '280px')
-  assert.equal(pill.classList.contains('chat__pill--tall'), true)
+  assert.equal(pill.hasAttribute('data-composer-tall'), true)
 })
 
 test('authoritative text can size before React commits it into the DOM value', () => {
@@ -57,7 +56,7 @@ test('authoritative text can size before React commits it into the DOM value', (
 
   assert.equal(resizeComposerTextarea(textarea, 'voice transcript'), 120)
   assert.equal(textarea.style.height, '120px')
-  assert.equal(pill.classList.contains('chat__pill--tall'), true)
+  assert.equal(pill.hasAttribute('data-composer-tall'), true)
 })
 
 test('hidden retained panes keep intrinsic height instead of receiving zero pixels', () => {
@@ -65,7 +64,7 @@ test('hidden retained panes keep intrinsic height instead of receiving zero pixe
 
   assert.equal(resizeComposerTextarea(textarea), 0)
   assert.equal(textarea.style.height, 'auto')
-  assert.equal(pill.classList.contains('chat__pill--tall'), false)
+  assert.equal(pill.hasAttribute('data-composer-tall'), false)
 })
 
 test('reset collapses immediately before React commits the empty value', () => {
@@ -73,7 +72,7 @@ test('reset collapses immediately before React commits the empty value', () => {
 
   resetComposerTextarea(textarea)
   assert.equal(textarea.style.height, 'auto')
-  assert.equal(pill.classList.contains('chat__pill--tall'), false)
+  assert.equal(pill.hasAttribute('data-composer-tall'), false)
 })
 
 test('authoritative empty state clears stale native inline geometry', () => {
@@ -85,7 +84,7 @@ test('authoritative empty state clears stale native inline geometry', () => {
 
   assert.equal(reconcileComposerTextarea(textarea, ''), 0)
   assert.equal(textarea.style.height, 'auto')
-  assert.equal(pill.classList.contains('chat__pill--tall'), false)
+  assert.equal(pill.hasAttribute('data-composer-tall'), false)
 })
 
 test('native content sizing is capability-gated without browser sniffing', () => {
@@ -98,12 +97,25 @@ test('native content sizing is capability-gated without browser sniffing', () =>
   assert.equal(textareaUsesNativeSizing(null), false)
 })
 
-test('native resize observation owns only the tall alignment class', () => {
+test('native resize observation owns only the tall alignment attribute', () => {
   const { textarea, pill } = textareaStub()
-  assert.equal(syncComposerTallClass(textarea, 31), 31)
-  assert.equal(pill.classList.contains('chat__pill--tall'), false)
-  assert.equal(syncComposerTallClass(textarea, 55), 55)
-  assert.equal(pill.classList.contains('chat__pill--tall'), true)
+  assert.equal(syncComposerTallState(textarea, 31), 31)
+  assert.equal(pill.hasAttribute('data-composer-tall'), false)
+  assert.equal(syncComposerTallState(textarea, 55), 55)
+  assert.equal(pill.hasAttribute('data-composer-tall'), true)
+})
+
+test('attachment class changes preserve measured multiline alignment', () => {
+  const { textarea, pill } = textareaStub()
+  syncComposerTallState(textarea, 78)
+
+  pill.className = 'chat__pill chat__pill--with-attach'
+  assert.equal(pill.hasAttribute('data-composer-tall'), true)
+  pill.className = 'chat__pill'
+  assert.equal(pill.hasAttribute('data-composer-tall'), true)
+
+  resetComposerTextarea(textarea)
+  assert.equal(pill.hasAttribute('data-composer-tall'), false)
 })
 
 test('ChatView reconciles textarea geometry on value commits and foreground return', () => {
@@ -114,7 +126,7 @@ test('ChatView reconciles textarea geometry on value commits and foreground retu
   assert.match(source, /const reconcileForegroundGeometry = \(\) => \{[\s\S]*reconcileComposerTextarea\(inputRef\.current, inputValueRef\.current\)[\s\S]*publishComposerRoom\(\)/)
   assert.match(source, /window\.addEventListener\('pageshow', reconcileForegroundGeometry\)/)
   assert.match(inputBarSource, /new ResizeObserver\(/)
-  assert.match(inputBarSource, /syncComposerTallClass\(/)
+  assert.match(inputBarSource, /syncComposerTallState\(/)
   assert.doesNotMatch(voiceSource, /resizeComposerTextarea/)
   const resets = source.match(/resetComposerTextarea\(inputRef\.current\)/g) || []
   assert.equal(resets.length, 2, 'both queued and immediate sends collapse stale textarea geometry')

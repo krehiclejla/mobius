@@ -2443,6 +2443,7 @@ def _run_turn_whose_stream_dies(
   should_abort=None,
   notifications=None,
   sdk_patch=None,
+  helper_host_key=None,
 ):
   """Runs one turn whose stream raises `exc`, optionally mid-teardown.
 
@@ -2493,6 +2494,7 @@ def _run_turn_whose_stream_dies(
       bc=bc,
       pending_questions={},
       db=None,
+      helper_host_key=helper_host_key,
       **({"should_abort": should_abort} if should_abort else {}),
     )
   )
@@ -2501,6 +2503,223 @@ def _run_turn_whose_stream_dies(
 
 def _mark_interrupted(handle):
   handle._interrupt_requested = True
+
+
+@pytest.mark.parametrize("exit_code, before, after, expected", [
+  (-9, 3, 4, True),
+  (-9, 4, 4, False),
+  (-15, 3, 4, False),
+  (1, 3, 4, False),
+  (None, 3, 4, False),
+  (-9, None, 4, False),
+])
+def test_codex_process_death_carries_only_attempt_correlated_oom_evidence(
+  monkeypatch, exit_code, before, after, expected,
+):
+  monkeypatch.setattr(codex_sdk_runner, "cgroup_oom_kill_count", lambda: before)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: after)
+  monkeypatch.setattr(codex_sdk_runner, "app_server_exit_code", lambda _client: exit_code)
+  result, _ = _run_turn_whose_stream_dies(
+    monkeypatch, _KilledTransportError("closed stdout"),
+  )
+  assert result["oom_killed"] is expected
+  assert result["error"] == codex_sdk_runner._TRANSPORT_DEATH_MESSAGE
+
+
+@pytest.mark.parametrize("shared_host", [False, True])
+def test_codex_oversized_provider_notification_is_not_laundered_into_memory_retry(
+  monkeypatch, shared_host,
+):
+  from app import chat, helper_hosts
+
+  monkeypatch.setattr(helper_hosts, "MANAGER", helper_hosts.HostManager())
+  monkeypatch.setattr(helper_hosts, "app_server_exit_code", lambda _client: -9)
+  monkeypatch.setattr(helper_hosts, "cgroup_oom_kill_count", lambda: 103)
+
+  monkeypatch.setattr(codex_sdk_runner, "cgroup_oom_kill_count", lambda: 100)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: 103)
+  monkeypatch.setattr(codex_sdk_runner, "app_server_exit_code", lambda _client: -9)
+  sdk = _fake_sdk(None)
+  message = '{"error":"request body is too large"}'
+  result, bc = _run_turn_whose_stream_dies(
+    monkeypatch, AssertionError("must stop at the provider error"),
+    notifications=[SimpleNamespace(
+      method="error",
+      payload=sdk["ErrorNotification"](
+        error=SimpleNamespace(message=message), thread_id="thread-1",
+        turn_id="turn-1", will_retry=False,
+      ),
+    )],
+    sdk_patch={"ErrorNotification": sdk["ErrorNotification"]},
+    helper_host_key=(
+      helper_hosts.HostKey("parent", "codex", "write", "/tmp", "setup")
+      if shared_host else None
+    ),
+  )
+  assert result["error"] == message
+  assert not result.get("oom_killed")
+  assert chat._park_exit(bc, result, result["error"]) == {"parked": False}
+  event = bc.events[-1]
+  assert "pause" not in event
+  assert message in event["message"]
+  assert "Retrying it unchanged will not help" in event["message"]
+
+
+def test_codex_owner_stop_is_not_an_oom_recovery_even_when_counter_increases(
+  monkeypatch,
+):
+  monkeypatch.setattr(codex_sdk_runner, "cgroup_oom_kill_count", lambda: 3)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: 4)
+  monkeypatch.setattr(codex_sdk_runner, "app_server_exit_code", lambda _client: -9)
+  result, _ = _run_turn_whose_stream_dies(
+    monkeypatch, _KilledTransportError("closed stdout"),
+    on_register=_mark_interrupted,
+  )
+  assert result["error"] is None
+  assert not result.get("oom_killed")
+
+
+@pytest.mark.asyncio
+async def test_codex_exit_is_observed_before_sdk_cleanup_can_kill_the_process(
+  monkeypatch,
+):
+  monkeypatch.setattr(
+    codex_sdk_runner, "app_server_exit_code", lambda client: client.exit_code,
+  )
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: 4)
+  observations = []
+
+  class Context:
+    exit_code = None
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      self.exit_code = -9
+
+  context = Context()
+  with pytest.raises(_KilledTransportError):
+    async with codex_sdk_runner._codex_client_scope(
+      context, None, {}, None,
+      oom_kills_before=3, observe_exit=observations.append,
+    ):
+      raise _KilledTransportError("closed stdout")
+  assert observations == [False]
+  assert context.exit_code == -9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["discard", "replacement", "close"])
+@pytest.mark.parametrize("sibling_started_before_death", [False, True])
+@pytest.mark.parametrize("exit_code,before,count,expected", [
+  (-9, 3, 4, True),
+  (-9, 4, 4, False),
+  (-9, None, 4, False),
+  (-9, 3, None, False),
+  (-15, 3, 4, False),
+  (None, 3, 4, False),
+])
+async def test_overlapping_codex_leases_keep_original_death_evidence(
+  monkeypatch, cleanup, exit_code, before, count, expected,
+  sibling_started_before_death,
+):
+  from app import helper_hosts
+
+  manager = helper_hosts.HostManager()
+  monkeypatch.setattr(helper_hosts, "MANAGER", manager)
+  monkeypatch.setattr(helper_hosts, "cgroup_oom_kill_count", lambda: count)
+  monkeypatch.setattr(
+    codex_sdk_runner, "_install_codex_call_executor", lambda *_args: None,
+  )
+  monkeypatch.setattr(
+    codex_sdk_runner, "_install_delegated_approval_handler", lambda *_a, **_k: None,
+  )
+
+  class Context:
+    def __init__(self, config=None):
+      self.code = None
+      self._client = SimpleNamespace(_sync=SimpleNamespace(
+        _proc=SimpleNamespace(poll=lambda: self.code),
+      ))
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      # Model both SDK hazards: intentional SIGKILL, then lost Popen evidence.
+      self.code = -9
+      self._client._sync._proc = None
+
+  key = helper_hosts.HostKey("parent", "codex", "write", "/tmp", "setup")
+  observations = []
+
+  def scope(baseline):
+    return codex_sdk_runner._codex_client_scope(
+      None, key, {"AsyncCodex": Context}, None,
+      oom_kills_before=baseline, observe_exit=observations.append,
+    )
+
+  try:
+    async with scope(before) as (client, _, host):
+      sibling_baseline = before if sibling_started_before_death else count
+      async with scope(sibling_baseline) as (_, _, sibling):
+        assert sibling is host
+        client.code = exit_code
+        if cleanup == "close":
+          await sibling.close()
+          await sibling.close()
+        elif cleanup == "replacement":
+          # A live host is legitimately reusable; replacement needs a death.
+          if exit_code is None:
+            await host.close()
+          async with scope(count) as (replacement, _, new_host):
+            assert new_host is not host
+            assert replacement is not client
+          observations.clear()
+      if cleanup == "discard":
+        # The first runner has left its scope and discards the dead host
+        # while the older runner is still unwinding its lease.
+        await manager.discard(sibling)
+      assert client._client._sync._proc is None
+      # An unrelated later cgroup kill cannot rewrite this death snapshot.
+      count = 100
+      sibling_expected = expected if sibling_started_before_death else False
+      assert observations == [sibling_expected]
+    assert observations == [sibling_expected, expected]
+  finally:
+    await manager.close_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_host", [False, True])
+async def test_codex_startup_without_process_evidence_does_not_report_oom(
+  monkeypatch, shared_host,
+):
+  from app import helper_hosts
+
+  monkeypatch.setattr(helper_hosts, "MANAGER", helper_hosts.HostManager())
+  monkeypatch.setattr(helper_hosts, "cgroup_oom_kill_count", lambda: 4)
+  monkeypatch.setattr(
+    codex_sdk_runner, "_install_codex_call_executor", lambda *_args: None,
+  )
+
+  class Context:
+    def __init__(self, config=None):
+      pass
+
+    async def __aenter__(self):
+      raise _KilledTransportError("closed stdout")
+
+  observations = []
+  key = helper_hosts.HostKey("parent", "codex", "write", "/tmp", "setup")
+  with pytest.raises(_KilledTransportError):
+    async with codex_sdk_runner._codex_client_scope(
+      Context(), key if shared_host else None, {"AsyncCodex": Context}, None,
+      oom_kills_before=3, observe_exit=observations.append,
+    ):
+      pytest.fail("Startup must fail")
+  assert observations == []
 
 
 def test_run_codex_sdk_turn_reports_self_requested_kill_as_interrupted(
@@ -3177,20 +3396,20 @@ def test_upstream_stream_stall_explains_the_stop_and_keeps_the_detail():
   assert "No next token received for 60000ms" in message
 
 
-def test_mobius_gateway_out_of_credit_points_to_mobius_you():
-  # The gateway's 402 body; the same wording applies whenever a turn has
-  # nothing left to spend, before the first token or mid-answer.
+def test_mobius_gateway_max_request_cost_points_to_mobius_you():
+  # The gateway's 402 body names the maximum request cost; it does not prove
+  # the account has no remaining credit.
   error = (
     "unexpected status 402 Payment Required: {\"error\":{\"message\":"
     "\"not enough credits for the maximum request cost\",\"type\":"
     "\"insufficient_credits\",\"code\":\"insufficient_credits\"}}"
   )
 
-  from app.codex_events import MOBIUS_NO_CREDIT_MESSAGE
+  from app.codex_events import MOBIUS_MAX_REQUEST_COST_MESSAGE
 
   message = codex_sdk_runner._codex_user_error(error)
 
-  assert message == MOBIUS_NO_CREDIT_MESSAGE
+  assert message == MOBIUS_MAX_REQUEST_COST_MESSAGE
   assert "[Open Möbius · You](/shell/?app=identity)" in message
 
 

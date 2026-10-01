@@ -81,8 +81,9 @@ CONTROL_ENV_VARS = (
   "MOBIUS_COORDINATION_ENABLED",
   # spawn_agent defaults a helper to the delegating agent's own provider.
   "MOBIUS_AGENT_PROVIDER",
+  "MOBIUS_AGENT_MODEL",
+  "MOBIUS_AGENT_EFFORT",
   "MOBIUS_DELEGATION_ID",
-  "MOBIUS_SUBAGENT_HELPER",
   # The screenshot tool captures at the owner's viewport in this chat's
   # browser session.
   "VIEWPORT_WIDTH",

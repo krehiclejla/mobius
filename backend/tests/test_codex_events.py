@@ -1,0 +1,46 @@
+"""Focused contracts for Codex error wording and limit signals."""
+
+from types import SimpleNamespace
+
+from app.codex_events import _codex_user_error, _extract_rate_limit_reset
+
+
+def test_mobius_insufficient_credits_code_does_not_claim_a_balance_or_trial():
+  error = (
+    'unexpected status 402 Payment Required: '
+    '{"error":{"code":"insufficient_credits"}}'
+  )
+
+  message = _codex_user_error(error)
+
+  assert "insufficient_credits" in message
+  assert "maximum request cost" not in message
+  assert "[Open Möbius · You](/shell/?app=identity)" in message
+  assert "trial" not in message.lower()
+
+
+def test_mobius_max_request_cost_reason_takes_priority_over_generic_code():
+  error = (
+    'unexpected status 402 Payment Required: {"error":{"message":'
+    '"not enough credits for the maximum request cost",'
+    '"code":"insufficient_credits"}}'
+  )
+
+  message = _codex_user_error(error)
+
+  assert "not enough credits for the maximum request cost" in message
+  assert "(insufficient_credits)" not in message
+  assert "[Open Möbius · You](/shell/?app=identity)" in message
+  assert "trial" not in message.lower()
+
+
+def test_provider_limit_error_and_structured_reset_remain_separate_from_credits():
+  error = "rate_limit_reached: wait until the provider reset"
+  snapshot = SimpleNamespace(
+    primary=SimpleNamespace(resets_at=1_800_000_000, used_percent=100),
+    secondary=None,
+    rate_limit_reached_type="rate_limit_reached",
+  )
+
+  assert _codex_user_error(error) == error
+  assert _extract_rate_limit_reset(snapshot) == (1_800_000_000, True)

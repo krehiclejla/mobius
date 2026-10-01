@@ -46,6 +46,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+from app.codex_sdk_contract import app_server_exit_code
+from app.memory_observability import ProcessExitEvidence, cgroup_oom_kill_count
+
 log = logging.getLogger(__name__)
 
 HOST_IDLE_SECONDS = 90.0
@@ -64,7 +67,8 @@ HOST_MARKER_ENV = "MOBIUS_HELPER_HOST"
 PER_TURN_ENV = frozenset({
   "AGENT_TOKEN", "CHAT_ID", "MOBIUS_RUN_TOKEN", "MOBIUS_RUN_MARKER",
   "MOBIUS_SUBAGENT_DEPTH", "MOBIUS_DELEGATION_ID", "MOBIUS_SUBAGENT_PROVIDER",
-  "MOBIUS_SUBAGENT_HELPER", "MOBIUS_COORDINATION_ENABLED",
+  "MOBIUS_COORDINATION_ENABLED",
+  "MOBIUS_AGENT_PROVIDER", "MOBIUS_AGENT_MODEL", "MOBIUS_AGENT_EFFORT",
   "TMPDIR", "TMP", "TEMP",
   "AGENT_BROWSER_PROFILE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_NAMESPACE",
   "AGENT_BROWSER_SOCKET_DIR",
@@ -72,8 +76,9 @@ PER_TURN_ENV = frozenset({
 # Per-turn entries safe to hand to a provider verbatim (it may persist them).
 PUBLIC_TURN_ENV = frozenset({
   "CHAT_ID", "MOBIUS_RUN_MARKER", "MOBIUS_SUBAGENT_DEPTH",
-  "MOBIUS_DELEGATION_ID", "MOBIUS_SUBAGENT_PROVIDER", "MOBIUS_SUBAGENT_HELPER",
+  "MOBIUS_DELEGATION_ID", "MOBIUS_SUBAGENT_PROVIDER",
   "MOBIUS_COORDINATION_ENABLED", "TMPDIR", "TMP", "TEMP",
+  "MOBIUS_AGENT_PROVIDER", "MOBIUS_AGENT_MODEL", "MOBIUS_AGENT_EFFORT",
 })
 # The control tool server loads a helper turn's identity from this file.
 CALLER_ENV_FILE_ENV = "MOBIUS_CALLER_ENV_FILE"
@@ -360,13 +365,30 @@ class CodexHelperHost(Host):
     self.client: Any = None
     self.process_group_id: int | None = None
     self._executor: Any = None
+    self._exit_evidence: ProcessExitEvidence | None = None
 
   @property
   def alive(self) -> bool:
     if self._closed or self.client is None:
       return False
-    proc = getattr(getattr(getattr(self.client, "_client", None), "_sync", None), "_proc", None)
-    return proc is None or proc.poll() is None
+    return self.exit_evidence.exit_code is None
+
+  @property
+  def exit_evidence(self) -> ProcessExitEvidence:
+    """Retain the first death observation for every outstanding lease.
+
+    Close freezes even absent evidence before the SDK can kill or clear _proc.
+    A later lease's counter baseline must not reinterpret this host's death.
+    """
+    if self._exit_evidence is None:
+      code = app_server_exit_code(self.client)
+      evidence = ProcessExitEvidence(
+        code, cgroup_oom_kill_count() if code is not None else None,
+      )
+      if code is not None:
+        self._exit_evidence = evidence
+      return evidence
+    return self._exit_evidence
 
   async def start(self) -> None:
     from app.codex_sdk_runner import (
@@ -409,6 +431,7 @@ class CodexHelperHost(Host):
       log.debug("helper thread unload failed thread=%s", thread_id, exc_info=True)
 
   async def close(self) -> None:
+    self._exit_evidence = self.exit_evidence
     self._closed = True
     context, self._context = self._context, None
     if context is not None:

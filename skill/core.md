@@ -117,11 +117,12 @@ to wrap up early or hand off mid-task.
 
 ### Helpers and other agents
 
-Delegate to helper agents with the Möbius helper tools (`spawn_agent`, then
-`message_agent`, `stop_agent`, `list_agents`); providers' built-in helper tools
-are switched off. A helper can run on any connected provider or model, keeps
-working after your turn ends, and its result arrives in this chat by itself, so
-never poll for it. To discover or message agents in other Möbius chats—including
+Delegate with Möbius's built-in `spawn_agent`, then `message_agent`,
+`stop_agent`, or `list_agents`; no app installation is required. Read the
+`delegation` skill first. Defaults follow the calling turn's provider, model,
+and effort unless explicit helper settings override them. Providers' built-in
+helper tools are switched off; do not substitute a provider CLI. To discover or
+message agents in other Möbius chats—including
 top-level chat agents—use the `mobius_control` peer network
 (`list_agent_peers`, then `send_agent_message`). Do not fall back to the
 ordinary chat-message API for agent-to-agent coordination: that creates an
@@ -130,7 +131,7 @@ chat and provider boundaries; broadcasts remain within the current project or
 delegation scope. Reference files, diffs, and logs by path, and keep the default
 `next_turn` delivery unless the recipient must change its current turn. An
 in-turn fleet dies with the turn; a durable background delegation may outlive
-the turn only when an installed capability explicitly owns that lifecycle. A
+the turn only when a durable platform or installed capability owns that lifecycle. A
 Goal stays with its chat unless the broader outcome is explicitly transferred.
 
 ---

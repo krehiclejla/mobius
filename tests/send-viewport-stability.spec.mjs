@@ -162,7 +162,7 @@ test('keyboard close never paints a sent row below its pin', async ({ page }) =>
     'The response remains delayed while every painted frame is sampled.',
   ].join('\n')
   await input.fill(multiline)
-  await expect(surface.locator('.chat__pill')).toHaveClass(/chat__pill--tall/)
+  await expect(surface.locator('.chat__pill')).toHaveAttribute('data-composer-tall', '')
   // Composer growth changes footer geometry. Re-enter the physical tail just
   // before submit, matching the reported precondition.
   await page.evaluate(() => {

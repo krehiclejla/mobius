@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
 import { upsertTerminalErrorItem } from '../streamReducers.js'
 import { ownsRecoveryAction } from '../recoveryCard.js'
+import { isProviderLimitPause, pauseTiming } from '../resetTime.js'
 
 const vite = await createServer({
   appType: 'custom',
@@ -21,6 +22,93 @@ const { default: MsgContent } = await vite.ssrLoadModule(
 )
 
 after(() => vite.close())
+
+test('new, legacy, and unknown provider timestamps keep check and reset distinct', () => {
+  const check = '2035-03-06T08:45:00Z'
+  const reset = '2035-05-20T11:05:00Z'
+  assert.deepEqual(pauseTiming({ kind: 'limit', check_at: check, resets_at: reset }), {
+    checkAt: check, resetAt: reset,
+  })
+  assert.deepEqual(pauseTiming({ kind: 'limit', check_at: check }), {
+    checkAt: check, resetAt: null,
+  })
+  assert.deepEqual(pauseTiming({ kind: 'limit', resets_at: check }), {
+    checkAt: check, resetAt: null,
+  })
+  assert.deepEqual(pauseTiming({ kind: 'limit', check_at: 'bad', resets_at: reset }), {
+    checkAt: null, resetAt: null,
+  })
+})
+
+test('real producer limit kinds and legacy limit retain rate-limit recovery', () => {
+  for (const kind of ['usage_limit', 'rate_limit', 'limit']) {
+    assert.equal(isProviderLimitPause({ kind }), true)
+    const block = {
+      type: 'error', resumable: true,
+      pause: { kind, check_at: '2099-09-14T12:00:00Z' },
+    }
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: { role: 'assistant', content: '', blocks: [block] },
+      isLastMsg: true, onResume() {}, onAutoResumeChange() {},
+      autoResumeAvailable: true,
+    }))
+    assert.match(html, /Provider limit reached/)
+    assert.match(html, /Provider reset time unknown/)
+    assert.match(html, /Turn on auto-continue/)
+    assert.match(html, />Try now<\/button>/)
+  }
+  for (const kind of ['memory', 'storage', 'model_capacity', 'restart']) {
+    assert.equal(isProviderLimitPause({ kind }), false)
+  }
+})
+
+test('provider date beyond bounded check remains separate and elapsed checks do not prove usage', () => {
+  const check = '2035-03-06T08:45:00Z'
+  const reset = '2035-05-20T11:05:00Z'
+  const block = { type: 'error', pause: { kind: 'limit', check_at: check, resets_at: reset } }
+  const html = renderToStaticMarkup(createElement(ErrorCard, { block, resetElapsed: true }))
+  assert.match(html, /Ready to retry/)
+  assert.match(html, /the provider may still be limited/)
+  assert.match(html, /Provider reports the limit resets/)
+  assert.match(html, /Next retry check/)
+  assert.doesNotMatch(html, /Usage is available again|at the reset/)
+
+  const unknown = renderToStaticMarkup(createElement(ErrorCard, {
+    block: { ...block, pause: { kind: 'limit', check_at: check } },
+  }))
+  assert.match(unknown, /Provider reset time unknown/)
+  assert.match(unknown, /Next retry check/)
+  const legacy = renderToStaticMarkup(createElement(ErrorCard, {
+    block: { ...block, pause: { kind: 'limit', resets_at: check } },
+  }))
+  assert.match(legacy, /Provider reset time unknown/)
+
+  const past = new Date(Date.now() - 3 * 86400000).toISOString()
+  const pastReset = renderToStaticMarkup(createElement(ErrorCard, {
+    block: { ...block, pause: { kind: 'limit', check_at: check, resets_at: past } },
+    resetElapsed: true,
+  }))
+  assert.match(pastReset, /Provider reports the limit resets/)
+  assert.doesNotMatch(pastReset, /Usage is available again|Provider reset time unknown/)
+})
+
+test('resource and model-capacity checks never claim provider quota resets', () => {
+  const check_at = '2099-09-14T12:00:00Z'
+  for (const kind of ['memory', 'storage', 'model_capacity']) {
+    const block = { type: 'error', pause: { kind, check_at } }
+    const html = renderToStaticMarkup(createElement(ErrorCard, { block }))
+    assert.doesNotMatch(html, /Provider reports the limit resets|Provider reset time unknown|Rate limit/)
+    if (kind === 'model_capacity') assert.match(html, /Trying again/)
+  }
+})
+
+test('retry clocks and embedded arming use check_at, never the provider reset', () => {
+  assert.match(chatView, /resetDeadlineState\(pendingLimitCheckAt\)/)
+  assert.match(chatView, /resetDeadlineDelay\(pendingLimitCheckAt\)/)
+  assert.match(chatView, /armedEmbeddedResetRef\.current = pendingLimitCheckAt/)
+  assert.match(chatView, /enabled: Boolean\(pendingLimitPark && pendingLimitProvider\)/)
+  assert.doesNotMatch(chatView, /resetDeadline(?:State|Delay)\(pendingLimitResetAt\)/)
+})
 
 for (const autoResumeEnabled of [true, false]) {
   test(`future limit exposes an explicit retry with auto-continue ${autoResumeEnabled}`, () => {
@@ -81,12 +169,12 @@ const settingsView = readFileSync(
 )
 const waitingChip = readFileSync(new URL('../WaitingChip.jsx', import.meta.url), 'utf8')
 
-test('ErrorCard renders a parked card for a block whose pause has a reset time', () => {
-  assert.match(errorCard, /block\.pause\?\.resets_at/,
-    'the card must key the parked classification on block.pause.resets_at')
-  assert.match(errorCard, /Usage resets/,
+test('ErrorCard renders a parked card for a provider-limit pause', () => {
+  assert.match(errorCard, /isProviderLimitPause\(block\.pause\)/,
+    'the card must key provider-limit classification on the shared predicate')
+  assert.match(errorCard, /Provider reports the limit resets/,
     'a parked block must lead with a plain-language reset outcome')
-  assert.match(errorCard, /Queued to continue/,
+  assert.match(errorCard, /Queued to retry/,
     'enabled automatic continuation is the authoritative state')
   assert.match(msgContent, /recoveryCredit\?\.actionLabel \|\| 'Try now'/,
     'a park names a reported paid continuation while retaining a safe retry fallback')
@@ -102,16 +190,16 @@ test('the rendered limit card explains automatic and early recovery states', () 
     block,
     autoResume: true,
   }))
-  assert.match(automatic, /Queued to continue/)
-  assert.match(automatic, /continue automatically at the reset/)
+  assert.match(automatic, /Queued to retry/)
+  assert.match(automatic, /check again/)
   assert.doesNotMatch(automatic, /Added credits/)
 
   const manual = renderToStaticMarkup(createElement(ErrorCard, {
     block,
     autoResume: false,
   }))
-  assert.match(manual, /Usage resets/)
-  assert.match(manual, /Turn on auto-continue, or try again after usage resets/)
+  assert.match(manual, /Provider reset time unknown/)
+  assert.match(manual, /Turn on auto-continue, or try again manually/)
 
   const withCredits = renderToStaticMarkup(createElement(ErrorCard, {
     block,
@@ -126,8 +214,8 @@ test('the rendered limit card explains automatic and early recovery states', () 
     autoResume: false,
     resetElapsed: true,
   }))
-  assert.match(elapsed, /Usage is available again/)
-  assert.match(elapsed, /Continue when you’re ready/)
+  assert.match(elapsed, /Ready to retry/)
+  assert.match(elapsed, /the provider may still be limited/)
 })
 
 test('a restart pause promises continuation only until it falls back to manual', () => {
@@ -246,7 +334,7 @@ test('the reset formatter is a defensive, viewer-local, day-aware helper', () =>
   assert.match(resetTime, /tomorrow at/,
     'the label is day-aware — a 7-day park must not read as a bare time')
   assert.match(errorCard,
-    /import \{ formatResetTime \} from '\.\/resetTime\.js'/,
+    /import \{ formatResetTime, isProviderLimitPause, pauseTiming \} from '\.\/resetTime\.js'/,
     'ErrorCard must consume the shared formatter, not a private copy')
 })
 
@@ -341,7 +429,7 @@ test('continuations render as product markers, not user bubbles', () => {
     'manual, restart, and limit continuations share the marker renderer')
   assert.match(continuationCard, /Resumed manually/)
   assert.match(continuationCard, /Server restarted — continuing automatically/)
-  assert.match(continuationCard, /Usage available again — continuing automatically/)
+  assert.match(continuationCard, /Retry check due — trying the provider again/)
   assert.match(msgContent, /onClick=\{onResume\}/,
     'Resume delegates the lifecycle action instead of manufacturing owner text')
   assert.match(chatView, /chat__msg--\$\{continuationMarker \? 'marker' : msg\.role\}/,

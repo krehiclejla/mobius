@@ -190,7 +190,7 @@ test('A tall-composer send lands once without a visible post-paint correction', 
     'before it collapses on send.',
   ].join('\n')
   await input.fill(multiline)
-  await expect(page.locator('[data-chat-surface="painted"] .chat__pill')).toHaveClass(/chat__pill--tall/)
+  await expect(page.locator('[data-chat-surface="painted"] .chat__pill')).toHaveAttribute('data-composer-tall', '')
   // Re-establish FOLLOW_BOTTOM after the composer grows. Footer geometry may
   // intentionally remain deferred while this gesture owns the viewport, so
   // the semantic mode — not an intermediate raw content gap — is the send-rule

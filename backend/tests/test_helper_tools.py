@@ -4,7 +4,6 @@ from tests.goal_fixtures import goal_run as make_goal_run
 
 import asyncio
 import importlib.util
-import types
 from pathlib import Path
 
 import pytest
@@ -31,15 +30,17 @@ def _control(monkeypatch, **env):
   return module
 
 
-def _fake_subagents(control, monkeypatch, *, enabled=True):
-  app = types.SimpleNamespace(
-    snapshot=lambda: {"app_id": 7, "providers": {
-      "claude": {"connected": True, "enabled": enabled, "default_effort": "medium"},
-      "codex": {"connected": True, "enabled": True, "default_effort": "low"},
+def _fake_capabilities(control, *, enabled=True):
+  control._test_capabilities = {
+    "connections": {name: {"configured": True} for name in ("claude", "codex", "mobius")},
+    "config": {"providers": {
+      "claude": {"enabled": enabled, "default_effort": "medium",
+                 "default_model": "claude-default"},
+      "codex": {"enabled": True, "default_effort": "low"},
     }},
-    _resolve_model=lambda provider, requested, state: requested or f"{provider}-default",
-  )
-  monkeypatch.setattr(control, "_subagents_app", lambda: app)
+    "models": {"claude": [{"id": "claude-default"}],
+               "mobius": [{"id": "spark"}]},
+  }
 
 
 def _capture_api(control, monkeypatch, responses):
@@ -47,6 +48,8 @@ def _capture_api(control, monkeypatch, responses):
 
   def fake(method, path, payload=None):
     calls.append((method, path, payload))
+    if path == "/api/delegations/capabilities":
+      return getattr(control, "_test_capabilities", {})
     for prefix, value in responses.items():
       if path.startswith(prefix):
         return value(payload) if callable(value) else value
@@ -67,7 +70,7 @@ def _row(**overrides):
 
 def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
   control = _control(monkeypatch, CHAT_ID="parent-1", MOBIUS_AGENT_PROVIDER="claude")
-  _fake_subagents(control, monkeypatch)
+  _fake_capabilities(control)
   calls = _capture_api(control, monkeypatch, {"/api/delegations": lambda body: _row(
     task_key=body["task_key"], provider=body["provider"], model=body["model"],
   )})
@@ -76,10 +79,10 @@ def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
     "name": "review", "task": "  Review the diff.  ", "access": "read",
   })
 
-  method, path, body = calls[0]
+  method, path, body = calls[-1]
   assert (method, path) == ("POST", "/api/delegations")
   assert body == {
-    "app_id": 7, "parent_chat_id": "parent-1", "task_key": "review",
+    "app_id": None, "parent_chat_id": "parent-1", "task_key": "review",
     "prompt": "Review the diff.", "provider": "claude", "model": "claude-default",
     "effort": "medium", "scope": "read", "notify_parent_on_complete": True,
   }
@@ -88,7 +91,7 @@ def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
 
 def test_spawn_honours_a_paused_provider_only_when_named(monkeypatch):
   control = _control(monkeypatch, CHAT_ID="parent-1", MOBIUS_AGENT_PROVIDER="claude")
-  _fake_subagents(control, monkeypatch, enabled=False)
+  _fake_capabilities(control, enabled=False)
   _capture_api(control, monkeypatch, {"/api/delegations": _row()})
 
   with pytest.raises(RuntimeError, match="paused"):
@@ -100,12 +103,12 @@ def test_spawn_honours_a_paused_provider_only_when_named(monkeypatch):
 
 def test_spawn_can_use_mobius_models_on_the_codex_harness(monkeypatch):
   control = _control(monkeypatch, CHAT_ID="parent-1")
-  _fake_subagents(control, monkeypatch)
+  _fake_capabilities(control)
   calls = _capture_api(control, monkeypatch, {"/api/delegations": _row()})
   control._call_spawn_agent({
     "name": "m", "task": "t", "access": "write", "provider": "mobius", "model": "spark",
   })
-  assert calls[0][2]["provider"] == "mobius" and calls[0][2]["model"] == "spark"
+  assert calls[-1][2]["provider"] == "mobius" and calls[-1][2]["model"] == "spark"
 
 
 def test_message_stop_and_list_address_helpers_by_name(monkeypatch):

@@ -1269,3 +1269,64 @@ def test_latest_compaction_brief_reads_newest_portable_seed():
     {"role": "assistant", "kind": "compaction", "content": "new"},
   ])
   assert chat_mod._latest_compaction_brief(row) == "new"
+
+
+@pytest.mark.parametrize("cause", [
+  "request body is too large",
+  "request_body_too_large",
+  "unexpected status 413 Payload Too Large",
+  "context_length_exceeded",
+])
+def test_compaction_size_refusal_is_actionable_without_echoing_provider_data(cause):
+  import json
+  stdout = json.dumps({
+    "type": "turn.failed",
+    "error": {"message": cause + " private-content-must-not-leak"},
+  }).encode()
+  message = compaction._codex_compaction_failure(stdout, b"credential-must-not-leak")
+  assert "request as too large" in message
+  assert "conversation is unchanged" in message
+  assert "must-not-leak" not in message
+
+
+def test_compaction_ignores_size_words_in_assistant_prose_and_unknown_stderr():
+  stdout = b'{"type":"agent_message","text":"request body is too large"}\n[]\n'
+  message = compaction._codex_compaction_failure(stdout, b"private-upstream-error")
+  assert message == "The incoming provider could not compact the chat."
+
+
+@pytest.mark.asyncio
+async def test_failed_codex_compaction_discards_partial_text_and_redacts_logs(
+  monkeypatch, tmp_path, caplog,
+):
+  class Provider:
+    def codex_config_overrides(self):
+      return []
+
+    def build_env(self, **_kwargs):
+      return {}
+
+  class Process:
+    returncode = 1
+
+    async def communicate(self, _stdin):
+      return (
+        b'{"type":"agent_message","text":"partial-private-briefing"}\n',
+        b'error: request body is too large secret-must-not-leak',
+      )
+
+  async def spawn(*_args, **_kwargs):
+    return Process()
+
+  monkeypatch.setattr("app.providers.get_provider", lambda _pid: Provider())
+  monkeypatch.setattr(compaction.shutil, "which", lambda _name: "/bin/codex")
+  monkeypatch.setattr(compaction.asyncio, "create_subprocess_exec", spawn)
+  with pytest.raises(compaction.CompactionError, match="request as too large"):
+    await compaction._run_codex_summarize_turn(
+      "private prompt", data_dir=str(tmp_path), provider_id="mobius",
+      model=None, effort=None,
+    )
+  assert "prompt_bytes=14" in caplog.text
+  assert "secret-must-not-leak" not in caplog.text
+  assert "partial-private-briefing" not in caplog.text
+  assert "private prompt" not in caplog.text

@@ -173,80 +173,149 @@ def _chat_row(chat_id: str):
 
 def test_park_fields_structured_datetime_aware():
   aware = datetime(2026, 7, 11, 1, 40, tzinfo=UTC)
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": aware}, "usage limit reached", now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
-  assert reason == "usage_limit"
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
+  assert timing.reason == "usage_limit"
+  assert timing.resets_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_structured_epoch_seconds():
   epoch = int(datetime(2026, 7, 11, 1, 40, tzinfo=UTC).timestamp())
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": epoch}, None, now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_structured_iso_string():
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": "2026-07-11T01:40:00Z"}, None, now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_text_clock_rolls_to_next_occurrence():
   # 1:40am has already passed at NOW (22:00), so the park rolls to tomorrow.
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "You've hit your weekly limit · resets 1:40am", now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
-  assert reason == "usage_limit"
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
+  assert timing.reason == "usage_limit"
+
+
+def test_park_fields_text_dated_clock_keeps_the_date():
+  # Reading only the clock would schedule tomorrow instead of the dated reset.
+  now = datetime(2031, 3, 4, 8)
+  timing = chat_mod._limit_park_fields(
+    {}, "Usage limit reached. Try again at Mar 9th, 2031 6:25 AM.",
+    now=now,
+  )
+  assert timing.check_at == datetime(2031, 3, 9, 6, 25)
+  assert timing.reason == "usage_limit"
+
+
+def test_park_fields_text_dated_clock_without_year_rolls_forward():
+  now = datetime(2031, 3, 4, 8)
+  timing = chat_mod._limit_park_fields(
+    {}, "Usage limit reached. Resets Mar 7 9:15 am", now=now,
+  )
+  assert timing.check_at == datetime(2031, 3, 7, 9, 15)
 
 
 def test_park_fields_text_relative_duration():
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "Server is temporarily limiting requests. Try again in 30 minutes.",
     now=NOW,
   )
-  assert target == NOW + timedelta(minutes=30)
-  assert reason == "rate_limit"
+  assert timing.check_at == NOW + timedelta(minutes=30)
+  assert timing.reason == "rate_limit"
 
 
 def test_park_fields_text_iso_timestamp():
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "Rate limited. Resets at 2026-07-11T01:40:00Z.", now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_fallback_on_unparseable_text():
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "429 too many requests", now=NOW,
   )
-  assert target == NOW + chat_mod.PARK_FALLBACK_DELAY
-  assert reason == "rate_limit"
+  assert timing.check_at == NOW + chat_mod.PARK_FALLBACK_DELAY
+  assert timing.reason == "rate_limit"
+  assert timing.resets_at is None
 
 
 def test_park_fields_clamps_past_reset_to_min_delay():
   past = datetime(2026, 7, 10, 1, 0, tzinfo=UTC)
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": past}, None, now=NOW,
   )
-  assert target == NOW + timedelta(seconds=60)
+  assert timing.check_at == NOW + timedelta(seconds=60)
+  assert timing.resets_at == past.replace(tzinfo=None)
 
 
 def test_park_fields_clamps_absurd_future_and_never_raises():
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": "9999-01-01T00:00:00Z"}, None, now=NOW,
   )
-  assert target == NOW + timedelta(days=7)
+  assert timing.check_at == NOW + timedelta(days=7)
+  assert timing.resets_at == datetime(9999, 1, 1)
   # A hostile structured value must degrade to the fallback, not raise.
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": object()}, None, now=NOW,
   )
-  assert target == NOW + chat_mod.PARK_FALLBACK_DELAY
-  assert reason == "rate_limit"
+  assert timing.check_at == NOW + chat_mod.PARK_FALLBACK_DELAY
+  assert timing.reason == "rate_limit"
+  assert timing.resets_at is None
+
+
+def test_monthly_reset_is_not_replaced_by_the_seven_day_check():
+  now = datetime(2032, 2, 3, 9, 47)
+  timing = chat_mod._limit_park_fields(
+    {}, "Usage limit reached. Try again at Mar 16th, 2032 10:26 AM.", now=now,
+  )
+  assert timing.resets_at == datetime(2032, 3, 16, 10, 26)
+  assert timing.check_at == now + timedelta(days=7)
+
+
+def test_structured_reset_wins_without_losing_its_timezone_or_date():
+  timing = chat_mod._limit_park_fields(
+    {"rate_limit_resets_at": "2026-08-10T09:00:00+02:00"},
+    "Usage limit; resets in 1 hour", now=NOW,
+  )
+  assert timing.resets_at == datetime(2026, 8, 10, 7)
+  assert timing.check_at == NOW + timedelta(days=7)
+
+
+def test_park_exit_keeps_long_reset_and_check_as_distinct_utc_facts():
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(
+    sink, {"api_error_status": 429, "rate_limit_resets_at": "2099-05-08T12:34:00Z"},
+    "Usage limit reached", provider_id="codex",
+  )
+  pause = sink.events[-1]["pause"]
+  assert pause["resets_at"] == "2099-05-08T12:34:00+00:00"
+  assert pause["check_at"] == kwargs["parked_until"].replace(tzinfo=UTC).isoformat()
+  assert kwargs["parked_until"] <= datetime.now(UTC).replace(tzinfo=None) + timedelta(days=7)
+
+
+@pytest.mark.parametrize("reason", ["memory", "storage", "model_capacity", "rate_limit"])
+def test_check_only_park_does_not_invent_a_provider_reset(reason):
+  pause = chat_mod._park_event("waiting", NOW, reason)["pause"]
+  assert pause["check_at"] == NOW.replace(tzinfo=UTC).isoformat()
+  assert "resets_at" not in pause
+
+
+def test_unknown_limit_reset_stays_unknown_with_fallback_retry():
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, {"api_error_status": 429}, None)
+  assert kwargs["parked"] is True
+  assert "check_at" in sink.events[-1]["pause"]
+  assert "resets_at" not in sink.events[-1]["pause"]
 
 
 # -- the shared exit classifier ------------------------------------------------
@@ -1027,7 +1096,9 @@ def test_sweep_notifies_once_and_resolves(owner_token, monkeypatch):
 
   assert resolved == ["sweep-once"]
   assert len(calls) == 1
-  assert "reset" in calls[0]["body"].lower()
+  assert "retry" in calls[0]["title"].lower()
+  assert "may still be limited" in calls[0]["body"]
+  assert "has reset" not in calls[0]["body"]
   assert calls[0]["source_id"] == "sweep-once"
   assert _run_row("rt-sweep-once")["status"] == "parked_notified"
 
@@ -1194,8 +1265,9 @@ def test_sweep_auto_resume_on_starts_one_staggered_continue(
     chat_mod.discard_starting("sweep-auto")
 
 
-def test_sweep_auto_resumes_an_active_delegation_under_its_app_identity(
-  owner_token, monkeypatch,
+@pytest.mark.parametrize("app_owned", [True, False])
+def test_sweep_auto_resumes_an_active_delegation_under_its_original_identity(
+  owner_token, monkeypatch, app_owned,
 ):
   """Quota suspension must not strand a bounded child behind its parent."""
   del owner_token
@@ -1217,9 +1289,11 @@ def test_sweep_auto_resumes_an_active_delegation_under_its_app_identity(
       source_dir="/tmp/mobius-tests/limit-resume-delegation",
       name="Subagents", description="", jsx_source="",
     )
-    db.add(app)
-    db.flush()
-    app_id = app.id
+    app_id = None
+    if app_owned:
+      db.add(app)
+      db.flush()
+      app_id = app.id
     db.add(models.Chat(
       id="sweep-delegation-parent", title="Parent", messages=[],
       provider="codex",
@@ -2932,7 +3006,7 @@ def test_parked_probe_tiebreak_is_deterministic():
     db.close()
 
 
-def _limit_complete_turn(cid, *, parked_until, monkeypatch=None,
+def _limit_complete_turn(cid, *, parked_until, provider_reset_at=None, monkeypatch=None,
                          park_raises=False, park_returns_false=False):
   """Drive _complete_turn's limit branch with a real bc + sink + seeded run."""
   from app.broadcast import create_broadcast
@@ -2944,6 +3018,7 @@ def _limit_complete_turn(cid, *, parked_until, monkeypatch=None,
   sink.publish({"type": "text", "content": "partial answer"})
   sink.publish(chat_mod._park_event(
     "hit your weekly limit · resets 1:40am", parked_until, "usage_limit",
+    resets_at=provider_reset_at,
   ))
   if park_raises:
     async def _boom(*a, **kw):
@@ -2963,6 +3038,29 @@ def _limit_complete_turn(cid, *, parked_until, monkeypatch=None,
   ))
   _drain_writer()
   return disposition
+
+
+@pytest.mark.parametrize("reset_days", [29, None, -1, "absurd"])
+def test_terminal_park_preserves_reported_reset_but_bounds_availability(reset_days):
+  now = datetime.now(UTC).replace(tzinfo=None)
+  check = now + timedelta(days=7)
+  reset = (datetime(9999, 1, 1) if reset_days == "absurd" else
+           now + timedelta(days=reset_days) if reset_days is not None else None)
+  cid = f"distinct-quota-clocks-{reset_days}"
+  disposition = _limit_complete_turn(cid, parked_until=check, provider_reset_at=reset)
+  assert disposition.value == "limit_parked"
+  assert _run_row(f"rt-{cid}")["parked_until"] == check
+  # Reopen sessions to prove both facts survive persistence/restart, not just
+  # an in-memory event. The transcript is the display owner, not the scheduler.
+  block = _chat_row(cid)["messages"][-1]["blocks"][-1]
+  assert block["pause"]["check_at"] == check.replace(tzinfo=UTC).isoformat()
+  if reset is None:
+    assert "resets_at" not in block["pause"]
+  else:
+    assert block["pause"]["resets_at"] == reset.replace(tzinfo=UTC).isoformat()
+  with SessionLocal() as db:
+    availability = db.get(models.ProviderAvailability, "claude")
+    assert availability.limited_until == check
 
 
 def test_park_failure_degrades_card_and_keeps_resume(monkeypatch):
@@ -3031,19 +3129,16 @@ def test_limit_park_releases_starting_claim_before_returning():
 
 # -- (h) platform-resource parks: memory kill and admission deferral ----------
 
-def test_park_exit_attributes_a_kernel_oom_kill_to_a_memory_park(monkeypatch):
-  """A provider process the kernel killed for memory parks and self-continues."""
-  counts = iter([3, 4, 4])
-  monkeypatch.setattr(
-    "app.memory_observability.cgroup_oom_kill_count", lambda: next(counts),
-  )
-  monkeypatch.setattr("app.memory_observability._oom_kills_attributed", None)
+def test_park_exit_uses_runner_correlated_oom_evidence_for_memory_recovery():
+  """The runner, not an unrelated cgroup counter, owns process-death evidence."""
   sink = _Sink()
-  # First exit establishes the mark; nothing to attribute yet.
   assert chat_mod._park_exit(sink, None, "process exited -9") == {
     "parked": False,
   }
-  kwargs = chat_mod._park_exit(sink, None, "process exited -9")
+  kwargs = chat_mod._park_exit(
+    sink, {"error": "process exited -9", "oom_killed": True},
+    "process exited -9",
+  )
   assert kwargs["parked"] is True
   assert kwargs["park_reason"] == "memory"
   assert kwargs["parked_until"] - datetime.now(UTC).replace(tzinfo=None) <= (
@@ -3052,10 +3147,58 @@ def test_park_exit_attributes_a_kernel_oom_kill_to_a_memory_park(monkeypatch):
   event = sink.events[-1]
   assert event["pause"]["kind"] == "memory"
   assert "memory" in event["message"]
-  # The single kill is consumed: an unrelated later failure stays a failure.
+  # A later attempt cannot inherit a prior runner's evidence.
   assert chat_mod._park_exit(sink, None, "syntax error") == {
     "parked": False,
   }
+
+
+@pytest.mark.parametrize("message", [
+  '{"error":"request body is too large"}',
+  "Invalid authentication credentials",
+  "unexpected notification payload",
+  "process exited -9",
+])
+def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
+  monkeypatch, message,
+):
+  counter = iter(range(100, 200))
+  monkeypatch.setattr(
+    "app.memory_observability.cgroup_oom_kill_count", lambda: next(counter),
+  )
+  sink = _Sink()
+  for _ in range(3):
+    assert chat_mod._park_exit(sink, {"error": message}, message) == {
+      "parked": False,
+    }
+  assert all("pause" not in event for event in sink.events)
+  assert all(message in event["message"] for event in sink.events)
+
+
+@pytest.mark.parametrize("result, message", [
+  ({"oom_killed": True}, '{"error":"request body is too large"}'),
+  ({"api_error_status": 413}, None),
+  ({}, "Request Entity Too Large"),
+])
+def test_oversized_request_preserves_reason_and_offers_remedy_without_retry(
+  result, message,
+):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, result, message) == {"parked": False}
+  assert len(sink.events) == 1
+  event = sink.events[0]
+  assert "pause" not in event
+  assert "Compact the conversation" in event["message"]
+  assert "Retrying it unchanged will not help" in event["message"]
+  if message:
+    assert message in event["message"]
+
+
+def test_generic_too_large_error_is_not_rewritten_as_a_provider_request_limit():
+  sink = _Sink()
+  message = "Image dimensions too large for the document layout"
+  assert chat_mod._park_exit(sink, {"error": message}, message) == {"parked": False}
+  assert sink.events == [{"type": "error", "message": message}]
 
 
 def test_sweep_continues_a_memory_park_without_the_limit_opt_in(
@@ -3274,3 +3417,15 @@ def test_model_capacity_sixth_failure_becomes_manual_resume(db, chat):
   assert kwargs == {"parked": False}
   assert sink.events[-1]["pause"]["kind"] == "model_capacity_exhausted"
   assert "five automatic retries" in sink.events[-1]["message"]
+
+
+def test_provider_limit_continuation_does_not_claim_quota_recovered():
+  from app.continuations import continuation_protocol_source
+
+  source = continuation_protocol_source(
+    reason="usage_limit", control_id="limit-check", run_token="retry-run",
+  )
+  assert source["continuation_reason"] == "usage_limit"
+  assert source["hidden"] is True
+  assert "Provider availability is not yet confirmed" in source["content"]
+  assert "usage is available" not in source["content"]

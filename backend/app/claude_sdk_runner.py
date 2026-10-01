@@ -76,6 +76,7 @@ from claude_agent_sdk.types import (
 )
 
 from app import activity, generated_files
+from app.memory_observability import cgroup_oom_kill_count, process_was_oom_killed
 from app.claude_events import (
   NativeContinuationTracker,
   _clip_task_text,
@@ -1475,6 +1476,7 @@ async def run_claude_sdk_turn(
     # them.
     helper_result: dict[str, Any] | None = None
 
+    oom_kills_before = cgroup_oom_kill_count()
     try:
       try:
         try:
@@ -1696,6 +1698,12 @@ async def run_claude_sdk_turn(
         **_helper_phase_spend(helper_result),
         "session_id": current_session_id,
         "error": _process_error_with_stderr_tail(exc, stderr_tail),
+        "oom_killed": (
+          not isinstance(exc, ResultError)
+          and process_was_oom_killed(
+            exc.exit_code, oom_kills_before=oom_kills_before,
+          )
+        ),
       }
     except Exception as exc:
       return {

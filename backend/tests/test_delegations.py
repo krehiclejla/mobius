@@ -21,7 +21,7 @@ from app.delegations import (
   delegation_execution_token,
   derived_status,
   ensure_delegation_started,
-  limit_resume_app_id,
+  limit_resume_delegation,
   mark_cancelled,
   parent_root_run_id,
   policy_for_chat,
@@ -143,17 +143,17 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   ))
   db.commit()
 
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
-  ) == app_id
+  ).app_id == app_id
   db.get(models.ChatRun, "resume-park").status = "parked_notified"
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
-  ) == app_id
-  assert limit_resume_app_id(
+  ).app_id == app_id
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id + 1,
   ) is None
@@ -161,7 +161,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   delegation = db.get(models.Delegation, "resume-delegation")
   delegation.cancelled_at = datetime.now(UTC).replace(tzinfo=None)
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
   ) is None
@@ -171,7 +171,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   app = db.get(models.App, app_id)
   app.deleted_at = datetime.now(UTC).replace(tzinfo=None)
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
   ) is None
@@ -183,7 +183,7 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
     status="running", provider="claude", initiated_by_app_id=app_id,
   ))
   db.commit()
-  assert limit_resume_app_id(
+  assert limit_resume_delegation(
     db, child_chat_id="resume-child", run_token="resume-park",
     initiated_by_app_id=app_id,
   ) is None

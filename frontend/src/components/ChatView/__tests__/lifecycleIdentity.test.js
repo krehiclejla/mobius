@@ -89,3 +89,11 @@ test('expanded Goal tasks have no dependency on the agent network query', async 
  assert.match(html, /Verify deployment/)
  assert.doesNotMatch(html, /Agent network|agent-relay/)
 })
+
+// A scheduled check is not evidence that the provider has restored quota.
+test('provider-limit continuation reports a retry without promising availability', () => {
+ const html = render(h(Resume, { msg: { continuation_reason: 'usage_limit' } }))
+ assert.match(html, /Resumed automatically/)
+ assert.match(html, /Retry check due — trying the provider again/)
+ assert.doesNotMatch(html, /[Uu]sage available|[Ll]imit (has )?reset|[Qq]uota restored/)
+})

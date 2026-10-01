@@ -29,6 +29,19 @@ def test_turn_identity_never_lives_in_the_shared_host_environment():
   }
 
 
+def test_core_helpers_are_available_and_caller_defaults_are_turn_scoped():
+  from app import platform_tools
+  host, turn = helper_hosts.split_env({
+    "MOBIUS_AGENT_PROVIDER": "codex", "MOBIUS_AGENT_MODEL": "chosen-model",
+    "MOBIUS_AGENT_EFFORT": "high", "AGENT_TOKEN": "secret",
+  })
+  assert host == {}
+  assert turn["MOBIUS_AGENT_MODEL"] == "chosen-model"
+  assert turn["MOBIUS_AGENT_PROVIDER"] == "codex"
+  assert turn["MOBIUS_AGENT_EFFORT"] == "high"
+  assert "spawn_agent" in platform_tools.expected_control_tool_names(top_level=False)
+
+
 def test_turn_env_file_is_private_round_trips_and_is_removed(tmp_path):
   values = {"AGENT_TOKEN": "tok with 'quotes' $x", "CHAT_ID": "c1"}
   env_file = helper_hosts.TurnEnvFile(tmp_path, "marker", values)
@@ -765,3 +778,21 @@ async def test_reused_claude_host_keeps_dispatch_names_across_capability_changes
     assert result["error"] is None
 
   assert seen == (["high", None] if initial_support else [None, None])
+
+
+def test_codex_host_death_observation_survives_sdk_and_counter_changes(monkeypatch):
+  from types import SimpleNamespace
+
+  count = 4
+  monkeypatch.setattr(helper_hosts, "cgroup_oom_kill_count", lambda: count)
+  sync = SimpleNamespace(_proc=SimpleNamespace(poll=lambda: -9))
+  host = helper_hosts.CodexHelperHost(_key(), sdk={}, config=None)
+  host.client = SimpleNamespace(_client=SimpleNamespace(_sync=sync))
+  assert not host.alive
+  evidence = host.exit_evidence
+  sync._proc = None
+  count = 5
+  assert not host.alive
+  assert host.exit_evidence is evidence
+  assert evidence.was_oom_killed(3)
+  assert not evidence.was_oom_killed(4)
