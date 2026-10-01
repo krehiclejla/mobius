@@ -6,9 +6,11 @@ Möbius in numbered chunks while the command runs; the final result still
 carries each stream's head and tail for callers that never read live output.
 """
 
+from contextlib import closing
 import asyncio
 import io
 import sys
+import threading
 import time
 import urllib.error
 
@@ -23,13 +25,11 @@ def _clear_connect_state():
   connect_routes._channels.clear()
   connect_routes._commands.clear()
   connect_routes._host_id_by_token_hash.clear()
-  connect_routes._finished_output.clear()
   connect_routes._pair_limiter.reset()
   yield
   connect_routes._channels.clear()
   connect_routes._commands.clear()
   connect_routes._host_id_by_token_hash.clear()
-  connect_routes._finished_output.clear()
   connect_routes._pair_limiter.reset()
 
 
@@ -72,7 +72,10 @@ def _chunks(*items):
 
 def _post_output(host_id, request_id, chunks):
   command = connect_routes._find_command(host_id, request_id)
-  command.output.append([chunk.model_dump() for chunk in chunks])
+  connect_routes.connect_output.append(
+    host_id, request_id, [chunk.model_dump() for chunk in chunks],
+  )
+  command.output.notify()
 
 
 @pytest.mark.asyncio
@@ -114,14 +117,14 @@ async def test_single_flight_runner_still_refuses_parallel_work_as_busy(
   host_id, channel = _paired_host(client, auth, capabilities=())
   await _start_streaming(host_id, channel, "1" * 16, "first")
 
-  with pytest.raises(connect_routes.HTTPException) as refused:
-    await connect_routes.exec_on_host(
-      host_id,
-      connect_routes.ExecBody(cmd="second", request_id="2" * 16, stream=True),
-      _owner=object(),
-    )
-  assert refused.value.status_code == 409
-  assert "one command at a time" in refused.value.detail
+  refused = await connect_routes.exec_on_host(
+    host_id,
+    connect_routes.ExecBody(cmd="second", request_id="2" * 16, stream=True),
+    _owner=object(),
+  )
+  assert refused.status_code == 409
+  assert refused.body and b"one command at a time" in refused.body
+  assert b"host_busy" in refused.body
   assert channel.queue.empty()
 
 
@@ -206,17 +209,11 @@ async def test_missing_output_stays_visible_as_a_sequence_jump(client, auth):
   assert view["next"] == 6
 
 
-def test_live_output_log_is_memory_bounded_but_keeps_the_newest(monkeypatch):
-  monkeypatch.setattr(connect_routes, "_MAX_LIVE_OUTPUT_CHARS", 10)
+def test_live_output_notification_keeps_no_duplicate_chunks():
   log = connect_routes._OutputLog()
-  log.append([
-    {"seq": 0, "stream": "stdout", "text": "aaaaaa"},
-    {"seq": 1, "stream": "stdout", "text": "bbbbbb"},
-  ])
-  view = log.read(0)
-  assert [(chunk["seq"], chunk["text"]) for chunk in view["chunks"]] == [
-    (1, "bbbbbb"),
-  ]
+  log.notify()
+  assert not hasattr(log, "chunks")
+  assert not hasattr(log, "read")
 
 
 @pytest.mark.asyncio
@@ -256,8 +253,8 @@ async def test_reconnect_reconciles_every_command_the_runner_reports(
 
   assert connect_routes._find_command(host_id, "6" * 16).state == "running"
   assert connect_routes._find_command(host_id, "7" * 16) is None
-  recent = connect_routes._load_host(host_id)["recent_commands"]
-  assert recent["7" * 16]["result"]["outcome"] == "lost"
+  recent = connect_routes.connect_output.finished(host_id, "7" * 16)
+  assert recent["result"]["outcome"] == "lost"
   # Work Möbius no longer tracks has no caller, so the runner is told to stop.
   assert await replacement.queue.get() == {"type": "cancel", "request_id": "8" * 16}
 
@@ -303,36 +300,43 @@ def test_runner_final_view_matches_the_capped_full_text():
 
 
 def test_runner_retries_undelivered_chunks_with_the_same_sequence():
-  output = connect_runner._CommandOutput()
-  output.append("stdout", "one ")
-  output.append("stdout", "two ")
-  first = output.take_batch()
-  assert [(c["seq"], c["text"]) for c in first] == [(0, "one "), (1, "two ")]
-  output.append("stderr", "three")
-  # The first delivery failed; a retry resends the same numbers plus new text.
-  retry = output.take_batch()
-  assert [c["seq"] for c in retry] == [0, 1, 2]
-  output.acknowledge(2)
-  assert output.take_batch() == []
+  with closing(connect_runner._CommandOutput()) as output:
+    output.append("stdout", "one ")
+    output.append("stdout", "two ")
+    first = output.take_batch()
+    assert [(c["seq"], c["text"]) for c in first] == [(0, "one "), (1, "two ")]
+    output.append("stderr", "three")
+    # The first delivery failed; a retry resends the same numbers plus new text.
+    retry = output.take_batch()
+    assert [c["seq"] for c in retry] == [0, 1, 2]
+    output.acknowledge(2)
+    assert output.take_batch() == []
 
 
-def test_runner_drops_oldest_undelivered_output_at_its_memory_bound(monkeypatch):
-  monkeypatch.setattr(connect_runner, "_MAX_PENDING_OUTPUT_CHARS", 10)
-  output = connect_runner._CommandOutput()
-  for text in ("aaaa", "bbbb", "cccc"):
-    output.append("stdout", text)
-  batch = output.take_batch()
-  assert [(c["seq"], c["text"]) for c in batch] == [(1, "bbbb"), (2, "cccc")]
-  # The capped final view is independent of live delivery.
-  assert output.final_streams() == ("aaaabbbbcccc", "", False)
+def test_runner_spools_undelivered_output_without_dropping_oldest():
+  with closing(connect_runner._CommandOutput()) as output:
+    for text in ("aaaa", "bbbb", "cccc"):
+      output.append("stdout", text)
+    batch = output.take_batch()
+    assert [(c["seq"], c["text"]) for c in batch] == [
+      (0, "aaaa"), (1, "bbbb"), (2, "cccc"),
+    ]
+    # The capped final view is independent of live delivery.
+    assert output.final_streams() == ("aaaabbbbcccc", "", False)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell contract")
 def test_runner_streams_output_before_reporting_the_result(monkeypatch):
   posts = []
+  result_posted = threading.Event()
 
-  def post(url, payload, token=None, timeout=30):
-    posts.append((url.rsplit("/", 1)[-1], payload))
+  def post(url, payload, token=None, timeout=30, **kwargs):
+    if payload.get("request_id") == request_id:
+      posts.append((url.rsplit("/", 1)[-1], payload))
+    if url.endswith("/result") and payload.get("request_id") == request_id:
+      result_posted.set()
+    if url.endswith("/output"):
+      return {"ok": True, "next": payload["chunks"][-1]["seq"] + 1}
     return {"ok": True}
 
   monkeypatch.setattr(connect_runner, "_post", post)
@@ -346,11 +350,7 @@ def test_runner_streams_output_before_reporting_the_result(monkeypatch):
     "not_after": time.time() + 5,
   })
 
-  deadline = time.monotonic() + 5
-  while time.monotonic() < deadline and not any(
-    kind == "result" for kind, _payload in posts
-  ):
-    time.sleep(0.05)
+  assert result_posted.wait(5)
 
   kinds = [kind for kind, _payload in posts]
   assert kinds[0] == "state"
@@ -377,22 +377,27 @@ def test_runner_sends_no_live_output_to_a_server_that_did_not_offer_it(
   monkeypatch,
 ):
   posts = []
+  result_posted = threading.Event()
+  request_id = "b" * 16
 
-  def post(url, payload, token=None, timeout=30):
-    posts.append((url.rsplit("/", 1)[-1], payload))
+  def post(url, payload, token=None, timeout=30, **kwargs):
+    if payload.get("request_id") == request_id:
+      posts.append((url.rsplit("/", 1)[-1], payload))
+    if url.endswith("/result") and payload.get("request_id") == request_id:
+      result_posted.set()
+    if url.endswith("/output"):
+      return {"ok": True, "next": payload["chunks"][-1]["seq"] + 1}
     return {"ok": True}
 
   monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://older.test", "token")
   runner.start({
-    "request_id": "b" * 16,
+    "request_id": request_id,
     "cmd": "printf 'one\\n'; sleep 0.7; printf 'two\\n'",
     "timeout": 30,
     "not_after": time.time() + 5,
   })
-  deadline = time.monotonic() + 5
-  while time.monotonic() < deadline and not any(k == "result" for k, _ in posts):
-    time.sleep(0.05)
+  assert result_posted.wait(5)
 
   assert [kind for kind, _ in posts] == ["state", "result"]
   assert posts[-1][1]["stdout"] == "one\ntwo\n"
@@ -400,32 +405,35 @@ def test_runner_sends_no_live_output_to_a_server_that_did_not_offer_it(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process contract")
 def test_heavy_output_cannot_starve_the_time_limit(monkeypatch):
-  results = []
+  queued = threading.Event()
 
   def slow_post(url, payload, token=None, timeout=30):
     if url.endswith("/output"):
       time.sleep(0.05)
-    if url.endswith("/result"):
-      results.append(payload)
+    if url.endswith("/output"):
+      return {"ok": True, "next": payload["chunks"][-1]["seq"] + 1}
     return {"ok": True}
 
   monkeypatch.setattr(connect_runner, "_post", slow_post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
   runner.live_output = True
+  monkeypatch.setattr(runner, "_wake_result_worker", lambda: queued.set())
   runner.start({
     "request_id": "c" * 16,
     "cmd": "yes",
     "timeout": 1,
     "not_after": time.time() + 5,
   })
-  deadline = time.monotonic() + 15
-  while time.monotonic() < deadline and not results:
-    time.sleep(0.1)
+  assert queued.wait(15)
+  [result] = runner.pending_messages()
 
   # Output arrives faster than it uploads, yet the limit still ends it.
-  assert results and results[0]["outcome"] == "timed_out"
-  assert results[0]["exit_code"] == 124
+  assert result["outcome"] == "timed_out"
+  assert result["exit_code"] == 124
   assert runner.active == {}
+  # This test deliberately disables delivery; it owns the retained scratch.
+  for record in runner.pending_outputs.values():
+    record["output"].close()
 
 
 def test_hello_enables_live_output_and_survives_reconnects(monkeypatch):

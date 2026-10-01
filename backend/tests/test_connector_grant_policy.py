@@ -124,7 +124,7 @@ async def test_delegated_chat_inherits_owner_connections(chat, db, monkeypatch):
     provider="codex",
     model="gpt-5.4",
     effort=None,
-    scope="read",
+    scope="write",
     cwd="/data",
     prompt_sha256=hashlib.sha256(b"hi").hexdigest(),
   ))
@@ -143,7 +143,6 @@ def test_delegated_prompt_allows_relevant_connected_tools():
     provider="codex",
     model=None,
     effort=None,
-    scope="read",
     cwd="/data",
   )
   assert "connected tools" in policy.system_prompt

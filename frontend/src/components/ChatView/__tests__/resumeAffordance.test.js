@@ -152,9 +152,9 @@ test('MsgContent memo compares onResume so a stable ref skips re-render', () => 
     'the memo comparator must include onResume')
 })
 
-test('ChatView wires both recovery surfaces to the separate Resume transaction', () => {
-  for (const tag of ['<MsgContent', '<ActiveAssistantSurface']) {
-    const element = sliceElement(chatView, tag)
+test('ChatView wires the shared live/saved recovery surface to the separate Resume transaction', () => {
+  {
+    const element = sliceElement(chatView, '<AssistantReply')
     assert.match(element, /onResume=\{[^}]*handleResume\}/)
     assert.match(element, /resumeState=\{resumeState\}/)
     assert.doesNotMatch(element, /onResume=\{[^}]*doSend/)
@@ -179,16 +179,16 @@ test('Resume button clears the 44px touch floor with press feedback', () => {
 test('ChatView routes both offscreen attention nudges through the controller', () => {
   assert.match(chatView, /hasPendingResume/,
     'ChatView detects a tail resumable pause/park block')
-  assert.match(chatView, /const pendingResumeBlock = tailResumableBlock\(messages\)/,
-    'the tail resumable block is found by walking the visible message tail')
+  assert.match(chatView, /const pendingResumeBlock = tailResumableBlock\(recoveryMessages\)/,
+    'the recovery cue uses the same superseded pause projection as the visible transcript')
   assert.match(chatView, /hasPendingResume && resumeCardOffscreen/,
     'the nudge shows only when the resume card is offscreen')
   assert.match(chatView, /Turn paused — tap to resume/,
     'the non-park nudge copy names the pause')
-  assert.match(chatView, /Queued to continue/,
+  assert.match(chatView, /Queued to retry/,
     'an automatic park nudge names the queued outcome')
-  assert.match(chatView, /Usage available — tap to continue/,
-    'an elapsed manual park names its now-available action')
+  assert.match(chatView, /Ready to retry — availability unconfirmed/,
+    'an elapsed manual park offers a retry without claiming restored quota')
   assert.match(
     openingTagWithClass(chatView, 'chat__question-nudge'),
     /revealPendingQuestion\(pendingQuestionEl\)/,
@@ -277,30 +277,18 @@ test('both attention nudges observe a node published by the card, not a lookup',
   // handoff reaches the observer as an ordinary node swap. Each element is
   // sliced to its OWN text first: an unbounded wildcard between the tag and the
   // prop lets one call site satisfy both patterns, which makes deleting the
-  // refs from the durable row — the reported bug, exactly — undetectable.
-  for (const [label, openTag] of [
-    ['durable message rows', '<MsgContent'],
-    ['the live active surface', '<ActiveAssistantSurface'],
-  ]) {
-    const element = sliceElement(chatView, openTag)
-    assert.match(element, /pendingQuestionRef=\{pendingQuestionRef\}/,
-      `${label} must publish the question card through the shared ref`)
-    assert.match(element, /resumeCardRef=\{resumeCardRef\}/,
-      `${label} must publish the resume card through the shared ref`)
-  }
-  // The live surface reaches MsgContent through two more components, and a hop
-  // that accepts the prop without forwarding it kills the cue for the whole
-  // live half of the turn — silently, since the durable half still works.
-  for (const [file, child] of [
-    ['../ActiveAssistantSurface.jsx', '<StreamingMessage'],
-    ['../StreamingMessage.jsx', '<MsgContent'],
-  ]) {
-    const source = readFileSync(new URL(file, import.meta.url), 'utf8')
-    const element = sliceElement(source, child)
-    for (const prop of ['pendingQuestionRef', 'resumeCardRef']) {
-      assert.match(element, new RegExp(`${prop}=\\{${prop}\\}`),
-        `${file} must forward ${prop} to ${child}`)
-    }
+  // refs from the shared live/saved reply — the reported bug — undetectable.
+  const replyElement = sliceElement(chatView, '<AssistantReply')
+  assert.match(replyElement, /pendingQuestionRef=\{pendingQuestionRef\}/,
+    'all live and saved replies must publish the pending question through the shared ref')
+  assert.match(replyElement, /resumeCardRef=\{resumeCardRef\}/,
+    'all live and saved replies must publish the resume card through the shared ref')
+  // One reply boundary forwards both publishers straight to the block renderer.
+  const reply = readFileSync(new URL('../AssistantReply.jsx', import.meta.url), 'utf8')
+  const replyBody = sliceElement(reply, '<MsgContent')
+  for (const prop of ['pendingQuestionRef', 'resumeCardRef']) {
+    assert.match(replyBody, new RegExp(`${prop}=\\{${prop}\\}`),
+      `the reply renderer must forward ${prop} directly to the block renderer`)
   }
   // Only the card that actually blocks the turn registers: an answered question
   // or a scrolled-back history card is not somewhere to send the owner back to.
@@ -319,10 +307,10 @@ test('both attention nudges observe a node published by the card, not a lookup',
 test('ariaStatus announces the recovery state instead of "Response ready."', () => {
   assert.match(chatView, /Turn paused — Resume available\./,
     'a paused turn announces the recovery state, not readiness')
-  assert.match(chatView, /Usage limit reached\. Queued to continue \$\{label\}\./,
-    'an automatic park announces the queued state')
-  assert.match(chatView, /Usage is available again\. Continue available\./,
-    'an elapsed manual park announces the available action')
+  assert.match(chatView, /Next retry check \$\{label\}\./,
+    'an automatic park announces the bounded retry check')
+  assert.match(chatView, /Ready to retry; availability is not confirmed\./,
+    'an elapsed manual park announces a retry, not restored quota')
   assert.match(chatView, /resumeStatus\s*\n?\s*\?\?/,
     'the recovery status takes precedence over the "Response ready." fallback')
 })

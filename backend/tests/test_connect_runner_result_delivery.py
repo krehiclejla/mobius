@@ -99,7 +99,7 @@ def test_flush_keeps_a_result_through_a_network_error(monkeypatch):
 
 def test_post_result_marks_runner_truncation(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
-    monkeypatch.setattr(runner, "flush_pending_results", lambda: False)
+    monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
 
     runner._post_result(
         "r1", "x" * (connect_runner._MAX_RESULT_STREAM + 1), "", 0,

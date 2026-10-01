@@ -47,7 +47,6 @@ DISPATCH_MODEL = "haiku"
 DISPATCH_START_TIMEOUT = 90.0
 DISPATCH_ATTEMPTS = 3
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 BUILTIN_HELPER_TOOLS = ("Agent", "Task", "Workflow")
 DISPATCHER_PROMPT = (
   "You are a dispatcher inside Möbius. You never do any work yourself and "
@@ -127,7 +126,6 @@ class HelperTurn:
   spec: dict[str, Any]
   sink: Any
   env_file: TurnEnvFile
-  read_only: bool
   agent_id: str | None = None
   launch_tool_use_id: str | None = None
   status: str | None = None
@@ -264,8 +262,6 @@ class ClaudeHelperHost(Host):
       )
     if turn is None:
       return {}
-    if turn.read_only and name in WRITE_TOOLS:
-      return _deny("This helper is read-only; it may not change files.")
     if name == "Bash" and isinstance(tool_input.get("command"), str):
       command = f". {shlex.quote(str(turn.env_file.path))} && {tool_input['command']}"
       return _allow({**tool_input, "command": command})
@@ -705,7 +701,6 @@ async def run_claude_host_turn(
   skills_enabled: bool,
   run_policy,
   connector_plan,
-  resumed_context: str | None,
   helper_host_key: HostKey,
   data_dir: str,
 ) -> dict:
@@ -726,7 +721,6 @@ async def run_claude_host_turn(
     effort = None
   _host_session, agent_id, launch_tool_use_id = parse_session(session_id)
   dispatch_id = f"d{uuid.uuid4().hex[:16]}"
-  read_only = bool(run_policy and run_policy.scope == "read")
 
   def spawn_spec(prompt: str) -> dict:
     return {
@@ -742,31 +736,26 @@ async def run_claude_host_turn(
     turn = HelperTurn(
       dispatch_id=dispatch_id, kind="message",
       spec={"to": agent_id, "summary": dispatch_id, "message": user_message},
-      sink=bc, env_file=env_file, read_only=read_only, agent_id=agent_id,
+      sink=bc, env_file=env_file, agent_id=agent_id,
       launch_tool_use_id=launch_tool_use_id,
     )
   else:
-    # A first turn, or a helper whose agent is gone (lost with its host, or
-    # run outside a host): start it here with its own history as context.
-    prompt = user_message
-    if session_id and resumed_context:
-      prompt = f"{resumed_context}\n\n{user_message}"
-    elif session_id and run_policy is not None and not run_policy.allow_session_reseed:
-      # Earlier history exists but may not be replayed (write helpers):
-      # starting from the follow-up alone would lose the helper's task.
+    # A first turn may spawn; a lost provider agent must not replay work.
+    if session_id:
+      # A trusted task may have changed state; never replay lost provider work.
       from app.delegations import REVIEW_REQUIRED_MARKER
       return {
         "session_id": session_id, "cost_usd": None,
         "error": (
-          f"{REVIEW_REQUIRED_MARKER}: This write helper's session could not "
+          f"{REVIEW_REQUIRED_MARKER}: This helper's session could not "
           "be resumed. Its durable history is intact, but Möbius will not "
-          "replay write work automatically; start a new helper if another "
+          "replay work automatically; start a new helper if another "
           "pass is needed."
         ),
       }
     turn = HelperTurn(
-      dispatch_id=dispatch_id, kind="spawn", spec=spawn_spec(prompt),
-      sink=bc, env_file=env_file, read_only=read_only,
+      dispatch_id=dispatch_id, kind="spawn", spec=spawn_spec(user_message),
+      sink=bc, env_file=env_file,
     )
 
   factory = _host_options(
@@ -792,33 +781,19 @@ async def run_claude_host_turn(
 
       await host.run_turn(turn, on_started)
       if turn.kind == "message" and turn.dispatch_error:
-        if run_policy is not None and not run_policy.allow_session_reseed:
-          # Never replay write work automatically (same rule as a lost
-          # private session): the parent reviews and restarts it if needed.
-          from app.delegations import REVIEW_REQUIRED_MARKER
-          return {
-            "session_id": session_id, "cost_usd": None,
-            "error": (
-              f"{REVIEW_REQUIRED_MARKER}: This write helper's session could not "
-              "be reached. Its durable history is intact, but Möbius will not "
-              "replay write work automatically; start a new helper if another "
-              "pass is needed."
-            ),
-          }
-        # The host cannot reach this read-only helper (its host session is
-        # gone): reseed it as a new helper from its own chat history.
-        log.info("helper %s unreachable in host; reseeding", agent_id)
-        prompt = f"{resumed_context}\n\n{user_message}" if resumed_context else user_message
-        turn = HelperTurn(
-          dispatch_id=f"d{uuid.uuid4().hex[:16]}", kind="spawn",
-          spec={}, sink=bc, env_file=env_file, read_only=read_only,
-        )
-        turn.spec = {**spawn_spec(prompt), "description": turn.dispatch_id}
-        handle._turn = turn
-        await host.run_turn(turn, on_started)
+        from app.delegations import REVIEW_REQUIRED_MARKER
+        return {
+          "session_id": session_id, "cost_usd": None,
+          "error": (
+            f"{REVIEW_REQUIRED_MARKER}: This helper's session could not be "
+            "reached. Its durable history is intact, but Möbius will not "
+            "replay work automatically; start a new helper if another pass "
+            "is needed."
+          ),
+        }
       if turn.host_lost:
-        # Its agent died with the host: the next turn must reseed, not
-        # message it. A failed turn's result never reaches the pointer.
+        # Clear the dead agent pointer; a later turn needs parent review rather
+        # than an automatic replay. A failed turn's result never reaches it.
         await record_reference(chat_id, resume_reference(host.session_id, turn))
       if turn.dispatch_error:
         return {

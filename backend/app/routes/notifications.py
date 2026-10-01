@@ -5,10 +5,10 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from slowapi import Limiter
-from sqlalchemy import and_, func, or_
+from sqlalchemy import JSON, and_, func, or_
 from sqlalchemy.orm import Session
 
-from app import models
+from app import activity, models
 from app.database import get_db
 from app.deps import (
   Principal,
@@ -52,6 +52,32 @@ def _sender_bucket(request: Request) -> str:
 
 
 limiter = Limiter(key_func=_sender_bucket)
+
+
+def _is_recovery_action(action: object) -> bool:
+  return (
+    isinstance(action, dict)
+    and isinstance(action.get("action"), str)
+    and action["action"].startswith("recover_")
+  )
+
+
+def _has_active_undo(actions: object, now: datetime) -> bool:
+  """Keep a live Undo receipt; preserve malformed ones rather than risk losing one."""
+  if not isinstance(actions, list):
+    return False
+  for action in actions:
+    if not _is_recovery_action(action):
+      continue
+    if action.get("completed_at"):
+      continue
+    try:
+      expires_at = datetime.fromisoformat(action["expires_at"].replace("Z", "+00:00"))
+      if expires_at.tzinfo is None or expires_at.astimezone(UTC) > now:
+        return True
+    except (KeyError, AttributeError, TypeError, ValueError):
+      return True
+  return False
 
 
 @router.post(
@@ -115,7 +141,7 @@ def unread_count(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Count of notifications not yet seen via the notification preview."""
+  """Count of notifications not explicitly marked read."""
   n = (
     db.query(func.count(models.Notification.id))
     .filter(
@@ -125,6 +151,39 @@ def unread_count(
     .scalar()
   )
   return {"count": int(n or 0)}
+
+
+@router.get("/new-count")
+def new_count(
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Arrivals not yet acknowledged by opening the notification panel."""
+  n = db.query(func.count(models.Notification.id)).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.seen_at.is_(None),
+  ).scalar()
+  return {"count": int(n or 0)}
+
+
+@router.post(
+  "/seen-all",
+  dependencies=[
+    Depends(reject_cross_site),
+    Depends(require_nondelegated_owner_or_app_control),
+  ],
+)
+def seen_all(
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Acknowledge current arrivals while leaving unread rows and history intact."""
+  updated = db.query(models.Notification).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.seen_at.is_(None),
+  ).update({"seen_at": datetime.now(UTC)}, synchronize_session=False)
+  db.commit()
+  return {"updated": int(updated)}
 
 
 @router.post(
@@ -138,7 +197,7 @@ def read_all(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Seen-on-open: mark every unread notification read. Idempotent.
+  """Explicitly mark every unread notification read. Idempotent.
 
   Only rows with read_at NULL are touched, so a notification that commits
   concurrently with this UPDATE simply stays unread and is picked up by the
@@ -151,8 +210,40 @@ def read_all(
       models.Notification.read_at.is_(None),
     )
     .update(
-      {"read_at": datetime.now(UTC)}, synchronize_session=False,
+      {"read_at": datetime.now(UTC), "seen_at": datetime.now(UTC)},
+      synchronize_session=False,
     )
+  )
+  db.commit()
+  return {"updated": int(updated)}
+
+
+@router.post(
+  "/{notification_id}/read",
+  dependencies=[
+    Depends(reject_cross_site),
+    Depends(require_nondelegated_owner_or_app_control),
+  ],
+)
+def read_notification(
+  notification_id: str,
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Mark one owner's notification read without removing its history or actions."""
+  exists = db.query(models.Notification.id).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.id == notification_id,
+  ).first()
+  if exists is None:
+    raise HTTPException(status_code=404, detail="Notification not found.")
+  updated = db.query(models.Notification).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.id == notification_id,
+    models.Notification.read_at.is_(None),
+  ).update(
+    {"read_at": datetime.now(UTC), "seen_at": datetime.now(UTC)},
+    synchronize_session=False,
   )
   db.commit()
   return {"updated": int(updated)}
@@ -169,13 +260,42 @@ def clear_notifications(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Delete all stored notifications for the owner. Idempotent."""
-  deleted = (
-    db.query(models.Notification)
-    .filter(models.Notification.owner_id == owner.id)
-    .delete(synchronize_session=False)
-  )
+  """Clear ordinary history without destroying still-usable Undo receipts."""
+  started_at = datetime.now(UTC)
+  deleted = 0
+  cursor = ""
+  while True:
+    batch = (
+      db.query(models.Notification.id, models.Notification.actions, models.Notification.sent_at)
+      .filter(
+        models.Notification.owner_id == owner.id,
+        models.Notification.id > cursor,
+        # A notification delivered during this sweep belongs to the next history.
+        or_(models.Notification.sent_at.is_(None), models.Notification.sent_at < started_at),
+      )
+      .order_by(models.Notification.id)
+      .limit(500)
+      .all()
+    )
+    if not batch:
+      break
+    cursor = batch[-1].id
+    for row in batch:
+      if _has_active_undo(row.actions, started_at):
+        continue
+      # Match the selected snapshot at the DELETE boundary: a concurrently
+      # changed receipt or arrival must not be removed on stale classification.
+      deleted += db.query(models.Notification).filter(
+        models.Notification.owner_id == owner.id,
+        models.Notification.id == row.id,
+        models.Notification.actions == row.actions if row.actions is not None
+        else or_(models.Notification.actions.is_(None), models.Notification.actions == JSON.NULL),
+        models.Notification.sent_at == row.sent_at if row.sent_at is not None
+        else models.Notification.sent_at.is_(None),
+      ).delete(synchronize_session=False)
   db.commit()
+  # Content-free, timestamped activity record for future history-loss diagnosis.
+  activity.log_event("notification_history_cleared", deleted=deleted)
   return {"deleted": int(deleted)}
 
 
@@ -203,12 +323,7 @@ def dismiss_notification(
   if notification is None:
     raise HTTPException(status_code=404, detail="Notification not found.")
   actions = notification.actions if isinstance(notification.actions, list) else []
-  if any(
-    isinstance(action, dict)
-    and isinstance(action.get("action"), str)
-    and action["action"].startswith("recover_")
-    for action in actions
-  ):
+  if any(_is_recovery_action(action) for action in actions):
     raise HTTPException(
       status_code=409,
       detail="Undo notifications cannot be dismissed individually.",
@@ -226,6 +341,7 @@ def list_notifications(
   db: Session = Depends(get_db),
   limit: int = Query(20, ge=1, le=100),
   before: str | None = Query(None),
+  before_at: datetime | None = Query(None),
 ):
   """Return notification history, paginated."""
   q = (
@@ -236,22 +352,30 @@ def list_notifications(
       models.Notification.id.desc(),
     )
   )
+  if before_at is not None and (not before or before_at.tzinfo is None):
+    raise HTTPException(status_code=400, detail="Invalid notification cursor.")
   if before:
-    ref = (
-      db.query(models.Notification)
-      .filter(
-        models.Notification.owner_id == owner.id,
-        models.Notification.id == before,
+    if before_at is None:
+      # Existing ID-only callers retain their cursor contract. The shell also
+      # sends the row's timestamp so paging survives that row being removed.
+      ref = (
+        db.query(models.Notification)
+        .filter(
+          models.Notification.owner_id == owner.id,
+          models.Notification.id == before,
+        )
+        .one_or_none()
       )
-      .one_or_none()
-    )
-    if ref is None:
-      raise HTTPException(status_code=400, detail="Invalid notification cursor.")
+      if ref is None:
+        raise HTTPException(status_code=400, detail="Invalid notification cursor.")
+      cursor_at = ref.sent_at
+    else:
+      cursor_at = before_at.astimezone(UTC).replace(tzinfo=None)
     q = q.filter(or_(
-      models.Notification.sent_at < ref.sent_at,
+      models.Notification.sent_at < cursor_at,
       and_(
-        models.Notification.sent_at == ref.sent_at,
-        models.Notification.id < ref.id,
+        models.Notification.sent_at == cursor_at,
+        models.Notification.id < before,
       ),
     ))
   return [

@@ -40,7 +40,7 @@ test('roomy composer images match sent attachment size and corners', () => {
 test('sent attachments render above message text in both message paths', () => {
   const attachmentNeedle = "msg.role === 'user' && <Attachments"
   const firstAttachments = msgContent.indexOf(attachmentNeedle)
-  const blockContent = msgContent.indexOf('{nodes.map(', firstAttachments)
+  const blockContent = msgContent.indexOf('{nodes.flatMap(', firstAttachments)
   const secondAttachments = msgContent.indexOf(attachmentNeedle, firstAttachments + 1)
   const plainText = msgContent.indexOf('{text ? (', secondAttachments)
 
@@ -48,7 +48,16 @@ test('sent attachments render above message text in both message paths', () => {
   assert.ok(secondAttachments >= 0 && secondAttachments < plainText)
 })
 
-test('a pending composer image opens the same full-screen viewer as a sent one', () => {
+test('document attachments keep transcript order on separate lines', () => {
+  const files = ruleBody('.chat__attach-files')
+  const expanded = ruleBody('.chat__document-card--expanded')
+
+  assert.match(files, /flex-direction:\s*column/)
+  assert.match(expanded, /width:\s*100%/)
+  assert.doesNotMatch(expanded, /order:/)
+})
+
+test('a pending composer image opens the same chat-pane viewer as a sent one', () => {
   const bar = readFileSync(new URL('../ChatInputBar.jsx', import.meta.url), 'utf8')
 
   // The thumbnail must be a real button (keyboard + a11y reachable), not a

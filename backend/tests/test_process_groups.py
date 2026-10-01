@@ -1,5 +1,6 @@
 import logging
 import signal
+from uuid import uuid4
 
 from app import process_groups
 
@@ -195,11 +196,12 @@ def _gone(proc, timeout=2.0):
 def test_run_commands_outside_the_agent_group_are_ended():
   """An abruptly killed agent leaves commands in their own sessions; the
   inherited run marker still finds and ends them."""
-  mine = _command_in_own_session("run-under-test")
+  marker = f"owned-{uuid4().hex}"
+  mine = _command_in_own_session(marker)
   try:
     assert process_groups.terminate_agent_processes(
       None,
-      run_marker="run-under-test",
+      run_marker=marker,
       logger=logging.getLogger(__name__),
       label="test",
       grace_seconds=0.2,
@@ -210,10 +212,10 @@ def test_run_commands_outside_the_agent_group_are_ended():
 
 
 def test_another_runs_commands_are_never_touched():
-  other = _command_in_own_session("another-run")
+  other = _command_in_own_session(f"other-{uuid4().hex}")
   try:
     assert process_groups.terminate_run_processes(
-      "run-under-test", logger=logging.getLogger(__name__), label="test",
+      f"absent-{uuid4().hex}", logger=logging.getLogger(__name__), label="test",
     ) == 0
     assert other.poll() is None
   finally:
@@ -252,11 +254,12 @@ def test_the_chats_browser_is_left_to_its_own_graceful_owner(tmp_path):
   import subprocess
   chrome = tmp_path / "chrome"
   chrome.symlink_to("/bin/sleep")
-  env = dict(os.environ, **{process_groups.RUN_MARKER_ENV: "run-under-test"})
+  marker = f"browser-{uuid4().hex}"
+  env = dict(os.environ, **{process_groups.RUN_MARKER_ENV: marker})
   browser = subprocess.Popen([str(chrome), "60"], env=env, start_new_session=True)
   try:
     assert process_groups.terminate_run_processes(
-      "run-under-test", logger=logging.getLogger(__name__), label="test",
+      marker, logger=logging.getLogger(__name__), label="test",
     ) == 0
     assert browser.poll() is None
   finally:

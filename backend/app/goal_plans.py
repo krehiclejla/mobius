@@ -12,6 +12,7 @@ from sqlalchemy import or_, update
 from sqlalchemy.orm import Session, load_only
 
 from app import models
+from app.chat_message_identity import assistant_message_run_id
 
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -607,13 +608,7 @@ def _goal_completion_anchor(messages, run_ids, result):
     message = messages[index]
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
-    message_id = message.get("id")
-    if not any(
-      message_id == run_id or (
-        isinstance(message_id, str)
-        and re.fullmatch(re.escape(run_id) + r":assistant:[1-9][0-9]*", message_id)
-      ) for run_id in run_ids
-    ):
+    if assistant_message_run_id(message.get("id")) not in run_ids:
       continue
     for block in reversed(message.get("blocks") or []):
       if (not isinstance(block, dict) or block.get("type") != "tool"
@@ -715,23 +710,11 @@ def terminal_goal_summaries_by_message_index(
     # Modern assistant segments carry the exact physical-run identity. Prefer
     # it so clock skew cannot attach a Goal card to an unrelated answer. The
     # bounded timestamp fallback is reserved for genuinely id-less legacy rows.
-    assistant_id = latest.id
-    segment_prefix = f"{assistant_id}:assistant:"
     candidate_index = next((
       index for index in range(len(messages) - 1, -1, -1)
       if isinstance(messages[index], dict)
       and messages[index].get("role") == "assistant"
-      and (
-        messages[index].get("id") == assistant_id
-        or (
-          isinstance(messages[index].get("id"), str)
-          and messages[index]["id"].startswith(segment_prefix)
-          and re.fullmatch(
-            r"[1-9][0-9]*",
-            messages[index]["id"][len(segment_prefix):],
-          ) is not None
-        )
-      )
+      and assistant_message_run_id(messages[index].get("id")) == latest.id
     ), None)
     if candidate_index is None:
       candidate_index = next((

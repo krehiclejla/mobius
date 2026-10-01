@@ -65,6 +65,15 @@ test('generated files collect in one turn-owned block and replay idempotently', 
   ])
 })
 
+test('generated image fingerprints reach the live attachment entry', () => {
+  const digest = 'a'.repeat(64)
+  const items = attachGeneratedFile([], {
+    name: 'image_1.png', size: 12, mime_type: 'image/png',
+    previewable: true, sha256: digest,
+  })
+  assert.equal(items[0].files[0].sha256, digest)
+})
+
 function questionEvent(id, text) {
   return {
     type: 'question',

@@ -1367,7 +1367,9 @@ export default function useNavigation({
         }
         bootPaneId = workspaceStateRef.current.ws.focusedPaneId
       }
-      const claimedReloadDestination = shellReload?.destinationClaimed
+      // A marked provider return, not an ordinary Settings link, may replace
+      // the stale destination claimed by a prior shell reload.
+      const claimedReloadDestination = shellReload?.destinationClaimed && !deepLink?.providerReturn
         ? {
             view: shellReload.activeView,
             appId: shellReload.activeAppId ?? null,
@@ -1438,6 +1440,14 @@ export default function useNavigation({
           { view: 'project', projectId: deepLink.projectId, chatId: null, appId: null, paneId: bootPaneId },
           tabModel.projectTab(deepLink.projectId),
         )
+      } else if (
+        initialNav.view === 'settings'
+        && workspaceStateRef.current.ws.viewMode === 'panes'
+      ) {
+        // Settings wins over the fallback chat tab even when a stored chat id
+        // exists and the workspace blob is invalid.
+        applySettingsDestination(bootPaneId)
+        bootPaneId = workspaceStateRef.current.ws.focusedPaneId
       } else if (!blobValid && initialNav.view === 'canvas' && initialNav.appId != null) {
         // No valid blob: the retained active-destination keys name the item to
         // restore. openBootTab replaces the lone implicit-home fallback and
@@ -1445,18 +1455,6 @@ export default function useNavigation({
         openBootTab(tabModel.makeTab('app', initialNav.appId))
       } else if (!blobValid && initialNav.chatId != null) {
         openBootTab(tabModel.makeTab('chat', initialNav.chatId))
-      } else if (
-        initialNav.view === 'settings'
-        && workspaceStateRef.current.ws.viewMode === 'panes'
-      ) {
-        // Reload/return-to-settings in builder mode: make the Settings tab the
-        // focused surface. Idempotent when a valid blob already restored it
-        // (OPEN_TAB dedups); NECESSARY when the blob was absent/invalid, where the
-        // flat seed carries no Settings tab and the overlay flag started closed —
-        // without this, builder return-to-settings would show nothing. Single /
-        // flag-off return keeps the initial overlay flag instead.
-        applySettingsDestination(bootPaneId)
-        bootPaneId = workspaceStateRef.current.ws.focusedPaneId
       }
 
       // Reset URL to /shell/ once on mount (must match the manifest scope). The
@@ -2238,6 +2236,7 @@ export default function useNavigation({
   }, [activeView, activeChatId, activeAppId])
 
   return {
+    initialNav,
     activeView,
     activeAppId,
     activeChatId,

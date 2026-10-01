@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { EmptyMessage } from '@openai/apps-sdk-ui/components/EmptyMessage'
@@ -77,6 +77,20 @@ import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import './Drawer.css'
 
+const LIST_TABS = ['recents', 'archived']
+const LIST_TAB_KEY = 'mobius:drawer:list-tab'
+
+function readListTab() {
+  try {
+    const stored = globalThis.localStorage?.getItem(LIST_TAB_KEY)
+    return LIST_TABS.includes(stored) ? stored : 'recents'
+  } catch { return 'recents' }
+}
+
+function writeListTab(tab) {
+  try { globalThis.localStorage?.setItem(LIST_TAB_KEY, tab) } catch {}
+}
+
 // Module-level constant so default Set props are stable across renders.
 // A fresh `new Set()` per call would break identity-based memoization
 // downstream.
@@ -123,6 +137,8 @@ export default function Drawer({
   onAddSourceToProjects,
   onNewChat,
   onDeleteChat,
+  // Owner filing: (chatId, archived) moves a chat between Recents and Archived.
+  onSetChatArchived,
   onDeleteApp,
   onDeleteAppData,
   onNotice,
@@ -198,6 +214,14 @@ export default function Drawer({
   const lastPendingPinnedAtRef = useRef(null)
   const [pendingPins, setPendingPins] = useState(() => new Map())
   const [pinnedOrderHandoff, setPinnedOrderHandoff] = useState(null)
+  // Recents and Archived are two lists in one panel, windowed by the same
+  // machinery below; each device remembers which one it shows.
+  const [listTab, setListTab] = useState(readListTab)
+  const showingArchived = listTab === 'archived'
+  const selectListTab = useCallback((tab) => {
+    setListTab(tab)
+    writeListTab(tab)
+  }, [])
   const projectedDrawerItems = useMemo(() => projectPendingDrawerPins(
     chats,
     apps,
@@ -207,12 +231,14 @@ export default function Drawer({
   const {
     pinned: basePinnedItems,
     recents: allRecents,
+    archived: archivedItems,
     apps: sortedApps,
   } = useMemo(() => buildDrawerSections(
     projectedDrawerItems.chats,
     projectedDrawerItems.apps,
     projectedDrawerItems.projects,
   ), [projectedDrawerItems])
+  const listItems = showingArchived ? archivedItems : allRecents
 
   const pinnedItems = useMemo(() => (
     pinnedOrderHandoff
@@ -239,36 +265,36 @@ export default function Drawer({
       && pinnedEntriesMatchRanks(basePinnedItems, pinnedOrderHandoff.releaseRanks)
     ) setPinnedOrderHandoff(null)
   }, [basePinnedItems, pinnedOrderHandoff])
-  const [recentWindow, setRecentWindow] = useState(
-    () => initialDrawerRowWindow(allRecents.length),
+  const [listWindow, setListWindow] = useState(
+    () => initialDrawerRowWindow(listItems.length),
   )
   const navigationScrollRef = useRef(null)
-  const recentSectionRef = useRef(null)
-  const recentRowsStartRef = useRef(null)
-  const recentSectionTopRef = useRef(0)
-  const recentWindowRafRef = useRef(0)
+  const listSectionRef = useRef(null)
+  const listRowsStartRef = useRef(null)
+  const listSectionTopRef = useRef(0)
+  const listWindowRafRef = useRef(0)
   const revealedActiveChatRef = useRef(null)
-  const visibleRecents = useMemo(
-    () => allRecents.slice(recentWindow.start, recentWindow.end),
-    [allRecents, recentWindow],
+  const visibleListItems = useMemo(
+    () => listItems.slice(listWindow.start, listWindow.end),
+    [listItems, listWindow],
   )
-  const recentSpacers = drawerRowSpacerHeights(recentWindow, allRecents.length)
+  const listSpacers = drawerRowSpacerHeights(listWindow, listItems.length)
 
   // Keep one viewport-sized DOM window no matter how far the owner scrolls.
   // Top/bottom spacers preserve the exact numeric scroll position, so unlike
   // resetting progressive rows on close this does not reintroduce the phone
   // drawer jump. Clamp only when deletion makes the list shorter.
   useEffect(() => {
-    setRecentWindow(current => {
-      const next = clampDrawerRowWindow(current, allRecents.length)
+    setListWindow(current => {
+      const next = clampDrawerRowWindow(current, listItems.length)
       return sameDrawerRowWindow(current, next) ? current : next
     })
-  }, [allRecents.length])
+  }, [listItems.length])
 
-  const measureRecentWindow = useCallback(() => {
+  const measureListWindow = useCallback(() => {
     const root = navigationScrollRef.current
-    const section = recentSectionRef.current
-    const rowsStart = recentRowsStartRef.current
+    const section = listSectionRef.current
+    const rowsStart = listRowsStartRef.current
     if (!root || !section || !rowsStart) return
     const rootRect = root.getBoundingClientRect()
     const rowsRect = rowsStart.getBoundingClientRect()
@@ -276,17 +302,17 @@ export default function Drawer({
       rowsRect.top - rootRect.top,
       captureLayoutSpace(root),
     )
-    recentSectionTopRef.current = rectDelta + root.scrollTop
+    listSectionTopRef.current = rectDelta + root.scrollTop
     const next = drawerRowWindow({
-      total: allRecents.length,
+      total: listItems.length,
       scrollTop: root.scrollTop,
       viewportHeight: root.clientHeight,
-      sectionTop: recentSectionTopRef.current,
+      sectionTop: listSectionTopRef.current,
     })
-    setRecentWindow(current => (
+    setListWindow(current => (
       sameDrawerRowWindow(current, next) ? current : next
     ))
-  }, [allRecents.length])
+  }, [listItems.length])
 
   // Measure once before an opened drawer paints, then update the small row
   // window at most once per animation frame while it scrolls. The scroll path
@@ -294,23 +320,23 @@ export default function Drawer({
   // when the pinned/Recent boundary changes.
   useLayoutEffect(() => {
     if (!open) return
-    measureRecentWindow()
-  }, [measureRecentWindow, open, pinnedItems.length])
+    measureListWindow()
+  }, [measureListWindow, open, pinnedItems.length, listTab])
   useEffect(() => {
     if (!open) return undefined
     const root = navigationScrollRef.current
     if (!root) return undefined
     const onScroll = () => {
-      if (recentWindowRafRef.current) return
-      recentWindowRafRef.current = requestAnimationFrame(() => {
-        recentWindowRafRef.current = 0
+      if (listWindowRafRef.current) return
+      listWindowRafRef.current = requestAnimationFrame(() => {
+        listWindowRafRef.current = 0
         const next = drawerRowWindow({
-          total: allRecents.length,
+          total: listItems.length,
           scrollTop: root.scrollTop,
           viewportHeight: root.clientHeight,
-          sectionTop: recentSectionTopRef.current,
+          sectionTop: listSectionTopRef.current,
         })
-        setRecentWindow(current => (
+        setListWindow(current => (
           sameDrawerRowWindow(current, next) ? current : next
         ))
       })
@@ -318,10 +344,10 @@ export default function Drawer({
     root.addEventListener('scroll', onScroll, { passive: true })
     return () => {
       root.removeEventListener('scroll', onScroll)
-      cancelAnimationFrame(recentWindowRafRef.current)
-      recentWindowRafRef.current = 0
+      cancelAnimationFrame(listWindowRafRef.current)
+      listWindowRafRef.current = 0
     }
-  }, [allRecents.length, open])
+  }, [listItems.length, open])
 
   // The always-visible desktop sidebar follows chat selections made elsewhere.
   // The phone drawer instead preserves its last manual scroll position: opening
@@ -341,18 +367,18 @@ export default function Drawer({
     const isPinned = pinnedItems.some(({ kind, item }) => (
       kind === 'chat' && String(item.id) === chatId
     ))
-    const recentIndex = allRecents.findIndex(({ kind, item }) => (
+    const listIndex = listItems.findIndex(({ kind, item }) => (
       kind === 'chat' && String(item.id) === chatId
     ))
-    if (!isPinned && recentIndex < 0) return
+    if (!isPinned && listIndex < 0) return
 
     const revealWindow = drawerRowWindowForIndex(
-      recentWindow,
-      allRecents.length,
-      recentIndex,
+      listWindow,
+      listItems.length,
+      listIndex,
     )
-    if (revealWindow !== recentWindow) {
-      setRecentWindow(revealWindow)
+    if (revealWindow !== listWindow) {
+      setListWindow(revealWindow)
       return
     }
 
@@ -366,11 +392,11 @@ export default function Drawer({
   }, [
     activeChatId,
     activeView,
-    allRecents,
+    listItems,
     open,
     persistent,
     pinnedItems,
-    recentWindow,
+    listWindow,
   ])
 
   // The drawer owns one action menu. Rows provide item identity, placement,
@@ -528,6 +554,9 @@ export default function Drawer({
     },
     reorderPinned(orderedKeys) {
       return rowActionInputsRef.current.reorderPinned(orderedKeys)
+    },
+    archive(id, archived) {
+      rowActionInputsRef.current.onSetChatArchived?.(id, archived)
     },
     remove(kind, id) {
       const current = rowActionInputsRef.current
@@ -1136,6 +1165,7 @@ export default function Drawer({
     onArtifact,
     projects,
     onDeleteChat,
+    onSetChatArchived,
     onDeleteApp,
     onDeleteAppData,
     onNotice,
@@ -1314,84 +1344,143 @@ export default function Drawer({
               )}
 
               <section
-                ref={recentSectionRef}
-                className="drawer__section"
-                aria-labelledby="drawer-recents-label"
+                ref={listSectionRef}
+                className="drawer__section drawer__section--lists"
+                aria-label="Chats"
               >
-                <h2 id="drawer-recents-label" className="drawer__label drawer__label--recents">
-                  <span>Recents</span>
-                </h2>
-                <div ref={recentRowsStartRef} aria-hidden="true" />
-                {recentSpacers.before > 0 && (
-                  <div
-                    className="drawer__virtual-spacer"
-                    style={{ height: recentSpacers.before }}
-                    aria-hidden="true"
-                  />
-                )}
-                {allRecents.length > 0 ? visibleRecents.map(({ kind, item }) => (
-                  kind === 'artifact' ? (
-                    <DrawerArtifactRow
-                      key={`${kind}:${item.id}`}
-                      item={item}
-                      active={isRowActive({ kind, item })}
-                      actions={rowActions}
+                <div
+                  className="drawer__tabs"
+                  role="tablist"
+                  aria-label="Chat lists"
+                  onKeyDown={(event) => {
+                    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+                    event.preventDefault()
+                    const next = LIST_TABS.find(tab => tab !== listTab)
+                    selectListTab(next)
+                    event.currentTarget
+                      .querySelector(`[data-list-tab="${next}"]`)
+                      ?.focus()
+                  }}
+                >
+                  {LIST_TABS.map((tab, index) => (
+                    <Fragment key={tab}>
+                      {index > 0 && (
+                        <span className="drawer__tab-separator" aria-hidden="true">/</span>
+                      )}
+                      <button
+                        type="button"
+                        role="tab"
+                        id={`drawer-tab-${tab}`}
+                        data-list-tab={tab}
+                        className="drawer__tab"
+                        aria-selected={listTab === tab}
+                        aria-controls="drawer-list-panel"
+                        tabIndex={listTab === tab ? 0 : -1}
+                        onClick={() => selectListTab(tab)}
+                      >
+                        {tab === 'recents' ? 'Recents' : 'Archived'}
+                        {tab === 'archived' && archivedItems.some(({ item }) => (
+                          ownerInputSet.has(item.id) || failedSet.has(item.id)
+                        )) && (
+                          <span
+                            className="drawer__attention-diamond drawer__owner-input-dot"
+                            role="img"
+                            aria-label="An archived chat needs you"
+                            title="An archived chat needs you"
+                          />
+                        )}
+                      </button>
+                    </Fragment>
+                  ))}
+                </div>
+                <div
+                  id="drawer-list-panel"
+                  role="tabpanel"
+                  aria-labelledby={`drawer-tab-${listTab}`}
+                >
+                  {showingArchived && archivedItems.length > 0 && (
+                    // The count lives inside the open list so the switch stays
+                    // quiet; the needs-you marker is its only signal.
+                    <p className="drawer__list-caption">
+                      {archivedItems.length === 1
+                        ? '1 archived chat'
+                        : `${archivedItems.length} archived chats`}
+                    </p>
+                  )}
+                  <div ref={listRowsStartRef} aria-hidden="true" />
+                  {listSpacers.before > 0 && (
+                    <div
+                      className="drawer__virtual-spacer"
+                      style={{ height: listSpacers.before }}
+                      aria-hidden="true"
                     />
-                  ) : <DrawerRow
-                    key={`${kind}:${item.id}`}
-                    kind={kind}
-                    item={item}
-                    surface="drawer"
-                    needsOwnerInput={kind === 'chat'
-                      ? ownerInputSet.has(item.id)
-                      : kind === 'app'
-                        ? !!(item.chat_id && ownerInputSet.has(item.chat_id))
-                        : false}
-                    streaming={kind === 'chat' && streamingSet.has(item.id)}
-                    failed={kind === 'chat' && failedSet.has(item.id)}
-                    building={kind === 'app' && !!(item.chat_id && streamingSet.has(item.chat_id))}
-                    attention={kind === 'chat'
-                      ? attentionSet.has(item.id)
-                      : kind === 'app' && newAppSet.has(Number(item.id))}
-                    active={isRowActive({ kind, item })}
-                    renaming={!!(renaming
-                      && renaming.surface === 'drawer'
-                      && renaming.kind === kind
-                      && renaming.id === item.id)}
-                    actions={rowActions}
-                    dragActiveRef={dragActiveRef}
-                    drawerRowGesturesRef={drawerRowGesturesRef}
-                  />
-                )) : chatsStatus === 'loading' || appsStatus === 'loading' || projectsStatus === 'loading' ? (
-                  <p className="drawer__list-status" role="status">Loading recents…</p>
-                ) : chatsStatus === 'error' || appsStatus === 'error' || projectsStatus === 'error' ? (
-                  <div className="drawer__list-status" role="alert">
-                    <span>Recents unavailable.</span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onRetryChats?.()
-                        onRetryApps?.()
-                        onRetryProjects?.()
-                      }}
-                    >
-                      Retry
-                    </button>
-                  </div>
-                ) : (
-                  <EmptyMessage className="drawer__empty" fill="static">
-                    <EmptyMessage.Description>
-                      Nothing recent yet
-                    </EmptyMessage.Description>
-                  </EmptyMessage>
-                )}
-                {recentSpacers.after > 0 && (
-                  <div
-                    className="drawer__virtual-spacer"
-                    style={{ height: recentSpacers.after }}
-                    aria-hidden="true"
-                  />
-                )}
+                  )}
+                  {listItems.length > 0 ? visibleListItems.map(({ kind, item }) => (
+                    kind === 'artifact' ? (
+                      <DrawerArtifactRow
+                        key={`${kind}:${item.id}`}
+                        item={item}
+                        active={isRowActive({ kind, item })}
+                        actions={rowActions}
+                      />
+                    ) : <DrawerRow
+                      key={`${kind}:${item.id}`}
+                      kind={kind}
+                      item={item}
+                      surface="drawer"
+                      needsOwnerInput={kind === 'chat'
+                        ? ownerInputSet.has(item.id)
+                        : kind === 'app'
+                          ? !!(item.chat_id && ownerInputSet.has(item.chat_id))
+                          : false}
+                      streaming={kind === 'chat' && streamingSet.has(item.id)}
+                      failed={kind === 'chat' && failedSet.has(item.id)}
+                      building={kind === 'app' && !!(item.chat_id && streamingSet.has(item.chat_id))}
+                      attention={kind === 'chat'
+                        ? attentionSet.has(item.id)
+                        : kind === 'app' && newAppSet.has(Number(item.id))}
+                      active={isRowActive({ kind, item })}
+                      renaming={!!(renaming
+                        && renaming.surface === 'drawer'
+                        && renaming.kind === kind
+                        && renaming.id === item.id)}
+                      actions={rowActions}
+                      dragActiveRef={dragActiveRef}
+                      drawerRowGesturesRef={drawerRowGesturesRef}
+                    />
+                  )) : chatsStatus === 'loading' || appsStatus === 'loading' || projectsStatus === 'loading' ? (
+                    <p className="drawer__list-status" role="status">Loading {showingArchived ? 'archived chats' : 'recents'}…</p>
+                  ) : chatsStatus === 'error' || appsStatus === 'error' || projectsStatus === 'error' ? (
+                    <div className="drawer__list-status" role="alert">
+                      <span>{showingArchived ? 'Archived chats' : 'Recents'} unavailable.</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onRetryChats?.()
+                          onRetryApps?.()
+                          onRetryProjects?.()
+                        }}
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  ) : (
+                    <EmptyMessage className="drawer__empty" fill="static">
+                      <EmptyMessage.Description>
+                        {showingArchived
+                          ? 'No archived chats. Archive one from its menu to file it here.'
+                          : 'Nothing recent yet'}
+                      </EmptyMessage.Description>
+                    </EmptyMessage>
+                  )}
+                  {listSpacers.after > 0 && (
+                    <div
+                      className="drawer__virtual-spacer"
+                      style={{ height: listSpacers.after }}
+                      aria-hidden="true"
+                    />
+                  )}
+                </div>
               </section>
             </div>
           </div>{/* /.drawer__scroll-wrap */}
@@ -2265,6 +2354,7 @@ const DrawerItemMenu = memo(function DrawerItemMenu({
   const id = menu?.id
   const surface = menu?.surface || 'drawer'
   const pinned = !!item?.pinned_at
+  const archived = kind === 'chat' && !!item?.archived_at
   const label = item ? (kind === 'chat' ? item.title : item.name) : ''
 
   return (
@@ -2273,6 +2363,7 @@ const DrawerItemMenu = memo(function DrawerItemMenu({
       itemKind={kind}
       itemName={label}
       pinned={pinned}
+      archived={archived}
       canInstall={kind === 'app' && Boolean(item?.slug)}
       canShare={kind === 'app' && isDrawerAppShareEligible(item)}
       projectActionLabel={projectAction?.label}
@@ -2284,6 +2375,7 @@ const DrawerItemMenu = memo(function DrawerItemMenu({
       restoreFocusRef={restoreFocusRef}
       onClose={actions.closeMenu}
       onPin={() => actions.pin(kind, id, !pinned)}
+      onArchive={kind === 'chat' ? () => actions.archive(id, !archived) : undefined}
       onCopy={() => actions.copyName(label)}
       onRename={() => actions.startRename(kind, id, surface)}
       onInstall={() => actions.install(item)}

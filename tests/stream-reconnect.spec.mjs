@@ -145,6 +145,69 @@ async function pillOverlapDiagnostics(page) {
 test.use({ serviceWorkers: 'block' })
 
 test.describe('Stream reconnection', () => {
+  test('confirmed live restart recovery supersedes its stale card before detail hydration', async ({ page }) => {
+    const chat = await setupChat(page)
+    const pausedId = 'restart-paused-answer'
+    const successorId = 'restart-resumed-answer'
+    const messages = [
+      { role: 'user', content: 'Resume the saved work.', ts: Date.now() },
+      { role: 'assistant', id: pausedId, blocks: [
+        { type: 'text', content: 'Progress saved before the restart.' },
+        { type: 'error', resumable: true, pause: { kind: 'restart' } },
+      ] },
+    ]
+    const runtime = runtimeSnapshot({
+      running: true, run_id: successorId, run_status: 'running',
+      active_assistant_message_id: successorId,
+      recovery_run_id: null, runtime_revision: 100,
+    })
+    await page.route(`**/api/chats/${chat.id}/runtime`, route => route.fulfill({
+      status: 200, contentType: 'application/json', json: runtime,
+    }))
+    await page.route(url => url.pathname === `/api/chats/${chat.id}` && url.searchParams.has('limit'), route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      json: { id: chat.id, messages, total: messages.length, offset: 0,
+        ...runtime, ...testChatAgentSettings() },
+    }))
+    await page.addInitScript(({ chatId }) => {
+      const realFetch = window.fetch.bind(window)
+      window.fetch = (input, init) => {
+        const url = typeof input === 'string' ? input : input.url
+        if (!new URL(url, location.href).pathname.endsWith(`/api/chats/${chatId}/stream`)) {
+          return realFetch(input, init)
+        }
+        const encoder = new TextEncoder()
+        const body = new ReadableStream({ start(controller) {
+          window.__resumeFixtureEmit = event => controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
+          )
+          window.__resumeFixtureEmit({ type: 'catch_up_done' })
+        } })
+        return Promise.resolve(new Response(body, {
+          status: 200, headers: { 'Content-Type': 'text/event-stream' },
+        }))
+      }
+    }, { chatId: chat.id })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    const surface = page.locator('[data-chat-surface="painted"]')
+    await expect(surface.locator('.chat__resume')).toHaveText('Reconnecting…')
+    await page.waitForFunction(() => !!window.__resumeFixtureEmit)
+    await page.evaluate(({ successorId }) => {
+      window.__resumeFixtureEmit({ type: 'assistant_identity', assistant_message_id: successorId })
+      window.__resumeFixtureEmit({ type: 'text', content: 'The resumed reply is streaming.' })
+    }, { successorId })
+    await expect(surface).toContainText('The resumed reply is streaming.')
+    await expect(surface.locator('.chat__text--error')).toHaveCount(0)
+    await expect(surface.locator('.chat__resume')).toHaveCount(0)
+    await expect(surface.locator('.chat__resume-nudge')).toHaveCount(0)
+    await page.evaluate(() => window.__resumeFixtureEmit({
+      type: 'text', content: ' A later live chunk also arrives.',
+    }))
+    await expect(surface).toContainText('A later live chunk also arrives.')
+    await expect(surface.locator('.chat__text--error')).toHaveCount(0)
+    await expect(surface).toContainText('Progress saved before the restart.')
+  })
+
   test('1. Completed stream stays idle after visibility change', async ({ page }) => {
     let streamRequestCount = 0
     await page.route(/\/api\/chats\/[0-9a-f-]+\/stream$/, route => {

@@ -506,6 +506,7 @@ export function _anchorRow(scrollEl, key) {
   const esc = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(key) : key
   return scrollEl.querySelector(`[data-key="${esc}"]`)
     || scrollEl.querySelector(`[data-anchor-key="${esc}"]`)
+    || scrollEl.querySelector(`[data-source-key="${esc}"]`)
     || scrollEl.querySelector(`[data-cid="${esc}"]`)
 }
 

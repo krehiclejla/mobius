@@ -22,8 +22,13 @@ async function sourceForReference(reference) {
     .join('/')
   const path = reference.kind === 'tmp'
     ? `/api/chats/${encodeURIComponent(reference.chatId)}/tmp-images/${encodedFilename}`
-    : `/api/chats/${encodeURIComponent(reference.chatId)}/${reference.collection}/${encodedFilename}`
-  return `${BASE}${path}${tokenParam}`
+    : reference.kind === 'scratch'
+      ? `/api/chats/${encodeURIComponent(reference.chatId)}/scratch-images/${encodedFilename}`
+      : `/api/chats/${encodeURIComponent(reference.chatId)}/${reference.collection}/${encodedFilename}`
+  const generatedPreview = reference.kind === 'generated'
+    ? `&preview=true${reference.expectedSha256 ? `&expected_sha256=${reference.expectedSha256}` : ''}`
+    : ''
+  return `${BASE}${path}${tokenParam}${generatedPreview}`
 }
 
 async function decodeImage(src, assignImage) {

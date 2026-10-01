@@ -4,6 +4,7 @@ import pytest
 
 from app.codex_sdk_contract import (
   CodexSdkContractError,
+  app_server_exit_code,
   app_server_pid,
   control_client,
   install_approval_handler,
@@ -45,4 +46,18 @@ def test_app_server_pid_owns_the_private_process_chain():
   assert app_server_pid(SimpleNamespace()) is None
   assert app_server_pid(SimpleNamespace(
     _client=SimpleNamespace(_sync=SimpleNamespace(_proc=SimpleNamespace(pid=1))),
+  )) is None
+
+
+@pytest.mark.parametrize("code", [-9, -15, 0, 1, None])
+def test_app_server_exit_code_reads_the_process_without_waiting(code):
+  process = SimpleNamespace(poll=lambda: code)
+  codex = SimpleNamespace(_client=SimpleNamespace(_sync=SimpleNamespace(_proc=process)))
+  assert app_server_exit_code(codex) == code
+
+
+def test_missing_app_server_process_is_not_exit_evidence():
+  assert app_server_exit_code(SimpleNamespace()) is None
+  assert app_server_exit_code(SimpleNamespace(
+    _client=SimpleNamespace(_sync=SimpleNamespace(_proc=None)),
   )) is None

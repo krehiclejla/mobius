@@ -49,6 +49,7 @@ def serve_generated_file(
   chat_id: str,
   name: str = PathParam(...),
   preview: bool = False,
+  expected_sha256: str | None = None,
   token_src: TokenSource = Depends(get_auth_token_source),
   db: Session = Depends(get_db),
 ):
@@ -60,6 +61,11 @@ def serve_generated_file(
   resolve_media_or_header_owner(
     token_src.token, db, chat_id=chat_id, from_query=token_src.from_query,
   )
+  if expected_sha256 is not None and (
+    len(expected_sha256) != 64
+    or any(c not in "0123456789abcdef" for c in expected_sha256)
+  ):
+    raise HTTPException(status_code=400, detail="Invalid image fingerprint.")
 
   row = db.query(models.GeneratedFile).filter(
     models.GeneratedFile.chat_id == chat_id,
@@ -83,14 +89,24 @@ def serve_generated_file(
   except OSError:
     raise HTTPException(status_code=404, detail="File not found.")
 
+  # The chat-scoped row is the authority; this client-supplied digest only
+  # rejects changed bytes from an already-authorized final attachment.
+  if expected_sha256 is not None:
+    if generated_files.sha256_open_file(file_fd, file_stat) != expected_sha256:
+      os.close(file_fd)
+      raise HTTPException(status_code=404, detail="Image content changed.")
+
   inline = preview and generated_files.previewable_mime_type(row.mime_type)
+  headers = {"X-Content-Type-Options": "nosniff"}
+  if expected_sha256 is not None:
+    headers["Cache-Control"] = "private, no-store"
   try:
     return _AnchoredFileResponse(
       file_fd,
       media_type=row.mime_type,
       filename=row.name,
       content_disposition_type="inline" if inline else "attachment",
-      headers={"X-Content-Type-Options": "nosniff"},
+      headers=headers,
       stat_result=file_stat,
     )
   except Exception:

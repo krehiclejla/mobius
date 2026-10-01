@@ -22,7 +22,7 @@
  * ║   CONTRACTS — small but load-bearing                             ║
  * ║                                                                  ║
  * ║   1. AUTOSIZE THRESHOLD                                          ║
- * ║      Shared textarea sizing toggles `chat__pill--tall` when     ║
+ * ║      Textarea sizing toggles `data-composer-tall` when           ║
  * ║      height > 45px. NOT 30 (single-line is ~31, fires every      ║
  * ║      keystroke), NOT 50 (lags two-line typing). 45 sits          ║
  * ║      safely between single-line and two-line. See ChatView.css   ║
@@ -81,8 +81,8 @@
  */
 
 import { useRef, useState, useEffect, useLayoutEffect } from 'react'
-import { createPortal } from 'react-dom'
 import ImageLightbox from './markdown/ImageLightbox.jsx'
+import ChatPanePortal from './ChatPanePortal.jsx'
 import { useHistoryDismiss } from '../../hooks/useHistoryDismiss.jsx'
 import { ArrowUp, DoubleChevronRight, Stop } from '@openai/apps-sdk-ui/components/Icon'
 import { BASE } from '../../api/client.js'
@@ -126,7 +126,7 @@ import {
 } from './markdownClipboard.js'
 import {
   textareaUsesNativeSizing,
-  syncComposerTallClass,
+  syncComposerTallState,
 } from './composerTextareaSizing.js'
 import {
   focusComposerElement,
@@ -289,6 +289,7 @@ function stripExt(name) {
  *  The remove `×` is a 20×20 button floating at the card's top-
  *  right corner (half-overlapping outside). */
 function FileChips({ files, onRemove, chatId }) {
+  const trayRef = useRef(null)
   const [tokenState, setTokenState] = useState({
     chatId: null,
     param: '',
@@ -355,7 +356,7 @@ function FileChips({ files, onRemove, chatId }) {
     : null
 
   return (
-    <div className="chat__attach-tray">
+    <div ref={trayRef} className="chat__attach-tray">
       {cards.map(({ chip, isImage, previewSrc, previewFailed, galleryIndex }) => {
         const cls = classifyFile(chip.name || '')
         const errorMark = chip.status === 'error' ? ' chat__attach-card--error' : ''
@@ -383,7 +384,7 @@ function FileChips({ files, onRemove, chatId }) {
                   historyDismiss.open()
                   setLightboxIndex(galleryIndex)
                 }}
-                aria-label={`View ${chip.name} full screen`}
+                aria-label={`Preview ${chip.name}`}
               >
                 <img className="chat__attach-card-thumb" src={previewSrc} alt="" />
               </button>
@@ -419,7 +420,7 @@ function FileChips({ files, onRemove, chatId }) {
           </div>
         )
       })}
-      {openIndex !== null && createPortal(
+      {openIndex !== null && <ChatPanePortal anchorRef={trayRef}>
         <ImageLightbox
           src={gallery[openIndex].src}
           alt={gallery[openIndex].alt}
@@ -427,9 +428,8 @@ function FileChips({ files, onRemove, chatId }) {
           index={openIndex}
           onNavigate={setLightboxIndex}
           onClose={historyDismiss.close}
-        />,
-        document.body,
-      )}
+        />
+      </ChatPanePortal>}
     </div>
   )
 }
@@ -682,7 +682,7 @@ export default function ChatInputBar({
       const borderSize = Array.isArray(entry?.borderBoxSize)
         ? entry.borderBoxSize[0]?.blockSize
         : entry?.borderBoxSize?.blockSize
-      syncComposerTallClass(textarea, borderSize ?? textarea.offsetHeight)
+      syncComposerTallState(textarea, borderSize ?? textarea.offsetHeight)
     })
     observer.observe(textarea)
     return () => observer.disconnect()

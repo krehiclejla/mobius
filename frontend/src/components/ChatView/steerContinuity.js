@@ -11,6 +11,16 @@ export function isSteeredUserMessage(message) {
   )
 }
 
+export function assistantReplyRoot(message) {
+  return message?.role === 'assistant' && typeof message.id === 'string'
+    ? message.id.replace(/:assistant:[1-9][0-9]*$/, '') : null
+}
+
+export function isHiddenReplyCarrier(message, root) {
+  return !!(root && isSteeredUserMessage(message) && message.hidden
+    && (!message.source_work_id || message.source_work_id === root))
+}
+
 
 /** Return the sealed assistant immediately before one or more steered rows. */
 export function sealedAssistantBeforeSteer(messages, continuationIndex) {
@@ -26,17 +36,22 @@ export function sealedAssistantBeforeSteer(messages, continuationIndex) {
 }
 
 
-function soleTextBlockContent(message) {
+function terminalTextBlockContent(message) {
   if (!message) return ''
   if (!Array.isArray(message.blocks) || message.blocks.length === 0) {
     return typeof message.content === 'string' ? message.content : ''
   }
-  const textBlocks = message.blocks.filter(block => (
-    block?.type === 'text' && typeof block.content === 'string' && block.content
-  ))
-  // Joining several text blocks would invent separators and could cross tool,
-  // question, or activity boundaries. Exactness is more important than reach.
-  return textBlocks.length === 1 ? textBlocks[0].content : ''
+  // A repeated steer can replay the current text section, not the whole reply.
+  // Never join sections or reach back past a tool/question boundary. Thinking
+  // is neutral activity, just as it is before the continuation's first text.
+  for (let index = message.blocks.length - 1; index >= 0; index -= 1) {
+    const block = message.blocks[index]
+    if (block?.type === 'thinking') continue
+    return block?.type === 'text' && typeof block.content === 'string'
+      ? block.content
+      : ''
+  }
+  return ''
 }
 
 
@@ -80,7 +95,10 @@ export function projectSteerContinuationMessage(
   if (!sealedMessage || continuationMessage?.role !== 'assistant') {
     return continuationMessage
   }
-  const prefix = soleTextBlockContent(sealedMessage)
+  if (sealedMessage.id && continuationMessage.id
+      && assistantReplyRoot(sealedMessage)
+        !== assistantReplyRoot(continuationMessage)) return continuationMessage
+  const prefix = terminalTextBlockContent(sealedMessage)
   if (!prefix) return continuationMessage
 
   const blocks = continuationMessage.blocks
@@ -100,21 +118,30 @@ export function projectSteerContinuationMessage(
       ...continuationMessage,
       content: projected,
       blocks: nextBlocks,
+      steer_replay: { textIndex, prefix, text, sourceOffset: blocks[textIndex].source_text_offset || 0 },
     }
   }
 
   const text = String(continuationMessage.content || '')
   const projected = projectedText(prefix, text, { active })
   if (projected == null) return continuationMessage
-  return { ...continuationMessage, content: projected }
+  return { ...continuationMessage, content: projected,
+    steer_replay: { textIndex: 0, prefix, text, sourceOffset: 0 } }
 }
 
 
 /** Apply the exact replay projection to settled transcript rows. */
-export function projectSettledSteerContinuations(messages) {
+export function projectSettledSteerContinuations(messages, { preserveHidden = false } = {}) {
   if (!Array.isArray(messages)) return []
   return messages.map((message, index) => {
     if (message?.role !== 'assistant') return message
+    const root = assistantReplyRoot(message)
+    let before = index - 1
+    while (isHiddenReplyCarrier(messages[before], root)) before -= 1
+    // Only defer to a proven reply group. Id-less rolling history retains its
+    // existing safe suppression; a hidden carrier alone does not create one.
+    if (preserveHidden && before < index - 1
+        && assistantReplyRoot(messages[before]) === root) return message
     return projectSteerContinuationMessage(
       sealedAssistantBeforeSteer(messages, index),
       message,

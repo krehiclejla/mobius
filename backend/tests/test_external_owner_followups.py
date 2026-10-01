@@ -43,7 +43,6 @@ def _owner_control_context(client, owner_token, db):
     provider="codex",
     model=None,
     effort=None,
-    scope="read",
     cwd="/data",
   )
   db.add(models.Delegation(
@@ -56,7 +55,7 @@ def _owner_control_context(client, owner_token, db):
     provider=policy.provider,
     model=policy.model,
     effort=policy.effort,
-    scope=policy.scope,
+    scope="write",
     cwd=policy.cwd,
     prompt_sha256=hashlib.sha256(b"owner control follow-up").hexdigest(),
   ))

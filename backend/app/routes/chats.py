@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app import (
   activity,
   auth,
+  chat_archive,
   chat_failure_activity,
   chat_search,
   drawer_pins,
@@ -36,6 +37,7 @@ from app.chat_visibility import (
 )
 from app.chat_event_sink import active_sink_assistant_message_id
 from app.chat_activity import chat_activity_page
+from app.chat_context import recent_chat_digest_order
 from app.chat_waits import (
   outstanding_wait_chat_ids,
   outstanding_waits_for_chat,
@@ -475,6 +477,9 @@ def _owner_chat_summary(
     "updated_at": chat.updated_at.isoformat(),
     "activity_at": chat.activity_at.isoformat() if chat.activity_at else None,
     "pinned_at": chat.pinned_at.isoformat() if chat.pinned_at else None,
+    # Archived chats stay in this list so the drawer can show them (and their
+    # needs-you badges) under Archived; see app.chat_archive.
+    "archived_at": chat.archived_at.isoformat() if chat.archived_at else None,
     "has_messages": bool(chat.has_messages),
     "created_by_app_id": chat.created_by_app_id,
     "project": project_ref,
@@ -707,15 +712,14 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
-  from app.continuations import recovery_reasons_by_run_id
-  recovery_reasons = recovery_reasons_by_run_id(db, chat.id, [
-    message["id"] for message in page
-    if message.get("role") == "assistant" and isinstance(message.get("id"), str)
-  ])
+  from app.continuations import recovery_reasons_by_message_index
+  recovery_reasons = recovery_reasons_by_message_index(
+    db, chat.id, all_msgs, message_start=start, message_end=start + len(page),
+  )
   if recovery_reasons:
     next_page = list(page)
     for relative_index, message in enumerate(page):
-      reason = recovery_reasons.get(message.get("id"))
+      reason = recovery_reasons.get(start + relative_index)
       if message.get("role") != "assistant" or reason is None:
         continue
       next_page[relative_index] = {**message, "continuation_reason": reason}
@@ -834,10 +838,11 @@ def list_chats(
   # a `desc()` on a nullable column would put NULL last under our
   # SQLite collation, but making the boolean explicit is clearer and
   # portable.
-  # Drawer projection only, served entirely by the ``ix_chats_drawer`` covering
-  # index (migration 0067): a column read from the row itself would walk past
-  # the inline transcript. A new projected column needs a new migration that
-  # replaces the index under a new name (IF NOT EXISTS matches names only).
+  # Drawer projection only, served entirely by the ``ix_chats_drawer_v2``
+  # covering index (migration 0077, which replaces 0067's ``ix_chats_drawer``):
+  # a column read from the row itself would walk past the inline transcript.
+  # A new projected column needs a new migration that replaces the index
+  # under a new name (IF NOT EXISTS matches names only).
   # ``has_messages`` is maintained with the transcript by the Chat model and the two writer bulk-update paths, so this hot query
   # never reads or decodes the potentially large ``messages`` JSON column.
   # Recents now INCLUDES project chats, each carrying its project so the drawer
@@ -854,6 +859,7 @@ def list_chats(
     models.Chat.updated_at,
     models.Chat.activity_at,
     models.Chat.pinned_at,
+    models.Chat.archived_at,
     models.Chat.created_by_app_id,
     # App-created owner-visible chats carry their visibility bit here. Owner
     # chats normally keep this NULL, so this remains a tiny projection rather
@@ -1598,8 +1604,24 @@ async def patch_chat(
         superseded = drawer_pins.intent_is_superseded(
           body.pin_intent_client, body.pin_intent_version,
         )
-        if not superseded:
-          chat.pinned_at = now_naive_utc() if body.pinned else None
+        if not superseded and body.pinned:
+          # Pinning keeps a chat in view; archiving files it away and clears
+          # the pin (app.chat_archive). One conditional UPDATE decides both,
+          # so a stale client cannot pin a chat archived meanwhile.
+          pinned = db.query(models.Chat).filter(
+            models.Chat.id == chat.id,
+            models.Chat.archived_at.is_(None),
+          ).update(
+            {models.Chat.pinned_at: now_naive_utc()},
+            synchronize_session="fetch",
+          )
+          if not pinned:
+            db.rollback()
+            raise HTTPException(
+              status_code=409, detail="Restore this chat before pinning it.",
+            )
+        elif not superseded:
+          chat.pinned_at = None
         db.commit()
         if not superseded:
           drawer_pins.record_committed_intent(
@@ -1677,6 +1699,30 @@ async def patch_chat(
         provider=chat.provider or "claude",
       ),
     }
+
+
+@router.post("/{chat_id}/archive", dependencies=[Depends(reject_cross_site)])
+def archive_owner_chat(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """File a chat under Archived without stopping or deleting anything."""
+  chat = get_active_chat_or_404(db, chat_id)
+  chat_archive.archive_chat(db, chat)
+  return {"archived_at": chat.archived_at, "pinned_at": chat.pinned_at}
+
+
+@router.post("/{chat_id}/unarchive", dependencies=[Depends(reject_cross_site)])
+def unarchive_owner_chat(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Return an archived chat to Recents at its existing activity position."""
+  chat = get_active_chat_or_404(db, chat_id)
+  chat_archive.unarchive_chat(db, chat)
+  return {"archived_at": chat.archived_at, "pinned_at": chat.pinned_at}
 
 
 @router.get("/{chat_id}")
@@ -2194,15 +2240,7 @@ def get_chat_agent_context(
   compaction_brief = _latest_compaction_brief(chat)
   chat_summary = load_cumulative_summary(data_dir, chat_id)
   chat_summary_metadata = memory.load_chat_summary_metadata(data_dir, chat_id)
-  ordered_chat_ids = [
-    row[0]
-    for row in db.query(models.Chat.id).filter(
-      models.Chat.deleted_at.is_(None),
-    ).order_by(
-      func.coalesce(models.Chat.activity_at, models.Chat.updated_at).desc(),
-      models.Chat.id.desc(),
-    ).all()
-  ]
+  ordered_chat_ids = recent_chat_digest_order(db)
   recent_chat_block = memory.build_memory_block(
     data_dir,
     ordered_chat_ids=ordered_chat_ids,

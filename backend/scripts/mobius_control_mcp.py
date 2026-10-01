@@ -104,7 +104,6 @@ DELEGATED_TOOLS = (
 CALLER_ENV_FILE_ENV = "MOBIUS_CALLER_ENV_FILE"
 HELPER_HOST_ENV = "MOBIUS_HELPER_HOST"
 CALLER_ENV_ARGUMENT = "_mobius_caller_env_file"
-DEFAULT_SUBAGENTS_HELPER = "/data/apps/subagents/subagents.py"
 PROMOTE_GOAL_DESCRIPTION = (
   "Promote this top-level owner turn into a durable Goal when a delegated, "
   "observable outcome needs several stages, turns, or restart safety. Not for "
@@ -378,9 +377,16 @@ def _initialize_result(params: Any) -> dict[str, Any]:
   tools = _available_tool_names()
   instructions = (
     "Run-bound Möbius controls, plus tools from installed apps (named "
-    "<app>_<tool>). Delegate to helper agents with spawn_agent (any connected "
-    "provider or model); their results arrive in this chat automatically."
+    "<app>_<tool>)."
   )
+  if SPAWN_AGENT_TOOL in tools:
+    instructions += (
+      " Delegate to helper agents with spawn_agent (any connected provider "
+      "or model), then message_agent, stop_agent, or list_agents. Read the "
+      "delegation skill before delegating. Helpers keep working after your "
+      "turn ends; their results arrive in this chat automatically, so never "
+      "poll for them."
+    )
   if any(name in PEER_TOOLS for name in tools):
     instructions += (
       " Use this server's peer tools to discover and message agents in other "
@@ -743,27 +749,73 @@ class _CallerEnv:
         os.environ[name] = value
 
 
-_SUBAGENTS_APP: dict[str, Any] = {}
+_RETIRED_MODELS = {
+  "claude-opus-4-5-20251001": "claude-opus-4-5-20251101",
+  "claude-sonnet-4-5-20251001": "claude-sonnet-4-5-20250929",
+  "claude-opus-4-6-20251015": "claude-opus-4-6",
+  "claude-opus-4-7-20251215": "claude-opus-4-7",
+  "claude-sonnet-4-7-20251215": "claude-sonnet-4-6",
+}
 
 
-def _subagents_app() -> ModuleType:
-  """The Subagents app owns provider switches, defaults, and model names."""
-  path = os.environ.get("MOBIUS_SUBAGENT_HELPER") or DEFAULT_SUBAGENTS_HELPER
-  if not Path(path).is_file():
+def _helper_selection(arguments: dict[str, Any]) -> tuple[str, str | None, str | None]:
+  """Resolve one helper from this turn, optional owner prefs, and live registry."""
+  capability = _agent_api_call("GET", "/api/delegations/capabilities")
+  provider = arguments.get("provider") or os.environ.get("MOBIUS_AGENT_PROVIDER")
+  if not isinstance(provider, str) or not provider:
+    raise RuntimeError("Calling agent provider is unavailable; choose a provider explicitly.")
+  connections = capability.get("connections") or {}
+  if provider not in connections:
+    raise ValueError(f"Unknown helper provider {provider!r}.")
+  connection = connections[provider]
+  if not isinstance(connection, dict) or not connection.get("configured"):
+    raise RuntimeError(f"{provider.title()} is not connected.")
+  config = capability.get("config") or {}
+  prefs = config.get("providers") if isinstance(config, dict) else None
+  pref = prefs.get(provider, {}) if isinstance(prefs, dict) else {}
+  if not isinstance(pref, dict):
+    pref = {}
+  # An explicit provider is an intentional one-off override of a pause.
+  paused = pref.get("enabled") is False if isinstance(prefs, dict) else (
+    provider == "codex" and bool(config) and config.get("enabled") is False
+  )
+  if paused and not arguments.get("provider"):
     raise RuntimeError(
-      "Helpers need the Subagents app, which is not installed."
+      f"{provider.title()} helpers are paused in the Subagents app; pass "
+      "a provider explicitly if the owner asked for it."
     )
-  stamp = (path, Path(path).stat().st_mtime_ns)
-  cached = _SUBAGENTS_APP.get("module")
-  if cached is not None and _SUBAGENTS_APP.get("stamp") == stamp:
-    return cached
-  spec = importlib.util.spec_from_file_location("mobius_subagents_app", path)
-  if spec is None or spec.loader is None:
-    raise RuntimeError("The Subagents app helper could not be loaded.")
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-  _SUBAGENTS_APP.update(module=module, stamp=stamp)
-  return module
+  same_provider = provider == os.environ.get("MOBIUS_AGENT_PROVIDER")
+  legacy_model = config.get("default") if provider == "codex" and not isinstance(prefs, dict) else None
+  wanted = (
+    arguments.get("model") or pref.get("default_model") or legacy_model
+    or (os.environ.get("MOBIUS_AGENT_MODEL") if same_provider else None)
+    or (capability.get("defaults") or {}).get(provider)
+  )
+  if isinstance(wanted, str):
+    wanted = _RETIRED_MODELS.get(wanted, wanted)
+  models = (capability.get("models") or {}).get(provider) or []
+  aliases = (capability.get("aliases") or {}).get(provider) or {}
+  if wanted:
+    key = str(wanted).strip().lower()
+    exact = [row.get("id") for row in models if str(row.get("id", "")).lower() == key]
+    matches = exact or [
+      row.get("id") for row in models
+      if any(key == str(value).strip().lower() for value in (
+        row.get("name"), *(aliases.get(row.get("id"), []) or [])
+      ) if value)
+    ]
+    if len(matches) == 1:
+      wanted = matches[0]
+    elif len(matches) > 1:
+      raise ValueError(f"Model {wanted!r} is ambiguous: {', '.join(matches)}.")
+    elif models:
+      available = ", ".join(str(row.get("id")) for row in models if row.get("id"))
+      raise ValueError(f"Model {wanted!r} is not in the current {provider} registry. Available: {available}.")
+  effort = (
+    arguments.get("effort") or pref.get("default_effort")
+    or (os.environ.get("MOBIUS_AGENT_EFFORT") if same_provider else None)
+  )
+  return provider, wanted, effort
 
 
 def _this_chat() -> str:
@@ -797,7 +849,6 @@ def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]
     "helper_id": row.get("id"),
     "provider": row.get("provider"),
     "model": row.get("model"),
-    "access": row.get("scope"),
     "status": row.get("status"),
   }
   if result and row.get("result"):
@@ -806,60 +857,40 @@ def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]
 
 
 def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
-  allowed = {"name", "task", "access", "provider", "model", "effort", "cwd"}
+  if "access" in arguments:
+    raise ValueError(
+      "spawn_agent no longer takes access; state any read-only constraint "
+      "in the bounded task instead"
+    )
+  allowed = {"name", "task", "provider", "model", "effort", "cwd", "plan_task"}
   if not set(arguments).issubset(allowed):
     raise ValueError("spawn_agent received unknown arguments")
   name, task = arguments.get("name"), arguments.get("task")
-  access = arguments.get("access")
   if not isinstance(name, str) or not name.strip():
     raise ValueError("name is required")
   if not isinstance(task, str) or not task.strip():
     raise ValueError("task is required")
-  if access not in ("read", "write"):
-    raise ValueError("access must be read or write")
-  app = _subagents_app()
-  try:
-    snapshot = app.snapshot()
-  except Exception as exc:
-    raise RuntimeError(f"Subagents settings are unavailable: {exc}") from exc
-  explicit = isinstance(arguments.get("provider"), str)
-  provider = (
-    arguments.get("provider")
-    or os.environ.get("MOBIUS_AGENT_PROVIDER")
-    or "claude"
-  )
-  model = arguments.get("model")
-  effort = arguments.get("effort")
-  states = snapshot.get("providers") or {}
-  if provider in states:
-    state = states[provider]
-    if not state.get("connected"):
-      raise RuntimeError(f"{provider.title()} is not connected.")
-    if not state.get("enabled") and not explicit:
-      raise RuntimeError(
-        f"{provider.title()} helpers are paused in the Subagents app; pass "
-        "another provider, or this one explicitly if the owner asked for it."
-      )
-    try:
-      model = app._resolve_model(provider, model, state)
-    except Exception as exc:
-      raise ValueError(str(exc)) from exc
-    effort = effort or state.get("default_effort")
-  elif provider != "mobius":
-    raise ValueError(f"Unknown helper provider {provider!r}.")
+  plan_task = arguments.get("plan_task")
+  if "plan_task" in arguments and (
+    not isinstance(plan_task, str) or not 1 <= len(plan_task.strip()) <= 128
+  ):
+    raise ValueError("plan_task must be a Goal task id of 1-128 characters")
+  provider, model, effort = _helper_selection(arguments)
   body = {
-    "app_id": snapshot.get("app_id"),
+    "app_id": None,
     "parent_chat_id": _this_chat(),
     "task_key": name.strip(),
     "prompt": task.strip(),
     "provider": provider,
     "model": model,
     "effort": effort,
-    "scope": access,
+    "scope": "write",
     "notify_parent_on_complete": True,
   }
   if isinstance(arguments.get("cwd"), str) and arguments["cwd"].strip():
     body["cwd"] = arguments["cwd"].strip()
+  if plan_task is not None:
+    body["plan_task"] = plan_task.strip()
   row = _agent_api_call("POST", "/api/delegations", body)
   view = _helper_view(row)
   view["note"] = (
@@ -1072,7 +1103,7 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
   if done.returncode != 0 or not lines:
     output = (done.stderr or done.stdout).strip()
     if "Permission denied" in output:
-      # A read-only sandbox (for example an access=read helper) also confines
+      # A read-only sandbox also confines
       # this server, and a capture must write its image and browser profile.
       raise RuntimeError(
         "screenshot needs write access: it saves the image and a browser "
@@ -1120,14 +1151,15 @@ _TOOL_DEFINITIONS = {
     "description": (
       "Start one helper agent in the background on a bounded task and return "
       "at once. For parallel work, start several in the same step. A helper "
-      "can run on any connected provider and model (defaults come from the "
-      "Subagents app) and has the same tools you do, but it does not see this "
+      "can run on any connected provider and model (defaults come from this "
+      "calling turn, unless owner-configured preferences override) and has "
+      "the same tools you do, but it does not see this "
       "conversation: write a self-contained task with the files, constraints, "
       "and what done looks like. Its result arrives in this chat by itself, "
       "during a live Codex turn when safe or after the turn settles; Claude "
       "is not interrupted just for a helper result. Stop leaves it owed for "
       "the next owner turn; never poll. "
-      "access=read forbids file changes."
+      "The task instructions define its work; owner and public-action safeguards still apply."
     ),
     "inputSchema": {
       "type": "object",
@@ -1138,16 +1170,17 @@ _TOOL_DEFINITIONS = {
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
         },
         "task": {"type": "string", "minLength": 1, "maxLength": 200000},
-        "access": {"type": "string", "enum": ["read", "write"]},
         "provider": {
           "type": "string", "enum": ["claude", "codex", "mobius"],
           "description": "Omit to use this chat's provider.",
         },
-        "model": {"type": "string", "description": "Model id or alias; omit for the default."},
-        "effort": {"type": "string", "description": "Reasoning effort; omit for the default."},
+        "model": {"type": "string", "description": "Exact live model id or supported alias. Omit for this turn's model or an explicit owner preference."},
+        "effort": {"type": "string", "description": "Reasoning effort; omit for this turn's effort or an explicit owner preference."},
         "cwd": {"type": "string", "description": "Working directory under /data; omit for /data."},
+        "plan_task": {"type": "string", "minLength": 1, "maxLength": 128,
+                      "description": "Optional Goal task id to file this helper under."},
       },
-      "required": ["name", "task", "access"],
+      "required": ["name", "task"],
       "additionalProperties": False,
     },
   },

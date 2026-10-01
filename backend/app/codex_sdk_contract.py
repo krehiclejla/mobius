@@ -35,6 +35,24 @@ def app_server_pid(codex: Any) -> int | None:
   return pid if isinstance(pid, int) and pid > 1 else None
 
 
+def app_server_exit_code(codex: Any) -> int | None:
+  """Read the app-server outcome before SDK close clears/reaps its process.
+
+  poll() is nonblocking. A live or unavailable process has no exit evidence;
+  callers must not substitute a PID, exception wording, or teardown's status.
+  """
+  client = getattr(codex, "_client", None)
+  sync_client = getattr(client, "_sync", None)
+  process = getattr(sync_client, "_proc", None)
+  if process is None:
+    return None
+  try:
+    code = process.poll()
+  except (AttributeError, OSError):
+    return None
+  return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
 def install_approval_handler(
   codex: Any,
   handler: Callable[[str, dict | None], dict],

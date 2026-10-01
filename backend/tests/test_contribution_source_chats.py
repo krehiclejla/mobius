@@ -88,7 +88,7 @@ def test_complete_sidecar_headers_own_membership_not_diff_body(client, db, setup
 def delegation(db, child, parent, **extra):
   row = models.Delegation(id=f"delegation-{child}", app_id=80, parent_chat_id=parent,
     child_chat_id=child, parent_root_run_id="parent-run", task_key=child,
-    provider="codex", model="test", scope="read", cwd="/data",
+    provider="codex", model="test", scope="write", cwd="/data",
     prompt_sha256="a" * 64, startup_prompt="Test task",
     **extra)
   db.add(row); db.commit()

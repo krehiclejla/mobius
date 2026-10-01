@@ -17,7 +17,6 @@ from sqlalchemy import create_engine, inspect, text
 from starlette.requests import Request
 
 from app import connect_outbound, connect_runner, models
-from app.connect_runner import _run_command
 from app.database import SessionLocal
 from app.manifest_contract import ManifestContractError, validate_manifest_contract
 from app.routes import connect as connect_routes
@@ -1295,6 +1294,7 @@ async def test_current_stream_rotates_without_losing_running_command(
     "query_string": (
       f"protocol=4&release={connect_runner.RUNNER_RELEASE}"
       f"&platform=TestOS%201&capability=parallel&capability=live_output"
+      f"&capability=command_file&capability=inventory_body"
       f"&active_request_id={request_id}"
     ).encode(),
     "headers": [
@@ -1511,7 +1511,7 @@ async def test_persisted_running_command_accepts_result_after_runtime_restart(
     outcome="completed",
   ))
   assert connect_routes._host_commands(pairing["id"]) == {}
-  last = connect_routes._load_host(pairing["id"])["recent_commands"][request_id]
+  last = connect_routes.connect_output.finished(pairing["id"], request_id)
   assert last["result"]["stdout"] == "finished after restart"
   monkeypatch.setattr(
     connect_routes,
@@ -1520,6 +1520,7 @@ async def test_persisted_running_command_accepts_result_after_runtime_restart(
   )
   connect_routes._prune_recent_commands(connect_routes._load_host(pairing["id"]))
   assert connect_routes._load_host(pairing["id"])["recent_commands"] == {}
+  assert connect_routes.connect_output.finished(pairing["id"], request_id) == last
 
 
 @pytest.mark.asyncio
@@ -1613,14 +1614,13 @@ async def test_busy_host_rejects_work_instead_of_queueing_it(client, auth):
   ))
   await asyncio.wait_for(channel.queue.get(), timeout=1)
 
-  with pytest.raises(connect_routes.HTTPException) as blocked:
-    await connect_routes.exec_on_host(
-      pairing["id"],
-      connect_routes.ExecBody(cmd="must not queue", request_id="d" * 16),
-      _owner=object(),
-    )
-  assert blocked.value.status_code == 409
-  assert "busy" in blocked.value.detail
+  blocked = await connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="must not queue", request_id="d" * 16),
+    _owner=object(),
+  )
+  assert blocked.status_code == 409
+  assert b"busy" in blocked.body and b"host_busy" in blocked.body
   assert channel.queue.empty()
   assert connect_routes._public_host(
     connect_routes._load_host(pairing["id"]),
@@ -1705,9 +1705,9 @@ async def test_current_runner_keeps_retryable_result_after_server_timeout(
     outcome="timed_out",
   ))
   assert connect_routes._host_commands(pairing["id"]) == {}
-  assert connect_routes._load_host(
-    pairing["id"],
-  )["recent_commands"][request_id]["result"]["outcome"] == "timed_out"
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "timed_out"
 
 
 @pytest.mark.asyncio
@@ -1731,25 +1731,25 @@ async def test_unacknowledged_dispatch_expires_and_sends_cancel(
   # requiring it to still be in the future when the observer is scheduled.
   assert dispatched["not_after"] > dispatch_requested_at
 
-  with pytest.raises(connect_routes.HTTPException) as raised:
-    await request
-  assert raised.value.status_code == 504
-  assert "did not start" in raised.value.detail
+  raised = await request
+  assert raised.status_code == 504
+  assert b"did not start" in raised.body
+  assert b"command_expired" in raised.body
   assert await asyncio.wait_for(channel.queue.get(), timeout=1) == {
     "type": "cancel", "request_id": request_id,
   }
   assert connect_routes._host_commands(pairing["id"]) == {}
-  assert connect_routes._load_host(
-    pairing["id"],
-  )["recent_commands"][request_id]["result"]["outcome"] == "expired"
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "expired"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")
-def test_runner_timeout_terminates_the_entire_command_tree(tmp_path: Path):
+def test_runner_timeout_terminates_the_entire_command_tree(tmp_path: Path, monkeypatch):
   """A timed-out command must not leave descendants running on the machine."""
   marker = tmp_path / "descendant-finished"
   descendant = (
-    "import pathlib,time; time.sleep(0.5); "
+    "import pathlib,time; time.sleep(1.5); "
     f"pathlib.Path({str(marker)!r}).touch()"
   )
   launcher = (
@@ -1761,23 +1761,43 @@ def test_runner_timeout_terminates_the_entire_command_tree(tmp_path: Path):
   # status would mistake a still-running command tree for completed work.
   cmd = f"{shlex.quote(sys.executable)} -c {shlex.quote(launcher)}"
 
-  stdout, stderr, exit_code, timed_out = _run_command(cmd, None, 0.05)
+  result = _run_command_through_runner(cmd, monkeypatch, timeout=1)
 
-  assert stdout == ""
-  assert "timed out" in stderr
-  assert exit_code == 124
-  assert timed_out is True
+  assert result["stdout"] == ""
+  assert "timed out" in result["stderr"]
+  assert result["exit_code"] == 124
+  assert result["timed_out"] is True
   time.sleep(0.6)
   assert not marker.exists()
 
 
-def test_runner_does_not_mislabel_command_exit_124_as_timeout():
-  stdout, stderr, exit_code, timed_out = _run_command("exit 124", None, 1)
+def _run_command_through_runner(cmd, monkeypatch, *, timeout):
+  finished = threading.Event()
+  results = []
 
-  assert stdout == ""
-  assert stderr == ""
-  assert exit_code == 124
-  assert timed_out is False
+  def post(url, payload, **_kwargs):
+    if url.endswith("/result"):
+      results.append(payload)
+      finished.set()
+    return {"ok": True}
+
+  monkeypatch.setattr(connect_runner, "_post", post)
+  runner = connect_runner._CommandRunner("https://example.test", "token")
+  runner.start({
+    "request_id": "runner-test-command", "cmd": cmd,
+    "timeout": timeout, "not_after": time.time() + 5,
+  })
+  assert finished.wait(10), "runner did not report a final result"
+  return results[0]
+
+
+def test_runner_does_not_mislabel_command_exit_124_as_timeout(monkeypatch):
+  result = _run_command_through_runner("exit 124", monkeypatch, timeout=1)
+
+  assert result["stdout"] == ""
+  assert result["stderr"] == ""
+  assert result["exit_code"] == 124
+  assert result["timed_out"] is False
 
 
 def test_runner_uses_standard_urllib_for_protocol_four_stream(monkeypatch):
@@ -1997,14 +2017,16 @@ def test_runner_refuses_expired_command_without_spawning(
     connect_runner, "_spawn_command",
     lambda *args, **kwargs: pytest.fail("expired command was spawned"),
   )
-  monkeypatch.setattr(
-    connect_runner,
-    "_post",
-    lambda *_args, **_kwargs: (_ for _ in ()).throw(
-      urllib.error.URLError("offline"),
-    ),
-  )
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
+  monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
+  reported = threading.Event()
+  original_post_result = runner._post_result
+
+  def post_result(*args, **kwargs):
+    original_post_result(*args, **kwargs)
+    reported.set()
+
+  monkeypatch.setattr(runner, "_post_result", post_result)
 
   runner.start({
     "request_id": "1" * 16,
@@ -2012,6 +2034,7 @@ def test_runner_refuses_expired_command_without_spawning(
     "timeout": 30,
     "not_after": time.time() - 1,
   })
+  assert reported.wait(2)
 
   messages = list(runner.outbox)
   assert messages[-1]["outcome"] == "expired"
@@ -2021,24 +2044,34 @@ def test_runner_refuses_expired_command_without_spawning(
 
 def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
   attempts = []
+  first_attempt = threading.Event()
+  second_attempt = threading.Event()
 
   def post(_url, payload, token=None):
     attempts.append((payload, token))
     if len(attempts) == 1:
+      first_attempt.set()
       raise urllib.error.URLError("rotating")
+    second_attempt.set()
     return {"ok": True}
 
   monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
   request_id = "4" * 16
   runner._post_result(request_id, "ready", "", 0, "completed")
+  assert first_attempt.wait(2)
+  with runner.flush_lock:
+    pass
 
   active_ids, pending_ids = runner.snapshot()
   assert active_ids == []
   assert pending_ids == [request_id]
   assert len(runner.pending_messages()) == 1
 
-  assert runner.flush_pending_results() is True
+  runner._wake_result_worker()
+  assert second_attempt.wait(2)
+  with runner.flush_lock:
+    pass
   assert runner.pending_messages() == []
   assert len(attempts) == 2
 
@@ -2052,7 +2085,7 @@ def test_runner_finishes_into_pending_result_atomically(monkeypatch):
     "timeout": 30,
   }
   runner.active[record["request_id"]] = record
-  monkeypatch.setattr(runner, "flush_pending_results", lambda: False)
+  monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
 
   runner._post_result(
     record["request_id"], "done", "", 0, "completed", record=record,
@@ -2066,13 +2099,24 @@ def test_runner_finishes_into_pending_result_atomically(monkeypatch):
 def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
   runner = connect_runner._CommandRunner("https://example.test", "token")
   spawned = []
+  ack_started = threading.Event()
+  release_ack = threading.Event()
+  spawned_event = threading.Event()
+  def spawn(cmd, cwd, *, before_spawn):
+    before_spawn()
+    spawned.append((cmd, cwd))
+    spawned_event.set()
+    return object()
   monkeypatch.setattr(
     connect_runner,
     "_spawn_command",
-    lambda cmd, cwd: spawned.append((cmd, cwd)) or object(),
+    spawn,
   )
-  monkeypatch.setattr(runner, "_post_started", lambda _request_id: None)
-  monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+  def post_started(_request_id):
+    ack_started.set()
+    assert release_ack.wait(2)
+  monkeypatch.setattr(runner, "_post_started", post_started)
+  monkeypatch.setattr(runner, "_wait", lambda _record: None)
   event = {
     "request_id": "b" * 16,
     "cmd": "do it once",
@@ -2082,23 +2126,34 @@ def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
   }
 
   runner.start(event)
+  assert ack_started.wait(2)
   runner.start(event)
+  release_ack.set()
+  assert spawned_event.wait(2)
 
   assert spawned == [("do it once", None)]
   assert list(runner.active) == [event["request_id"]]
   assert runner.pending_messages() == []
+  runner.active[event["request_id"]]["output"].close()
 
 
 def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
   runner = connect_runner._CommandRunner("https://a.test", "ta")
   spawned = []
+  both_spawned = threading.Event()
+  def spawn(cmd, cwd, *, before_spawn):
+    before_spawn()
+    spawned.append((cmd, cwd))
+    if len(spawned) == 2:
+      both_spawned.set()
+    return object()
   monkeypatch.setattr(
     connect_runner,
     "_spawn_command",
-    lambda cmd, cwd: spawned.append((cmd, cwd)) or object(),
+    spawn,
   )
   monkeypatch.setattr(runner, "_post_started", lambda _request_id: None)
-  monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+  monkeypatch.setattr(runner, "_wait", lambda _record: None)
 
   for request_id, cmd in (("1" * 16, "first"), ("2" * 16, "second")):
     runner.start({
@@ -2107,9 +2162,10 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
       "timeout": 30,
       "not_after": time.time() + 10,
     })
+  assert both_spawned.wait(2)
 
   # Both start at once; neither waits behind the other.
-  assert spawned == [("first", None), ("second", None)]
+  assert sorted(spawned) == [("first", None), ("second", None)]
   assert runner.snapshot() == (["1" * 16, "2" * 16], [])
   assert runner.pending_messages() == []
 
@@ -2121,20 +2177,25 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
   assert runner.cancel("1" * 16) is True
   assert first["reason"] == "canceled"
   assert runner.active["2" * 16]["reason"] is None
+  for record in runner.active.values():
+    record["output"].close()
 
 
 def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
   runner = connect_runner._CommandRunner("https://example.test", "token")
   spawned = []
+  spawned_event = threading.Event()
   script = "for value in '$literal' one; do printf '%s\\n' \"$value\"; done\n"
 
-  def spawn(cmd, cwd, *, script=None, shell=None):
+  def spawn(cmd, cwd, *, script=None, shell=None, before_spawn):
+    before_spawn()
     spawned.append((cmd, cwd, script, shell))
+    spawned_event.set()
     return object()
 
   monkeypatch.setattr(connect_runner, "_spawn_command", spawn)
   monkeypatch.setattr(runner, "_post_started", lambda _request_id: None)
-  monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+  monkeypatch.setattr(runner, "_wait", lambda _record: None)
 
   runner.start({
     "request_id": "e" * 16,
@@ -2144,9 +2205,11 @@ def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
     "timeout": 30,
     "not_after": time.time() + 10,
   })
+  assert spawned_event.wait(2)
 
   assert spawned == [(None, "/srv/app", script, "bash")]
   assert runner.active["e" * 16]["input"] == script
+  runner.active["e" * 16]["output"].close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell contract")
@@ -2190,24 +2253,21 @@ def test_windows_literal_script_stdin_is_unicode_safe_ascii():
 
 
 def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
-  clock = iter((100.0, 102.0))
+  clock = iter((100.0, 100.0, 102.0))
   # Replace this module's clock reference rather than mutating the process-wide
   # time module that pytest and database teardown also use.
   monkeypatch.setattr(
     connect_runner, "time", SimpleNamespace(time=lambda: next(clock)),
   )
   monkeypatch.setattr(
-    connect_runner, "_spawn_command",
+    connect_runner.subprocess, "Popen",
     lambda *args, **kwargs: pytest.fail("late command was spawned"),
   )
 
-  def post(url, _payload, token=None):
-    if url.endswith("/result"):
-      raise urllib.error.URLError("offline")
-    return {"ok": True}
-
-  monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
+  reported = threading.Event()
+  monkeypatch.setattr(runner, "_post_started", lambda _id: None)
+  monkeypatch.setattr(runner, "_wake_result_worker", reported.set)
 
   runner.start({
     "request_id": "3" * 16,
@@ -2215,6 +2275,7 @@ def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
     "timeout": 30,
     "not_after": 101.0,
   })
+  assert reported.wait(2)
 
   messages = list(runner.outbox)
   assert [message["type"] for message in messages] == ["result"]
@@ -2224,13 +2285,18 @@ def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cancellation timing")
 def test_runner_cancel_stops_process_tree_and_reports_once(monkeypatch):
-  def post(url, _payload, token=None):
-    if url.endswith("/result"):
-      raise urllib.error.URLError("offline")
-    return {"ok": True}
-
-  monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
+  process_started = threading.Event()
+  reported = threading.Event()
+  supervise = connect_runner._supervise_process
+
+  def process_ready(*args, **kwargs):
+    process_started.set()
+    return supervise(*args, **kwargs)
+
+  monkeypatch.setattr(connect_runner, "_supervise_process", process_ready)
+  monkeypatch.setattr(runner, "_post_started", lambda _id: None)
+  monkeypatch.setattr(runner, "_wake_result_worker", reported.set)
   request_id = "2" * 16
   started = time.monotonic()
   runner.start({
@@ -2239,15 +2305,10 @@ def test_runner_cancel_stops_process_tree_and_reports_once(monkeypatch):
     "timeout": 30,
     "not_after": time.time() + 5,
   })
-
+  assert process_started.wait(2)
   assert runner.cancel(request_id) is True
-  deadline = time.monotonic() + 3
-  results = []
-  while time.monotonic() < deadline:
-    results = [message for message in runner.outbox if message["type"] == "result"]
-    if results:
-      break
-    time.sleep(0.025)
+  assert reported.wait(2)
+  results = runner.pending_messages()
 
   assert len(results) == 1
   assert results[0]["outcome"] == "canceled"

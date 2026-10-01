@@ -183,6 +183,71 @@ test('a later continuation does not erase an unrelated historical pause', () => 
   assert.equal(supersedeResumedPauseBlocks(pauseOnly), pauseOnly)
 })
 
+const restartPause = () => ({
+  role: 'assistant', id: 'paused-answer',
+  blocks: [
+    { type: 'text', content: 'Saved progress.' },
+    { type: 'error', resumable: true, pause: { kind: 'restart' } },
+  ],
+})
+const liveSuccessor = {
+  running: true,
+  activeAssistantMessageId: 'resumed-answer',
+  streamAssistantMessageId: 'resumed-answer',
+}
+
+test('confirmed live successor retires the pause before its transcript row is hydrated', () => {
+  const pause = restartPause()
+  const hidden = { role: 'user', hidden: true, content: 'continue' }
+  const messages = [pause, hidden]
+  const displayed = supersedeResumedPauseBlocks(messages, liveSuccessor)
+  assert.deepEqual(displayed[0].blocks, [pause.blocks[0]])
+  assert.equal(displayed[1], hidden)
+  assert.equal(displayed.length, messages.length, 'live output is not inserted into the durable transcript')
+  assert.equal(messages[0], pause)
+  assert.equal(messages[0].blocks.length, 2, 'saved recovery history is never rewritten')
+})
+
+test('a live successor hides a pause-only anchor without hiding its following output', () => {
+  const pause = restartPause()
+  pause.blocks = [pause.blocks.at(-1)]
+  const displayed = supersedeResumedPauseBlocks([pause], liveSuccessor)
+  assert.equal(displayed[0].hidden, true)
+  assert.deepEqual(displayed[0].blocks, [])
+})
+
+test('live recovery supersession requires a running server and matching stream identity', () => {
+  const messages = [restartPause()]
+  for (const runtime of [
+    {},
+    { ...liveSuccessor, running: false },
+    { ...liveSuccessor, activeAssistantMessageId: null },
+    { ...liveSuccessor, streamAssistantMessageId: null },
+    { ...liveSuccessor, streamAssistantMessageId: 'older-answer' },
+    { ...liveSuccessor, activeAssistantMessageId: 'paused-answer', streamAssistantMessageId: 'paused-answer' },
+  ]) {
+    assert.equal(supersedeResumedPauseBlocks(messages, runtime), messages,
+      'offline, optimistic or replayed ownership cannot consume a current pause')
+  }
+})
+
+test('live recovery supersession preserves owner boundaries, questions and newer parked answers', () => {
+  const pause = restartPause()
+  const cases = [
+    [{ ...pause, id: undefined }],
+    [pause, { role: 'user', content: 'Separate owner request.' }],
+    [{ ...pause, blocks: [
+      { type: 'question', question_id: 'waiting-question', questions: [], answers: null },
+      ...pause.blocks,
+    ] }],
+    [{ role: 'assistant', id: liveSuccessor.activeAssistantMessageId, content: 'Earlier reply.' }, pause],
+    [{ ...pause, blocks: [{ type: 'error', resumable: false, message: 'Not recoverable.' }] }],
+  ]
+  for (const messages of cases) {
+    assert.equal(supersedeResumedPauseBlocks(messages, liveSuccessor), messages)
+  }
+})
+
 test('the initial pageshow cannot retire a fast first-send pin', () => {
   assert.equal(shouldFreezeStreamingReturn({
     eventType: 'pageshow',

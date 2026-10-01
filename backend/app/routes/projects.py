@@ -411,6 +411,7 @@ def _project_chat_response(chat: models.Chat) -> dict[str, Any]:
     "created_at": chat.created_at,
     "updated_at": chat.updated_at,
     "activity_at": chat.activity_at,
+    "archived_at": chat.archived_at,
   }
 
 

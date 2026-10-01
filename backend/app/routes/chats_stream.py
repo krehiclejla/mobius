@@ -13,7 +13,7 @@ from starlette.background import BackgroundTask
 from starlette.responses import Response
 from sqlalchemy.orm import Session
 
-from app import activity, models, questions, schemas
+from app import activity, chat_archive, models, questions, schemas
 from app.broadcast import create_broadcast, get_broadcast, get_system_broadcast
 from app.chat_event_sink import active_sink_stream_snapshot
 from app.chat import (
@@ -286,6 +286,7 @@ async def _append_to_pending(
   *, initiated_by_app_id: int | None = None,
   front: bool = False,
   require_answer_match: bool = False,
+  restore_archived: bool = False,
 ) -> dict:
   """Queue a message via the actor's AppendPending; return the stored dict.
 
@@ -311,6 +312,7 @@ async def _append_to_pending(
       selected_options=body.selected_options, question_id=body.question_id,
       initiated_by_app_id=initiated_by_app_id,
       front=front, require_answer_match=require_answer_match,
+      restore_archived=restore_archived,
     ),
   )
   return result["stored"]
@@ -319,6 +321,7 @@ async def _append_to_pending(
 async def _append_restart_feedback_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
   *, initiated_by_app_id: int | None = None,
+  restore_archived: bool = False,
 ) -> dict:
   """Settle a Restart card and queue its written response as one command."""
   return await _submit_pending_message(
@@ -326,6 +329,7 @@ async def _append_restart_feedback_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       question_id=body.question_id, initiated_by_app_id=initiated_by_app_id,
+      restore_archived=restore_archived,
     ),
   )
 
@@ -646,6 +650,33 @@ async def send_message(
   principal: Principal = Depends(get_chat_view_principal),
   db: Session = Depends(get_db),
 ):
+  # The writer joins restoration to the first accepted owner-input commit.
+  # This route only publishes the committed drawer change on the event loop;
+  # the actor must never touch ChatBroadcast.
+  restore = (
+    principal.scope == "owner" and is_owner_input_principal(principal)
+    and body.continuation != "manual" and not body.force_steer
+  )
+  was_archived = bool(
+    restore and get_active_chat_for_principal(db, chat_id, principal).archived_at
+  )
+  try:
+    return await _send_message_impl(body, chat_id, principal, db, restore)
+  finally:
+    if was_archived:
+      db.rollback()  # See the writer's committed row, including on a later 410.
+      chat = get_active_chat_for_principal(db, chat_id, principal)
+      if chat.archived_at is None:
+        chat_archive.publish_archive_changed(chat)
+
+
+async def _send_message_impl(
+  body: schemas.SendMessage,
+  chat_id: str,
+  principal: Principal,
+  db: Session,
+  restore_archived: bool,
+):
   """Saves the user message, starts the agent as a background task,
   and returns 202 immediately.  The client streams via GET /stream.
 
@@ -709,6 +740,7 @@ async def send_message(
           try:
             append_result = await _append_restart_feedback_to_pending(
               chat, body, db, initiated_by_app_id=principal.app_id,
+              restore_archived=restore_archived,
             )
             stored = append_result["stored"]
             duplicate = append_result.get("duplicate") is True
@@ -824,6 +856,7 @@ async def send_message(
               run_token="",
               question_id=body.question_id or "",
               selected_option_id=selections["restart"][0],
+              restore_archived=restore_archived,
             )
           ))
         except RestartCardStateChanged as exc:
@@ -979,6 +1012,7 @@ async def send_message(
             chat_id=chat_id, question_id=body.question_id,
             answers=body.answers, selected_options=body.selected_options,
             close_without_reply=True,
+            restore_archived=restore_archived,
           )))
       except questions.AnswerConflict as exc:
         raise HTTPException(409, detail=str(exc)) from exc
@@ -1022,6 +1056,7 @@ async def send_message(
         # wake, so neither a second runner nor a polling task is needed.
         stored = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
+          restore_archived=restore_archived,
           front=True, require_answer_match=True,
         )
         from app.chat_event_sink import get_active_sink
@@ -1064,6 +1099,7 @@ async def send_message(
             question_id=(body.question_id or pending.question_id),
             answers=body.answers,
             selected_options=body.selected_options,
+            restore_archived=restore_archived,
           )
         )
         try:
@@ -1156,6 +1192,7 @@ async def send_message(
           body,
           db,
           initiated_by_app_id=principal.app_id,
+          restore_archived=restore_archived,
           front=True,
           require_answer_match=True,
         )
@@ -1224,7 +1261,9 @@ async def send_message(
       # won the transition lock first.
       db.rollback()
       chat = get_active_chat_for_principal(db, chat_id, principal)
-      return await _send_message_locked(body, chat_id, principal, db, chat)
+      return await _send_message_locked(
+        body, chat_id, principal, db, chat, restore_archived,
+      )
 
 
 async def _send_message_locked(
@@ -1233,6 +1272,7 @@ async def _send_message_locked(
   principal: Principal,
   db: Session,
   chat: models.Chat,
+  restore_archived: bool,
 ):
   """Handle a normal send while holding the per-chat transition lock."""
 
@@ -1350,6 +1390,7 @@ async def _send_message_locked(
   if is_draining():
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      restore_archived=restore_archived,
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1361,6 +1402,7 @@ async def _send_message_locked(
   if activation_barrier_wait_id(db, chat_id) is not None:
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      restore_archived=restore_archived,
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1378,6 +1420,7 @@ async def _send_message_locked(
   ):
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      restore_archived=restore_archived,
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1435,6 +1478,7 @@ async def _send_message_locked(
       else:
         reserved = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
+          restore_archived=restore_archived,
         )
         db.expire(chat)
         reserved_cid = cid_of(reserved)
@@ -1485,6 +1529,7 @@ async def _send_message_locked(
 
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      restore_archived=restore_archived,
     )
     started_message = None
 
@@ -1565,6 +1610,7 @@ async def _send_message_locked(
       })
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      restore_archived=restore_archived,
     )
     return _queued_response(new_msg, len(chat.pending_messages))
 
@@ -1612,6 +1658,7 @@ async def _send_message_locked(
         title_source=body.content,
         default_provider=default_provider,
         initiated_by_app_id=principal.app_id,
+        restore_archived=restore_archived,
         resume_run_id=body.resume_run_id,
       )
     )

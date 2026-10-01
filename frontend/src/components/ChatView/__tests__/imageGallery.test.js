@@ -27,6 +27,10 @@ const lightboxCss = readFileSync(
   new URL('../lightbox.css', import.meta.url),
   'utf8',
 )
+const panePortalSource = readFileSync(
+  new URL('../ChatPanePortal.jsx', import.meta.url),
+  'utf8',
+)
 
 const image = (href, text) => ({ type: 'image', href, text })
 const paragraph = (...tokens) => ({
@@ -157,11 +161,29 @@ test('lightbox fills its actual overlay and dismisses from every backdrop edge',
   )
   assert.match(lightboxCss, /max-width:\s*calc\(100% - 32px\)/)
   assert.match(lightboxCss, /max-height:\s*calc\(100% - 32px\)/)
+  assert.match(lightboxCss, /\.lightbox-overlay\s*\{[^}]*position:\s*absolute;/s)
+  assert.match(lightboxSource, /viewportWidth:\s*space\.width/)
+  assert.match(lightboxSource, /viewportHeight:\s*space\.height/)
+  assert.match(gallerySource, /<ChatPanePortal anchorRef=\{railRef\}>/)
   assert.doesNotMatch(
     lightboxCss,
     /\.lightbox-(?:content|image)\s*\{[^}]*(?:100vw|100vh|100dvh)/s,
     'the fixed overlay already owns the correct bounds without a second viewport calculation',
   )
+})
+
+test('chat image viewers mount above only their owning chat pane', () => {
+  assert.match(panePortalSource, /anchorRef\.current\?\.closest\('\.chat'\)/)
+  assert.match(panePortalSource, /createPortal\(children, chat\)/)
+  for (const source of [
+    gallerySource,
+    readFileSync(new URL('../ImagePreviewButton.jsx', import.meta.url), 'utf8'),
+    readFileSync(new URL('../ChatInputBar.jsx', import.meta.url), 'utf8'),
+    readFileSync(new URL('../markdown/InlineContent.jsx', import.meta.url), 'utf8'),
+  ]) {
+    assert.match(source, /<ChatPanePortal anchorRef=/)
+    assert.doesNotMatch(source, /createPortal\([\s\S]*?document\.body/)
+  }
 })
 
 test('zoomed touch pan keeps its gesture snapshot through a queued render', () => {

@@ -51,18 +51,17 @@
    ║      be32e58 after two iterations adding overcomplicated   ║
    ║      multi-layer glows.)                                   ║
    ║                                                            ║
-   ║   7. `.chat__pill--tall` toggles when textarea height > 45 ║
+   ║   7. `data-composer-tall` marks heights above 45px.        ║
    ║      (not 30, not 50). 31 ≈ single line, 55 ≈ two lines,   ║
    ║      45 sits safely between. Earlier 30-threshold fired    ║
    ║      on every keystroke and yanked send/mic to the bottom. ║
    ║      Tall state anchors send/stop/mic to flex-end so the   ║
    ║      action stays near the cursor.                         ║
    ║                                                            ║
-   ║   8. `.chat__pill--with-attach .chat__input-line` always   ║
-   ║      uses align-items: flex-end. When chips are present    ║
-   ║      and the user types multi-line, the cursor must stay   ║
-   ║      pinned at the visible bottom of the pill — pure       ║
-   ║      `--tall` alignment alone missed the chips case.       ║
+   ║   8. Attachments add room above the text row, not a new   ║
+   ║      alignment policy. Single-line text stays centered;    ║
+   ║      The measured tall state bottom-aligns text and its   ║
+   ║      action, with or without attachment chips.             ║
    ║                                                            ║
    ║   9. Attach cards are UNIFORM 96×96 squares (image and     ║
    ║      file alike). Tray uses `align-items: center` so a     ║
@@ -201,6 +200,13 @@
 }
 
 /* ── Empty state ───────────────────────────────────── */
+
+/* A reply is one conversation item; source rows keep their anchors and
+   compact block spacing without cancelling the surrounding conversation gap. */
+.chat__reply-rows { list-style: none; padding: 0; margin: 0; }
+.chat__reply-rows > .chat__msg + .chat__msg:not(:has(> .chat__assistant-copy-surface:empty)) {
+  margin-top: 8px;
+}
 
 .chat__empty {
   display: flex;
@@ -1331,6 +1337,7 @@
      The cap keeps that reading surface inside the disclosure; the transcript
      and its tail reservation never absorb the hidden overflow. */
   overflow-y: auto;
+  overscroll-behavior-y: auto;
   line-height: 1.5;
 }
 
@@ -2268,6 +2275,7 @@
   margin-top: 2px;
   max-height: 360px;
   overflow-y: auto;
+  overscroll-behavior-y: auto;
 }
 
 /* ── Input footer ──────────────────────────────────── */
@@ -2356,6 +2364,7 @@
 .chat__foot .chat__goal-plan,
 .chat__foot .chat__wait-summary,
 .chat__foot .chat__wait-cancel,
+.chat__foot .chat__archived-restore,
 .chat__foot .slash-menu,
 .chat__foot .chat__pill,
 .chat__foot .composer-plus { pointer-events: auto; }
@@ -2460,11 +2469,11 @@
 
 /* Multi-line: pill grows downward and the send/mic anchor to the
    bottom-right so the action stays near the cursor. */
-.chat__pill--tall { align-items: flex-end; }
-.chat__pill--tall .chat__send,
-.chat__pill--tall .chat__stop,
-.chat__pill--tall .chat__steer,
-.chat__pill--tall .chat__mic { align-self: flex-end; }
+[data-composer-tall] { align-items: flex-end; }
+[data-composer-tall] .chat__send,
+[data-composer-tall] .chat__stop,
+[data-composer-tall] .chat__steer,
+[data-composer-tall] .chat__mic { align-self: flex-end; }
 
 /* Focus halo — exact restore of the be32e58 rule that was on the
    old `.chat__form`: a single 3px translucent-accent ring around
@@ -3139,7 +3148,7 @@
 /* Inner row inside the pill containing the textarea + send/mic.
    Default: center-aligned so a single line of text + the mic icon
    read as vertically centered in the pill. When the textarea grows
-   multi-line, `.chat__pill--tall` flips to flex-end so the buttons
+   multi-line, `[data-composer-tall]` flips to flex-end so the buttons
    stay anchored at the bottom-right while the textarea expands up. */
 .chat__input-line {
   flex: 1;
@@ -3148,7 +3157,7 @@
   align-items: center;
   gap: 2px;
 }
-.chat__pill--tall .chat__input-line {
+[data-composer-tall] .chat__input-line {
   align-items: flex-end;
 }
 
@@ -3199,13 +3208,10 @@
     + var(--composer-stack-chrome)
   );
 }
-/* When chips are attached the pill is in column layout and the
-   input-line sits BELOW the chip tray. Anchor send/mic to the
-   bottom of input-line regardless of textarea height so they don't
-   drift upward as the user types multiple lines. */
+/* Keep the text row's alignment independent of the attachment tray;
+   data-composer-tall already anchors multi-line actions at the bottom of the row. */
 .chat__pill--with-attach .chat__input-line {
   min-height: 38px;
-  align-items: flex-end;
 }
 
 /* `align-items: center` keeps the row from stretching a shorter
@@ -3412,6 +3418,19 @@
   max-width: min(85%, 75ch);
 }
 
+.chat__attachments--documents {
+  width: min(100%, 780px);
+  max-width: min(100%, 780px);
+}
+
+.chat__attach-files {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+}
+
 .chat__attach-images {
   display: flex;
   flex-wrap: wrap;
@@ -3528,6 +3547,249 @@
   color: var(--muted); /* CONTRACT: low-contrast text on opaque fill */
   font-size: 11px;
   white-space: nowrap;
+}
+
+.chat__document-card {
+  position: relative;
+  width: min(232px, 100%);
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 13px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.chat__document-card--expanded {
+  width: 100%;
+}
+
+.chat__document-card-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: zoom-in;
+}
+
+.chat__document-card-open:hover .chat__document-card-visual {
+  background: var(--surface-2);
+}
+
+.chat__document-card-open:focus-visible,
+.chat__document-card-download:focus-visible,
+.chat__document-card-actions > :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.chat__document-card-visual {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  height: 154px;
+  overflow: hidden;
+  padding: 12px 15px 0;
+  border-bottom: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--surface-2) 70%, var(--bg));
+}
+
+.chat__document-card-paper,
+.chat__document-card-pdf {
+  width: 100%;
+  min-height: 210px;
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 5px 5px 0 0;
+  background: var(--bg);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, .12);
+}
+
+.chat__document-card-paper {
+  padding: 15px 14px;
+}
+
+.chat__document-card-paper strong {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 15px;
+  line-height: 1.22;
+}
+
+.chat__document-card-paper p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.chat__document-card-paper > span,
+.chat__document-card-pdf > span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat__document-card-pdf {
+  position: relative;
+  background: white;
+}
+
+.chat__document-card-pdf canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.chat__document-card-pdf canvas.is-loading {
+  visibility: hidden;
+}
+
+.chat__document-card-pdf > span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #53565d;
+}
+
+.chat__document-card-caption {
+  display: block;
+  min-width: 0;
+  padding: 10px 42px 11px 12px;
+}
+
+.chat__document-card-caption strong {
+  display: block;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__document-card-caption small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat__document-card-download {
+  position: absolute;
+  right: 7px;
+  bottom: 8px;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: var(--text);
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.chat__document-card-download:hover {
+  background: var(--surface-2);
+}
+
+.chat__document-card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 51px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.chat__document-card-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.chat__document-card-title strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__document-card-title span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat__document-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat__document-card-actions > button,
+.chat__document-card-reader button {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat__document-card-actions > :hover,
+.chat__document-card-reader button:hover {
+  background: var(--surface-2);
+}
+
+.chat__document-card-reader {
+  max-height: min(62vh, 620px);
+  overflow: auto;
+  padding: 24px clamp(16px, 4vw, 34px) 36px;
+  overscroll-behavior-y: auto;
+}
+
+.chat__document-card-reader > .standard-markdown {
+  max-width: 75ch;
+  margin: 0 auto;
+}
+
+.chat__document-card-iframe {
+  display: block;
+  width: 100%;
+  height: min(62vh, 620px);
+  border: 0;
+  background: white;
+}
+
+.chat__document-card-status {
+  margin: 0;
+  padding: 24px;
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chat__document-card--expanded {
+    animation: chat-document-open .18s cubic-bezier(.2, .7, .2, 1) both;
+  }
+  @keyframes chat-document-open {
+    from { opacity: .72; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
 }
 
 /* ── Shared chat-foot entrance ─────────────────────── */
@@ -3901,6 +4163,57 @@
   font-size: 13px;
   font-weight: 650;
   line-height: 1.45;
+}
+
+/* Archived notice: the waiting-card shell with one Restore action. */
+.chat__archived-card {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 6px 4px 12px;
+}
+
+.chat__archived-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: var(--chat-status-font-size);
+  line-height: 1.3;
+}
+
+.chat__archived-text > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__archived-restore {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 11px;
+  border: 1px solid var(--border-light);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .chat__archived-restore:hover {
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border-light));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+}
+
+.chat__archived-restore:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .chat__wait-cancel {

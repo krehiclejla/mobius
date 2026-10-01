@@ -73,11 +73,13 @@ test('receipt completion updates an older history page without resurrecting clea
 test('notification history follows server cursors beyond the newest eight and retains pages on refresh', async (t) => {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const original = api.notifications.list
-  const notifications = Array.from({ length: 20 }, (_, i) => ({ id: `n-${i}`, actions: [] }))
+  const notifications = Array.from({ length: 20 }, (_, i) => ({
+    id: `n-${i}`, sent_at: new Date(Date.UTC(2026, 8, 30, 12, 0, -i)).toISOString(), actions: [],
+  }))
   notifications.at(-1).actions = [receipt()]
   const requests = []
-  api.notifications.list = async ({ before, limit }) => {
-    requests.push(before)
+  api.notifications.list = async ({ before, beforeAt, limit }) => {
+    requests.push({ before, beforeAt })
     const start = before ? notifications.findIndex(n => n.id === before) + 1 : 0
     return { ok: true, json: async () => notifications.slice(start, start + limit) }
   }
@@ -86,7 +88,11 @@ test('notification history follows server cursors beyond the newest eight and re
   await observer.refetch()
   await observer.fetchNextPage()
   const result = await observer.fetchNextPage()
-  assert.deepEqual(requests, [null, 'n-7', 'n-15'])
+  assert.deepEqual(requests, [
+    { before: undefined, beforeAt: undefined },
+    { before: 'n-7', beforeAt: notifications[7].sent_at },
+    { before: 'n-15', beforeAt: notifications[15].sent_at },
+  ])
   assert.equal(result.hasNextPage, false)
   assert.equal(result.data.pages.flat().length, 20)
   assert.equal(notificationRecoveryAction(result.data.pages.flat().at(-1)).resourceId, 'chat-123')

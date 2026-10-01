@@ -18,8 +18,10 @@ import gc
 import logging
 import os
 import re
+import signal
 import time
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -224,9 +226,9 @@ def cgroup_oom_kill_count(
 ) -> int | None:
   """Kernel count of processes this cgroup lost to the OOM killer.
 
-  ``memory.events`` is the kernel's own record; a rising ``oom_kill`` is the
-  only trustworthy proof that a provider process died for memory rather than
-  for any other reason. ``None`` outside a cgroup-v2 runtime.
+  This counts every process in the cgroup, including tools and other turns;
+  it is not by itself evidence that a particular provider died for memory.
+  ``None`` outside a cgroup-v2 runtime.
   """
   root = _cgroup_dir(proc_root=proc_root, cgroup_root=cgroup_root)
   for line in (_read_text(root / "memory.events") or "").splitlines():
@@ -239,24 +241,35 @@ def cgroup_oom_kill_count(
   return None
 
 
-_oom_kills_attributed: int | None = None
+@dataclass(frozen=True)
+class ProcessExitEvidence:
+  """Original process outcome and cgroup counter, never cleanup's outcome."""
+
+  exit_code: int | None
+  oom_kills: int | None
+
+  def was_oom_killed(self, oom_kills_before: int | None) -> bool:
+    return (
+      self.exit_code == -signal.SIGKILL
+      and oom_kills_before is not None
+      and self.oom_kills is not None
+      and self.oom_kills > oom_kills_before
+    )
 
 
-def claim_oom_kill() -> bool:
-  """Whether the cgroup lost a process to the OOM killer since the last claim.
+def process_was_oom_killed(
+  exit_code: int | None, *, oom_kills_before: int | None,
+) -> bool:
+  """Correlate an unexpected process SIGKILL with this attempt's OOM window.
 
-  The counter only rises, so each failing provider exit may claim at most one
-  kill above the mark; the first call after boot only establishes the mark.
+  Call only at the runner's process-death boundary, before our own teardown.
+  Neither a cgroup kill nor SIGKILL alone identifies OOM. Their conjunction
+  is best-effort evidence, not kernel victim identification. Missing counters
+  fail closed; historical kills cannot be consumed by later failed requests.
   """
-  global _oom_kills_attributed
-  count = cgroup_oom_kill_count()
-  if count is None:
-    return False
-  if _oom_kills_attributed is None or count <= _oom_kills_attributed:
-    _oom_kills_attributed = count
-    return False
-  _oom_kills_attributed += 1
-  return True
+  return ProcessExitEvidence(
+    exit_code, cgroup_oom_kill_count() if exit_code == -signal.SIGKILL else None,
+  ).was_oom_killed(oom_kills_before)
 
 
 def cgroup_memory_snapshot(

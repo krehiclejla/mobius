@@ -18,6 +18,9 @@ class RunnerResult(TypedDict):
   # False when the turn ended before its provider received the prompt, so
   # nothing the turn carried (peer notes, Wait results) was delivered.
   prompt_sent: NotRequired[bool]
+  # Only unexpected main-process death correlated with an OOM increase during
+  # this attempt, observed before runner teardown. Never a provider API error.
+  oom_killed: NotRequired[bool]
 
 
 class ChatEvent(TypedDict):

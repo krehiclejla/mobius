@@ -897,7 +897,7 @@ def get_delegation_principal(
     if row is None:
       raise HTTPException(status_code=403, detail="Delegation token is stale.")
     return Principal(
-      owner=owner, app_id=int(app_id), scope="delegation",
+      owner=owner, app_id=int(app_id) if app_id is not None else None, scope="delegation",
       chat_id=str(chat_id), delegation_id=str(delegation_id),
     )
   if payload.get("scope") not in (None, "app"):

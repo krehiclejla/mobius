@@ -3,6 +3,7 @@ import { FileDocument } from '@openai/apps-sdk-ui/components/Icon'
 import { BASE } from '../../api/client.js'
 import { mediaTokenParam } from '../../api/mediaToken.js'
 import ImagePreviewButton from './ImagePreviewButton.jsx'
+import DocumentAttachment from './DocumentAttachment.jsx'
 
 export function generatedFileCanPreview(file) {
   return file?.kind === 'generated'
@@ -14,12 +15,25 @@ export function attachmentIsGalleryImage(file) {
     && (file.kind !== 'generated' || file.previewable === true)
 }
 
+export function generatedFileIsMarkdown(file) {
+  return file?.kind === 'generated' && file.mime_type === 'text/markdown'
+}
+
+export function generatedFileIsPdf(file) {
+  return generatedFileCanPreview(file) && file.mime_type === 'application/pdf'
+}
+
+export function documentAttachmentIdentity(file, chatId) {
+  return `${chatId}:${file.name}:${file.sha256 || ''}`
+}
+
 export default function Attachments({ attachments, chatId }) {
   const hasAttachments = Array.isArray(attachments) && attachments.length > 0
 
   // Fetch a short-lived media token for this chat. Owner JWTs must not appear
   // in ?token= query params (they leak into access logs/history/Referer).
   const [tokenParam, setTokenParam] = useState(null)
+  const [expandedNames, setExpandedNames] = useState(() => new Set())
   useEffect(() => {
     if (!hasAttachments) return undefined
     setTokenParam(null)
@@ -33,9 +47,10 @@ export default function Attachments({ attachments, chatId }) {
   if (!hasAttachments) return null
   const images = attachments.filter(attachmentIsGalleryImage)
   const files = attachments.filter(a => !attachmentIsGalleryImage(a))
+  const hasDocuments = files.some(f => generatedFileIsMarkdown(f) || generatedFileIsPdf(f))
 
   return (
-    <div className="chat__attachments">
+    <div className={`chat__attachments${hasDocuments ? ' chat__attachments--documents' : ''}`}>
       {images.length > 0 && (
         <div className="chat__attach-images">
           {images.map((img, i) => (
@@ -53,12 +68,16 @@ export default function Attachments({ attachments, chatId }) {
           ))}
         </div>
       )}
-      {files.map((f, i) => {
+      {files.length > 0 && <div className="chat__attach-files">{files.map((f, i) => {
         const isGenerated = f.kind === 'generated'
+        const isMarkdown = generatedFileIsMarkdown(f)
+        const hasChatPreview = isMarkdown || generatedFileIsPdf(f)
+        const identity = documentAttachmentIdentity(f, chatId)
+        const previewOpen = expandedNames.has(identity)
         const canPreview = generatedFileCanPreview(f)
-        const href = tokenParam ? `${BASE}/api/chats/${chatId}/${
+        const href = tokenParam ? `${BASE}/api/chats/${encodeURIComponent(chatId)}/${
           isGenerated ? 'generated-files' : 'uploads'
-        }/${encodeURIComponent(f.name)}${tokenParam}${canPreview ? '&preview=true' : ''}` : ''
+        }/${encodeURIComponent(f.name)}${tokenParam}${canPreview && !hasChatPreview ? '&preview=true' : ''}` : ''
         const content = (
           <>
             <FileDocument width={12} height={12} aria-hidden="true" />
@@ -66,6 +85,18 @@ export default function Attachments({ attachments, chatId }) {
             <span className="chat__attach-file-size">{Math.round(f.size / 1024)}KB</span>
           </>
         )
+        if (hasChatPreview) return <DocumentAttachment
+          key={identity}
+          file={f}
+          chatId={chatId}
+          expanded={previewOpen}
+          onToggle={() => setExpandedNames(current => {
+            const next = new Set(current)
+            if (next.has(identity)) next.delete(identity)
+            else next.add(identity)
+            return next
+          })}
+        />
         if (!tokenParam) return isGenerated ? (
           <span key={i} className="chat__attach-file" aria-disabled="true">
             {content}
@@ -83,7 +114,7 @@ export default function Attachments({ attachments, chatId }) {
             {content}
           </a>
         )
-      })}
+      })}</div>}
     </div>
   )
 }

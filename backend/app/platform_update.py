@@ -132,7 +132,6 @@ _LATE_REF = "refs/mobius/update-late"
 # need the rolled-back image's packages, so they are never merged back
 # automatically.
 _SET_ASIDE_PREFIX = "refs/mobius/platform-set-aside"
-_SET_ASIDE_KEEP = 5
 # Written by the image entrypoint once this boot's own boot transaction
 # (``app.platform_boot``) succeeded; it holds that transaction's protocol.
 BOOT_TRANSACTION_MARKER = Path("/tmp/platform-boot-transaction")
@@ -3188,12 +3187,12 @@ def _swap_position(repo: Path, record: PreparedUpdate, head: str) -> str:
   """Where the checkout stands after a swap: the booted update awaiting its
   late edits (``pending``), those edits merged back (``replayed``), the saved
   previous state (``not_swapped``), or something else."""
-  if head == record["prepared"]:
-    return "pending"
   if record["replayed"]:
     if head == record["replayed"] or _is_ancestor(repo, record["replayed"], head):
       return "replayed"
-  elif _is_ancestor(repo, record["prepared"], head):
+  if head == record["prepared"]:
+    return "pending"
+  if not record["replayed"] and _is_ancestor(repo, record["prepared"], head):
     # Nothing but the merge-back moves the checkout between the swap and the
     # first started server, so a descendant of the update is its result even
     # if the process died before recording it.
@@ -3547,12 +3546,6 @@ def _keep_set_aside(repo: Path, commit: str) -> str:
   stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
   ref = f"{_SET_ASIDE_PREFIX}/{stamp}"
   _git("update-ref", ref, commit, repo=repo)
-  kept = _git(
-    "for-each-ref", "--sort=-refname", "--format=%(refname)", _SET_ASIDE_PREFIX,
-    repo=repo, check=False,
-  ).stdout.split()
-  for old in kept[_SET_ASIDE_KEEP:]:
-    _git("update-ref", "-d", old, repo=repo, check=False)
   return ref
 
 

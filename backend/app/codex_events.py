@@ -879,15 +879,21 @@ def _enum_wire_value(value: Any) -> str | None:
   return raw if isinstance(raw, str) else str(raw)
 
 
-# The Möbius gateway refuses a request it can't pay for with this code (HTTP
-# 402), whether the trial was never activated, is used up, or a top-up ran out.
-_MOBIUS_NO_CREDIT_RE = re.compile(
-  r"insufficient_credits|not enough credits for the maximum request cost",
+# The gateway may return the broad code alone or a more specific request-cost
+# reason. Do not turn either into a claim about the owner's balance or trial.
+_MOBIUS_INSUFFICIENT_CREDITS_RE = re.compile(r"insufficient_credits")
+_MOBIUS_MAX_REQUEST_COST_RE = re.compile(
+  r"not enough credits for the maximum request cost"
 )
-MOBIUS_NO_CREDIT_MESSAGE = (
-  "M\u00f6bius models need credit. "
-  "[Open M\u00f6bius \u00b7 You](/shell/?app=identity) to activate your trial "
-  "or see your options."
+MOBIUS_MAX_REQUEST_COST_MESSAGE = (
+  "M\u00f6bius declined this request: not enough credits for the maximum "
+  "request cost. [Open M\u00f6bius \u00b7 You](/shell/?app=identity) to review "
+  "your credit options."
+)
+MOBIUS_INSUFFICIENT_CREDITS_MESSAGE = (
+  "M\u00f6bius declined this request (insufficient_credits). "
+  "[Open M\u00f6bius \u00b7 You](/shell/?app=identity) to review your credit "
+  "options."
 )
 
 _CHATGPT_MODEL_UNAVAILABLE_RE = re.compile(
@@ -930,8 +936,10 @@ def _codex_user_error(error_text: str | None) -> str | None:
     return error_text
   if _STREAM_STALL_RE.search(error_text):
     return _stream_stall_message(error_text)
-  if _MOBIUS_NO_CREDIT_RE.search(error_text):
-    return MOBIUS_NO_CREDIT_MESSAGE
+  if _MOBIUS_MAX_REQUEST_COST_RE.search(error_text):
+    return MOBIUS_MAX_REQUEST_COST_MESSAGE
+  if _MOBIUS_INSUFFICIENT_CREDITS_RE.search(error_text):
+    return MOBIUS_INSUFFICIENT_CREDITS_MESSAGE
   match = _CHATGPT_MODEL_UNAVAILABLE_RE.search(error_text)
   if match is None:
     return error_text

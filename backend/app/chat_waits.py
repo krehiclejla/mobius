@@ -39,6 +39,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app import models
+from app.chat_message_identity import assistant_message_run_id
 from app.config import get_settings
 from app.continuations import (
   PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND,
@@ -430,8 +431,8 @@ def terminal_wait_summaries_by_message_index(
   ``ChatWait`` remains the sole durable owner. Copying outcomes into
   ``Chat.messages`` would create a second write path and could race the wait's
   wake turn, so chat detail derives a small presentational marker instead.
-  Successful/failed/deadline outcomes settle beside the first answer after
-  their wake was delivered; a deliberate stop stays beside the most recent
+  Successful/failed/deadline outcomes settle beside the first visible answer
+  of the run that received them; a deliberate stop stays beside the most recent
   answer that owned the wait. Until a wake answer exists, the latest prior
   answer is a truthful temporary anchor and naturally moves on the next read.
   """
@@ -468,6 +469,26 @@ def terminal_wait_summaries_by_message_index(
       value = value.replace(tzinfo=UTC)
     return round(value.timestamp() * 1000)
 
+  # Delivery is acknowledged near provider completion, whereas an answer's
+  # timestamp marks its start. Join through the durable execution interval and
+  # exact sink identity instead of mistaking the next answer for the recipient.
+  answer_by_run_id: dict[str, int] = {}
+  for index, _ts in assistant_rows:
+    run_id = assistant_message_run_id(messages[index].get("id"))
+    if run_id is not None:
+      answer_by_run_id.setdefault(run_id, index)
+  receiving_runs = []
+  if answer_by_run_id and any(row.resume_delivered_at for row in rows):
+    receiving_runs = [
+      (answer_by_run_id[run_id], epoch_ms(started_at), epoch_ms(ended_at))
+      for run_id, started_at, ended_at in db.query(
+        models.ChatRun.id, models.ChatRun.started_at, models.ChatRun.ended_at,
+      ).filter(
+        models.ChatRun.chat_id == chat_id,
+        models.ChatRun.id.in_(answer_by_run_id),
+      ).all()
+    ]
+
   projected: dict[int, list[dict]] = {}
   for row in rows:
     settled_at = (
@@ -490,10 +511,20 @@ def terminal_wait_summaries_by_message_index(
         candidate_index = assistant_rows[0][0]
     else:
       wake_ms = epoch_ms(row.resume_delivered_at) or settled_ms
-      candidate_index = next((
-        index for index, ts in assistant_rows
-        if ts >= wake_ms - 1000
-      ), None)
+      recipients = [
+        index for index, started_ms, ended_ms in receiving_runs
+        if row.resume_delivered_at is not None and started_ms is not None
+        and started_ms <= wake_ms
+        and (ended_ms is None or wake_ms <= ended_ms)
+      ]
+      candidate_index = recipients[0] if len(recipients) == 1 else None
+      if candidate_index is None:
+        # Preserve pre-run-ledger/id-less history and the temporary anchor of
+        # results that have not reached a visible answer yet.
+        candidate_index = next((
+          index for index, ts in assistant_rows
+          if ts >= wake_ms - 1000
+        ), None)
       if candidate_index is None:
         candidate_index = next((
           index for index, ts in reversed(assistant_rows)
@@ -679,6 +710,9 @@ def safe_startup_writer_orphan(
   still open; any drift or partial output falls through to conservative normal
   crash recovery.
   """
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat.id):
+    return False
   activation = physical.id.startswith("activation-resume-")
   prefix = "activation-resume-" if activation else "wait-resume-"
   if (
@@ -757,7 +791,8 @@ async def _deliver_resume(row_id: str) -> bool:
       or row.resume_delivered_at is not None
     ):
       return False
-    chat = db.query(models.Chat).filter(
+    # The resume gate needs existence, not the potentially large transcript.
+    chat = db.query(models.Chat.id).filter(
       models.Chat.id == row.chat_id,
       models.Chat.deleted_at.is_(None),
     ).first()

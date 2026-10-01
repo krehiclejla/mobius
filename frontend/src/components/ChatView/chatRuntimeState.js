@@ -65,40 +65,55 @@ export function chatEntryFrame({
  * Project a completed resume as one product event instead of leaving the old
  * actionable pause beside its continuation marker. The durable transcript is
  * untouched; only the render projection drops the resumable tail block that
- * the following continuation has superseded.
+ * the following continuation has superseded. Runtime and stream identity can
+ * confirm the successor before its transcript row has been hydrated.
  */
-export function supersedeResumedPauseBlocks(messages) {
+export function supersedeResumedPauseBlocks(messages, {
+  running = false,
+  activeAssistantMessageId = null,
+  streamAssistantMessageId = null,
+} = {}) {
   if (!Array.isArray(messages) || messages.length === 0) return messages
 
   let projected = messages
   let previousVisibleIndex = -1
+  let activeAssistantInTranscript = false
+  const supersedePause = index => {
+    const previous = projected[index]
+    const blocks = Array.isArray(previous?.blocks) ? previous.blocks : []
+    const tail = blocks.at(-1)
+    if (previous?.role !== 'assistant' || tail?.type !== 'error'
+        || tail.resumable !== true) return
+    if (projected === messages) projected = [...messages]
+    const remainingBlocks = blocks.slice(0, -1)
+    projected[index] = {
+      ...previous,
+      blocks: remainingBlocks,
+      ...(remainingBlocks.length === 0 ? { hidden: true } : {}),
+    }
+  }
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index]
+    if (message?.role === 'assistant' && message.id === activeAssistantMessageId) {
+      activeAssistantInTranscript = true
+    }
     if (message?.hidden) continue
 
     // A recovery run's answer carries its projected continuation reason.
     const resumes = isContinuationMessage(message)
       || (message?.role === 'assistant' && !!message.continuation_reason)
     if (resumes && previousVisibleIndex >= 0) {
-      const previous = projected[previousVisibleIndex]
-      const blocks = Array.isArray(previous?.blocks) ? previous.blocks : []
-      const tail = blocks.at(-1)
-      if (
-        previous?.role === 'assistant'
-        && tail?.type === 'error'
-        && tail.resumable === true
-      ) {
-        if (projected === messages) projected = [...messages]
-        const remainingBlocks = blocks.slice(0, -1)
-        projected[previousVisibleIndex] = {
-          ...previous,
-          blocks: remainingBlocks,
-          ...(remainingBlocks.length === 0 ? { hidden: true } : {}),
-        }
-      }
+      supersedePause(previousVisibleIndex)
     }
 
     previousVisibleIndex = index
+  }
+  const previous = projected[previousVisibleIndex]
+  if (running && activeAssistantMessageId
+      && streamAssistantMessageId === activeAssistantMessageId
+      && !activeAssistantInTranscript && previous?.id
+      && !(previous.blocks || []).some(block => block.type === 'question' && !block.answers)) {
+    supersedePause(previousVisibleIndex)
   }
   return projected
 }

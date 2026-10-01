@@ -1,7 +1,7 @@
 /* Shared trigger for the chat's zoomable image lightbox. */
-import { useState } from 'react'
-import { createPortal } from 'react-dom'
+import { useRef, useState } from 'react'
 import ImageLightbox from './markdown/ImageLightbox.jsx'
+import ChatPanePortal from './ChatPanePortal.jsx'
 import { useHistoryDismiss } from '../../hooks/useHistoryDismiss.jsx'
 
 export default function ImagePreviewButton({
@@ -16,6 +16,7 @@ export default function ImagePreviewButton({
   onError,
 }) {
   const [open, setOpen] = useState(false)
+  const buttonRef = useRef(null)
   const historyDismiss = useHistoryDismiss(() => setOpen(false))
 
   if (!src) return null
@@ -23,6 +24,7 @@ export default function ImagePreviewButton({
   return (
     <>
       <button
+        ref={buttonRef}
         type="button"
         className={buttonClassName}
         aria-label={`Open ${alt || 'image'} preview`}
@@ -43,10 +45,9 @@ export default function ImagePreviewButton({
           onError={onError}
         />
       </button>
-      {open && createPortal(
-        <ImageLightbox src={src} alt={alt} onClose={historyDismiss.close} />,
-        document.body,
-      )}
+      {open && <ChatPanePortal anchorRef={buttonRef}>
+        <ImageLightbox src={src} alt={alt} onClose={historyDismiss.close} />
+      </ChatPanePortal>}
     </>
   )
 }

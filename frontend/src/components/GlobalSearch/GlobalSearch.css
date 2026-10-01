@@ -373,6 +373,17 @@
   font-size: 11px;
 }
 
+/* Archived chats stay findable; this quiet tag says where they are filed. */
+.global-search__archived-tag {
+  padding: 1px 6px;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
 .global-search__result-time {
   color: var(--muted);
   font-size: 11px;

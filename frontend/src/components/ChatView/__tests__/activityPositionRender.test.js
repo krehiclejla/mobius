@@ -6,22 +6,44 @@ import { renderWithModels } from './modelRegistryRender.js'
 import { createServer } from 'vite'
 globalThis.window = { location: { origin: 'http://localhost', href: 'http://localhost/shell/' }, innerWidth: 420 }
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
-const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/ActiveAssistantSurface.jsx')
+const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/AssistantReply.jsx')
+const { assistantReplyGroups } = await vite.ssrLoadModule('/src/components/ChatView/assistantReplies.js')
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 const { PeerTimelineRows } = await vite.ssrLoadModule('/src/components/ChatView/PeerTimeline.jsx')
 const { PeerTimelineContext } = await vite.ssrLoadModule('/src/components/ChatView/peerTimelineContext.js')
 const { _resetDisclosureStateForTests, persistDisclosureOpen } = await vite.ssrLoadModule('/src/components/ChatView/disclosureState.js')
 after(() => vite.close())
+test('hidden final segment leaves a visible recovery control and stable source owner', () => {
+  const first = { role: 'assistant', id: 'run', blocks: [
+    { type: 'text', content: 'Progress saved.' },
+    { type: 'error', message: 'Paused', resumable: true, pause: { kind: 'restart' } },
+  ] }
+  const hidden = { role: 'assistant', id: 'run:assistant:1', hidden: true, blocks: [] }
+  const group = assistantReplyGroups([
+    first,
+    { role: 'user', hidden: true, steered: true, source_work_id: 'run' },
+    hidden,
+  ]).get(0)
+  const html = render(Active, {
+    replyGroup: group, activeRowIndex: -1, activeMirrorMsg: hidden,
+    useDbActivePayload: true, chatId: 'chat', onResume: () => {},
+    isLastMsg: group.lastVisibleIndex === 0,
+  }, { tools: new Map(), positions: new Map() })
+  assert.match(html, /class="chat__resume chat__recovery-action"/)
+  assert.doesNotMatch(html, /data-key="run:assistant:1"/)
+  assert.match(html, /data-key="run"/)
+})
 const note = { id: 'incoming', sender_chat_id: 'peer', sender_name: 'Colleague', body: 'New information', created_at: 2000, display_position: { assistant_message_id: 'answer', block_index: 0, text_offset: 9 } }
 const context = { tools: new Map([['peer-incoming', [note]]]), positions: new Map([['answer', [note]]]) }
 const message = { id: 'answer', role: 'assistant', blocks: [{ type: 'text', content: 'Earlier\n\nLater response' }] }
+const replyGroup = { rows: [{ message, key: 'answer', anchorKey: 'answer', notes: [] }] }
 function render(Component, props, value = context) {
   return renderWithModels(React.createElement(PeerTimelineContext.Provider, { value }, React.createElement(Component, props)))
 }
 test('live and reopened response place the incoming row before later prose', () => {
   const saved = render(Message, { msg: message, chatId: 'chat', messageKey: 'answer' })
-  const live = render(Active, { activeMirrorMsg: message, activityMessageId: 'answer', activitySourceBlocks: message.blocks, useDbActivePayload: true, hasLivePayload: false, streamItems: [], chatId: 'chat', dataKey: 'answer', isStreaming: true })
-  const streamed = render(Active, { activeMirrorMsg: null, activityMessageId: 'answer', useDbActivePayload: false, hasLivePayload: true, streamItems: message.blocks, chatId: 'chat', dataKey: 'answer', isStreaming: true })
+  const live = render(Active, { replyGroup, activeMirrorMsg: message, activitySourceBlocks: message.blocks, useDbActivePayload: true, hasLivePayload: false, streamItems: [], chatId: 'chat', isStreaming: true })
+  const streamed = render(Active, { replyGroup, activeMirrorMsg: null, useDbActivePayload: false, hasLivePayload: true, streamItems: message.blocks, chatId: 'chat', isStreaming: true })
   for (const html of [saved, live, streamed]) {
     assert.ok(html.indexOf('Earlier') < html.indexOf('Received from Colleague'))
     assert.ok(html.indexOf('Received from Colleague') < html.indexOf('Later response'))
@@ -314,4 +336,52 @@ test('a later standalone Restart request owns the card before legacy activity', 
 
   assert.match(html, /\(3 steps\)/)
   assert.doesNotMatch(html, /standalone-success/)
+})
+
+for (const isStreaming of [true, false]) {
+  test(`hidden replay uses one Markdown paragraph in the shared reply surface (${isStreaming})`, () => {
+    const prefix = 'This sentence continues;'
+    const answer = `${prefix} without an artificial paragraph boundary.`
+    const first = { role: 'assistant', id: 'reply', blocks: [{ type: 'text', content: prefix }], source_ref: { message_index: 1, count: 1 } }
+    const tail = { role: 'assistant', id: 'reply:assistant:1', blocks: [{ type: 'text', content: answer }], source_ref: { message_index: 3, count: 1 } }
+    const group = assistantReplyGroups([first, { role: 'user', hidden: true, steered: true }, tail]).get(0)
+    const html = render(Active, {
+      replyGroup: group, activeRowIndex: isStreaming ? 1 : -1,
+      activeMirrorMsg: tail, activitySourceBlocks: tail.blocks,
+      useDbActivePayload: true, isStreaming, chatId: 'reply-fixture',
+    }, { tools: new Map(), positions: new Map() })
+    assert.ok(html.includes(answer), 'the suffix belongs to the original paragraph')
+    assert.equal((html.match(/<p\b[^>]*>/g) || []).length, 1)
+    assert.equal((html.match(/<section class="chat__sources"/g) || []).length, isStreaming ? 0 : 1)
+    assert.match(html, /data-key="reply"/)
+    assert.match(html, /data-key="reply:assistant:1"/)
+  })
+}
+
+
+test('one reply owns its final References, including a folded source row', () => {
+  const first = { role: 'assistant', id: 'reference-reply', blocks: [{ type: 'text', content: 'First section' }], source_ref: { message_index: 0, count: 1 } }
+  const tail = { role: 'assistant', id: 'reference-reply:assistant:1', blocks: [
+    { type: 'thinking', thinking_id: 'thinking', content: 'Considering the new information' },
+    { type: 'text', content: 'First section continued after thinking' },
+  ] }
+  const folded = { role: 'assistant', id: 'reference-reply:assistant:2', hidden: true,
+    blocks: [{ type: 'tool', sources: [{ url: 'https://folded.example', title: 'Folded source' }] }],
+    source_ref: { message_index: 4, count: 1 } }
+  const carrier = { role: 'user', steered: true, hidden: true }
+  const group = assistantReplyGroups([first, carrier, tail, carrier, folded]).get(0)
+  _resetDisclosureStateForTests()
+  persistDisclosureOpen('reply-fixture', `${tail.id}:references`, true)
+  const html = render(Active, { replyGroup: group, activeRowIndex: -1,
+    activeMirrorMsg: folded, useDbActivePayload: true, chatId: 'reply-fixture' },
+  { tools: new Map(), positions: new Map() })
+  assert.equal((html.match(/class="chat__reply"/g) || []).length, 1)
+  assert.equal((html.match(/class="chat__sources(?: |")/g) || []).length, 1)
+  assert.ok(html.indexOf('First section') < html.indexOf('chat__activity'))
+  assert.ok(html.indexOf('chat__activity') < html.indexOf('continued after thinking'))
+  assert.ok(html.indexOf('continued after thinking') < html.indexOf('chat__sources'))
+  assert.match(html, /href="https:\/\/folded.example"/)
+  assert.match(html, /data-key="reference-reply"/)
+  assert.match(html, /data-key="reference-reply:assistant:1"/)
+  assert.doesNotMatch(html, /data-key="reference-reply:assistant:2"/)
 })

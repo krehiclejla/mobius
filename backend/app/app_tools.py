@@ -138,8 +138,9 @@ async def call_app_tool(
   """Call one live app tool through its service; return (result, is_error).
 
   ``actor`` is the calling run as every service request states it
-  (app_services.request_actor): a helper is ``delegated``, and a read-only
-  helper has ``access: "read"`` so the app can refuse to change anything.
+  (app_services.request_actor): an active helper is ``delegated`` and uses
+  one trusted mode. A retired delegated identity reports ``access: "read"``
+  defensively; this is not a selectable read-only helper boundary.
   """
   tool = next(
     (item for item in live_app_tools(db) if item.exposed_name == exposed_name),

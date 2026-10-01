@@ -39,10 +39,9 @@ Owner/app surface:
 
 Live sockets and waiting callers are in-process — safe because the backend runs
 a single uvicorn worker, the same assumption broadcast.py already relies on.
-Active commands and recent results are also written into the host's registry
-record, so transport loss or a backend restart cannot duplicate work. Live
-output is in-memory only; after a backend restart the final result still
-carries the head and tail of each stream.
+Active commands are written into the host registry. Full numbered output and
+terminal identity have one private per-host ledger; legacy recent results are
+migrated on read. Reconnects and backend restarts preserve replay and output.
 
 Runners that announce the "parallel" capability run any number of commands at
 once, each with its own id, time limit, output, and cancellation. Other
@@ -53,6 +52,9 @@ in a hidden queue. Capabilities, not release numbers, decide this.
 from __future__ import annotations
 
 import asyncio
+import io
+import math
+import sqlite3
 import json
 import re
 import secrets
@@ -66,12 +68,12 @@ from fastapi import (
   HTTPException,
   Request,
 )
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from app import connect_outbound, connect_runner, models
+from app import connect_outbound, connect_runner, connect_output, models
 from app.config import get_settings
 from app.deps import (
   get_owner_or_app_with_connect_manage,
@@ -112,10 +114,6 @@ _START_ACK_TIMEOUT = 10
 _RESULT_GRACE_SECONDS = 15
 _RESULT_RETENTION_SECONDS = 15 * 60
 _RUNNER_CAPABILITIES = frozenset(connect_runner.RUNNER_CAPABILITIES)
-# Live output kept per command for readers that attach late. This is a memory
-# bound, not a result limit: readers following along receive every chunk, and
-# the final result independently carries each stream's head and tail.
-_MAX_LIVE_OUTPUT_CHARS = 2_000_000
 # Longest single output long-poll. Stays well inside proxy idle-request cuts.
 _MAX_OUTPUT_WAIT_SECONDS = 25
 _COMMAND_LABEL_CHARS = 120
@@ -236,41 +234,10 @@ class _Channel:
 
 
 class _OutputLog:
-  """One command's live output, addressed by the runner's chunk sequence.
-
-  Delivery is idempotent: a retried chunk whose sequence is already present is
-  ignored. Sequences missing because of runner-side drops, trimming, or a
-  backend restart stay visible to readers as jumps in the sequence.
-  """
+  """Only a notification event; chunks have one authoritative disk owner."""
 
   def __init__(self) -> None:
-    self.chunks: list[dict] = []
-    self.end_seq = 0
-    self.chars = 0
     self._changed = asyncio.Event()
-
-  def append(self, chunks: list[dict]) -> None:
-    added = False
-    for chunk in sorted(chunks, key=lambda item: item["seq"]):
-      seq = chunk["seq"]
-      if seq < self.end_seq:
-        continue
-      self.chunks.append(chunk)
-      self.chars += len(chunk["text"])
-      self.end_seq = seq + 1
-      added = True
-    while self.chars > _MAX_LIVE_OUTPUT_CHARS and len(self.chunks) > 1:
-      self.chars -= len(self.chunks.pop(0)["text"])
-    if added:
-      self.notify()
-
-  def read(self, after: int) -> dict:
-    """Chunks from `after` on. A reader detects missing output by comparing
-    each chunk's sequence with the one it expected."""
-    return {
-      "chunks": [chunk for chunk in self.chunks if chunk["seq"] >= after],
-      "next": max(after, self.end_seq),
-    }
 
   def notify(self) -> None:
     self._changed.set()
@@ -286,13 +253,19 @@ class _OutputLog:
 
 def _command_label(cmd: str | None, script: str | None) -> str | None:
   """A short in-memory description; command text is never persisted."""
-  lines = [
-    line.strip() for line in (cmd if cmd is not None else script or "").splitlines()
-    if line.strip()
-  ]
-  if not lines:
+  first = None
+  multiple = False
+  for line in io.StringIO(cmd if cmd is not None else script or ""):
+    if not line.strip():
+      continue
+    if first is None:
+      first = line.strip()
+    else:
+      multiple = True
+      break
+  if first is None:
     return None
-  label = lines[0] + (" …" if len(lines) > 1 else "")
+  label = first + (" …" if multiple else "")
   if len(label) > _COMMAND_LABEL_CHARS:
     label = label[:_COMMAND_LABEL_CHARS - 1] + "…"
   return label
@@ -410,6 +383,13 @@ def _active_public(command: _ActiveCommand) -> dict:
   }
 
 
+def _ledger_read(operation, *args):
+  try:
+    return operation(*args)
+  except (OSError, sqlite3.Error, ValueError) as exc:
+    raise HTTPException(status_code=503, detail="Connect history is unavailable.") from exc
+
+
 def _host_commands(host_id: str) -> dict[str, _ActiveCommand]:
   """The host's active commands, restored from its record after a restart."""
   commands = _commands.get(host_id)
@@ -424,7 +404,8 @@ def _host_commands(host_id: str) -> dict[str, _ActiveCommand]:
     if isinstance(legacy, dict):
       records.append(legacy)
     for record in records:
-      if isinstance(record, dict) and record.get("id"):
+      if (isinstance(record, dict) and record.get("id")
+          and _ledger_read(connect_output.finished, host_id, str(record["id"])) is None):
         command = _ActiveCommand.from_record(record)
         commands[command.request_id] = command
   _commands[host_id] = commands
@@ -460,31 +441,27 @@ def _mark_command_started(host_id: str, request_id: str) -> bool:
 
 
 def _finish_command(host_id: str, request_id: str, result: dict) -> bool:
-  command = _host_commands(host_id).pop(request_id, None)
+  command = _find_command(host_id, request_id)
   if command is None:
     return False
   public_result = _format_result(request_id, result)
-  if not command.result.done():
-    command.result.set_result(public_result)
   finished_at = _now()
   output_seq = result.get("output_seq")
-  _finished_output.setdefault(host_id, {})[request_id] = command.output
+  # The terminal record commits before the registry changes or waiters resolve.
+  connect_output.finish(host_id, request_id, command.fingerprint,
+                        finished_at, output_seq, public_result)
+  _host_commands(host_id).pop(request_id, None)
+  if not command.result.done():
+    command.result.set_result(public_result)
   host = _load_host(host_id)
   if host is not None:
     host["active_commands"] = [
       active.record() for active in _host_commands(host_id).values()
     ]
     host.pop("active_command", None)
-    recent = host.get("recent_commands")
-    if not isinstance(recent, dict):
-      recent = {}
-    recent[request_id] = {
-      "fingerprint": command.fingerprint,
-      "finished_at": finished_at,
-      "output_seq": output_seq,
-      "result": public_result,
-    }
-    host["recent_commands"] = recent
+    # The ledger is the single owner of finished identities and previews.
+    # Legacy registry history is migrated on read; never duplicate new output
+    # into a growing JSON file that every state transition must rewrite.
     host.pop("last_command", None)
     _save_host(host)
   command.output.notify()
@@ -525,9 +502,6 @@ async def _request_command_cancel(
 
 _channels: dict[str, _Channel] = {}
 _commands: dict[str, dict[str, _ActiveCommand]] = {}
-# Output logs of finished commands, retained with their results so a caller
-# that attaches late still sees what the command printed.
-_finished_output: dict[str, dict[str, _OutputLog]] = {}
 _host_id_by_token_hash: dict[str, str] = {}
 
 
@@ -599,6 +573,7 @@ class ResultBody(BaseModel):
   outcome: str | None = Field(default=None, max_length=16)
   truncated: bool = False
   output_seq: int | None = Field(default=None, ge=0)
+  output_error: str | None = Field(default=None, max_length=1024)
 
 
 class OutputChunk(BaseModel):
@@ -613,8 +588,8 @@ class OutputBody(BaseModel):
 
 
 class ExecBody(BaseModel):
-  cmd: str | None = Field(default=None, min_length=1, max_length=64 * 1024)
-  script: str | None = Field(default=None, min_length=1, max_length=64 * 1024)
+  cmd: str | None = Field(default=None, min_length=1)
+  script: str | None = Field(default=None, min_length=1)
   shell: str | None = Field(default=None, min_length=1, max_length=4096)
   cwd: str | None = Field(default=None, max_length=4096)
   # One year is a validity bound, not a working limit: it keeps deadline
@@ -626,6 +601,14 @@ class ExecBody(BaseModel):
   # Return as soon as the machine starts the command; read its output and
   # result from the output endpoint. Otherwise wait for the final result.
   stream: bool = False
+  admission_deadline: float | None = None
+
+  @field_validator("admission_deadline")
+  @classmethod
+  def finite_deadline(cls, value: float | None) -> float | None:
+    if value is not None and not math.isfinite(value):
+      raise ValueError("admission_deadline must be finite")
+    return value
 
   @model_validator(mode="after")
   def validate_work(self) -> ExecBody:
@@ -795,6 +778,7 @@ def _public_host(host: dict) -> dict:
     "active_commands": active,
     # Older Connect app releases read one command; they can still stop it.
     "active_command": active[0] if active else None,
+    "recent_commands": _ledger_read(connect_output.recent, host["id"]),
     "parallel_commands": _runs_in_parallel(host),
     "runner_protocol": runner_protocol,
     "runner_release": runner_release,
@@ -812,28 +796,49 @@ def _public_host(host: dict) -> dict:
 
 
 def _prune_recent_commands(host: dict) -> None:
-  """Expire finished commands past retention; the only expiry path."""
+  """Migrate legacy recent metadata once, then bound only the registry cache.
+
+  The ledger has no automatic history expiry. A failed migration leaves the
+  original record in place so a later request can retry it.
+  """
   recent = host.get("recent_commands")
   recent = dict(recent) if isinstance(recent, dict) else {}
-  # A record written before parallel commands kept one finished command.
-  changed = "last_command" in host
-  legacy = host.pop("last_command", None)
+  changed = False
+  legacy = host.get("last_command")
   if isinstance(legacy, dict) and legacy.get("id"):
     recent.setdefault(str(legacy["id"]), {
       key: legacy.get(key) for key in ("fingerprint", "finished_at", "result")
     })
+  if not host.get("recent_ledger_migrated"):
+    all_migrated = True
+    for request_id, entry in recent.items():
+      if not isinstance(entry, dict) or not isinstance(entry.get("result"), dict):
+        all_migrated = False
+        continue
+      fingerprint = entry.get("fingerprint")
+      if not isinstance(fingerprint, str) or not fingerprint:
+        all_migrated = False
+        continue
+      _ledger_read(
+        connect_output.finish, host["id"], request_id, fingerprint,
+        float(entry.get("finished_at") or _now()),
+        entry.get("output_seq"), entry["result"],
+      )
+    if all_migrated:
+      host["recent_ledger_migrated"] = True
+      host.pop("last_command", None)
+      changed = True
   cutoff = _now() - _RESULT_RETENTION_SECONDS
   kept = {
     request_id: entry for request_id, entry in recent.items()
-    if isinstance(entry, dict) and float(entry.get("finished_at") or 0) >= cutoff
+    if isinstance(entry, dict) and (
+      not host.get("recent_ledger_migrated")
+      or float(entry.get("finished_at") or 0) >= cutoff
+    )
   }
   if kept != host.get("recent_commands"):
     host["recent_commands"] = kept
     changed = True
-  logs = _finished_output.get(host["id"])
-  if logs:
-    for request_id in [key for key in logs if key not in kept]:
-      logs.pop(request_id, None)
   if changed:
     _save_host(host)
 
@@ -854,8 +859,8 @@ def _forget_host(host_id: str) -> None:
     if not command.result.done():
       command.result.cancel()
     command.output.notify()
-  _finished_output.pop(host_id, None)
   _host_path(host_id).unlink(missing_ok=True)
+  connect_output.delete_host(host_id)
 
 
 async def _ask_runner_to_disconnect(ch: _Channel) -> str:
@@ -1039,6 +1044,10 @@ async def delete_host(
   return {"ok": True, "daemon": daemon}
 
 
+def _connect_error(status: int, detail: str, code: str) -> JSONResponse:
+  return JSONResponse(status_code=status, content={"detail": detail, "code": code})
+
+
 def _started_response(command: _ActiveCommand) -> dict:
   return {"request_id": command.request_id, "state": command.state}
 
@@ -1062,7 +1071,7 @@ async def exec_on_host(
     shell=body.shell,
   )
   _prune_recent_commands(host)
-  recent = _recent_command(host, request_id)
+  recent = _ledger_read(connect_output.finished, host_id, request_id) or _recent_command(host, request_id)
   if recent is not None:
     if recent.get("fingerprint") != fingerprint:
       raise HTTPException(
@@ -1088,20 +1097,34 @@ async def exec_on_host(
     if body.stream:
       return _started_response(command)
     return await _await_command_result(host_id, command)
+  if body.admission_deadline is not None and _now() >= body.admission_deadline:
+    return _connect_error(504, "Command admission expired.", "command_expired")
   if commands and not _runs_in_parallel(host):
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        f"{host.get('name') or 'That machine'} is busy with another command, "
-        "and its Connect runner runs one command at a time. Wait for it to "
-        "finish, stop it in Connect, or update the runner to run commands "
-        "in parallel."
-      ),
+    return _connect_error(
+      409,
+      f"{host.get('name') or 'That machine'} is busy with another command, "
+      "and its Connect runner runs one command at a time. Wait for it to "
+      "finish, stop it in Connect, or update the runner to run commands "
+      "in parallel.",
+      "host_busy",
     )
   if ch is None:
-    raise HTTPException(
-      status_code=409,
-      detail=f"{host.get('name') or 'That machine'} is offline right now.",
+    if host.get("token_sha256") and host.get("runner_protocol") not in (
+      None, _RUNNER_PROTOCOL_VERSION,
+    ):
+      return _connect_error(
+        409, "This machine’s Connect runner must be updated before it can run commands.",
+        "runner_update_required",
+      )
+    return _connect_error(
+      409, f"{host.get('name') or 'That machine'} is offline right now.",
+      "host_offline",
+    )
+  if (body.cmd is not None and len(body.cmd.encode("utf-8")) > 32_000
+      and "command_file" not in _runner_capabilities(host)):
+    return _connect_error(
+      409, "Update this machine’s Connect runner to run large inline commands, "
+      "or use literal script mode.", "runner_update_required",
     )
   timeout = body.timeout
   not_after = _now() + _START_ACK_TIMEOUT
@@ -1131,9 +1154,9 @@ async def exec_on_host(
         "exit_code": 124,
         "outcome": "expired",
       })
-      raise HTTPException(
-        status_code=504,
-        detail="The machine did not start the command before it expired.",
+      return _connect_error(
+        504, "The machine did not start the command before it expired.",
+        "command_expired",
       )
     # Execution time belongs to the runner and begins only after its start ack.
     if body.stream:
@@ -1161,17 +1184,7 @@ async def list_host_commands(
       _host_commands(host_id).values(), key=lambda item: item.created_at,
     )
   ]
-  recent = []
-  for request_id, entry in (host.get("recent_commands") or {}).items():
-    result = entry.get("result") or {}
-    recent.append({
-      "id": request_id,
-      "finished_at": entry.get("finished_at"),
-      "outcome": result.get("outcome"),
-      "exit_code": result.get("exit_code"),
-    })
-  recent.sort(key=lambda item: item.get("finished_at") or 0, reverse=True)
-  return {"running": running, "recent": recent}
+  return {"running": running, "recent": _ledger_read(connect_output.recent, host_id)}
 
 
 @router.get("/hosts/{host_id}/commands/{request_id}/output")
@@ -1194,37 +1207,32 @@ async def read_command_output(
   deadline = _now() + max(0.0, min(float(wait), _MAX_OUTPUT_WAIT_SECONDS))
   while True:
     command = _find_command(host_id, request_id)
-    if command is not None:
-      view = command.output.read(after)
-      if view["chunks"] or _now() >= deadline:
-        return {
-          "request_id": request_id,
-          "state": command.state,
-          **view,
-          "result": None,
-          "output_seq": None,
-        }
-      await command.output.wait_for_change(
-        max(0.01, min(_HEARTBEAT_SECONDS, deadline - _now())),
-      )
-      continue
-    host = _load_host(host_id)
-    if host is not None:
+    entry = _ledger_read(connect_output.finished, host_id, request_id)
+    if command is None and entry is None:
+      # Move still-retained legacy terminal metadata before its short cache
+      # expires. The ledger then owns it indefinitely.
       _prune_recent_commands(host)
-    entry = _recent_command(host, request_id) if host is not None else None
-    if entry is None:
-      raise HTTPException(
-        status_code=404,
-        detail="Connect has no running or recent command with that id.",
-      )
-    log = _finished_output.get(host_id, {}).get(request_id) or _OutputLog()
-    return {
-      "request_id": request_id,
-      "state": "finished",
-      **log.read(after),
-      "result": entry.get("result"),
-      "output_seq": entry.get("output_seq"),
-    }
+      entry = _ledger_read(connect_output.finished, host_id, request_id)
+    if command is None and entry is None:
+      raise HTTPException(status_code=404, detail="Connect has no command with that id.")
+    view = _ledger_read(connect_output.page, host_id, request_id, after)
+    if command is None or view["chunks"] or _now() >= deadline:
+      expected = entry.get("output_seq") if entry else None
+      return {
+        "request_id": request_id,
+        "state": command.state if command is not None else "finished",
+        **view,
+        "result": entry.get("result") if entry else None,
+        "output_seq": expected,
+        "output_complete": (
+          _ledger_read(connect_output.complete, host_id, request_id, expected)
+          and not (entry["result"] or {}).get("output_error")
+          if entry else False
+        ),
+      }
+    await command.output.wait_for_change(
+      max(0.01, min(_HEARTBEAT_SECONDS, deadline - _now())),
+    )
 
 
 @router.post("/hosts/{host_id}/commands/{request_id}/cancel")
@@ -1240,12 +1248,11 @@ async def cancel_host_command(
   if command is None:
     raise HTTPException(status_code=404, detail="That command is no longer running.")
   if not await _request_command_cancel(host_id, command):
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        "This machine’s runner must be updated before commands can be stopped "
-        "remotely. The current command is still running."
-      ),
+    return _connect_error(
+      409,
+      "This machine’s runner must be updated before commands can be stopped "
+      "remotely. The current command is still running.",
+      "runner_update_required",
     )
   return {"ok": True, "request_id": request_id, "state": command.state}
 
@@ -1278,6 +1285,8 @@ def _format_result(request_id: str, result: dict) -> dict:
     ),
     "timed_out": outcome in ("timed_out", "expired"),
     "canceled": outcome == "canceled",
+    **({"output_error": result["output_error"]}
+       if result.get("output_error") else {}),
   }
 
 
@@ -1312,6 +1321,7 @@ def _runner_result(host_id: str, body: ResultBody) -> None:
     "outcome": outcome,
     "truncated": body.truncated,
     "output_seq": body.output_seq,
+    "output_error": body.output_error,
   })
 
 
@@ -1382,8 +1392,22 @@ async def pair(request: Request, body: PairBody) -> dict:
   raise HTTPException(status_code=400, detail="Invalid pairing code.")
 
 
+class StreamInventory(BaseModel):
+  """Reconnect identity travels in the body, not an intermediary-sized URL."""
+  active_request_ids: list[str] = Field(default_factory=list)
+  pending_result_ids: list[str] = Field(default_factory=list)
+
+  @field_validator("active_request_ids", "pending_result_ids")
+  @classmethod
+  def valid_ids(cls, value: list[str]) -> list[str]:
+    if any(not 1 <= len(item) <= 64 for item in value):
+      raise ValueError("Reconnect request ids must contain 1–64 characters")
+    return value
+
+
 @router.get("/stream")
-async def stream(request: Request) -> StreamingResponse:
+@router.post("/stream")
+async def stream(request: Request, inventory: StreamInventory | None = None) -> StreamingResponse:
   host = _auth_host(request)
   host_id = host["id"]
   try:
@@ -1423,7 +1447,9 @@ async def stream(request: Request) -> StreamingResponse:
   # Runners that stream output wait for this before sending any; older runners
   # ignore event types they do not know.
   await ch.queue.put({"type": "hello", "live_output": True})
-  await _reconcile_runner(host_id, ch, {
+  # GET remains the published older-runner contract. New runners use POST so
+  # concurrent-command recovery cannot exceed a proxy's request-line budget.
+  await _reconcile_runner(host_id, ch, inventory.model_dump() if inventory else {
     "active_request_ids": request.query_params.getlist("active_request_id"),
     "pending_result_ids": request.query_params.getlist("pending_result_id"),
   })
@@ -1470,16 +1496,28 @@ async def stream(request: Request) -> StreamingResponse:
 async def command_output(body: OutputBody, request: Request) -> dict:
   host = _auth_host(request)
   command = _find_command(host["id"], body.request_id)
-  if command is None:
-    raise HTTPException(status_code=409, detail="That command is no longer active.")
-  command.output.append([chunk.model_dump() for chunk in body.chunks])
-  return {"ok": True, "next": command.output.end_seq}
+  if command is None and _ledger_read(connect_output.finished, host["id"], body.request_id) is None:
+    raise HTTPException(status_code=409, detail="That command is unknown or no longer active.")
+  try:
+    next_cursor = connect_output.append(
+      host["id"], body.request_id, [chunk.model_dump() for chunk in body.chunks],
+    )
+  except ValueError as exc:
+    raise HTTPException(status_code=409, detail="Conflicting output chunk replay.") from exc
+  except (OSError, sqlite3.Error) as exc:
+    raise HTTPException(status_code=503, detail="Connect output could not be saved.") from exc
+  if command is not None:
+    command.output.notify()
+  return {"ok": True, "next": next_cursor}
 
 
 @router.post("/result")
 async def result(body: ResultBody, request: Request) -> dict:
   host = _auth_host(request)
-  _runner_result(host["id"], body)
+  try:
+    _runner_result(host["id"], body)
+  except (OSError, sqlite3.Error) as exc:
+    raise HTTPException(status_code=503, detail="Connect result could not be saved.") from exc
   _touch(host["id"])
   return {"ok": True}
 

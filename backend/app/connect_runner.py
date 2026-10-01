@@ -20,6 +20,7 @@ Manage the installed service:
 import argparse
 import base64
 import codecs
+import http.client
 from collections import deque
 from contextlib import contextmanager
 import io
@@ -28,12 +29,15 @@ import json
 import locale
 import os
 import platform
+import shlex
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -60,11 +64,11 @@ RUNNER_PROTOCOL_VERSION = 4
 # Increment this for every shipped runner change that an existing installation
 # should receive. Protocol only describes wire compatibility; compatible
 # releases can keep using the same protocol while still offering an update.
-RUNNER_RELEASE = 3
+RUNNER_RELEASE = 6
 # What this runner can do, announced on every stream. Möbius gates behavior on
 # these names, never on release numbers: independently maintained copies of
 # this runner can reach the same release number with different abilities.
-RUNNER_CAPABILITIES = ("parallel",)
+RUNNER_CAPABILITIES = ("parallel", "command_file", "inventory_body")
 # A live stream receives a server heartbeat every 15 seconds. Some hosting
 # proxies keep the client TCP socket open after the backend behind it restarts,
 # leaving the runner blocked forever on a stream the new backend no longer
@@ -153,7 +157,10 @@ def _open_url(request, *, timeout, context=None):
     handlers = [_NoRedirect()]
     if context is not None:
         handlers.append(urllib.request.HTTPSHandler(context=context))
-    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+    try:
+        return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+    except http.client.HTTPException as exc:
+        raise urllib.error.URLError(exc) from exc
 
 
 def _load_config():
@@ -166,9 +173,17 @@ def _load_config():
 
 def _save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh)
-    os.chmod(CONFIG_PATH, 0o600)
+    fd, temporary = tempfile.mkstemp(prefix=".config-", dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, CONFIG_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # One machine can be paired to several Mobius instances at once. The config
@@ -265,8 +280,43 @@ def _post(url, payload, token=None, timeout=30):
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", "Bearer " + token)
-    with _open_url(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with _open_url(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except http.client.HTTPException as exc:
+        raise urllib.error.URLError(exc) from exc
+
+
+def _open_stream(base, token, metadata, active_ids, pending_ids, context):
+    """Open a bounded-URL stream; fall back only for a legacy GET server."""
+    endpoint = base + "/api/connect/stream?" + urllib.parse.urlencode(metadata)
+    body = json.dumps({
+        "active_request_ids": active_ids,
+        "pending_result_ids": pending_ids,
+    }).encode("utf-8")
+    request = urllib.request.Request(endpoint, data=body, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Authorization", "Bearer " + token)
+    request.add_header("Accept", "text/event-stream")
+    try:
+        return _open_url(
+            request, timeout=STREAM_READ_TIMEOUT_SECONDS, context=context,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 405):
+            raise
+    # Older external Mobius copies know only GET and the legacy query shape.
+    legacy = list(metadata)
+    legacy.extend(("active_request_id", item) for item in active_ids)
+    legacy.extend(("pending_result_id", item) for item in pending_ids)
+    request = urllib.request.Request(
+        base + "/api/connect/stream?" + urllib.parse.urlencode(legacy),
+    )
+    request.add_header("Authorization", "Bearer " + token)
+    request.add_header("Accept", "text/event-stream")
+    return _open_url(
+        request, timeout=STREAM_READ_TIMEOUT_SECONDS, context=context,
+    )
 
 
 def _pair(base, code):
@@ -299,11 +349,27 @@ def _run_required(cmd, action):
 
 def _self_download(base):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with _open_url(base + "/api/connect/runner", timeout=30) as resp:
-        src = resp.read()
-    with open(RUNNER_PATH, "wb") as fh:
-        fh.write(src)
-    os.chmod(RUNNER_PATH, 0o755)
+    try:
+        with _open_url(base + "/api/connect/runner", timeout=30) as resp:
+            src = resp.read()
+    except http.client.HTTPException as exc:
+        raise urllib.error.URLError(exc) from exc
+    # Never replace a working service with an empty, truncated, or non-Python
+    # response from a proxy. Compile before the atomic replacement.
+    if not src or not src.startswith(b"#!/usr/bin/env python3"):
+        raise ValueError("Connect runner download was not a Python runner")
+    compile(src, RUNNER_PATH, "exec")
+    fd, temporary = tempfile.mkstemp(prefix=".runner-", dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(src)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, RUNNER_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _install_launchd(py):
@@ -518,7 +584,7 @@ def _script_input(script, *, is_windows=None):
     return script
 
 
-def _spawn_command(cmd, cwd, *, script=None, shell=None):
+def _spawn_command(cmd, cwd, *, script=None, shell=None, before_spawn=None):
     """Start one command with binary pipes so output can stream as it arrives."""
     popen_args = {
         "stdout": subprocess.PIPE,
@@ -533,13 +599,51 @@ def _spawn_command(cmd, cwd, *, script=None, shell=None):
         popen_args["stdin"] = subprocess.PIPE
         command = _script_argv(shell)
     else:
-        popen_args["shell"] = True
-        command = cmd
+        if "\x00" in cmd:
+            raise ValueError("a command cannot contain a NUL byte")
+        if os.name != "nt" and len(cmd.encode("utf-8")) > 32_000:
+            # POSIX execve has an OS-dependent per-argument limit. Execute a
+            # private script file instead of changing inline-command stdin.
+            fd, path = tempfile.mkstemp(prefix="mobius-connect-command-")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(cmd.encode("utf-8"))
+                # Source in the same -c shell, not `sh path`: the latter
+                # changes $0 and positional parameters. Clear the one
+                # bootstrap argument before user code runs.
+                command = ["/bin/sh", "-c", "set --; . " + shlex.quote(path),
+                           "/bin/sh"]
+            except BaseException:
+                os.unlink(path)
+                raise
+        else:
+            path = None
+            popen_args["shell"] = True
+            command = cmd
     if os.name == "nt":
         popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_args["start_new_session"] = True
-    return subprocess.Popen(command, **popen_args)
+    try:
+        # Preparation above can include writing a large private command file.
+        # Recheck eligibility only after that work, immediately before Popen.
+        if before_spawn is not None:
+            before_spawn()
+        proc = subprocess.Popen(command, **popen_args)
+    except BaseException:
+        if script is None and path is not None:
+            os.unlink(path)
+        raise
+    if script is None and path is not None:
+        proc._mobius_command_file = path
+    return proc
+
+
+class _StartRefused(Exception):
+    """A reserved command became ineligible before its process launch."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
 
 
 # The final result keeps a head+tail view that matches what the server can
@@ -548,14 +652,13 @@ def _spawn_command(cmd, cwd, *, script=None, shell=None):
 # boundary. Both the first error and the final summary usually matter.
 _MAX_RESULT_STREAM = 60_000
 # Live output is delivered in numbered chunks about twice a second. Unsent
-# chunks are held only up to a memory bound; if the server is unreachable for
-# long enough, the oldest are dropped and the server sees a sequence gap.
+# chunks are spooled to an anonymous temporary file so an outage cannot drop
+# their sequence history merely because a process keeps printing.
 _OUTPUT_FLUSH_SECONDS = 0.5
 # Output is delivered from each command's own watch loop, so a slow Möbius
 # must not hold up that loop's time-limit and cancel checks for long.
 _OUTPUT_POST_TIMEOUT_SECONDS = 5
-_OUTPUT_BATCH_CHARS = 512_000
-_MAX_PENDING_OUTPUT_CHARS = 4_000_000
+_OUTPUT_BATCH_BYTES = 512_000
 # After a timeout or cancel kills the process group, a descendant that escaped
 # the group could keep the pipes open. Stop waiting for it after this long.
 _PIPE_DRAIN_AFTER_KILL_SECONDS = 5
@@ -596,6 +699,9 @@ class _HeadTail:
         return _truncated_view(self.head, self.tail), True
 
 
+_SPOOL_HEADER = struct.Struct(">QI")  # sequence, JSON byte length
+
+
 class _CommandOutput:
     """One command's undelivered live chunks plus its capped final view.
 
@@ -605,47 +711,107 @@ class _CommandOutput:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.chunks = []
+        self.spool = tempfile.TemporaryFile(mode="w+b")
+        self.read_offset = 0
+        self.write_offset = 0
         self.next_seq = 0
-        self.pending_chars = 0
+        self.output_error = None
         self.final = {"stdout": _HeadTail(), "stderr": _HeadTail()}
 
     def append(self, stream, text):
         if not text:
             return
         with self.lock:
+            # Delivery can finish after the bounded drain of an escaped child.
+            # Its late reader must not reopen or write to released scratch.
+            if self.spool.closed:
+                return
             self.final[stream].append(text)
-            self.chunks.append(
-                {"seq": self.next_seq, "stream": stream, "text": text},
-            )
-            self.next_seq += 1
-            self.pending_chars += len(text)
-            while (
-                self.pending_chars > _MAX_PENDING_OUTPUT_CHARS
-                and len(self.chunks) > 1
-            ):
-                self.pending_chars -= len(self.chunks.pop(0)["text"])
+            if self.output_error is not None:
+                return
+            # JSON's default ASCII escaping can use twelve bytes per Unicode
+            # scalar; keep even that worst case within one batch.
+            for start in range(0, len(text), 30_000):
+                chunk = {"seq": self.next_seq, "stream": stream,
+                         "text": text[start:start + 30_000]}
+                data = json.dumps(chunk).encode("utf-8")
+                try:
+                    self.spool.seek(0, os.SEEK_END)
+                    self.spool.write(_SPOOL_HEADER.pack(self.next_seq, len(data)))
+                    self.spool.write(data)
+                    self.spool.flush()
+                except OSError as exc:
+                    self.output_error = "live output spool failed: %s" % exc
+                    return
+                self.write_offset = self.spool.tell()
+                self.next_seq += 1
+
+    def _header_at(self, offset):
+        self.spool.seek(offset)
+        header = self.spool.read(_SPOOL_HEADER.size)
+        if len(header) != _SPOOL_HEADER.size:
+            raise OSError("short output spool header")
+        seq, length = _SPOOL_HEADER.unpack(header)
+        if not 0 < length <= _OUTPUT_BATCH_BYTES or offset + _SPOOL_HEADER.size + length > self.write_offset:
+            raise OSError("invalid output spool record length")
+        return seq, length
 
     def take_batch(self):
         with self.lock:
             batch = []
-            size = 0
-            for chunk in self.chunks:
-                if batch and size + len(chunk["text"]) > _OUTPUT_BATCH_CHARS:
-                    break
-                batch.append(dict(chunk))
-                size += len(chunk["text"])
+            size = 8192  # envelope, up to 4096 separators, and margin
+            offset = self.read_offset
+            while offset < self.write_offset and len(batch) < 4096:
+                try:
+                    _seq, length = self._header_at(offset)
+                    if batch and size + length + 2 > _OUTPUT_BATCH_BYTES:
+                        break
+                    data = self.spool.read(length)
+                    if len(data) != length:
+                        raise OSError("short output spool read")
+                    batch.append(json.loads(data))
+                except (OSError, ValueError) as exc:
+                    self.output_error = "live output spool failed: %s" % exc
+                    return []
+                size += length + 2
+                offset += _SPOOL_HEADER.size + length
             return batch
 
     def acknowledge(self, through_seq):
         with self.lock:
-            while self.chunks and self.chunks[0]["seq"] <= through_seq:
-                self.pending_chars -= len(self.chunks.pop(0)["text"])
+            while self.read_offset < self.write_offset:
+                seq, length = self._header_at(self.read_offset)
+                if seq > through_seq:
+                    break
+                self.read_offset += _SPOOL_HEADER.size + length
+            # Acknowledged text already belongs to the server's durable ledger.
+            if self.read_offset == self.write_offset:
+                try:
+                    self.spool.seek(0)
+                    self.spool.truncate()
+                except OSError:
+                    # Reclaiming scratch is optional: the output is already
+                    # acknowledged, so cleanup failure is not capture loss.
+                    pass
+                else:
+                    self.read_offset = self.write_offset = 0
 
     def discard_pending(self):
         with self.lock:
-            self.chunks = []
-            self.pending_chars = 0
+            self.read_offset = self.write_offset
+
+    def has_pending(self):
+        with self.lock:
+            return self.read_offset < self.write_offset
+
+    def close(self):
+        with self.lock:
+            self.read_offset = self.write_offset
+            try:
+                self.spool.close()
+            except OSError as exc:
+                # Cleanup cannot overturn an acknowledged result.
+                print("failed to close output scratch: %s" % exc)
 
     def final_streams(self):
         with self.lock:
@@ -676,13 +842,15 @@ def _pump_stream(pipe, stream, output):
     except (OSError, ValueError):
         pass
     finally:
-        output.append(stream, decoder.decode(b"", final=True))
+        try:
+            output.append(stream, decoder.decode(b"", final=True))
+        finally:
+            pipe.close()
 
 
 def _feed_stdin(pipe, text):
-    encoding = locale.getpreferredencoding(False) or "utf-8"
     try:
-        pipe.write(text.encode(encoding, errors="replace"))
+        pipe.write(text.encode("ascii" if os.name == "nt" else "utf-8"))
     except (BrokenPipeError, OSError, ValueError):
         pass
     finally:
@@ -750,23 +918,7 @@ def _supervise_process(proc, output, *, timeout, stdin_text=None,
         on_tick()
     if proc.poll() is None:
         proc.wait()
-    # cancel() terminates the tree directly, so the loop can observe the exit
-    # before it observes the request that caused it.
     return ended_by if ended_by is not None else stop_reason()
-
-
-def _run_command(cmd, cwd, timeout):
-    """Run one command to completion here; used by local diagnostics/tests."""
-    output = _CommandOutput()
-    try:
-        proc = _spawn_command(cmd, cwd)
-    except Exception as exc:  # noqa: BLE001 - report any spawn failure back
-        return "", "runner error: %s" % exc, 1, False
-    ended_by = _supervise_process(proc, output, timeout=timeout)
-    stdout, stderr, _truncated = output.final_streams()
-    if ended_by == "timed_out":
-        return stdout, stderr or "command timed out after %ss" % timeout, 124, True
-    return stdout, stderr, proc.returncode, False
 
 
 class _CommandRunner:
@@ -784,6 +936,7 @@ class _CommandRunner:
         self.flush_lock = threading.Lock()
         self.active = {}
         self.outbox = deque()
+        self.pending_outputs = {}
         self.reconcile_requested = False
         # Turned on by the server's stream hello and kept across reconnects,
         # so output buffered during an outage is still delivered. Older
@@ -792,18 +945,24 @@ class _CommandRunner:
         # A rotating stream can deliver the same event from the retiring and
         # replacement connection. Request ids are idempotency keys: once this
         # process accepts one, never spawn it a second time.
-        self.seen_request_ids = deque(maxlen=512)
+        self.recent_request_ids = {}  # id -> accept-until timestamp
+        self.result_wakeup = threading.Event()
+        self.result_worker = None
 
     def pending_messages(self):
         with self.lock:
             return list(self.outbox)
 
     def acknowledge_message(self, message):
+        record = None
         with self.lock:
             for index, pending in enumerate(self.outbox):
                 if pending is message:
                     del self.outbox[index]
-                    return
+                    record = self.pending_outputs.pop(message.get("request_id"), None)
+                    break
+        if record is not None:
+            record["output"].close()
 
     def snapshot(self):
         with self.lock:
@@ -825,6 +984,22 @@ class _CommandRunner:
         """Retry retained results without holding the subprocess-state lock."""
         with self.flush_lock:
             for message in self.pending_messages():
+                record = self.pending_outputs.get(message.get("request_id"))
+                if record is not None:
+                    try:
+                        if not self.flush_output(record, drain=True):
+                            if record["output"].output_error is None:
+                                return False
+                    except Exception as exc:
+                        record["output"].output_error = (
+                            "live output drain failed: %s" % exc
+                        )
+                    if record["output"].output_error is not None:
+                        message.pop("output_seq", None)
+                        message["output_error"] = record["output"].output_error[:1024]
+                        record["output"].discard_pending()
+                        self.pending_outputs.pop(message.get("request_id"), None)
+                        record["output"].close()
                 try:
                     _post(
                         self.base + "/api/connect/result", message,
@@ -851,7 +1026,8 @@ class _CommandRunner:
                         continue
                     print("failed to report result: %s" % exc)
                     return False
-                except urllib.error.URLError as exc:
+                except (urllib.error.URLError, http.client.HTTPException,
+                        OSError, ValueError) as exc:
                     print("failed to report result: %s" % exc)
                     return False
                 self.acknowledge_message(message)
@@ -865,6 +1041,8 @@ class _CommandRunner:
         """
         output = record["output"]
         while True:
+            if output.output_error is not None:
+                return False
             if not self.live_output:
                 output.discard_pending()
                 return True
@@ -872,25 +1050,37 @@ class _CommandRunner:
             if not batch:
                 return True
             try:
-                _post(self.base + "/api/connect/output", {
+                response = _post(self.base + "/api/connect/output", {
                     "request_id": record["request_id"],
                     "chunks": batch,
                 }, token=self.token, timeout=_OUTPUT_POST_TIMEOUT_SECONDS)
             except urllib.error.HTTPError as exc:
                 if 400 <= exc.code < 500 and exc.code not in (408, 425, 429):
-                    # The server no longer tracks this command's output.
-                    output.discard_pending()
-                    return True
+                    # Rejection is not acknowledgement. Keep the known
+                    # execution outcome, but never advertise complete output.
+                    output.output_error = "live output upload rejected: HTTP %s" % exc.code
                 return False
-            except (urllib.error.URLError, OSError, ValueError):
+            except (urllib.error.URLError, http.client.HTTPException,
+                    OSError, ValueError):
                 return False
-            output.acknowledge(batch[-1]["seq"])
+            # The server's durable cursor, not our attempted last chunk, is
+            # authoritative when a previous response was lost after commit.
+            next_seq = response.get("next") if isinstance(response, dict) else None
+            if not isinstance(next_seq, int) or next_seq < 0:
+                return False
+            if next_seq <= batch[0]["seq"]:
+                return False
+            try:
+                output.acknowledge(next_seq - 1)
+            except OSError as exc:
+                output.output_error = "live output spool failed: %s" % exc
+                return False
             if not drain:
                 return True
 
     def _post_result(
         self, request_id, stdout, stderr, exit_code, outcome, record=None,
-        truncated=False, output_seq=None,
+        truncated=False, output_seq=None, output_error=None,
     ):
         stdout, stdout_truncated = _cap_output(stdout)
         stderr, stderr_truncated = _cap_output(stderr)
@@ -906,6 +1096,8 @@ class _CommandRunner:
         }
         if output_seq is not None:
             message["output_seq"] = output_seq
+        if output_error:
+            message["output_error"] = output_error[:1024]
         # Retain before attempting the network request. A concurrent stream
         # rotation can now always announce this pending id, so the server will
         # never mistake the just-finished command for lost work and replay it.
@@ -914,9 +1106,41 @@ class _CommandRunner:
         # and tell the server that successfully completed work was lost.
         with self.lock:
             self.outbox.append(message)
+            output = record.get("output") if record is not None else None
+            retain_output = (output is not None and output.output_error is None
+                             and output.has_pending())
+            if retain_output:
+                self.pending_outputs[request_id] = record
             if record is not None and self.active.get(request_id) is record:
                 del self.active[request_id]
-        self.flush_pending_results()
+        if output is not None and not retain_output:
+            output.close()
+        self._wake_result_worker()
+
+    def _wake_result_worker(self):
+        with self.lock:
+            if self.result_worker is None:
+                worker = threading.Thread(
+                    target=self._result_loop, daemon=True,
+                    name="mobius-connect-results",
+                )
+                try:
+                    worker.start()
+                except RuntimeError as exc:
+                    print("result worker unavailable; retaining result: %s" % exc)
+                    return
+                self.result_worker = worker
+        self.result_wakeup.set()
+
+    def _result_loop(self):
+        while True:
+            self.result_wakeup.wait(timeout=2)
+            self.result_wakeup.clear()
+            self.flush_pending_results()
+            with self.lock:
+                if not self.outbox:
+                    self.result_worker = None
+                    return
 
     def _post_started(self, request_id):
         try:
@@ -931,53 +1155,77 @@ class _CommandRunner:
 
     def start(self, evt):
         request_id = str(evt.get("request_id") or "")
-        with self.lock:
-            if request_id in self.seen_request_ids:
-                return
-            self.seen_request_ids.append(request_id)
         not_after = float(evt.get("not_after") or 0)
+        now = time.time()
+        with self.lock:
+            for old_id, expiry in list(self.recent_request_ids.items()):
+                if expiry <= now:
+                    del self.recent_request_ids[old_id]
+            if (request_id in self.active
+                    or any(m.get("request_id") == request_id for m in self.outbox)
+                    or request_id in self.recent_request_ids):
+                return
+            self.recent_request_ids[request_id] = max(not_after, now + 3600)
+            record = {
+                "request_id": request_id, "proc": None, "reason": None,
+                "timeout": max(1, int(evt.get("timeout", 60))),
+                "input": None, "output": None,
+            }
+            self.active[request_id] = record
+        try:
+            threading.Thread(
+                target=self._start_reserved, args=(evt, record, not_after),
+                daemon=True, name="mobius-connect-start",
+            ).start()
+        except RuntimeError as exc:
+            self._post_result(request_id, "", "runner error: %s" % exc,
+                              1, "lost", record=record)
+
+    def _start_reserved(self, evt, record, not_after):
+        request_id = record["request_id"]
         if not_after and time.time() > not_after:
-            self._post_result(
-                request_id, "", "command expired before it could start", 124,
-                "expired",
-            )
+            self._post_result(request_id, "", "command expired before it could start",
+                              124, "expired", record=record)
             return
 
-        record = {
-            "request_id": request_id,
-            "proc": None,
-            "reason": None,
-            "timeout": max(1, int(evt.get("timeout", 60))),
-            "input": None,
-            "output": _CommandOutput(),
-        }
-        with self.lock:
-            self.active[request_id] = record
-
         try:
+            record["output"] = _CommandOutput()
             self._post_started(request_id)
-            # The state acknowledgement itself crosses the network and can
-            # outlive the server's dispatch window. Check the absolute
-            # deadline again at the last possible point before spawning so an
-            # expired request can never become delayed work on this machine.
-            if not_after and time.time() > not_after:
-                self._post_result(
-                    request_id, "", "command expired before it could start",
-                    124, "expired", record=record,
-                )
-                return
             script = evt.get("script")
             if script is not None:
-                proc = _spawn_command(
-                    None,
-                    evt.get("cwd"),
-                    script=script,
-                    shell=evt.get("shell"),
-                )
                 record["input"] = _script_input(script)
+
+            def before_spawn():
+                # Do not hold the lifecycle lock across file preparation or
+                # Popen: another request's deadline and cancel must progress.
+                with self.lock:
+                    if record["reason"] is not None:
+                        raise _StartRefused("canceled")
+                    if not_after and time.time() > not_after:
+                        raise _StartRefused("expired")
+
+            if script is not None:
+                proc = _spawn_command(
+                    None, evt.get("cwd"), script=script,
+                    shell=evt.get("shell"), before_spawn=before_spawn,
+                )
             else:
-                proc = _spawn_command(evt.get("cmd", ""), evt.get("cwd"))
-            record["proc"] = proc
+                proc = _spawn_command(
+                    evt.get("cmd", ""), evt.get("cwd"),
+                    before_spawn=before_spawn,
+                )
+            with self.lock:
+                # A cancel during Popen is retained in reason; _wait observes
+                # it as soon as the new process is available.
+                record["proc"] = proc
+        except _StartRefused as refusal:
+            expired = refusal.outcome == "expired"
+            self._post_result(
+                request_id, "", "command expired before it could start" if expired
+                else "command canceled before it could start",
+                124 if expired else 130, refusal.outcome, record=record,
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - report the spawn boundary
             self._post_result(
                 request_id, "", "runner error: %s" % exc, 1, "completed",
@@ -985,10 +1233,18 @@ class _CommandRunner:
             )
             return
 
-        threading.Thread(
-            target=self._wait, args=(record,), daemon=True,
-            name="mobius-connect-command",
-        ).start()
+        try:
+            threading.Thread(
+                target=self._wait, args=(record,), daemon=True,
+                name="mobius-connect-command",
+            ).start()
+        except RuntimeError as exc:
+            _terminate_process_tree(proc)
+            path = getattr(proc, "_mobius_command_file", None)
+            if path is not None:
+                os.unlink(path)
+            self._post_result(request_id, "", "runner error: %s" % exc,
+                              1, "lost", record=record)
 
     def _wait(self, record):
         proc = record["proc"]
@@ -1009,10 +1265,15 @@ class _CommandRunner:
             )
             error = None
         except Exception as exc:  # noqa: BLE001 - preserve a final result
-            _terminate_process_tree(proc)
+            try:
+                _terminate_process_tree(proc)
+            except Exception as kill_exc:
+                exc = RuntimeError("%s; cleanup failed: %s" % (exc, kill_exc))
             ended_by = stop_reason()
             error = "runner error: %s" % exc
-        self.flush_output(record, drain=True)
+        # Retain the final result first. The independent result worker drains
+        # any remaining chunks before uploading it; a slow or failed drain
+        # must never leave the command in active state indefinitely.
         stdout, stderr, truncated = output.final_streams()
         if error is not None:
             stderr = (stderr + "\n" if stderr else "") + error
@@ -1024,10 +1285,20 @@ class _CommandRunner:
             stderr = stderr or "command canceled"
         else:
             outcome, exit_code = "completed", proc.returncode
-        self._post_result(
-            record["request_id"], stdout, stderr, exit_code, outcome,
-            record=record, truncated=truncated, output_seq=output.next_seq,
-        )
+        try:
+            self._post_result(
+                record["request_id"], stdout, stderr, exit_code, outcome,
+                record=record, truncated=truncated,
+                output_seq=None if output.output_error else output.next_seq,
+                output_error=output.output_error,
+            )
+        finally:
+            path = getattr(proc, "_mobius_command_file", None)
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
     def cancel(self, request_id, reason="canceled"):
         """Stop one command, or every command when request_id is None."""
@@ -1040,9 +1311,8 @@ class _CommandRunner:
             for record in records:
                 if record["reason"] is None:
                     record["reason"] = reason
-        for record in records:
-            if record["proc"] is not None:
-                _terminate_process_tree(record["proc"])
+        # The watch loop observes the marked reason within one tick and kills
+        # the process tree. Never make the control reader wait for that kill.
         return bool(records)
 
 
@@ -1064,10 +1334,10 @@ def _serve_connection(conn, stop_event=None):
         if stop_event is not None and stop_event.is_set():
             return
         try:
-            # Results are ordinary HTTPS requests. Attempt them before the
-            # next stream hello so its pending list reflects what still needs
-            # recovery, then again after connecting to close any race.
-            commands.flush_pending_results()
+            # Result and output uploads run separately from stream setup and
+            # reading. Pending ids in the hello protect their retry lifecycle.
+            if commands.pending_messages():
+                commands._wake_result_worker()
             # A result discarded before opening the stream has already made
             # this upcoming hello the required reconciliation boundary.
             commands.take_reconcile_request()
@@ -1081,30 +1351,16 @@ def _serve_connection(conn, stop_event=None):
                 ("capability", capability)
                 for capability in RUNNER_CAPABILITIES
             )
-            query.extend(
-                ("active_request_id", request_id) for request_id in active_ids
-            )
-            query.extend(
-                ("pending_result_id", request_id)
-                for request_id in pending_ids
-            )
             if os.environ.get(SUPERVISOR_ENV) == "mobius":
                 query.append(("managed", "mobius"))
-            stream_url = base + "/api/connect/stream?" + urllib.parse.urlencode(
-                query,
-            )
-            req = urllib.request.Request(stream_url)
-            req.add_header("Authorization", "Bearer " + token)
-            req.add_header("Accept", "text/event-stream")
-            with _open_url(
-                req, timeout=STREAM_READ_TIMEOUT_SECONDS, context=ctx,
+            with _open_stream(
+                base, token, query, active_ids, pending_ids, ctx,
             ) as stream:
                 # Start the health window only after the response is open.
                 # A slow DNS/TLS/HTTP handshake followed by an immediate EOF
                 # is still an early failure and must retain retry backoff.
                 stream_opened_at = time.monotonic()
                 print("Connected. This machine is now reachable from Mobius.")
-                commands.flush_pending_results()
                 if commands.take_reconcile_request():
                     print("reconnecting to reconcile a rejected result")
                     continue
@@ -1119,7 +1375,6 @@ def _serve_connection(conn, stop_event=None):
                         backoff = 1
                     # Heartbeat comments make this retry path run even while
                     # the host has no new commands.
-                    commands.flush_pending_results()
                     if commands.take_reconcile_request():
                         print("reconnecting to reconcile a rejected result")
                         break
@@ -1176,7 +1431,7 @@ def _serve_connection(conn, stop_event=None):
                         return
                     if evt.get("type") != "exec":
                         continue
-                    print("$ " + evt.get("cmd", ""))
+                    print("Starting command %s" % evt.get("request_id", ""))
                     commands.start(evt)
             if stop_event is not None and stop_event.is_set():
                 return
@@ -1207,14 +1462,14 @@ def _serve_connection(conn, stop_event=None):
                 # loss, not another failed open. Start its recovery quickly.
                 backoff = 1
             print("connection stalled; retrying in %ss" % backoff)
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, http.client.HTTPException) as exc:
             if (
                 stream_opened_at is not None
                 and time.monotonic() - stream_opened_at
                 >= STREAM_HEALTHY_SECONDS
             ):
                 backoff = 1
-            print("connection lost (%s); retrying in %ss" % (exc.reason, backoff))
+            print("connection lost (%s); retrying in %ss" % (exc, backoff))
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
 

@@ -324,3 +324,43 @@ The image must therefore contain the launcher before a served broker becomes
 authoritative. The one-time transition from an image that predates the
 launcher is handled by the updater version shipped in that old image; current
 boot has only the single whole-platform source decision described above.
+
+## Disposable release replay
+
+The **Tests** workflow has a manual `release_replay` input (off by default).
+It runs `scripts/test-host-helper.sh` on a fresh GitHub-hosted Ubuntu runner,
+using published releases `238360c3e762be161e4fdb0a6c5d909c3af9e98b` (worker 1)
+and `ab689f035552fca839bf221c4882c98ff931b24b` (worker 2). It does not build or
+publish an image and needs no live-host credentials. Ordinary PR, merge-queue,
+and manual runs without the input do not run this job.
+
+The replay installs the previous release and its helper once. It prepares the
+reviewed target source, then uses the real inbox, root launcher, cutover and
+container replacement. Persistent fixture declarations request `figlet` and
+`pyfiglet==1.0.4`; the pristine target image must lack both. After replacement,
+the target source must be loaded, its update record retired, setup results
+ready, both packages usable, and the fixture data preserved—without a manual
+setup rerun or installation in the target container. A second real replacement
+back to the previous image must be performed by worker 2 and promote that worker;
+its active file and recorded hash must match the target release's worker bytes.
+The historical pair has unchanged platform dependency locks and database schema;
+changing the pair requires reviewing downgrade compatibility again.
+
+For an equivalent **fresh disposable systemd host only**, with Docker Compose
+and both commits fetched:
+
+```sh
+sudo env MOBIUS_RELEASE_REPLAY=1 scripts/test-host-helper.sh \
+  238360c3e762be161e4fdb0a6c5d909c3af9e98b \
+  ab689f035552fca839bf221c4882c98ff931b24b
+```
+
+Never run this against a live installation. It uses the `mobius` container,
+volume and systemd names and installs root-owned helper files; the entire runner
+is disposable. The replay refuses an existing container, data volume or helper
+configuration, helper state, executable or units. It proves this historical upgrade path, not deployment-specific
+state on another host, and does not exercise post-update conflict resolution.
+Allow up to 60 minutes; network/registry/package failures fail the test rather
+than count as success. Hosted execution and any publication of the test branch
+are separate owner decisions. Running locally available syntax/contract tests
+is preparation, not evidence that the real image replay passed.

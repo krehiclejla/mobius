@@ -11,7 +11,7 @@ export default function ContinuationCard({ msg }) {
     : manual ? 'Resumed manually' : 'Resumed automatically'
   const subtitle = {
     restart: 'Server restarted — continuing automatically',
-    usage_limit: 'Usage available again — continuing automatically',
+    usage_limit: 'Retry check due — trying the provider again',
     memory: 'Memory freed up — continuing automatically',
     storage: 'Storage freed up — continuing automatically',
     model_capacity: 'Model available again — continuing automatically',

@@ -82,7 +82,7 @@ def test_delegated_execution_bearer_cannot_stop_child_parent_foreign_or_all(
   db.commit()
   delegated_token = delegation_execution_token(db, RunPolicy(
     delegation_id=delegation_id, app_id=app.id, provider="codex",
-    model=None, effort=None, scope="write", cwd="/data",
+    model=None, effort=None, cwd="/data",
   ), run_id="stop-boundary-child-run")
   delegated_auth = {"Authorization": f"Bearer {delegated_token}"}
 

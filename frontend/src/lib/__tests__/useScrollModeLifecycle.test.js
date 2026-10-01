@@ -83,6 +83,7 @@ function installBrowserEnvironment({ observers = [], frames = null } = {}) {
 
 function mountTailController(chatId, overrides = {}) {
   const listeners = new Map()
+  const listenerOptions = new Map()
   const lastUser = fakeElement({
     dataset: { cid: 'user-1', key: 'user-1' },
     offsetTop: 0,
@@ -98,7 +99,10 @@ function mountTailController(chatId, overrides = {}) {
     scrollTop: 400,
     scrollHeight: 900,
     clientHeight: 500,
-    addEventListener(type, listener) { listeners.set(type, listener) },
+    addEventListener(type, listener, options) {
+      listeners.set(type, listener)
+      listenerOptions.set(type, options)
+    },
     removeEventListener(type, listener) {
       if (listeners.get(type) === listener) listeners.delete(type)
     },
@@ -139,7 +143,7 @@ function mountTailController(chatId, overrides = {}) {
     ...overrides,
   }
   const hook = renderHook(useScrollMode, args)
-  return { hook, listeners, scroll, list, assistant, args }
+  return { hook, listeners, listenerOptions, scroll, list, assistant, args }
 }
 
 
@@ -199,10 +203,12 @@ test('transcript changes keep one scroll owner after the first row mounts', () =
   }
 })
 
-test('nested controls cannot relatch the transcript while they own the input', () => {
+test('nested controls own their input until native edge handoff reaches the transcript', () => {
   const restoreBrowser = installBrowserEnvironment()
   try {
-    const { hook, listeners, scroll } = mountTailController('nested-input-owner')
+    const { hook, listeners, listenerOptions, scroll } = mountTailController('nested-input-owner')
+    assert.equal(listenerOptions.get('wheel').passive, true,
+      'intent observation must not delay or cancel native scrolling')
     assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT')
 
     const editor = {
@@ -224,18 +230,28 @@ test('nested controls cannot relatch the transcript while they own the input', (
         return selector === '[data-chat-scroll-region], .chat__scroll' ? this : null
       },
     }
+    const outerTop = scroll.scrollTop
+    const preventDefault = () => assert.fail('wheel movement must stay browser-native')
     listeners.get('wheel')({
-      type: 'wheel', deltaY: 80, shiftKey: false, target: nested,
+      type: 'wheel', deltaY: 80, shiftKey: false, target: nested, timeStamp: 1000,
+      preventDefault,
     })
     assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT',
       'a nested vertical surface keeps the wheel while it can move')
+    assert.equal(nested.scrollTop, 10, 'the controller never writes the nested position')
+    assert.equal(scroll.scrollTop, outerTop, 'the controller leaves outer movement to the browser')
 
     nested.scrollTop = 120
     listeners.get('wheel')({
-      type: 'wheel', deltaY: 80, shiftKey: false, target: nested,
+      type: 'wheel', deltaY: 80, shiftKey: false, target: nested, timeStamp: 1050,
+      preventDefault,
     })
     assert.equal(scroll.dataset.scrollMode, 'FOLLOW_BOTTOM',
-      'the same gesture may chain to the transcript at the nested edge')
+      'an edge input can reach the transcript without a custom quiet-time gate')
+    assert.equal(nested.scrollTop, 120)
+    assert.equal(scroll.scrollTop, outerTop, 'native handoff does not manually forward wheel deltas')
+    assert.equal(listeners.has('touchmove'), false,
+      'no cancelable touch handoff substitutes manual movement for native panning')
     hook.unmount()
   } finally {
     restoreBrowser()

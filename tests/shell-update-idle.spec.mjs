@@ -99,7 +99,7 @@ test.describe('shell update — owner-controlled navigation', () => {
     await resetLoadCount(page)
 
     releaseEvents()
-    await expect(page.getByRole('button', { name: /Notifications, \d+ unread/ })).toBeVisible()
+    await expect(page.getByRole('button', { name: /Notifications, \d+ new/ })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Reload shell' })).toHaveCount(0)
     await page.getByRole('button', { name: /Notifications/ }).click()
     await expect(page.getByRole('button', { name: 'Reload shell' })).toBeVisible()
@@ -140,7 +140,7 @@ test.describe('shell update — owner-controlled navigation', () => {
     })
 
     releaseEvent()
-    await page.getByRole('button', { name: /Notifications, \d+ unread/ }).click()
+    await page.getByRole('button', { name: /Notifications, \d+ new/ }).click()
     const update = page.getByRole('button', { name: 'Reload shell' })
     await expect(update).toBeVisible()
     await update.click()

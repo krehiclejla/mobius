@@ -189,6 +189,23 @@ def test_tool_end_marks_done():
   assert blocks[0]["status"] == "done"
 
 
+def test_image_view_end_persists_content_binding_only_on_own_tool():
+  blocks = [
+    {"type": "tool", "tool": "ViewImage", "status": "running", "tool_use_id": "image"},
+    {"type": "tool", "tool": "Bash", "status": "running", "tool_use_id": "shell"},
+  ]
+  digest = "a" * 64
+  process_event({
+    "type": "tool_end", "tool_use_id": "image", "viewed_image_sha256": digest,
+  }, blocks)
+  assert blocks[0]["viewed_image_sha256"] == digest
+  assert "viewed_image_sha256" not in blocks[1]
+  process_event({
+    "type": "tool_end", "tool_use_id": "shell", "viewed_image_sha256": digest,
+  }, blocks)
+  assert "viewed_image_sha256" not in blocks[1]
+
+
 def test_tool_output_and_end_match_batched_tools_by_id():
   blocks = [
     {"type": "tool", "tool": "WebSearch", "input": "first",

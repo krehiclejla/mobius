@@ -60,6 +60,22 @@ export function withChatOwnerActivity(rows, chatId, at = new Date().toISOString(
   })
 }
 
+/** Apply one chat's committed (or optimistic) archive state in place. */
+export function withChatArchive(rows, chatId, { archivedAt, pinnedAt } = {}) {
+  return withChatListRowPatch(rows, chatId, {
+    archived_at: archivedAt || null,
+    pinned_at: pinnedAt || null,
+  })
+}
+
+/** Keep an in-flight archive intent visible across complete and scoped reads. */
+export function withPendingChatArchives(rows, pending) {
+  return rows.map(row => {
+    const intent = pending.get(String(row.id))
+    return intent ? { ...row, archived_at: intent.archivedAt, pinned_at: intent.pinnedAt } : row
+  })
+}
+
 export function withChatRunState(rows, chatId, running) {
   return withChatListRowPatch(rows, chatId, {
     running: !!running,

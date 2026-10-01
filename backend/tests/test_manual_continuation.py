@@ -286,3 +286,78 @@ def test_chat_detail_marks_the_answer_a_recovery_run_started(
   messages = client.get(f"/api/chats/{chat_id}", headers=auth).json()["messages"]
   assert "continuation_reason" not in messages[1]
   assert messages[2]["continuation_reason"] == "restart"
+
+
+@pytest.mark.parametrize("reason", ["restart", "manual", "usage_limit"])
+@pytest.mark.parametrize("root_answer", ["visible", "missing", "hidden"])
+@pytest.mark.parametrize("compact", [False, True])
+def test_resume_notice_belongs_only_to_first_visible_answer_across_pages(
+  client, owner_token, db, reason, root_answer, compact,
+):
+  """An early steer may skip the empty root; later segments are not new resumes."""
+  from app import models
+  from app.continuations import continuation_control_envelope
+
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  messages = [{"role": "assistant", "id": "parked", "content": "Paused", "ts": 10}]
+  if root_answer != "missing":
+    messages.append({
+      "role": "assistant", "id": "resumed", "content": "Root reply",
+      "ts": 100, "hidden": root_answer == "hidden",
+    })
+  messages.extend([
+    {"role": "user", "content": "Another message", "ts": 20},
+    {"role": "assistant", "id": "resumed:assistant:1", "content": "First split reply", "ts": 30},
+    {"role": "assistant", "id": "resumed:assistant:2", "content": "Later split reply", "ts": 40},
+    {"role": "assistant", "id": "unrelated", "content": "Later turn", "ts": 50},
+  ])
+  created = client.post(
+    "/api/chats", json={"title": "Split recovery", "messages": messages},
+    headers=auth,
+  )
+  assert created.status_code == 200, created.text
+  chat_id = created.json()["id"]
+  db.add(models.ChatRun(
+    id="resumed", chat_id=chat_id, status="completed",
+    continuation_json=continuation_control_envelope(
+      reason=reason, control_id="resume-control", supersedes_run_token="parked",
+    ),
+  ))
+  db.commit()
+  first_id = "resumed" if root_answer == "visible" else "resumed:assistant:1"
+  query = f"compact={str(compact).lower()}"
+  full = client.get(f"/api/chats/{chat_id}?limit=20&{query}", headers=auth).json()
+  assert {
+    message["id"]: message["continuation_reason"]
+    for message in full["messages"] if "continuation_reason" in message
+  } == {first_id: reason}
+
+  # A later page must not move the earlier notice onto another segment.
+  later_page = client.get(f"/api/chats/{chat_id}?limit=2&{query}", headers=auth).json()
+  assert all("continuation_reason" not in message for message in later_page["messages"])
+  first_index = next(i for i, message in enumerate(messages) if message.get("id") == first_id)
+  first_page = client.get(
+    f"/api/chats/{chat_id}?limit=1&before={first_index + 1}&{query}", headers=auth,
+  ).json()
+  assert first_page["messages"][0]["continuation_reason"] == reason
+  db.refresh(db.get(models.Chat, chat_id))
+  assert all("continuation_reason" not in message for message in db.get(models.Chat, chat_id).messages)
+
+
+def test_resume_notice_cannot_borrow_a_run_from_another_chat_or_invalid_segment(
+  client, owner_token, db,
+):
+  from app import models
+  from app.continuations import recovery_reasons_by_message_index
+
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  chat_id = client.post("/api/chats", json={"title": "Local"}, headers=auth).json()["id"]
+  foreign_chat_id = client.post("/api/chats", json={"title": "Foreign"}, headers=auth).json()["id"]
+  db.add_all([
+    models.ChatRun(id="foreign", chat_id=foreign_chat_id, continuation_json={"reason": "restart"}),
+    models.ChatRun(id="local", chat_id=chat_id, continuation_json={"reason": "manual"}),
+  ])
+  db.commit()
+  ids = ["foreign:assistant:1", "local:assistant:0", "local:assistant:01", "local:assistant:notes"]
+  messages = [{"role": "assistant", "id": message_id} for message_id in ids]
+  assert recovery_reasons_by_message_index(db, chat_id, messages) == {}

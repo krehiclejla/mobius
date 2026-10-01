@@ -132,7 +132,10 @@ function TimelineThought({ label, thought, chatId, disclosureKey, direct = false
   )
 }
 
-function SingleActivity({ entry, chatId, live, surfaceKey, onInternalNav }) {
+function SingleActivity({
+  entry, chatId, live, surfaceKey, onInternalNav,
+  generatedFiles, generatedCapturePending,
+}) {
   const { item, idx } = entry
   const blockKey = assistantBlockKey(item, idx)
   if (item.type === 'thinking') {
@@ -157,6 +160,8 @@ function SingleActivity({ entry, chatId, live, surfaceKey, onInternalNav }) {
       t={item}
       chatId={chatId}
       compact
+      generatedFiles={generatedFiles}
+      generatedCapturePending={generatedCapturePending}
       disclosureKey={`${surfaceKey}:tool:${blockKey}`}
       onInternalNav={onInternalNav}
     />
@@ -174,6 +179,8 @@ export function activityDetailUrl(chatId, detailRef) {
 function GroupedActivityStretch({
   entries,
   chatId,
+  generatedFiles,
+  generatedCapturePending,
   live = false,
   surfaceKey,
   detailRef = null,
@@ -461,6 +468,8 @@ function GroupedActivityStretch({
               key={assistantBlockKey(item, idx)}
               t={item}
               chatId={chatId}
+              generatedFiles={generatedFiles}
+              generatedCapturePending={generatedCapturePending}
               disclosureKey={`${surfaceKey}:tool:${assistantBlockKey(item, idx)}`}
               onInternalNav={onInternalNav}
             />
@@ -474,6 +483,8 @@ function GroupedActivityStretch({
 export default function ActivityStretch({
   entries,
   chatId,
+  generatedFiles,
+  generatedCapturePending = false,
   live = false,
   surfaceKey,
   detailRef = null,
@@ -492,6 +503,8 @@ export default function ActivityStretch({
       <SingleActivity
         entry={entries[0]}
         chatId={chatId}
+        generatedFiles={generatedFiles}
+        generatedCapturePending={generatedCapturePending}
         live={live}
         surfaceKey={surfaceKey}
         onInternalNav={onInternalNav}
@@ -502,6 +515,8 @@ export default function ActivityStretch({
     <GroupedActivityStretch
       entries={entries}
       chatId={chatId}
+      generatedFiles={generatedFiles}
+      generatedCapturePending={generatedCapturePending}
       live={live}
       surfaceKey={surfaceKey}
       detailRef={detailRef}

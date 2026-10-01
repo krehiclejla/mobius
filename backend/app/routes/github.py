@@ -3052,7 +3052,6 @@ async def start_contribution_work(
         provider=provider,
         model=selection["model"],
         effort=selection.get("effort"),
-        scope="write",
         cwd="/data",
         notify_parent_on_complete=False,
         source_work_id=work_id,

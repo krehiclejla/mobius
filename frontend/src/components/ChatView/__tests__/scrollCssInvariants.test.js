@@ -36,6 +36,22 @@ test('.chat__scroll contains its overscroll and is a positioning context', () =>
   assert.match(body, /position:\s*relative/)
 })
 
+test('nested chat readers allow browser-native vertical handoff to their transcript', () => {
+  for (const selector of [
+    '.chat__tool-detail', '.chat__marker-body', '.chat__document-card-reader',
+  ]) {
+    assert.match(ruleBody(selector), /overscroll-behavior-y:\s*auto/)
+  }
+  const questionCss = readFileSync(join(dir, '..', 'QuestionCard.css'), 'utf8')
+  assert.match(questionCss, /\.qcard__input\s*\{[^}]*overscroll-behavior-y:\s*auto/)
+})
+
+test('project copy files hand off inside their dialog, not to the background', () => {
+  const copyCss = readFileSync(join(dir, '..', '..', 'Projects', 'ProjectCopy.css'), 'utf8')
+  assert.match(copyCss, /\.project-copy__files\s*\{[^}]*overscroll-behavior:\s*contain auto/)
+  assert.match(copyCss, /\.project-copy-dialog\s*\{[^}]*overscroll-behavior:\s*contain;/)
+})
+
 test('the composer and transcript both reserve the full device safe area', () => {
   const foot = ruleBody('.chat__foot')
   const list = ruleBody('.chat__list')

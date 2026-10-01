@@ -4,7 +4,7 @@ from pathlib import Path
 from PIL import Image
 
 import app.routes.media as media_routes
-from app.config import get_settings
+from app.config import agent_scratch_root, get_settings
 
 
 def _write_chat_image(chat_id: str, subdir: str, filename: str, data: bytes) -> None:
@@ -207,6 +207,63 @@ def test_serve_agent_tmp_image_rejects_symlink_escape(
   )
 
   assert response.status_code == 400
+
+
+def test_serve_agent_scratch_image_from_same_chat_with_media_token(
+  client, auth, chat,
+):
+  source = agent_scratch_root() / chat.id / "renders" / "preview one.png"
+  source.parent.mkdir(parents=True, exist_ok=True)
+  source.write_bytes(b"current-scratch-image")
+
+  response = client.get(
+    f"/api/chats/{chat.id}/scratch-images/renders/preview%20one.png",
+    params={"token": _media_token(client, auth, chat.id)},
+  )
+
+  assert response.status_code == 200
+  assert response.content == b"current-scratch-image"
+  assert response.headers["content-type"] == "image/png"
+  assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_serve_agent_scratch_image_rejects_other_chat_token(client, auth, chat):
+  from uuid import uuid4
+
+  other_chat_id = str(uuid4())
+  source = agent_scratch_root() / other_chat_id / "private.png"
+  source.parent.mkdir(parents=True, exist_ok=True)
+  source.write_bytes(b"other-chat-image")
+
+  response = client.get(
+    f"/api/chats/{other_chat_id}/scratch-images/private.png",
+    params={"token": _media_token(client, auth, chat.id)},
+  )
+
+  assert response.status_code == 403
+
+
+def test_serve_agent_scratch_image_rejects_non_raster_and_escape(
+  client, auth, chat, tmp_path,
+):
+  scratch = agent_scratch_root() / chat.id
+  scratch.mkdir(parents=True, exist_ok=True)
+  (scratch / "private.txt").write_text("not an image", encoding="utf-8")
+  outside = tmp_path / "outside.png"
+  outside.write_bytes(b"outside")
+  (scratch / "escape.png").symlink_to(outside)
+
+  non_raster = client.get(
+    f"/api/chats/{chat.id}/scratch-images/private.txt",
+    headers=auth,
+  )
+  escape = client.get(
+    f"/api/chats/{chat.id}/scratch-images/escape.png",
+    headers=auth,
+  )
+
+  assert non_raster.status_code == 415
+  assert escape.status_code == 400
 
 
 def test_serve_media_rejects_non_uuid_chat_id(client, auth):

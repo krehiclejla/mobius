@@ -6,6 +6,8 @@ from collections.abc import Mapping
 import hashlib
 from typing import Any
 
+from app.chat_message_identity import assistant_message_run_id
+
 
 # ``auto_continuation`` is the durable legacy value already stored in partner
 # transcripts. New writes use the origin-neutral name because a manual Resume
@@ -138,7 +140,7 @@ def continuation_protocol_source(
   prompts = {
     "manual": "Resume the interrupted owner work from its saved state.",
     "restart": "Resume the interrupted owner work after the planned server restart.",
-    "usage_limit": "Resume the interrupted owner work now that provider usage is available.",
+    "usage_limit": "Resume the interrupted owner work after a provider-limit check. Provider availability is not yet confirmed.",
     "memory": "Resume the interrupted owner work now that memory pressure has cleared.",
     "storage": "Resume the interrupted owner work now that storage pressure has cleared.",
     "model_capacity": "Resume the interrupted owner work now that the selected model may be available.",
@@ -188,25 +190,40 @@ def manual_continuation_run_token(chat_id: str, control_id: str) -> str:
   return f"manual-resume-{digest}"
 
 
-def recovery_reasons_by_run_id(
-  db, chat_id: str, run_ids: list[str],
-) -> dict[str, str]:
-  """Map each recovery run among ``run_ids`` to its continuation reason.
+def recovery_reasons_by_message_index(
+  db, chat_id: str, messages: list[dict], *,
+  message_start: int = 0, message_end: int | None = None,
+) -> dict[int, str]:
+  """Mark the first visible answer of each physical recovery, exactly once.
 
   A physical recovery keeps its control only in ``ChatRun.continuation_json``,
-  so chat detail projects the reason onto the answer that run wrote; the shell
-  marks why that answer started without a transcript row.
+  so chat detail projects the reason without a transcript write. An early
+  steer can skip the empty root answer: a valid sink segment then owns the
+  notice. Resolve that owner across history before filtering to the page, so
+  loading a later segment cannot repeat or move an earlier notice.
   """
-  if not run_ids:
+  first_answer_by_run: dict[str, int] = {}
+  for index, message in enumerate(messages):
+    if (not isinstance(message, dict) or message.get("role") != "assistant"
+        or message.get("hidden") is True):
+      continue
+    run_id = assistant_message_run_id(message.get("id"))
+    if run_id is not None:
+      first_answer_by_run.setdefault(run_id, index)
+  candidates = {
+    run_id: index for run_id, index in first_answer_by_run.items()
+    if index >= message_start and (message_end is None or index < message_end)
+  }
+  if not candidates:
     return {}
   from app import models  # keep this low-level module free of ORM imports
   rows = db.query(models.ChatRun.id, models.ChatRun.continuation_json).filter(
     models.ChatRun.chat_id == chat_id,
-    models.ChatRun.id.in_(run_ids),
+    models.ChatRun.id.in_(candidates),
     models.ChatRun.continuation_json.is_not(None),
   ).all()
   return {
-    run_id: control["reason"]
+    candidates[run_id]: control["reason"]
     for run_id, control in rows
     if isinstance(control, dict) and isinstance(control.get("reason"), str)
   }

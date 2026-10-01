@@ -54,6 +54,7 @@ const SETTLED = {
   completed: ['done', 'Finished'],
   failed: ['failed', 'Failed'],
   needs_review: ['failed', 'Needs review'],
+  interrupted: ['failed', 'Interrupted'],
 }
 
 /* A helper's one row, from launch to result: its name, provider and model,

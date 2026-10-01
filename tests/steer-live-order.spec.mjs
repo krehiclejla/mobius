@@ -51,13 +51,13 @@ test('a fetched steer never precedes its still-live sealed assistant, including 
   await page.waitForFunction(() => typeof window.__emitSteerOrderEvent === 'function')
   const surface = page.locator('[data-chat-surface="painted"]')
   await expect(surface.locator('[data-active-assistant="true"]')).toContainText(text)
-  const order = () => surface.locator('.chat__list > .chat__msg').evaluateAll((rows, needles) => rows.map(row => row.textContent).filter(text => needles.some(needle => text.includes(needle))), ['Original request', text, steer.content])
+  const order = () => surface.locator('.chat__list .chat__msg').evaluateAll((rows, needles) => rows.map(row => row.textContent).filter(text => needles.some(needle => text.includes(needle))), ['Original request', text, steer.content])
   await expect.poll(order).toEqual([expect.stringContaining('Original request'), expect.stringContaining(text), expect.stringContaining(steer.content)])
 
   await page.evaluate(({ text, steer }) => {
     window.__steerOrderViolations = []
     const check = () => {
-      const rows = [...document.querySelectorAll('[data-chat-surface="painted"] .chat__list > .chat__msg')]
+      const rows = [...document.querySelectorAll('[data-chat-surface="painted"] .chat__list .chat__msg')]
       const assistant = rows.findIndex(row => row.textContent.includes(text))
       const owner = rows.findIndex(row => row.textContent.includes(steer))
       if (owner >= 0 && assistant >= 0 && owner < assistant) window.__steerOrderViolations.push(rows.map(row => row.textContent))

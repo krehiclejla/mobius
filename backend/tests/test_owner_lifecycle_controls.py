@@ -77,7 +77,7 @@ def _delegated_and_top_level_auth(client, owner_token, db):
   db.flush()
   policy = RunPolicy(
     delegation_id="lifecycle-boundary-delegation", app_id=app.id,
-    provider="codex", model=None, effort=None, scope="write", cwd="/data",
+    provider="codex", model=None, effort=None, cwd="/data",
   )
   db.add(models.Delegation(
     id=policy.delegation_id,
@@ -89,7 +89,7 @@ def _delegated_and_top_level_auth(client, owner_token, db):
     provider=policy.provider,
     model=policy.model,
     effort=policy.effort,
-    scope=policy.scope,
+    scope="write",
     cwd=policy.cwd,
     prompt_sha256=hashlib.sha256(b"check lifecycle boundary").hexdigest(),
   ))

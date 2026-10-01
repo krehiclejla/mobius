@@ -683,13 +683,13 @@ def test_goal_promotion_rejects_delegation_and_app_scope_tokens(
     id=delegation_id, app_id=app.id, parent_chat_id=parent.id,
     parent_root_run_id=parent.id, task_key="goal-boundary",
     child_chat_id=chat_id, provider="codex", model=None, effort=None,
-    scope="read", cwd="/data/platform",
+    scope="write", cwd="/data/platform",
     prompt_sha256=hashlib.sha256(b"check goal boundary").hexdigest(),
   ))
   db.commit()
   delegated_token = delegation_execution_token(db, RunPolicy(
     delegation_id=delegation_id, app_id=app.id, provider="codex",
-    model=None, effort=None, scope="read", cwd="/data/platform",
+    model=None, effort=None, cwd="/data/platform",
   ), run_id="scoped-run")
   delegation_auth = {
     "Authorization": "Bearer " + auth_mod.create_delegation_token(
@@ -741,7 +741,7 @@ def test_delegated_execution_bearer_cannot_mutate_or_clear_any_goal(
     id=delegation_id, app_id=app.id, parent_chat_id=parent_id,
     parent_root_run_id=parent_id, task_key="goal-mutation-boundary",
     child_chat_id=child_id, provider="codex", model=None, effort=None,
-    scope="read", cwd="/data/platform",
+    scope="write", cwd="/data/platform",
     prompt_sha256=hashlib.sha256(b"check every goal route").hexdigest(),
   ))
   db.add(make_goal_run(db,
@@ -763,7 +763,7 @@ def test_delegated_execution_bearer_cannot_mutate_or_clear_any_goal(
 
   token = delegation_execution_token(db, RunPolicy(
     delegation_id=delegation_id, app_id=app.id, provider="codex",
-    model=None, effort=None, scope="read", cwd="/data/platform",
+    model=None, effort=None, cwd="/data/platform",
   ), run_id="goal-mutation-run")
   auth = {"Authorization": f"Bearer {token}"}
 
@@ -1257,7 +1257,7 @@ def test_plan_projects_recursive_delegation_ownership_without_transcripts(
   db.flush()
   common = {
     "app_id": app.id, "provider": "codex", "model": None,
-    "effort": None, "scope": "read", "cwd": "/data",
+    "effort": None, "scope": "write", "cwd": "/data",
     "prompt_sha256": hashlib.sha256(b"").hexdigest(),
   }
   db.add_all([
@@ -1321,7 +1321,7 @@ def test_resumed_goal_projects_only_latest_delegation_attempt_per_task(
   db.flush()
   common = {
     "app_id": app.id, "provider": "codex", "model": None,
-    "effort": None, "scope": "read", "cwd": "/data",
+    "effort": None, "scope": "write", "cwd": "/data",
     "prompt_sha256": hashlib.sha256(b"").hexdigest(),
   }
   now = datetime.now(UTC).replace(tzinfo=None)

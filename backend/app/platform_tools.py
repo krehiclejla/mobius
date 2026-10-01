@@ -81,8 +81,9 @@ CONTROL_ENV_VARS = (
   "MOBIUS_COORDINATION_ENABLED",
   # spawn_agent defaults a helper to the delegating agent's own provider.
   "MOBIUS_AGENT_PROVIDER",
+  "MOBIUS_AGENT_MODEL",
+  "MOBIUS_AGENT_EFFORT",
   "MOBIUS_DELEGATION_ID",
-  "MOBIUS_SUBAGENT_HELPER",
   # The screenshot tool captures at the owner's viewport in this chat's
   # browser session.
   "VIEWPORT_WIDTH",
@@ -136,8 +137,8 @@ def codex_turn_mcp_config(
 
   ``app_tool_names`` are the install-reviewed tools live apps serve through the
   same control server (app/app_tools.py); they are approved by exact name like
-  the platform's own primitives. Each call tells the app whether a read-only
-  helper made it (``actor.access``), and the app refuses writes for one.
+  the platform's own primitives. The app still receives ``actor.access`` for
+  the published service contract; new helpers use the trusted mode.
   """
   servers: dict[str, Any] = {}
   if connector_plan is not None and connector_plan.codex_config:

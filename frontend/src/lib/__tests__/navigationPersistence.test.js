@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { resolveInitialNav } from '../resolveInitialNav.js'
 
 import {
   consumeReturnView,
@@ -54,11 +55,48 @@ test('legacy path deep links translate /app, /chat, and /settings', () => {
   assert.deepEqual(parseShellDeepLink({ pathname: '/chat/c-1', search: '' }),
     { view: 'chat', chatId: 'c-1', intent: null, focusQuestion: false })
   assert.deepEqual(parseShellDeepLink({ pathname: '/settings', search: '?section=ai-providers' }),
-    { view: 'settings' })
+    { view: 'settings', section: 'ai-providers' })
   assert.deepEqual(parseShellDeepLink({ pathname: '/settings/', search: '' }),
     { view: 'settings' })
   // A non-legacy single segment is still an ordinary empty destination.
   assert.equal(parseShellDeepLink({ pathname: '/app', search: '' }), null)
+})
+
+test('OAuth success and error callbacks mark only the allowed Settings section', () => {
+  for (const search of [
+    '?section=ai-providers&mobius_enroll_return=1',
+    '?section=ai-providers&mobius_enroll_error=1',
+  ]) {
+    assert.deepEqual(parseShellDeepLink({ pathname: '/settings', search }),
+      { view: 'settings', section: 'ai-providers', providerReturn: true })
+  }
+  assert.deepEqual(parseShellDeepLink({ pathname: '/settings', search: '?section=ai-providers' }),
+    { view: 'settings', section: 'ai-providers' })
+  for (const search of [
+    '?section=unknown',
+    '?section=%23settings-ai-providers',
+    '?section=ai-providers&section=unknown',
+    '?mobius_enroll_error=1',
+    '?section=ai-providers&mobius_enroll_return=1&mobius_enroll_return=1',
+  ]) {
+    assert.equal(parseShellDeepLink({ pathname: '/settings', search }).providerReturn, undefined)
+  }
+})
+
+test('cold OAuth callback beats stale reload and retains the focus section', () => {
+  const shellReload = { activeView: 'canvas', activeAppId: 42, activeChatId: 'chat-1', destinationClaimed: true }
+  for (const search of [
+    '?section=ai-providers&mobius_enroll_return=1',
+    '?section=ai-providers&mobius_enroll_error=1',
+  ]) {
+    const deepLink = parseShellDeepLink({ pathname: '/settings', search })
+    assert.deepEqual(resolveInitialNav({ shellReload, deepLink, storedChatId: 'chat-1' }), {
+      view: 'settings', appId: null, chatId: 'chat-1', seedHome: true, section: 'ai-providers',
+    })
+  }
+  const ordinary = parseShellDeepLink({ pathname: '/settings', search: '?section=ai-providers' })
+  assert.equal(resolveInitialNav({ shellReload, deepLink: ordinary }).appId, 42)
+  assert.equal(resolveInitialNav({ deepLink: ordinary }).section, 'ai-providers')
 })
 
 test('deep links can open the Projects directory or one project', () => {

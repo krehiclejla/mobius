@@ -1,4 +1,4 @@
-import { Fragment, memo } from 'react'
+import { Fragment, memo, useMemo } from 'react'
 import { usePositionedPeerNotes } from './peerTimelineContext.js'
 import {
   insertPositionedActivity,
@@ -17,7 +17,6 @@ import { foldAppActivityOperations } from './activityGrouping.js'
 import QuestionCard from './QuestionCard.jsx'
 import { isDurableRestartOffer } from './restartCard.js'
 import SecureInputCard from './SecureInputCard.jsx'
-import MessageSources from './MessageSources.jsx'
 import Attachments from './Attachments.jsx'
 import CompactionCard from './CompactionCard.jsx'
 import ContinuationCard from './ContinuationCard.jsx'
@@ -196,6 +195,15 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
+  const generatedFiles = useMemo(() => (
+    msg.role === 'assistant' && !isStreaming
+      ? (msg.blocks || []).flatMap(block =>
+          block.type === 'generated_files' && Array.isArray(block.files)
+            ? block.files.map(file => ({ ...file, kind: 'generated' }))
+            : [],
+        )
+      : []
+  ), [msg.role, msg.blocks, isStreaming])
   // Build a stable per-render answerable predicate that closes over the
   // scalar props (no function prop needed from ChatView).
   const isQuestionAnswerable = (block) =>
@@ -251,9 +259,8 @@ function MsgContentInner({
     // positions — and their keys — are stable mid-run too.)
     const entries = displayBlocks
       .map((block, i) => ({ item: block, rawIdx: i }))
-      // Deliverables render once in the dedicated post-answer surface below.
-      // Excluding that non-inline block here also keeps the actual visible
-      // tail authoritative for Resume/Try-now ownership.
+      // Deliverables are positioned separately below, so they do not change
+      // the visible tail used by Resume/Try-now ownership.
       .filter(({ item, rawIdx }) => (
         item.type !== 'generated_files' && !skipToolIdx.has(rawIdx)
       ))
@@ -347,6 +354,8 @@ function MsgContentInner({
             <ActivityStretch
               entries={visibleEntries}
               chatId={chatId}
+              generatedFiles={generatedFiles}
+              generatedCapturePending={isStreaming}
               live={false}
               surfaceKey={messageKey}
               detailRef={block.detail_segments ? null : {
@@ -388,10 +397,10 @@ function MsgContentInner({
             data-assistant-markdown-block={msg.role === 'assistant' ? i : undefined}
           >
             {msg.role === 'assistant'
-              ? (isActiveAnswer
+              ? (isActiveAnswer || block.reply_text_owner
                   ? <ProgressiveMarkdown
                       text={text}
-                      isStreaming={isStreaming && i === lastEntryIdx}
+                      isStreaming={block.reply_live_text || (isStreaming && i === lastEntryIdx)}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
                     />
@@ -562,7 +571,7 @@ function MsgContentInner({
                   : undefined}
               >
                 {resumeState?.pending ? 'Resuming…' : resumeState?.unavailable ? 'Reconnecting…' : parked
-                  ? limitResetElapsed ? 'Continue now' : (recoveryCredit?.actionLabel || 'Try now')
+                  ? limitResetElapsed ? 'Try now' : (recoveryCredit?.actionLabel || 'Try now')
                   : 'Resume'}
               </button>
             )}
@@ -582,12 +591,32 @@ function MsgContentInner({
     // arrive here after conversion to the same block shape, so the transcript
     // doesn't reshuffle on promote.
     const nodes = groupActivityRuns(foldAppActivityOperations(finalEntries))
+    const generatedFiles = msg.role === 'assistant' && !isStreaming
+      ? (msg.blocks || []).flatMap(block =>
+          block.type === 'generated_files' && Array.isArray(block.files)
+            ? block.files.map(file => ({ ...file, kind: 'generated' }))
+            : [],
+        )
+      : []
+    // The inbox is captured after the turn ends, which can be after a saved
+    // question. Place those files after the agent's last prose but before any
+    // terminal question card, including in already-saved transcripts.
+    const lastTextNode = nodes.findLastIndex(node => node.single?.item?.type === 'text')
+    const beforeQuestionNode = generatedFiles.length
+      ? nodes.findIndex((node, index) =>
+          index > lastTextNode && node.single?.item?.type === 'question',
+        )
+      : -1
+    const fileAttachments = generatedFiles.length
+      ? <Attachments key="generated-files" attachments={generatedFiles} chatId={chatId} />
+      : null
 
     return (
       <AssistantCopySurface msg={msg} markdownByIndex={assistantMarkdownByIndex}>
         <AnswerCause msg={msg} />
         {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
-        {nodes.map((node, nodeIdx) => {
+        {nodes.flatMap((node, nodeIdx) => {
+          const before = nodeIdx === beforeQuestionNode ? [fileAttachments] : []
           if (node.group) {
             // A stretch is LIVE only when it's the trailing node of the
             // active answer while the TURN is running — the agent is working
@@ -604,7 +633,7 @@ function MsgContentInner({
             // swapping keys and forcing a delete+insert. Each entry inside the
             // stretch keeps its own key so a catch-up commit reconciles by
             // identity.
-            return (
+            return [...before, (
               <div
                 key={assistantBlockKey(node.group[0].item, node.group[0].idx)}
                 className="chat__tools"
@@ -612,37 +641,19 @@ function MsgContentInner({
                 <ActivityStretch
                   entries={node.group}
                   chatId={chatId}
+                  generatedFiles={generatedFiles}
+                  generatedCapturePending={isStreaming}
                   live={live}
                   surfaceKey={messageKey}
                   onInternalNav={onInternalNav}
                 />
               </div>
-            )
+            )]
           }
-          return renderBlock(node.single.item, node.single.idx)
+          return [...before, renderBlock(node.single.item, node.single.idx)]
         })}
-        {/* Deliverables are one turn-owned block rendered after the final text.
-            Keep them hidden while prose is still moving. */}
-        {msg.role === 'assistant' && !isStreaming && (() => {
-          const allFiles = (msg.blocks || []).flatMap(b =>
-            b.type === 'generated_files' && Array.isArray(b.files)
-              ? b.files.map(f => ({ ...f, kind: 'generated' }))
-              : []
-          )
-          return allFiles.length > 0
-            ? <Attachments attachments={allFiles} chatId={chatId} />
-            : null
-        })()}
-        {/* Web sources collected from the turn's tool blocks and shown once
-            after the answer. Memory keeps its own richer lookup card inline. */}
-        {msg.role === 'assistant' && !isStreaming && (
-          <MessageSources
-            blocks={msg.blocks}
-            chatId={chatId}
-            sourceRef={msg.source_ref}
-            disclosureKey={`${messageKey}:references`}
-          />
-        )}
+        {/* The final attachment owns each deliverable, before any terminal question. */}
+        {beforeQuestionNode < 0 && fileAttachments}
         {!isStreaming && <GoalHistory msg={msg} />}
         {!isStreaming && <StoppedWaits msg={msg} />}
       </AssistantCopySurface>

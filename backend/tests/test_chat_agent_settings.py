@@ -684,6 +684,9 @@ def test_run_chat_passes_merged_settings_into_claude_sdk(
   # spawn_agent defaults helpers to this provider, so it must be the id the
   # Subagents app knows ("claude"), never the display name ("Claude Code").
   assert captured["base_env"]["MOBIUS_AGENT_PROVIDER"] == "claude"
+  assert captured["base_env"]["MOBIUS_AGENT_MODEL"] == settings["model"]
+  assert captured["base_env"]["MOBIUS_AGENT_EFFORT"] == settings["effort"]
+  assert "MOBIUS_SUBAGENT_HELPER" not in captured["base_env"]
 
 
 def test_claude_receives_an_owner_goal_command_as_a_plain_request(

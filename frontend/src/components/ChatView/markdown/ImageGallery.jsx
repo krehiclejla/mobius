@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { ChevronLeft, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { ExpandableImage } from './InlineContent.jsx'
 import ImageLightbox from './ImageLightbox.jsx'
+import ChatPanePortal from '../ChatPanePortal.jsx'
 import { projectResolvedGalleryItems } from './imageGallery.js'
 import { useHistoryDismiss } from '../../../hooks/useHistoryDismiss.jsx'
 import { captureLayoutSpace, clientLengthToLayout } from '../../../lib/layoutSpace.js'
@@ -229,7 +229,7 @@ export default function ImageGallery({ images, mediaDimensions }) {
         <ChevronRight width={18} height={18} aria-hidden="true" />
       </button>
 
-      {viewerItem?.src && createPortal(
+      {viewerItem?.src && <ChatPanePortal anchorRef={railRef}>
         <ImageLightbox
           src={viewerItem.src}
           alt={viewerItem.alt}
@@ -237,9 +237,8 @@ export default function ImageGallery({ images, mediaDimensions }) {
           index={viewerIndex}
           onNavigate={(nextIndex) => setViewerKey(resolvedItems[nextIndex]?.key || null)}
           onClose={historyDismiss.close}
-        />,
-        document.body,
-      )}
+        />
+      </ChatPanePortal>}
     </section>
   )
 }

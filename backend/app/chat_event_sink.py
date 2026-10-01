@@ -83,6 +83,7 @@ def _pause_note(
   *,
   kind: str | None = None,
   resets_at: str | None = None,
+  check_at: str | None = None,
   provider: str | None = None,
   resumable: bool = True,
 ) -> dict:
@@ -90,9 +91,10 @@ def _pause_note(
 
   A pause folds its whole classification into a single `pause` descriptor on
   the block: `kind` names the family ('restart' | 'rate_limit' |
-  'usage_limit'), and `resets_at` (an explicit-UTC ISO string, present only
-  for the limit kinds) is the reset time the card renders. Absorbing the reset
-  reason into `kind` keeps the wire at two block keys — `resumable` + `pause` —
+  'usage_limit'). `check_at` is the next bounded retry/check; `resets_at` is
+  only the provider-reported reset, when known. Both are explicit-UTC ISO.
+  Absorbing the reset reason into `kind` keeps the wire at two block keys —
+  `resumable` + `pause` —
   no matter how many pause facts exist, so the passthrough never grows a field
   again (events.ERROR_PASSTHROUGH_FIELDS stays `('resumable', 'pause')`).
 
@@ -109,6 +111,8 @@ def _pause_note(
     pause: dict = {"kind": kind}
     if resets_at is not None:
       pause["resets_at"] = resets_at
+    if check_at is not None:
+      pause["check_at"] = check_at
     if provider is not None:
       pause["provider"] = provider
     note["pause"] = pause

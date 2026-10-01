@@ -15,22 +15,23 @@ import { readFileSync } from 'node:fs'
 const chatViewSource = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const streamHookSource = readFileSync(new URL('../useStreamConnection.js', import.meta.url), 'utf8')
 const msgContentSource = readFileSync(new URL('../MsgContent.jsx', import.meta.url), 'utf8')
-const streamingMessageSource = readFileSync(new URL('../StreamingMessage.jsx', import.meta.url), 'utf8')
 const activeAssistantSource = readFileSync(
-  new URL('../ActiveAssistantSurface.jsx', import.meta.url),
+  new URL('../AssistantReply.jsx', import.meta.url),
   'utf8',
 )
 const blockRendererSource = readFileSync(new URL('../markdown/BlockRenderer.jsx', import.meta.url), 'utf8')
 
 test('active DB, live deltas, and reconnect snapshots share one assistant surface', () => {
-  assert.match(streamingMessageSource, /<MsgContent[\s\S]*msg=\{msg\}/,
+  assert.match(activeAssistantSource, /<MsgContent[\s\S]*msg=\{row\.message\}/,
     'the stable active <li> must always delegate its selected payload to MsgContent')
-  assert.doesNotMatch(streamingMessageSource, /ToolBlock|QuestionCard|ErrorCard|ProgressiveMarkdown/,
-    'StreamingMessage must not mount a competing assistant block tree')
+  assert.doesNotMatch(activeAssistantSource, /ToolBlock|QuestionCard|ErrorCard|ProgressiveMarkdown/,
+    'AssistantReply must not mount a competing assistant block tree')
   assert.match(activeAssistantSource, /streamItemsToAssistantPayload\(streamItems, \{ finalize: false \}\)/,
     'the live source must feed the same DB-shaped payload consumed by MsgContent')
-  assert.match(chatViewSource, /key=\{streamingDataKey\}[\s\S]*dataKey=\{streamingDataKey\}/,
-    'the active row key and scroll-anchor data-key must remain stable across source selection')
+  assert.match(chatViewSource, /activeKey: streamingDataKey/,
+    'the active source row must retain its display key across live and DB selection')
+  assert.match(activeAssistantSource, /<Fragment key=\{row\.key\}>[\s\S]*data-key=\{row\.key\}/,
+    'each physical row must use the same React key and scroll-anchor data-key')
   assert.match(streamHookSource, /\/stream[\s\S]*?'X-Mobius-Stream-Snapshot': '1'/,
     'new clients must opt into snapshot catch-up without changing the stable stream URL')
   assert.match(

@@ -55,7 +55,7 @@ from pathlib import Path
 from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import models, schemas
+from app import chat_archive, models, schemas
 from app.goals import admit_goal
 from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
@@ -317,6 +317,7 @@ class AnswerQuestion(_Command):
   legacy_save_only: bool = False
   require_exact_card: bool = False
   selected_options: dict | None = None
+  restore_archived: bool = False
 
 
 @dataclass
@@ -359,6 +360,7 @@ class ResolvePlatformRestartCard(_Command):
   run_token: str = ""
   question_id: str = ""
   selected_option_id: str = ""
+  restore_archived: bool = False
 
 
 @dataclass
@@ -643,6 +645,7 @@ class StartTurn(_Command):
   initiated_by_app_id: int | None = None
   # The rendered recovery control names its exact interrupted physical run.
   resume_run_id: str | None = None
+  restore_archived: bool = False
 
 
 @dataclass(frozen=True)
@@ -909,6 +912,7 @@ class AppendPending(_Command):
   initiated_by_app_id: int | None = None
   front: bool = False
   require_answer_match: bool = False
+  restore_archived: bool = False
 
 
 @dataclass
@@ -1128,8 +1132,9 @@ class ParkRun(_Command):
   The identity-keyed sibling of `FinishRun` for the limit exit: instead of
   closing the run's `chat_runs` row "completed", the row moves to
   ``status="parked"`` carrying `parked_until` (the due time,
-  naive UTC) and `park_reason`. Provider limits use their parsed reset time;
-  a successfully drained planned restart uses ``park_reason="restart"`` and
+  naive UTC) and `park_reason`. Provider limits use a bounded retry/check time;
+  the same deadline bounds background-provider suppression.
+  A successfully drained planned restart uses ``park_reason="restart"`` and
   a due time of now. That parked row IS the durable continuation signal; no
   separate state enum exists. Same ownership discipline as
   FinishRun: a dying run superseded by a fresh turn still closes its OWN row
@@ -2313,6 +2318,24 @@ class ChatWriterActor:
     chat = _active_chat(db, cmd.chat_id)
     if chat is None:
       raise _PersistFailed("AnswerQuestion: chat not found or deleted")
+    # A lost-acknowledgement retry can reapply the same answer. Only the first
+    # accepted answer may restore an archive created since that first write.
+    from app.questions import saved_question
+    card = saved_question(chat, cmd.question_id)
+    if card is None and not cmd.question_id:
+      card = next((block for message in reversed(chat.messages or [])
+                   if message.get("role") == "assistant"
+                   for block in reversed(message.get("blocks") or [])
+                   if block.get("type") == "question"), None)
+    if card is None and isinstance(chat.live_assistant, dict):
+      card = next((block for block in reversed(
+                     chat.live_assistant.get("blocks") or [])
+                   if block.get("type") == "question"
+                   and (not cmd.question_id
+                        or block.get("question_id") == cmd.question_id)), None)
+    first_answer = card is not None and not (
+      "answers" in card or "selected_options" in card
+    )
     if cmd.legacy_save_only:
       from app.questions import (
         AnswerConflict,
@@ -2378,6 +2401,9 @@ class ChatWriterActor:
     # as the answer commits (including the same-turn answer-delivery path).
     from datetime import UTC, datetime
     chat.activity_at = datetime.now(UTC)
+    chat_archive.restore_on_accepted_input(
+      chat, cmd.restore_archived and first_answer,
+    )
     if not _commit_or_rollback(db):
       raise _PersistFailed("AnswerQuestion did not persist")
     return True
@@ -2512,6 +2538,7 @@ class ChatWriterActor:
     if chat.pending_question_id == cmd.question_id:
       chat.pending_question_id = None
     chat.activity_at = now
+    chat_archive.restore_on_accepted_input(chat, cmd.restore_archived)
     if not _commit_or_rollback(db):
       raise _PersistFailed("Restart card resolution did not persist")
     return {
@@ -3406,6 +3433,9 @@ class ChatWriterActor:
     # Owner-send: advance the drawer ordering key (see models.Chat.activity_at).
     if not resuming:
       chat.activity_at = datetime.now(UTC)
+    chat_archive.restore_on_accepted_input(
+      chat, cmd.restore_archived and not resuming,
+    )
     # The durable run row is inserted in the SAME commit as the user message.
     # Its id is the one identity the sink and FinishRun also carry.
     # A fresh start claims an idle chat (mark_starting guarantees no live run),
@@ -4227,6 +4257,7 @@ class ChatWriterActor:
         chat.active_assistant_message_id = None
     chat.updated_at = datetime.now(UTC)
     chat.activity_at = datetime.now(UTC)
+    chat_archive.restore_on_accepted_input(chat, cmd.restore_archived)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AppendPending did not persist")
     return {
@@ -5217,8 +5248,8 @@ class ChatWriterActor:
           cmd.restart_nonce if cmd.park_reason == "restart" else None
         )
         parked = True
-        # Record the provider's reset time so background selection skips it
-        # until it recovers (the single serialized quota-signal write point).
+        # Suppress background selection until the bounded retry check, not an
+        # untrusted reported reset that could exclude a provider indefinitely.
         if run.park_reason in ("usage_limit", "rate_limit"):
           from app.provider_availability import mark_provider_limited
           from app.models import Chat as _Chat

@@ -121,7 +121,7 @@ def test_recovery_action_rejects_mismatched_or_unsafe_payload(client, auth, acti
   assert response.status_code == 422
 
 
-def test_clear_notifications_deletes_owner_history(client, auth):
+def test_clear_notifications_deletes_ordinary_owner_history(client, auth):
   for title in ["One", "Two"]:
     r = client.post(
       "/api/notifications/send",

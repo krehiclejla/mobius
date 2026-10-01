@@ -420,9 +420,8 @@ export function nestedReaderTargetOwnsInput({
 }
 
 
-/** Resolve the one marked nested vertical scroller under an input target.
- * Input ownership and WebKit's explicit edge handoff share this geometry so
- * they cannot disagree about which surface can still consume a gesture. */
+/** Resolve the marked nested reader's remaining range for input ownership.
+ * Browser-native scrolling owns the movement and edge handoff. */
 export function nestedScrollRange(target, scrollEl) {
   const nested = target?.closest?.(NESTED_SCROLL_SELECTOR)
   if (!nested || nested === scrollEl || !scrollEl?.contains?.(nested)) return null

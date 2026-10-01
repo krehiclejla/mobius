@@ -9,8 +9,8 @@ import {
 } from './appIcon.js'
 import './AppIcon.css'
 
-export default function AppIcon({ item, label, className = '' }) {
-  const iconUrl = appIconUrl(item)
+export default function AppIcon({ item, label, className = '', size = 128 }) {
+  const iconUrl = appIconUrl(item, size)
   const iconOwner = item?.id ?? item?.slug ?? label
   const currentIconRef = useRef(null)
   currentIconRef.current = { owner: iconOwner, url: iconUrl }

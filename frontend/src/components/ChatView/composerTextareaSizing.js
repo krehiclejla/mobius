@@ -50,13 +50,15 @@ export function textareaUsesNativeSizing(css = globalThis.CSS) {
   return nativeSizingSupport
 }
 
-export function syncComposerTallClass(
+// React owns the pill's className; geometry owns this separate attribute so
+// an attachment render cannot erase alignment without a textarea resize.
+export function syncComposerTallState(
   textarea,
   height = textarea?.offsetHeight,
 ) {
   const measured = Number(height) || 0
-  composerPill(textarea)?.classList?.toggle(
-    'chat__pill--tall',
+  composerPill(textarea)?.toggleAttribute(
+    'data-composer-tall',
     measured > COMPOSER_TEXTAREA_TALL_THRESHOLD,
   )
   return measured
@@ -99,7 +101,7 @@ export function resizeComposerTextarea(textarea, value = textarea?.value) {
 
   const height = Math.min(measured, COMPOSER_TEXTAREA_MAX_HEIGHT)
   textarea.style.height = `${height}px`
-  syncComposerTallClass(textarea, height)
+  syncComposerTallState(textarea, height)
   return height
 }
 
@@ -128,7 +130,7 @@ export function autoGrowTextarea(textarea, maxHeight) {
 export function resetComposerTextarea(textarea) {
   if (!textarea?.style) return
   textarea.style.height = textareaUsesNativeSizing() ? '' : 'auto'
-  composerPill(textarea)?.classList?.remove?.('chat__pill--tall')
+  composerPill(textarea)?.removeAttribute('data-composer-tall')
 }
 
 /**

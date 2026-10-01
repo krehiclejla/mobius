@@ -14,30 +14,52 @@ export default function useNotificationCenter(queryClient) {
 
   const unreadQuery = notificationQueries.unreadCount.useQuery()
   const unreadCount = unreadQuery.data ?? 0
+  const newQuery = notificationQueries.newCount.useQuery()
+  const newCount = newQuery.data ?? 0
 
-  const markSeen = useCallback(() => (
-    api.notifications.readAll()
-      .then(() => {
-        queryClient.setQueryData(notificationQueries.unreadCount.key, 0)
-      })
-      .catch(() => { /* Offline is safe: the unread count retries later. */ })
-  ), [queryClient])
+  const acknowledgeNew = useCallback(async () => {
+    await queryClient.cancelQueries({ queryKey: notificationQueries.newCount.key })
+    queryClient.setQueryData(notificationQueries.newCount.key, 0)
+    try {
+      await api.notifications.seenAll()
+    } finally {
+      await notificationQueries.newCount.invalidate(queryClient)
+    }
+  }, [queryClient])
+
+  const markAllRead = useCallback(async () => {
+    await api.notifications.readAll()
+    await Promise.all([
+      notificationQueries.list.invalidate(queryClient),
+      notificationQueries.unreadCount.invalidate(queryClient),
+      notificationQueries.newCount.invalidate(queryClient),
+    ])
+  }, [queryClient])
+
+  const markRead = useCallback(async (notificationId) => {
+    await api.notifications.read(notificationId)
+    await Promise.all([
+      notificationQueries.list.invalidate(queryClient),
+      notificationQueries.unreadCount.invalidate(queryClient),
+      notificationQueries.newCount.invalidate(queryClient),
+    ])
+  }, [queryClient])
 
   const clearAll = useCallback(async () => {
     await api.notifications.clearAll()
-    queryClient.setQueryData(notificationQueries.list.key, { pages: [[]], pageParams: [null] })
-    queryClient.setQueryData(notificationQueries.unreadCount.key, 0)
+    await Promise.all([
+      queryClient.resetQueries({ queryKey: notificationQueries.list.key }),
+      notificationQueries.unreadCount.invalidate(queryClient),
+      notificationQueries.newCount.invalidate(queryClient),
+    ])
   }, [queryClient])
 
   const dismiss = useCallback(async (notificationId) => {
     await api.notifications.dismiss(notificationId)
     await queryClient.resetQueries({ queryKey: notificationQueries.list.key })
     notificationQueries.unreadCount.invalidate(queryClient)
+    notificationQueries.newCount.invalidate(queryClient)
   }, [queryClient])
-
-  useEffect(() => {
-    if (open) void markSeen()
-  }, [open, markSeen])
 
   useEffect(() => {
     if (!open) return undefined
@@ -57,21 +79,26 @@ export default function useNotificationCenter(queryClient) {
     }
   }, [open])
 
-  const toggle = useCallback(() => setOpen(value => !value), [])
+  const toggle = useCallback(() => {
+    if (!openRef.current) void acknowledgeNew().catch(() => {})
+    setOpen(value => !value)
+  }, [acknowledgeNew])
   const close = useCallback(() => setOpen(false), [])
   const reconcile = useCallback(() => {
     notificationQueries.unreadCount.invalidate(queryClient)
+    notificationQueries.newCount.invalidate(queryClient)
     if (openRef.current) notificationQueries.list.invalidate(queryClient)
   }, [queryClient])
   const onCreated = useCallback(() => {
     notificationQueries.unreadCount.invalidate(queryClient)
     notificationQueries.list.invalidate(queryClient)
-    if (openRef.current) void markSeen()
-  }, [markSeen, queryClient])
+    notificationQueries.newCount.invalidate(queryClient)
+    if (openRef.current) void acknowledgeNew().catch(() => {})
+  }, [acknowledgeNew, queryClient])
 
   return {
-    state: { open, unreadCount },
-    actions: { toggle, close, clearAll, dismiss, reconcile, onCreated },
+    state: { open, unreadCount, newCount },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
     meta: { rootRef, bellRef },
   }
 }
