@@ -2755,7 +2755,6 @@ export default function Shell({ onInitialVisualReady }) {
         await newChatRef.current?.({
           draft: request.draft || undefined,
           forceNew: true,
-          autoSend: request.autoSend,
         })
         return
       }
@@ -4010,7 +4009,7 @@ export default function Shell({ onInitialVisualReady }) {
   // bootstrap) have no live typing surface to preserve. Owner-facing New Chat
   // actions must use startUserChat(), which mounts the final-UUID composer
   // synchronously before allocation begins.
-  async function newChat({ draft, forceNew, autoSend, recordHistory } = {}) {
+  async function newChat({ draft, forceNew, recordHistory } = {}) {
     let resolution
     try {
       resolution = await resolveNewChatId()
@@ -4034,9 +4033,7 @@ export default function Shell({ onInitialVisualReady }) {
       && !!(draft || forceNew || drawerPushedRef.current || recordHistory)
     const suppliedDraft = draft ? String(draft) : ''
     if (suppliedDraft) {
-      stageComposerHandoff(chatId, suppliedDraft, {
-        autoSend: !!autoSend,
-      })
+      stageComposerHandoff(chatId, suppliedDraft)
     }
     // Keep history writes inside useNavigation so the entry gets its route,
     // unique identity, and monotonic cursor synchronously. The former direct

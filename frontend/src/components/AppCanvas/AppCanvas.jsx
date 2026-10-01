@@ -24,7 +24,7 @@ import { createCapabilityHost } from '../../lib/capabilityHost.js'
 import { builtInCapabilityProviders } from '../../lib/capabilityProviders.js'
 import { clampCameraPreviewRect } from '../../lib/cameraPreview.js'
 import { requestAppCodeWarm } from '../../lib/appPrecache.js'
-import { appHostRequest, hasTransientUserActivation } from '../../lib/appHostRequest.js'
+import { appHostRequest } from '../../lib/appHostRequest.js'
 import {
   accountLinkCompletion,
   accountLinkRegistration,
@@ -195,9 +195,8 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //
 // Host-level messages (attributed and narrowed here, outcomes owned by the
 // `onHostRequest` callback):
-//   - {type: 'moebius:new-chat', draft?, autoSend?}          frame → host
-//     (autoSend is honored only right after the owner acts in the visible
-//     app; otherwise the draft stays editable — see appHostRequest)
+//   - {type: 'moebius:new-chat', draft?}                     frame → host
+//     (always an editable draft; see appHostRequest)
 //   - {type: 'moebius:open-chat', chatId, draft?}            frame → host
 //   - {type: 'moebius:open-app', appId, intent?}             frame → host
 //   - {type: 'moebius:open-settings', section?}              frame → host
@@ -1009,10 +1008,7 @@ const AppCanvas = forwardRef(function AppCanvas({
       // Navigation outside the app belongs to its trusted host. Keep source
       // attribution and wire-format narrowing here, beside every other frame
       // request, so no host needs to rediscover iframe identity.
-      const hostRequest = appHostRequest(msg, {
-        mayAutoSend: activeRef.current && visibleRef.current
-          && interactiveRef.current && hasTransientUserActivation(),
-      })
+      const hostRequest = appHostRequest(msg)
       if (hostRequest && onHostRequest) {
         const responseTarget = e.source
         const responseOrigin = e.origin === 'null' ? '*' : e.origin

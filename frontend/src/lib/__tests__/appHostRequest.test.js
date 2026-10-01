@@ -1,13 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { appHostRequest, hasTransientUserActivation } from '../appHostRequest.js'
+import { appHostRequest } from '../appHostRequest.js'
 
 test('app host requests expose only the reviewed navigation contract', () => {
   assert.deepEqual(appHostRequest({
     type: 'moebius:new-chat', draft: 'hello', autoSend: 1, secret: 'drop-me',
   }), {
-    type: 'moebius:new-chat', draft: 'hello', autoSend: false,
+    type: 'moebius:new-chat', draft: 'hello',
   })
   assert.deepEqual(appHostRequest({
     type: 'moebius:open-app', appId: 'atlas', intent: 'setup', extra: true,
@@ -83,20 +83,10 @@ test('source import requests retain only the bounded source identity, never a ch
   assert.equal(appHostRequest({ type: 'moebius:projects', requestId: 'projects:abc:2', action: 'import-sources' }).action, 'import-sources')
 })
 
-test('an app can auto-send a new owner chat only right after the owner acts', () => {
-  const request = { type: 'moebius:new-chat', draft: 'run this', autoSend: true }
-  // Untrusted app code alone (hidden pane, timer, no click) only stages a draft.
-  assert.equal(appHostRequest(request).autoSend, false)
-  assert.equal(appHostRequest(request, { mayAutoSend: false }).autoSend, false)
-  assert.equal(appHostRequest(request, { mayAutoSend: 'yes' }).autoSend, false)
-  assert.deepEqual(appHostRequest(request, { mayAutoSend: true }), {
+test('an app new-chat request never asks the host to submit its text', () => {
+  // The owner's composer Send is the only approval of app-chosen text; no
+  // frame flag, click, or activation signal turns the draft into a sent turn.
+  assert.deepEqual(appHostRequest({
     type: 'moebius:new-chat', draft: 'run this', autoSend: true,
-  })
-})
-
-test('user activation is read from the browser and fails closed', () => {
-  assert.equal(hasTransientUserActivation({ userActivation: { isActive: true } }), true)
-  assert.equal(hasTransientUserActivation({ userActivation: { isActive: false } }), false)
-  assert.equal(hasTransientUserActivation({}), false)
-  assert.equal(hasTransientUserActivation(undefined), false)
+  }), { type: 'moebius:new-chat', draft: 'run this' })
 })
