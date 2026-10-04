@@ -79,8 +79,6 @@ CONTROL_TOOL_NAMES = (*OWNER_CONTROL_TOOL_NAMES, *PEER_TOOL_NAMES)
 CONTROL_TOOL_TIMEOUT_SECONDS = 630
 CONTROL_ENV_VARS = (
   "API_BASE_URL",
-  # view_image stores its snapshot under this chat's media.
-  "DATA_DIR",
   "AGENT_TOKEN",
   "CHAT_ID",
   "MOBIUS_RUN_TOKEN",

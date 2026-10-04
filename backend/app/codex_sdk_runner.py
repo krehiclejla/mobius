@@ -166,7 +166,9 @@ def _codex_config_overrides() -> list[str]:
   overrides.append("features.goals=false")
   # The native viewer reports only a path whose bytes can change after the
   # read. Möbius's view_image owns the read instead (platform_tools.py).
-  overrides.append("tools.view_image=false")
+  # Codex 0.159 names this switch `features.view_image`; a `tools.view_image`
+  # key is ignored (`codex features list` shows the difference).
+  overrides.append("features.view_image=false")
   overrides += CODEX_NATIVE_HELPERS_OFF
   return overrides
 
@@ -2117,16 +2119,20 @@ async def _run_codex_sdk_turn(
               deltas = command_output_deltas.pop(item_id, []) if item_id else []
               if deltas and not getattr(item, "aggregated_output", None):
                 streamed_command_output = "".join(deltas)
+            control_image = _is_control_image_view(item, sdk)
+            snapshot_name = ""
+            if control_image:
+              # Decode, hash and store the returned payload once. The preview
+              # is the chat snapshot of exactly what the provider received.
+              snapshot_name = await asyncio.to_thread(
+                viewed_images.snapshot_result,
+                runtime_data_dir, chat_id, _model_dump(getattr(item, "result", None)),
+              )
             for event in _tool_completed_events(
               item, sdk, streamed_command_output=streamed_command_output,
             ):
-              if _is_control_image_view(item, sdk):
-                # The preview is the chat snapshot of exactly the image this
-                # call returned to the provider; anything else has none.
-                event["viewed_image_media"] = await asyncio.to_thread(
-                  viewed_images.bound_snapshot,
-                  runtime_data_dir, chat_id, _model_dump(getattr(item, "result", None)),
-                )
+              if control_image and event.get("type") == "tool_end":
+                event["viewed_image_media"] = snapshot_name
               image_view_cls = sdk.get("ImageViewThreadItem")
               if image_view_cls is not None and isinstance(item, image_view_cls):
                 # Bind the completed view to its bytes without retaining a

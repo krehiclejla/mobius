@@ -828,7 +828,13 @@ def _tool_completed_events(
     failed = status == "failed" or bool(error)
     # A tool-level refusal arrives as a failed call with its explanation in
     # result.content, not a transport error. Keep that body even when failed.
-    content = error or _format_json(getattr(item, "result", None))
+    result = getattr(item, "result", None)
+    if _is_control_image_view(item, sdk):
+      # The chat snapshot holds the picture; keep its base64 out of the
+      # stored transcript so a view is not saved twice.
+      from app.viewed_images import without_image_data
+      result = without_image_data(_model_dump(result))
+    content = error or _format_json(result)
     return [
       {
         "type": "tool_output",

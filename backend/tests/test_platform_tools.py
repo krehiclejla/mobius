@@ -172,8 +172,6 @@ def test_control_server_configs_share_one_script_and_no_secret_arguments():
   assert set(codex_server["env_vars"]) == {
     "API_BASE_URL", "AGENT_TOKEN", "CHAT_ID", "MOBIUS_RUN_TOKEN",
     "MOBIUS_COORDINATION_ENABLED",
-    # Where view_image stores this chat's snapshot.
-    "DATA_DIR",
     # Non-secret calling-turn selection and delegation identity.
     "MOBIUS_AGENT_PROVIDER", "MOBIUS_AGENT_MODEL", "MOBIUS_AGENT_EFFORT",
     "MOBIUS_DELEGATION_ID",

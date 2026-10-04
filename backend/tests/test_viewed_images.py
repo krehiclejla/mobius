@@ -2,6 +2,8 @@
 
 import base64
 import importlib.util
+import io
+import os
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +25,6 @@ def _control(monkeypatch, chat_id):
   spec.loader.exec_module(module)
   monkeypatch.setenv("MOBIUS_IMAGE_VIEWER", "1")
   monkeypatch.setenv("MOBIUS_RUN_TOKEN", "run")
-  monkeypatch.setenv("DATA_DIR", get_settings().data_dir)
   monkeypatch.setenv("CHAT_ID", chat_id)
   return module
 
@@ -34,7 +35,7 @@ def _view(control, monkeypatch, chat_id, path):
 
 
 def _bound(chat_id, result):
-  return viewed_images.bound_snapshot(get_settings().data_dir, chat_id, result)
+  return viewed_images.snapshot_result(get_settings().data_dir, chat_id, result)
 
 
 def _served(client, auth, chat_id, name):
@@ -75,7 +76,7 @@ def test_overwriting_the_path_after_the_view_keeps_its_preview(
   assert _served(client, auth, chat.id, _bound(chat.id, second)).content == OTHER_PNG
 
 
-def test_another_chats_same_named_file_cannot_bind_or_replace_this_view(
+def test_each_chat_stores_and_serves_only_its_own_payload(
   monkeypatch, tmp_path, client, auth, chat,
 ):
   source = tmp_path / "shared-name.png"
@@ -86,10 +87,13 @@ def test_another_chats_same_named_file_cannot_bind_or_replace_this_view(
   source.write_bytes(OTHER_PNG)
   theirs = _view(control, monkeypatch, other_chat, source)
 
-  # Each view binds only inside its own chat, to its own bytes.
-  assert _bound(chat.id, theirs) == ""
-  assert _bound(other_chat, mine) == ""
-  assert _served(client, auth, chat.id, _bound(chat.id, mine)).content == PNG
+  name = _bound(chat.id, mine)
+  other_name = _bound(other_chat, theirs)
+  assert name != other_name
+  assert _served(client, auth, chat.id, name).content == PNG
+  # The other chat's snapshot is not in this chat's media, so its name does
+  # not resolve here.
+  assert _served(client, auth, chat.id, other_name).status_code == 404
 
 
 def test_a_non_image_is_refused_and_leaves_no_snapshot(monkeypatch, tmp_path, chat):
@@ -105,37 +109,97 @@ def test_a_non_image_is_refused_and_leaves_no_snapshot(monkeypatch, tmp_path, ch
   assert not list(media.glob("viewed-*"))
 
 
-def test_a_view_that_cannot_store_its_snapshot_still_shows_the_model(
-  monkeypatch, tmp_path, chat,
-):
+def test_viewing_writes_no_snapshot_itself(monkeypatch, tmp_path, chat):
   source = tmp_path / "render.png"
   source.write_bytes(PNG)
   control = _control(monkeypatch, chat.id)
 
-  def read_only(*_args):
-    raise PermissionError("read-only")
+  _view(control, monkeypatch, chat.id, source)
 
-  monkeypatch.setattr(control._VIEWED_IMAGES, "store_snapshot", read_only)
-  result = _view(control, monkeypatch, chat.id, source)
-
-  assert base64.b64decode(result["content"][0]["data"]) == PNG
-  assert "no preview" in result["content"][1]["text"]
-  assert _bound(chat.id, result) == ""
+  media = viewed_images.chat_media_dir(get_settings().data_dir, chat.id)
+  assert not list(media.glob("viewed-*"))
 
 
-def test_only_the_exact_stored_payload_binds(chat):
-  name = viewed_images.store_snapshot(
-    viewed_images.chat_media_dir(get_settings().data_dir, chat.id), PNG, "image/png",
-  )
+def test_a_fifo_path_is_refused_without_blocking(monkeypatch, tmp_path, chat):
+  fifo = tmp_path / "pipe.png"
+  os.mkfifo(fifo)
+  control = _control(monkeypatch, chat.id)
+
+  result = _view(control, monkeypatch, chat.id, fifo)
+
+  assert result["isError"] is True
+  assert "not a regular file" in result["content"][0]["text"]
+
+
+def test_an_oversized_image_is_scaled_down_for_the_model(monkeypatch, tmp_path, chat):
+  from PIL import Image
+  source = tmp_path / "wide.png"
+  Image.new("RGB", (5000, 100), "red").save(source)
+  control = _control(monkeypatch, chat.id)
+
+  image = _view(control, monkeypatch, chat.id, source)["content"][0]
+
+  data = base64.b64decode(image["data"])
+  assert viewed_images.image_type(data) == image["mimeType"] == "image/png"
+  with Image.open(io.BytesIO(data)) as scaled:
+    assert max(scaled.size) == viewed_images.MAX_MODEL_EDGE
+
+
+def test_the_stored_transcript_result_omits_the_image_bytes():
+  image = {"type": "image", "data": base64.b64encode(PNG).decode(), "mimeType": "image/png"}
+  text = {"type": "text", "text": "Viewed /tmp/a.png."}
+  result = {"content": [image, text]}
+
+  stripped = viewed_images.without_image_data(result)
+
+  assert stripped["content"] == [{**image, "data": ""}, text]
+  assert result["content"][0]["data"]  # the provider's payload is untouched
+  assert viewed_images.without_image_data(None) is None
+
+
+def test_only_one_valid_matching_payload_is_stored(chat):
+  media = viewed_images.chat_media_dir(get_settings().data_dir, chat.id)
   image = {"type": "image", "data": base64.b64encode(PNG).decode(), "mimeType": "image/png"}
 
-  assert _bound(chat.id, {"content": [image]}) == name
   assert _bound(chat.id, {"content": [{**image, "mimeType": "image/gif"}]}) == ""
   assert _bound(chat.id, {"content": [image, image]}) == ""
   assert _bound(chat.id, {"content": [{**image, "data": "not base64!"}]}) == ""
-  unstored = base64.b64encode(OTHER_PNG).decode()
-  assert _bound(chat.id, {"content": [{**image, "data": unstored}]}) == ""
+  assert _bound(chat.id, {"content": [{**image, "data": ""}]}) == ""
   assert _bound(chat.id, None) == ""
+  assert not list(media.glob("viewed-*"))
+
+  name = _bound(chat.id, {"content": [image]})
+  assert name == viewed_images.snapshot_name(PNG, "image/png")
+  assert (media / name).read_bytes() == PNG
+  assert _bound(chat.id, {"content": [image]}) == name
+
+
+def test_a_completed_control_view_keeps_no_image_bytes_in_its_output():
+  from app.codex_events import _tool_completed_events
+
+  class McpCall(SimpleNamespace):
+    pass
+
+  payload = base64.b64encode(PNG).decode()
+  result = {"content": [
+    {"type": "image", "data": payload, "mimeType": "image/png"},
+    {"type": "text", "text": "Viewed /tmp/a.png."},
+  ]}
+  item = McpCall(
+    server="mobius_control", tool="view_image", status="completed",
+    error=None, result=result,
+  )
+
+  sdk = {
+    "McpToolCallThreadItem": McpCall,
+    "CommandExecutionThreadItem": type("Command", (), {}),
+    "FileChangeThreadItem": type("FileChange", (), {}),
+  }
+  events = _tool_completed_events(item, sdk)
+
+  assert payload not in repr(events)
+  assert "Viewed /tmp/a.png." in events[0]["content"]
+  assert events[-1] == {"type": "tool_end"}
 
 
 def test_view_image_is_offered_only_where_it_replaces_codexs_viewer(monkeypatch, chat):
@@ -143,7 +207,8 @@ def test_view_image_is_offered_only_where_it_replaces_codexs_viewer(monkeypatch,
   assert "view_image" in control._available_tool_names()
   monkeypatch.delenv("MOBIUS_IMAGE_VIEWER")
   assert "view_image" not in control._available_tool_names()
-  assert "tools.view_image=false" in _codex_config_overrides()
+  assert "features.view_image=false" in _codex_config_overrides()
+  assert not any(o.startswith("tools.view_image") for o in _codex_config_overrides())
 
 
 def test_a_control_view_renders_as_an_image_view_of_its_path():

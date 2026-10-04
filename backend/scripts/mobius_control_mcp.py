@@ -1130,27 +1130,16 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
 
 
 def _call_view_image(arguments: dict[str, Any]) -> ToolContent:
-  """Show the model one local image, as the chat-owned snapshot it previews.
+  """Show the model one local image, read once.
 
-  The file is read once. Those exact bytes are both returned to the provider
-  and stored as this chat's immutable snapshot, so a later overwrite of the
-  path, or another chat's same-named file, cannot change what the owner's
-  preview shows for this view.
+  The runner stores a chat snapshot of exactly the payload returned here when
+  the call completes, so the owner's preview cannot drift with the path.
   """
   _require_args(VIEW_IMAGE_TOOL, arguments, {"path"}, ("path",))
   data, mime = _VIEWED_IMAGES.read_viewed_image(arguments["path"])
-  media_dir = _VIEWED_IMAGES.chat_media_dir(
-    os.environ.get("DATA_DIR") or "/data", _chat_id(),
-  )
-  try:
-    _VIEWED_IMAGES.store_snapshot(media_dir, data, mime)
-    note = f"Viewed {arguments['path']}."
-  except OSError:
-    # A read-only run still sees the image; only the owner's preview is lost.
-    note = f"Viewed {arguments['path']} (no preview: this run cannot write chat media)."
   return ToolContent([
     {"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": mime},
-    {"type": "text", "text": note},
+    {"type": "text", "text": f"Viewed {arguments['path']}."},
   ])
 
 
@@ -1159,8 +1148,9 @@ _TOOL_DEFINITIONS = {
     "name": VIEW_IMAGE_TOOL,
     "description": (
       "Look at a local PNG, JPEG, GIF, or WebP image file (up to 20 MB) by "
-      "absolute path. The image is returned to you and the owner sees the "
-      "same picture in this chat."
+      "absolute path; large images are scaled down. The picture is for you: it "
+      "appears only in this chat's collapsed activity, so to show the owner an "
+      "image, embed it in your reply as usual."
     ),
     "inputSchema": {
       "type": "object", "additionalProperties": False, "required": ["path"],

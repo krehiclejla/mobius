@@ -2,12 +2,11 @@
 
 A viewed path names a mutable file (often under the global ``/tmp``), so it
 cannot prove which bytes the provider saw. The image tool therefore reads the
-file once, stores those bytes under the viewing chat's media as an immutable
-content-addressed snapshot, and hands the provider that same payload. The
-transcript then binds the view to the snapshot whose digest matches the
-payload the provider received, and the owner's preview serves exactly it.
+file once and returns the bytes to the provider as its result. When the call
+completes, the runner stores that very payload under the viewing chat's media
+as an immutable content-addressed snapshot, and the owner's preview serves it.
 
-Standard library only: the control MCP server loads this file directly rather
+Standard library only (Pillow is used when present): the control MCP server loads this file directly rather
 than importing the backend application.
 """
 
@@ -17,10 +16,12 @@ import base64
 import hashlib
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
 MAX_VIEWED_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_MODEL_EDGE = 2048
 _SIGNATURES = (
   (b"\x89PNG\r\n\x1a\n", "image/png"),
   (b"\xff\xd8\xff", "image/jpeg"),
@@ -49,21 +50,59 @@ def chat_media_dir(data_dir: str | os.PathLike, chat_id: str) -> Path:
   return Path(data_dir) / "chats" / chat_id / "media"
 
 
+def _fit_for_model(data: bytes, mime: str) -> tuple[bytes, str]:
+  """Shrink an oversized raster the way Codex's own viewer does.
+
+  A long edge above ``MAX_MODEL_EDGE`` adds tokens and bytes the model cannot
+  use. Pillow is optional here; any failure keeps the original bytes, which
+  the size cap already bounds.
+  """
+  try:
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as image:
+      if max(image.size) <= MAX_MODEL_EDGE:
+        return data, mime
+      image.thumbnail((MAX_MODEL_EDGE, MAX_MODEL_EDGE))
+      out = io.BytesIO()
+      if mime == "image/jpeg":
+        image.convert("RGB").save(out, "JPEG", quality=90)
+        return out.getvalue(), mime
+      image.save(out, "PNG")
+      return out.getvalue(), "image/png"
+  except Exception:
+    return data, mime
+
+
 def read_viewed_image(path: str) -> tuple[bytes, str]:
-  """Read one raster image in a single bounded read, or raise ValueError."""
+  """Read one regular raster image in a single bounded read, or raise ValueError.
+
+  The descriptor is opened non-blocking and checked after opening, so a FIFO
+  or device path is refused instead of holding the worker.
+  """
   if not isinstance(path, str) or not os.path.isabs(path):
     raise ValueError("path must be an absolute file path")
   try:
-    with open(path, "rb") as handle:
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+  except OSError as exc:
+    raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from exc
+  try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+      raise ValueError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as handle:
+      fd = -1
       data = handle.read(MAX_VIEWED_IMAGE_BYTES + 1)
   except OSError as exc:
     raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from exc
+  finally:
+    if fd >= 0:
+      os.close(fd)
   if len(data) > MAX_VIEWED_IMAGE_BYTES:
     raise ValueError("image is larger than 20 MB")
   mime = image_type(data)
   if mime is None:
     raise ValueError(f"{path} is not a PNG, JPEG, GIF, or WebP image")
-  return data, mime
+  return _fit_for_model(data, mime)
 
 
 def store_snapshot(media_dir: Path, data: bytes, mime: str) -> str:
@@ -90,20 +129,25 @@ def store_snapshot(media_dir: Path, data: bytes, mime: str) -> str:
   return name
 
 
-def bound_snapshot(
-  data_dir: str | os.PathLike, chat_id: str, result: Any,
-) -> str:
-  """Name the chat snapshot holding exactly the image the provider received.
-
-  ``result`` is the tool's MCP result. The name is derived from the payload
-  itself, so only a stored snapshot of those very bytes can be bound; anything
-  else yields ``""`` and the view has no preview.
-  """
+def _payload_images(result: Any) -> list[dict]:
   content = result.get("content") if isinstance(result, dict) else None
-  images = [
+  return [
     block for block in content or ()
     if isinstance(block, dict) and block.get("type") == "image"
   ]
+
+
+def snapshot_result(
+  data_dir: str | os.PathLike, chat_id: str, result: Any,
+) -> str:
+  """Store the image the provider received as this chat's snapshot; name it.
+
+  ``result`` is the tool's MCP result. The bytes are decoded and hashed once
+  from that payload, so the snapshot is exactly what the model saw, whatever
+  happens to the viewed path afterwards. Anything that is not one valid image
+  yields ``""`` and the view has no preview.
+  """
+  images = _payload_images(result)
   if len(images) != 1:
     return ""
   try:
@@ -113,7 +157,22 @@ def bound_snapshot(
   mime = image_type(data)
   if mime is None or mime != images[0].get("mimeType"):
     return ""
-  name = snapshot_name(data, mime)
-  if (chat_media_dir(data_dir, chat_id) / name).is_file():
-    return name
-  return ""
+  try:
+    return store_snapshot(chat_media_dir(data_dir, chat_id), data, mime)
+  except OSError:
+    return ""
+
+
+def without_image_data(result: Any) -> Any:
+  """The result with each image's base64 replaced, for the stored transcript.
+
+  The snapshot already holds the bytes, so keeping them in the tool output
+  would store every view twice.
+  """
+  if not _payload_images(result):
+    return result
+  return {**result, "content": [
+    {**block, "data": ""}
+    if isinstance(block, dict) and block.get("type") == "image" else block
+    for block in result["content"]
+  ]}

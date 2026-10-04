@@ -73,6 +73,25 @@ def test_codex_turn_settings_carry_public_values_and_only_a_path_to_secrets(tmp_
   assert base["mcp_servers"][CONTROL_SERVER_NAME]["env_vars"][1] == "AGENT_TOKEN"
 
 
+def test_per_turn_identity_extends_the_real_control_servers_env(tmp_path):
+  from app import platform_tools
+  env_file = helper_hosts.TurnEnvFile(tmp_path, "m", {"AGENT_TOKEN": "secret"})
+  base = platform_tools.codex_turn_mcp_config(None, control_enabled=True)
+
+  config = helper_hosts.codex_turn_thread_config(
+    base,
+    turn_env={"AGENT_TOKEN": "secret", "CHAT_ID": "c1", "MOBIUS_RUN_MARKER": "m"},
+    env_file=env_file,
+  )
+
+  control = config["mcp_servers"][platform_tools.CONTROL_SERVER_NAME]
+  assert control["env"] == {
+    "MOBIUS_IMAGE_VIEWER": "1",
+    helper_hosts.CALLER_ENV_FILE_ENV: str(env_file.path),
+    "MOBIUS_RUN_MARKER": "m",
+  }
+
+
 # ----------------------------------------------------------------- lifecycle
 
 
