@@ -816,7 +816,9 @@ export async function jsonOrThrow(response, label = 'Request failed') {
       : (detail?.message || `${label} (${response.status})`)
     // A compile refusal's reason and location live in its sanitized
     // diagnostic; the message alone only says that compilation failed.
-    const diagnostic = typeof detail?.stderr === 'string' ? detail.stderr.trim() : ''
+    const diagnostic = detail?.code === 'compile_failed' && typeof detail.stderr === 'string'
+      ? detail.stderr.trim()
+      : ''
     const message = diagnostic ? `${reason}\n${diagnostic}` : reason
     const error = new Error(message)
     error.status = response.status
