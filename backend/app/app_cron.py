@@ -1,6 +1,7 @@
 """Shared cron declaration and parsing primitives for installed apps."""
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -12,6 +13,8 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 BAKED_CRON_SCAFFOLD = Path("/app/scripts/init-cron-scaffold.sh")
 _ALLOW_TEST_CRON_ENV = "MOBIUS_ALLOW_TEST_CRON"
@@ -86,23 +89,58 @@ def clear_schedule_choice(app_id: int) -> None:
   (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).unlink(missing_ok=True)
 
 
+_INIT_CRON_FILE = "init-cron.sh"
+
+
+def _restore_file(path: Path, data: bytes | None, mode: int | None) -> None:
+  """Put ``path`` back to the snapshot; ``None`` data means it was absent."""
+  if data is None:
+    path.unlink(missing_ok=True)
+    return
+  tmp = path.with_name(f".{path.name}.{os.getpid()}.rollback")
+  tmp.write_bytes(data)
+  if mode is not None:
+    os.chmod(tmp, mode)
+  os.replace(tmp, path)
+
+
 @contextmanager
 def schedule_choice_rollback(app_id: int):
-  """Keep recorded provenance from outliving the registration it describes.
+  """Keep a failed save from leaving a schedule the owner was told failed.
 
   Provenance is written before the declaration so no declaration exists whose
-  origin a later update must guess. A registration that then fails would leave
-  a recorded choice the app never ran, which an accepted update later applies
-  as the owner's schedule, so the prior provenance is restored instead.
+  origin a later update must guess. The scaffold then writes the durable
+  ``init-cron.sh`` before touching the live crontab, so a failure can leave
+  the new declaration behind (startup retries it). Either way the owner was
+  told the save failed, and an accepted update or a startup replay would later
+  apply that time. Both files are therefore restored to their prior state:
+  the recorded choice and the durable declaration, deleted if absent before.
+
+  A failure of the rollback itself is logged and never replaces the original
+  error.
   """
+  state_dir = schedule_state_dir(app_id)
   prior = read_schedule_choice(app_id)
+  init_path = state_dir / _INIT_CRON_FILE
+  try:
+    init_data: bytes | None = init_path.read_bytes()
+    init_mode: int | None = init_path.stat().st_mode & 0o7777
+  except OSError:
+    init_data, init_mode = None, None
   try:
     yield
   except BaseException:
-    if prior is None:
-      clear_schedule_choice(app_id)
-    else:
-      record_schedule_choice(app_id, prior)
+    try:
+      if prior is None:
+        clear_schedule_choice(app_id)
+      else:
+        record_schedule_choice(app_id, prior)
+      if init_data is not None or init_path.exists():
+        _restore_file(init_path, init_data, init_mode)
+    except OSError:
+      logger.exception(
+        "Could not roll back the schedule record for app %s", app_id,
+      )
     raise
 
 

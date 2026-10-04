@@ -3144,8 +3144,8 @@ def _apply_schedule_choice(
 
   Provenance is written first so a failed or interrupted registration can
   never leave a declaration whose origin a later update must guess, and the
-  rollback keeps a failed registration from leaving provenance for a schedule
-  that was never registered.
+  rollback restores provenance and the durable declaration when registration
+  fails, so neither describes a schedule that was never saved.
   """
   from app import cron_tz
 
