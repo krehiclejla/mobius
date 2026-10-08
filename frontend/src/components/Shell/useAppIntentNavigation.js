@@ -9,7 +9,7 @@ export function findAppForOpenTarget(list, target) {
 export default function useAppIntentNavigation({
   appsRef,
   refreshApps,
-  showToast,
+  notifyShell,
   setAppIntents,
   navToRef,
 }) {
@@ -26,9 +26,8 @@ export default function useAppIntentNavigation({
     }
     if (!shouldContinue()) return
     if (!app) {
-      showToast('App is not installed yet.', {
+      notifyShell('App is not installed yet.', {
         variant: 'info',
-        duration: 6000,
       })
       return
     }
@@ -43,7 +42,7 @@ export default function useAppIntentNavigation({
       appId: app.id,
       ...(typeof paneId === 'string' && paneId ? { paneId } : {}),
     })
-  }, [refreshApps, showToast])
+  }, [refreshApps, notifyShell])
 
   const handleChatInternalNav = useCallback((url) => {
     const app = url.searchParams.get('app')

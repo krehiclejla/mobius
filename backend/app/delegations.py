@@ -10,7 +10,7 @@ projection. It never writes Chat.messages or Chat.pending_messages directly.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -20,9 +20,12 @@ import uuid
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session, aliased, load_only
 
+from app import chat_writer
+from app import transcript_rows
 from app import auth, models
+from app.browser_access import BrowserLineage, require_live
 from app.timeutil import now_naive_utc
 from app.usage_metrics import summarize_chat_run_tokens
 
@@ -66,7 +69,9 @@ class RunPolicy:
     return (
       "You are a delegated subagent running as a durable child task inside "
       "Möbius. Complete only the bounded user task in this child conversation "
-      "and return a clear result to the parent. When parallelism or local "
+      "and return a clear result to the parent. The parent receives only your "
+      "final message, so write your complete report last, after any tool "
+      "calls. When parallelism or local "
       "decomposition materially helps, start your own helpers with the Möbius "
       "spawn_agent tool with stable names; you remain responsible for checking your own "
       "completion condition after they settle, and their results reach you by "
@@ -111,6 +116,7 @@ class DelegationIntent:
   # Placement under the parent Goal's plan, not task identity: reattaching by
   # name never re-files the helper.
   goal_task_id: str | None = None
+  browser_grant_id: str | None = None
 
 
 def same_delegation_intent(
@@ -150,6 +156,8 @@ def _attach_existing_delegation(
     raise ValueError(
       "task key is already attached to different immutable work"
     )
+  if intent.browser_grant_id is not None and row.browser_grant_id != intent.browser_grant_id:
+    raise ValueError("task key belongs to different browser authority")
   # Notification is an observation owner, not task identity. Reattachment
   # must not add a second observer: the submit route may transfer an
   # undelivered background wake to a blocking caller under the parent's
@@ -168,19 +176,44 @@ def create_or_attach_delegation(
   steps leaves a discoverable ``starting`` delegation that reconciliation can
   safely start with the same immutable prompt.
   """
+  spawning_run = db.query(models.ChatRun).filter(
+    models.ChatRun.chat_id == intent.parent_chat_id,
+    models.ChatRun.status.in_(ACTIVE_RUN_STATUSES),
+  ).order_by(models.ChatRun.started_at.desc()).first()
+  if spawning_run is not None:
+    spawning_root = (
+      spawning_run.goal_id or spawning_run.root_run_id or spawning_run.id
+    )
+    if spawning_root != intent.parent_root_run_id:
+      spawning_run = None
+  if spawning_run is None:
+    spawning_run = db.query(models.ChatRun).filter(
+      models.ChatRun.chat_id == intent.parent_chat_id,
+      or_(
+        models.ChatRun.id == intent.parent_root_run_id,
+        models.ChatRun.root_run_id == intent.parent_root_run_id,
+        models.ChatRun.goal_id == intent.parent_root_run_id,
+      ),
+    ).order_by(models.ChatRun.started_at.desc()).first()
+  grant_id = intent.browser_grant_id or (spawning_run.browser_grant_id if spawning_run else None)
+  if grant_id is not None:
+    require_live(db, BrowserLineage(grant_id), db.query(models.Owner.id).scalar())
+  # Attachment must carry the same authority as the existing child. The
+  # authenticated guest wins over an owner-authored parent physical run.
+  resolved_intent = replace(intent, browser_grant_id=grant_id)
   row = db.query(models.Delegation).filter(
     models.Delegation.parent_root_run_id == intent.parent_root_run_id,
     models.Delegation.task_key == intent.task_key,
   ).first()
   if row is not None:
-    return _attach_existing_delegation(db, row, intent)
-
+    return _attach_existing_delegation(db, row, resolved_intent)
   child_id = str(uuid.uuid4())
   row = models.Delegation(
     id=str(uuid.uuid4()),
     app_id=intent.app_id,
     parent_chat_id=intent.parent_chat_id,
     parent_root_run_id=intent.parent_root_run_id,
+    browser_grant_id=grant_id,
     task_key=intent.task_key,
     goal_task_id=intent.goal_task_id,
     child_chat_id=child_id,
@@ -203,7 +236,7 @@ def create_or_attach_delegation(
       intent.parent_chat_id if intent.source_work_id is not None else None
     ),
   )
-  child = models.Chat(
+  child = chat_writer.create_chat(
     id=child_id,
     title=f"Delegation · {intent.task_key}",
     messages=[],
@@ -229,7 +262,7 @@ def create_or_attach_delegation(
     ).first()
     if row is None:
       raise ValueError("different delegation claimed the task key")
-    return _attach_existing_delegation(db, row, intent)
+    return _attach_existing_delegation(db, row, resolved_intent)
   # Anchor the parent's live "helper working" row where the launch happened.
   from app.activity_position import record_activity_position
   record_activity_position(
@@ -343,7 +376,7 @@ async def retry_limit_park(
   action and accepts only the latest, still-owned usage-limit park; active,
   terminal, cancelled, or superseded child attempts remain idempotent no-ops.
   """
-  status, run, _ = derived_status(db, row)
+  status, run, _ = derived_status(db, row, load_result=False)
   if (
     status != "paused"
     or run is None
@@ -447,7 +480,7 @@ def normalize_cwd(raw: str | None) -> str:
 
 
 def _first_user_prompt(chat: models.Chat) -> str | None:
-  for message in list(chat.messages or []):
+  for message in list(transcript_rows.history(chat)):
     if isinstance(message, dict) and message.get("role") == "user":
       content = message.get("content")
       return content if isinstance(content, str) else None
@@ -556,26 +589,28 @@ def parent_root_run_id(
 
 
 def _assistant_result(chat: models.Chat) -> str:
-  """Return the latest child assistant outcome as plain text."""
-  parts: list[str] = []
-  for message in reversed(list(chat.messages or [])):
+  """Return the latest child assistant outcome as plain text.
+
+  The outcome is the message's last text block (the report; earlier text
+  blocks are progress narration split off by tools or provider items) plus
+  its latest error, so a failed or stopped helper stays actionable.
+  """
+  for message in reversed(transcript_rows.history(chat)):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
+    blocks = message.get("blocks")
+    blocks = blocks if isinstance(blocks, list) else []
+    texts = [b["content"].strip() for b in blocks if isinstance(b, dict)
+             and b.get("type") == "text" and isinstance(b.get("content"), str)
+             and b["content"].strip()]
+    errors = [b["message"].strip() for b in blocks if isinstance(b, dict)
+              and b.get("type") == "error" and isinstance(b.get("message"), str)
+              and b["message"].strip()]
+    if texts or errors:
+      return "\n\n".join(texts[-1:] + errors[-1:])
     content = message.get("content")
     if isinstance(content, str) and content.strip():
       return content.strip()
-    blocks = message.get("blocks")
-    if not isinstance(blocks, list):
-      continue
-    for block in blocks:
-      if not isinstance(block, dict):
-        continue
-      if block.get("type") == "text" and isinstance(block.get("content"), str):
-        parts.append(block["content"])
-      elif block.get("type") == "error" and isinstance(block.get("message"), str):
-        parts.append(block["message"])
-    if parts:
-      return "\n".join(part.strip() for part in parts if part.strip()).strip()
   return ""
 
 
@@ -589,6 +624,39 @@ def derived_status(
     if load_result else None
   )
   result = _assistant_result(chat) if chat is not None else ""
+  return _project_delegation_status(row, run, result)
+
+
+def delegation_statuses(
+  db: Session, rows: list[models.Delegation],
+) -> dict[str, str]:
+  """Project a helper collection with one read, without child transcripts.
+
+  Use the same exact latest-run ordering and status rules as result-bearing
+  reads. Plans need only statuses, not the runs' provider or activity payloads.
+  This snapshot belongs to this call; nothing is cached across lifecycle changes.
+  """
+  if not rows:
+    return {}
+  runs = db.query(models.ChatRun).join(
+    models.Delegation, models.ChatRun.id == _latest_child_run_id(),
+  ).filter(
+    models.Delegation.id.in_([row.id for row in rows]),
+  ).options(load_only(
+    models.ChatRun.id, models.ChatRun.chat_id, models.ChatRun.status,
+    raiseload=True,
+  )).all()
+  by_chat = {run.chat_id: run for run in runs}
+  return {
+    row.id: _project_delegation_status(row, by_chat.get(row.child_chat_id), "")[0]
+    for row in rows
+  }
+
+
+def _project_delegation_status(
+  row: models.Delegation, run: models.ChatRun | None, result: str,
+) -> tuple[str, models.ChatRun | None, str]:
+  """Shared status rules for full results and lightweight plan reads."""
   if row.interrupted_at is not None:
     notice = (
       "This legacy read-only helper was interrupted during the single-mode "
@@ -834,10 +902,8 @@ def limit_resume_successor_delegation(
   return delegation
 
 
-def _record_lifecycle(
-  db: Session, row: models.Delegation, status: str,
-) -> None:
-  from app.agent_lifecycle import normalize_chat_event, record_event
+def _lifecycle_values(row: models.Delegation, status: str) -> dict | None:
+  from app.agent_lifecycle import normalize_chat_event
 
   terminal = status in TERMINAL_DELEGATION_STATUSES
   event = {
@@ -858,7 +924,7 @@ def _record_lifecycle(
     "source": "delegation",
     "source_event_id": f"delegation:{row.id}:{'terminal:' + status if terminal else 'started'}",
   }
-  values = normalize_chat_event(
+  return normalize_chat_event(
     chat_id=row.parent_chat_id,
     # Source-attached work belongs to the chat but deliberately creates no
     # source ChatRun. Its stable source_work_id is the lifecycle activation;
@@ -866,10 +932,32 @@ def _record_lifecycle(
     chat_run_id=(None if row.source_work_id is not None else row.parent_root_run_id),
     event=event,
   )
-  if values is not None and not db.query(models.AgentLifecycleEvent.id).filter(
-    models.AgentLifecycleEvent.event_key == values["event_key"],
-  ).first():
-    record_event(db, values)
+
+
+def _record_missing_lifecycles(db: Session, values: list[dict]) -> None:
+  """Append the lifecycle facts not yet recorded, checking them in one read."""
+  if not values:
+    return
+  from app.agent_lifecycle import record_event
+
+  recorded = {
+    key for (key,) in db.query(models.AgentLifecycleEvent.event_key).filter(
+      models.AgentLifecycleEvent.event_key.in_(
+        {item["event_key"] for item in values}
+      ),
+    )
+  }
+  for item in values:
+    if item["event_key"] not in recorded:
+      record_event(db, item)
+      recorded.add(item["event_key"])
+
+
+def _record_lifecycle(
+  db: Session, row: models.Delegation, status: str,
+) -> None:
+  values = _lifecycle_values(row, status)
+  _record_missing_lifecycles(db, [values] if values is not None else [])
 
 
 def serialize_delegation(
@@ -884,6 +972,55 @@ def serialize_delegation(
     .filter(models.Chat.id == row.parent_chat_id)
     .scalar()
   )
+  return _delegation_payload(row, status, run, result, parent_chat_title)
+
+
+def serialize_delegation_list(
+  db: Session, rows: list[models.Delegation],
+) -> list[dict]:
+  """Serialize a page of helpers without results in a fixed number of reads.
+
+  Same projection as `serialize_delegation(include_result=False)`, but child
+  runs, parent titles, and lifecycle repair are each one batched read rather
+  than three queries per row (the Subagents app polls this list).
+  """
+  if not rows:
+    return []
+  runs = db.query(models.ChatRun).join(
+    models.Delegation, models.ChatRun.id == _latest_child_run_id(),
+  ).filter(
+    models.Delegation.id.in_([row.id for row in rows]),
+  ).all()
+  run_by_chat = {run.chat_id: run for run in runs}
+  titles = dict(
+    db.query(models.Chat.id, models.Chat.title).filter(
+      models.Chat.id.in_({row.parent_chat_id for row in rows}),
+    ).all()
+  )
+  payloads = []
+  lifecycle = []
+  for row in rows:
+    status, run, result = _project_delegation_status(
+      row, run_by_chat.get(row.child_chat_id), "",
+    )
+    payloads.append(_delegation_payload(
+      row, status, run, result, titles.get(row.parent_chat_id),
+    ))
+    values = _lifecycle_values(row, status)
+    if values is not None:
+      lifecycle.append(values)
+  # Payloads are built first: recording commits, which would expire every row.
+  _record_missing_lifecycles(db, lifecycle)
+  return payloads
+
+
+def _delegation_payload(
+  row: models.Delegation,
+  status: str,
+  run: models.ChatRun | None,
+  result: str,
+  parent_chat_title: str | None,
+) -> dict:
   return {
     "id": row.id,
     "app_id": row.app_id,
@@ -1151,6 +1288,15 @@ def delegation_execution_token(
     raise RuntimeError("delegation is unavailable")
   if row.scope != "write" or row.interrupted_at is not None:
     raise RuntimeError("legacy helper cannot receive an execution token")
+  run = db.get(models.ChatRun, run_id) if run_id else None
+  if run is None:
+    raise RuntimeError("Delegation has no durable run lineage")
+  if run.chat_id != row.child_chat_id:
+    raise RuntimeError("Delegation run does not belong to its child chat")
+  if run.browser_grant_id != row.browser_grant_id:
+    raise RuntimeError("Delegation run browser lineage does not match")
+  browser = BrowserLineage.of(run.browser_grant_id)
+  require_live(db, browser, owner.id)
   return auth.create_agent_token(
     row.child_chat_id,
     owner.username,
@@ -1159,6 +1305,7 @@ def delegation_execution_token(
     expires_delta=auth.AGENT_RUN_TOKEN_TTL,
     delegation_id=policy.delegation_id,
     delegation_chat=row.child_chat_id,
+    browser=browser,
   )
 
 
@@ -2474,8 +2621,7 @@ def safe_parent_wake_startup_writer_orphan(
     return False
   if safe_parent_activity_startup_writer_orphan(db, chat, physical):
     return True
-  messages = list(chat.messages or [])
-  continuation = messages[-1] if messages else None
+  continuation = transcript_rows.at(db, chat, -1)
   committed = _committed_parent_wake(db, chat, continuation)
   return bool(
     committed is not None
@@ -2541,7 +2687,7 @@ def _committed_parent_wake_is_unowned(
     return False
   physical, _rows, _carried = committed
   if physical.status in ("interrupted", "stopped"):
-    messages = list(chat.messages or [])
+    messages = list(transcript_rows.history(chat))
     wake_cid = message.get("cid")
     matches = [
       index for index, candidate in enumerate(messages)
@@ -2739,7 +2885,7 @@ async def _deliver_parent_wake_once(
       # deterministic ChatRun still owns its pre-upgrade recovery attempt.
       committed = next((
         candidate
-        for message in reversed(list(parent_chat.messages or []))
+        for message in reversed(transcript_rows.history(parent_chat))
         if (
           (candidate := _committed_parent_wake(db, parent_chat, message))
           is not None
@@ -2816,7 +2962,7 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
         .first()
       )
       if row is not None and row.source_work_id is not None:
-        status, _, _ = derived_status(db, row)
+        status, _, _ = derived_status(db, row, load_result=False)
         if status in TERMINAL_DELEGATION_STATUSES:
           row.source_work_active_chat_id = None
         _record_lifecycle(db, row, status)
@@ -2829,7 +2975,7 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
       from app.goal_plans import publish_plan_for_delegation
       publish_plan_for_delegation(db, row)
       publish_parent_waiting_changed(row.parent_chat_id)
-      status, _, _ = derived_status(db, row)
+      status, _, _ = derived_status(db, row, load_result=False)
       if status in TERMINAL_DELEGATION_STATUSES:
         publish_chat_activity_changed(row.parent_chat_id)
       if (

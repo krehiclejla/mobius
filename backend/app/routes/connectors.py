@@ -8,6 +8,7 @@ import json
 import logging
 import secrets
 import dataclasses
+from contextlib import aclosing
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -18,10 +19,11 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import access_signal
 from app import connectors as core
 from app import connector_oauth as connector_oauth_mod
 from app import models
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import (
   get_owner_or_app_with_connections_manage,
   require_nondelegated_owner_or_app_control,
@@ -63,6 +65,9 @@ _BROKER_RESPONSE_HEADERS = {
   "mcp-session-id",
 }
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+# Commits in this process wake open exchanges at once; this bounds how long a
+# revocation written by another process (an operator script) can go unseen.
+_BROKER_OUT_OF_PROCESS_RECHECK_SECONDS = access_signal.OUT_OF_PROCESS_RECHECK_SECONDS
 _CREATE_LOCK = asyncio.Lock()
 
 
@@ -71,15 +76,21 @@ class _BrokerSnapshot:
   url: str
   auth_header: str | None
   secret: str | None
+  connector_id: int | None = None
   # Connector identity authenticated by the broker capability. Passing it to
   # token refresh prevents a deleted/recreated numeric id from refreshing a
   # replacement connection's grant.
   generation: str | None = None
+  # Signed capability claims, checked again while a long response streams.
+  lineage: dict | None = None
   # Non-secret static headers the provider requires alongside auth — currently
   # only Google Cloud's ``x-goog-user-project`` billing/quota project. A tuple
   # of (name, value) pairs keeps the frozen snapshot cleanly copyable through
   # ``dataclasses.replace`` when the OAuth token is attached.
   extra_headers: tuple[tuple[str, str], ...] = ()
+  # Access-change revision captured before this snapshot's lineage was last
+  # validated; any later revocation advances past it.
+  access_revision: int = 0
 
 
 class ConnectorCreate(BaseModel):
@@ -263,10 +274,11 @@ def _snapshot_broker_row(
   if row is None:
     raise HTTPException(status_code=404, detail="MCP connection unavailable.")
   try:
-    core.verify_broker_capability(
+    lineage = core.verify_broker_capability(
       capability,
       connector_id,
       row.capability_id,
+      db=db,
     )
   except core.ConnectorError as exc:
     raise HTTPException(
@@ -313,7 +325,9 @@ def _snapshot_broker_row(
     url=str(row.url),
     auth_header=auth_header,
     secret=secret,
+    connector_id=connector_id,
     generation=str(row.capability_id),
+    lineage=lineage,
     extra_headers=extra_headers,
   )
 
@@ -446,7 +460,11 @@ async def _open_broker_upstream(
       (declared_length is not None and declared_length != "0")
       or "transfer-encoding" in request.headers
     )
-    content = request.stream() if has_body else None
+    content = (
+      _revocable_broker_upload(request, snapshot.connector_id, snapshot)
+      if has_body and snapshot.connector_id is not None else
+      request.stream() if has_body else None
+    )
     upstream_request = client.build_request(
       request.method,
       pinned_url,
@@ -475,6 +493,54 @@ async def _open_broker_upstream(
   except BaseException:
     await client.aclose()
     raise
+
+
+def _broker_lineage_active(connector_id: int, snapshot: _BrokerSnapshot) -> bool:
+  """Fresh broker-side check; a copied provider token is never grant authority.
+
+  Every table read here must be in ``access_signal.ACCESS_TABLES`` so
+  that a committed change to it wakes open exchanges for a recheck.
+  """
+  with SessionLocal() as db:
+    row = db.get(models.Connector, connector_id)
+    if (row is None or not row.enabled or row.status != "ok"
+        or row.capability_id != snapshot.generation):
+      return False
+    try:
+      core.validate_broker_lineage(db, snapshot.lineage or {})
+    except core.ConnectorError:
+      return False
+  return True
+
+
+_BrokerRevoked = access_signal.AccessRevoked
+
+
+def _until_broker_revoked(
+  iterator, connector_id: int, snapshot: _BrokerSnapshot,
+):
+  """Forward ``iterator`` items, raising ``_BrokerRevoked`` once access ends."""
+  return access_signal.until_revoked(
+    iterator, lambda: _broker_lineage_active(connector_id, snapshot),
+    checked=snapshot.access_revision,
+    recheck_seconds=_BROKER_OUT_OF_PROCESS_RECHECK_SECONDS,
+  )
+
+
+async def _revocable_broker_upload(
+  request: Request, connector_id: int, snapshot: _BrokerSnapshot,
+):
+  """Stop forwarding a long request body as soon as its grant disappears."""
+  async with aclosing(
+    _until_broker_revoked(request.stream(), connector_id, snapshot),
+  ) as chunks:
+    try:
+      async for chunk in chunks:
+        yield chunk
+    except _BrokerRevoked:
+      raise HTTPException(
+        status_code=401, detail="MCP broker capability rejected.",
+      ) from None
 
 
 @router.api_route("/{connector_id}/broker", methods=["GET", "POST", "DELETE"])
@@ -513,12 +579,24 @@ async def broker_connector(
   finally:
     db.close()
 
+  # Capture the revision before validating, so a revocation that commits
+  # during or after this check always wakes the exchange for a recheck.
+  snapshot = dataclasses.replace(
+    snapshot, access_revision=access_signal.current_revision(),
+  )
+  if not await asyncio.to_thread(_broker_lineage_active, connector_id, snapshot):
+    raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
   client, upstream = await _open_broker_upstream(request, snapshot)
 
   async def stream():
     try:
-      async for chunk in _redacted_broker_stream(upstream, snapshot):
-        yield chunk
+      async with aclosing(_until_broker_revoked(
+        _redacted_broker_stream(upstream, snapshot), connector_id, snapshot,
+      )) as chunks:
+        async for chunk in chunks:
+          yield chunk
+    except _BrokerRevoked:
+      return
     finally:
       await upstream.aclose()
       await client.aclose()

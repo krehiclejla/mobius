@@ -32,6 +32,12 @@ test('cold restore reads one coherent app destination', () => {
 
 test('deep links preserve slug, numeric identity, and intent', () => {
   assert.deepEqual(parseShellDeepLink({
+    pathname: '/shell/shared', search: '?chat=guest-chat&focus=question',
+  }), { view: 'chat', chatId: 'guest-chat', intent: null, focusQuestion: true })
+  assert.deepEqual(parseShellDeepLink({
+    pathname: '/shell/shared/', search: '?app=42&intent=open%3Areport',
+  }), { view: 'canvas', app: '42', appId: 42, intent: 'open:report' })
+  assert.deepEqual(parseShellDeepLink({
     pathname: '/shell/', search: '?app=42&intent=open%3Areport',
   }), { view: 'canvas', app: '42', appId: 42, intent: 'open:report' })
   assert.deepEqual(parseShellDeepLink({

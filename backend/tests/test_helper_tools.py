@@ -1,4 +1,6 @@
 """Möbius helper tools: spawn/message/stop/list, identity, and result delivery."""
+from sqlalchemy.orm import object_session
+from app import transcript_rows
 
 from tests.goal_fixtures import goal_run as make_goal_run
 
@@ -139,6 +141,28 @@ def test_message_stop_and_list_address_helpers_by_name(monkeypatch):
     control._call_stop_agent({"helper": "missing"})
 
 
+def test_message_agent_reports_wrong_fields_and_peer_chat_target_without_echoing_values(monkeypatch):
+  control = _control(monkeypatch, CHAT_ID="parent-1")
+  calls = _capture_api(control, monkeypatch, {
+    "/api/delegations?parent_chat_id=parent-1": {"items": []},
+  })
+  with pytest.raises(ValueError) as wrong:
+    control._call_message_agent({"recipient": "secret-target", "body": "secret-body"})
+  assert "invalid keys: body, recipient" in str(wrong.value)
+  assert "missing: helper, message" in str(wrong.value)
+  assert "send_agent_message(recipients, body" in str(wrong.value)
+  assert "secret-target" not in str(wrong.value)
+  assert "secret-body" not in str(wrong.value)
+  assert calls == []
+
+  with pytest.raises(ValueError) as target:
+    control._call_message_agent({"helper": "peer-chat-secret", "message": "Follow up"})
+  assert "list_agents" in str(target.value)
+  assert "send_agent_message(recipients, body)" in str(target.value)
+  assert "peer-chat-secret" not in str(target.value)
+  assert calls == [("GET", "/api/delegations?parent_chat_id=parent-1&limit=200", None)]
+
+
 def test_every_agent_level_offers_the_helper_tools(monkeypatch):
   from app import platform_tools
   control = _control(monkeypatch, MOBIUS_RUN_TOKEN="run")
@@ -218,6 +242,8 @@ def test_a_working_or_stopped_helper_cannot_be_messaged(client, owner_token, db)
   gone = client.post(f"/api/delegations/{stopped_id}/messages",
                      json={"message": "x"}, headers=headers)
   assert busy.status_code == 409 and "still working" in busy.text
+  assert "send_agent_message(recipients, body)" in busy.text
+  assert "list_agent_peers" in busy.text
   assert gone.status_code == 409 and "stopped" in gone.text
 
 
@@ -247,6 +273,32 @@ def test_an_agent_reading_a_settled_result_is_not_woken_to_receive_it_again(
   assert delegations_mod._wake_eligible_rows_for_parent(
     db, parent_id, row.parent_root_run_id,
   ) == []
+
+
+def test_failed_setup_recovery_makes_helper_result_eligible_for_parent_wake(db):
+  """Interrupted attempts are not deliverable; failed setup is terminal."""
+  from app.chat_writer import RecoverWedgedRun, get_writer
+
+  parent_id, child_id, delegation_id = _seed_delegation(
+    db, suffix="setup-recovery-wake", child_status="running",
+  )
+  source = db.get(models.Delegation, delegation_id).parent_root_run_id
+  assert delegations_mod._wake_eligible_rows_for_parent(db, parent_id, source) == []
+
+  get_writer().submit(RecoverWedgedRun(
+    chat_id=child_id,
+    run_token="child-run-setup-recovery-wake",
+    terminal_status="failed",
+    interruption_block={
+      "type": "error", "message": "Setup failed.", "resumable": True,
+    },
+  )).result(timeout=5)
+
+  db.expire_all()
+  assert db.get(models.ChatRun, "child-run-setup-recovery-wake").status == "failed"
+  assert [row.id for row in delegations_mod._wake_eligible_rows_for_parent(
+    db, parent_id, source,
+  )] == [delegation_id]
 
 
 def test_viewing_a_helper_does_not_count_as_its_parent_receiving_the_result(
@@ -631,10 +683,10 @@ def test_the_conversation_panel_shows_a_helpers_own_steps(client, owner_token, d
     ],
   )
   child = db.get(models.Chat, child_id)
-  child.messages = [
-    *child.messages,
+  transcript_rows.replace_all(object_session(child), child, [
+    *list(transcript_rows.history(child)),
     {"role": "user", "content": "carrier", "hidden": True, "kind": "delegation_result"},
-  ]
+  ])
   db.commit()
   response = client.get(
     f"/api/chats/{_parent}/helpers/{delegation_id}",

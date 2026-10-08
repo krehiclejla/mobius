@@ -31,6 +31,7 @@ from app.broadcast import (
 )
 from app.database import get_db
 from app.deps import (
+  revocable_browser_stream,
   Principal, chat_embed_session_is_active, get_owner_or_chat_embed_principal,
   get_current_owner, reject_cross_site,
   require_chat_embed_operation,
@@ -429,7 +430,7 @@ async def stream_system_events(
       broadcast.unsubscribe(queue)
 
   return _SystemEventStreamingResponse(
-    generate(),
+    revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
   )

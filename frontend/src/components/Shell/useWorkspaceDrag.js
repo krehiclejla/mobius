@@ -660,10 +660,7 @@ export default function useWorkspaceDrag({
         const tab = tabFromKey(key)
         if (!tab) return false
         const label = labelForTabRef.current ? labelForTabRef.current(tab) : 'tab'
-        // The undo toast is driven by the reducer's undo slot (Shell), not raised
-        // here: OPEN_TAB_AT stamps a `toast` on the slot only when the drop
-        // actually mutates, so the toast can never outlive or mis-name its
-        // snapshot (design §3.5).
+        // OPEN_TAB_AT records an undo snapshot only when the drop mutates.
         // DRAG IS BUILDING (point 15): ANY drop made from single-screen mode commits
         // builder mode — you built something, you stay in the build world. Fold the
         // 'panes' flip INTO the OPEN_TAB_AT payload so the drop and the flip are ONE

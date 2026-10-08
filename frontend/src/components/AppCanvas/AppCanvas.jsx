@@ -142,8 +142,8 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //
 //   5. {type: 'moebius:frame-insets', insets}              parent → frame
 //      The device safe-area insets ({top,right,bottom,left} px strings),
-//      forwarded so an immersive (full-bleed, under-the-notch) app can pad
-//      away from the notch/home-indicator. env(safe-area-inset-*) reads 0
+//      forwarded so an immersive app can pad away from a cutout/gesture area
+//      when the host paints beneath one. env(safe-area-inset-*) reads 0
 //      inside the sandboxed iframe (only the top-level document resolves
 //      viewport-fit insets), so the shell reads the REAL values off a probe
 //      element and posts them; the frame applies them as
@@ -173,7 +173,11 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      and {type:'moebius:shell-shortcut', actionId}       frame → parent
 //      The shell advertises only its reserved named actions to the live,
 //      interactive frame. Exact source + focus gating prevents arbitrary
-//      keylogging or a hidden frame dispatching workspace behavior.
+//      keylogging or a hidden frame dispatching workspace behavior. An app
+//      whose manifest sets "shell_shortcuts": false is advertised none. The
+//      frame shares the list with any direct child frame and relays a child's
+//      action only while that child's iframe has keyboard focus in a focused
+//      app document, so this side still sees only the frame as the source.
 //
 //  10. moebius:screen-control-command/result                bidirectional
 //      The owner-granted shell session may inspect or operate the VISIBLE app
@@ -705,10 +709,6 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
-        shellShortcuts: v === liveVersionRef.current && activeRef.current
-          && visibleRef.current && interactiveRef.current
-          ? shellShortcutsRef.current
-          : [],
       },
       '*',
     )

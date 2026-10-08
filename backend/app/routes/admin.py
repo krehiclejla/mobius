@@ -74,7 +74,7 @@ def read_activity(
   since: str = Query(..., description="ISO8601 lower bound (inclusive)"),
   until: str | None = Query(None, description="ISO8601 upper bound; defaults to now"),
   app_id: int | None = Query(None, description="Filter to one app"),
-  _owner: models.Owner = Depends(get_current_owner),
+  _owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
 ):
   """Streams the activity log as JSONL within [since, until], optionally
   filtered to one app_id.
@@ -160,7 +160,7 @@ class ContainerCutoverPrepare(BaseModel):
 def emit_activity_event(
   body: ActivityEmit,
   _csrf: None = Depends(reject_cross_site),
-  _owner: models.Owner = Depends(get_current_owner),
+  _owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
 ):
   """Lets cron scripts (and the rare server-external caller) record an
   activity event via the API instead of writing to the file directly.

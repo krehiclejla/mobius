@@ -217,6 +217,40 @@ test('boundary plus final-only item does not replace the preceding text', () => 
   ])
 })
 
+test('distinct final-only items survive replay without deltas or boundaries', () => {
+  let items = []
+  for (const [textItemId, content] of [['one', 'First.'], ['two', 'Second.'], ['one', 'First.']]) {
+    items = replaceTextItem(items, content, { textItemId })
+  }
+  assert.deepEqual(items, [
+    { type: 'text', content: 'First.', text_item_id: 'one' },
+    { type: 'text', content: 'Second.', text_item_id: 'two' },
+  ])
+})
+
+test('distinct final items are not deduplicated by equal text', () => {
+  let items = []
+  for (const textItemId of ['one', 'two']) {
+    items = replaceTextItem(items, 'Same.', { textItemId })
+  }
+  assert.equal(items.length, 2)
+})
+
+test('final adopts identity when repairing anonymous trailing text', () => {
+  for (const content of ['Fin', 'Final.']) {
+    const before = [{ type: 'text', content }]
+    const items = replaceTextItem(before, 'Final.', { textItemId: 'one' })
+    assert.deepEqual(items, [{ type: 'text', content: 'Final.', text_item_id: 'one' }])
+    assert.deepEqual(before, [{ type: 'text', content }], 'original snapshot is untouched')
+  }
+})
+
+test('anonymous final keeps legacy trailing repair and known identity', () => {
+  assert.deepEqual(replaceTextItem([
+    { type: 'text', content: 'Fin', text_item_id: 'one' },
+  ], 'Final.'), [{ type: 'text', content: 'Final.', text_item_id: 'one' }])
+})
+
 test('abandoned text removal uses provider identity, not content overlap', () => {
   const items = discardTextItem([
     { type: 'text', content: 'settled', text_item_id: 'msg-1' },

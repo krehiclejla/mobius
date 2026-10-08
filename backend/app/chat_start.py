@@ -11,6 +11,7 @@ import asyncio
 from contextlib import nullcontext
 import time
 
+from app import transcript_rows
 from app import models, providers
 from app.broadcast import (
   create_broadcast,
@@ -178,6 +179,7 @@ async def start_programmatic_chat_continuation(
     _schedule_continuation,
     discard_starting,
     is_chat_running,
+    is_draining,
     mark_starting,
     programmatic_start_blocker,
   )
@@ -198,6 +200,11 @@ async def start_programmatic_chat_continuation(
       )
       async with transition_guard:
         async with chat_queue.get_lock(chat_id):
+          # Shutdown owns the exact unfinished run, even after its runner has
+          # stopped. Orphan cleanup here would erase its restart authorization
+          # before the drain can park it. Check after acquiring both locks.
+          if is_draining():
+            return False
           # A retry after the durable command committed must attach even while
           # the in-process runner still owns the transient starting/running
           # marker. The command repeats this check inside its transaction for
@@ -230,8 +237,7 @@ async def start_programmatic_chat_continuation(
                 models.Chat.id == chat_id,
                 models.Chat.deleted_at.is_(None),
               ).first()
-              messages = list(chat.messages or []) if chat is not None else []
-              continuation = messages[-1] if messages else None
+              continuation = transcript_rows.at(db, chat, -1) if chat is not None else None
               safe_orphan = bool(
                 existing.provider_execution_admitted is False
                 and isinstance(continuation, dict)
@@ -252,7 +258,7 @@ async def start_programmatic_chat_continuation(
                     role=message.get("role", "user"),
                     content=message.get("content", "") or "",
                   )
-                  for message in messages
+                  for message in transcript_rows.history(chat)
                 ]
                 orphaned = {
                   "history": history,
@@ -368,6 +374,7 @@ async def start_programmatic_activity_continuation(
     _schedule_continuation,
     discard_starting,
     is_chat_running,
+    is_draining,
     mark_starting,
     programmatic_start_blocker,
   )
@@ -388,6 +395,10 @@ async def start_programmatic_activity_continuation(
       )
       async with transition_guard:
         async with chat_queue.get_lock(chat_id):
+          # A stopped runner during shutdown is drain-owned, not an orphan.
+          # Leave its run and restart binding for the drain/boot handoff.
+          if is_draining():
+            return False
           orphaned = None
           with SessionLocal() as db:
             existing = db.query(models.ChatRun).filter(
@@ -427,7 +438,7 @@ async def start_programmatic_activity_continuation(
                     role=message.get("role", "user"),
                     content=message.get("content", "") or "",
                   )
-                  for message in list(chat.messages or [])
+                  for message in list(transcript_rows.history(chat))
                 ]
                 history.append(schemas.ChatMessage(
                   role="user", content=source["content"],

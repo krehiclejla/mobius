@@ -22,6 +22,7 @@ import {
 } from '../lib/navigationPersistence.js'
 import { drawerOpenBlockedByDrag } from '../lib/drawerLifecycle.js'
 import { shellReload } from '../lib/shellReloadState.js'
+import { isOwnerWorkspace, ownerStore } from '../lib/workspaceStorage.js'
 import { recordClientError } from '../lib/errorLog.js'
 import * as tabModel from '../components/Shell/tabModel.js'
 import * as paneModel from '../components/Shell/paneModel.js'
@@ -47,6 +48,13 @@ function _anyAppHasSentinels(map) {
     if (n > 0) return true
   }
   return false
+}
+
+// A shell `nav` entry above the first one has a shell entry behind it. After a
+// reload resumes such an entry, the destructive navStack is empty, but Back
+// still belongs to the shell rather than leaving Möbius.
+function hasShellEntryBelow(state) {
+  return navEntryIndex(state) > 0 && state?.kind === 'nav'
 }
 
 // A restorable route carries a `paneId` HINT (design §5). The hint is never a
@@ -90,9 +98,12 @@ export const deepLink = parseShellDeepLink(window.location)
 // instead of defaulting to a chat. Only the canvas needs an explicit
 // signal (chat is the default). shellReload / deepLink (an explicit
 // destination for THIS load) take precedence — see below.
-const restored = readRestoredCanvas(localStorage)
+// A guest has no owner cold-restore or return view; it restores from its own
+// navigationStorage when the hook mounts.
+const ownerWorkspace = isOwnerWorkspace()
+const restored = readRestoredCanvas(ownerStore())
 
-const returnView = consumeReturnView(sessionStorage)
+const returnView = ownerWorkspace ? consumeReturnView() : null
 
 // The app id cold-restored to the canvas (null unless the storage-restore
 // — not shellReload/deepLink — drove it). The restore is OPTIMISTIC: this
@@ -150,6 +161,8 @@ export default function useNavigation({
   replaceImplicitBootTab,
   dragActiveRef,
   beforeRestoreRouteRef,
+  navigationStorage = localStorage,
+  routePath = '/shell/',
 }) {
   // Monotonic presentation signal for re-revealing an already-active tab. The
   // semantic route remains a no-op (no history or workspace write), but a drawer
@@ -164,8 +177,8 @@ export default function useNavigation({
     shellReload,
     deepLink,
     returnView,
-    restored,
-    storedChatId: safeStoredChatId(),
+    restored: ownerWorkspace ? restored : readRestoredCanvas(navigationStorage),
+    storedChatId: safeStoredChatId(navigationStorage),
   }))
   // Settings is the ONLY view state navigation owns globally (§1). It is the
   // full-workspace TAKEOVER overlay used in single mode (and when the builder
@@ -282,7 +295,7 @@ export default function useNavigation({
   // Non-authoritative: the last non-null active chat id, used ONLY to resolve
   // the semantic-home (`homeSeed`) route. It never decides what renders while a
   // pane has an active tab.
-  const lastChatIdRef = useRef(initialNav.chatId ?? safeStoredChatId())
+  const lastChatIdRef = useRef(initialNav.chatId ?? safeStoredChatId(navigationStorage))
   if (activeChatId) lastChatIdRef.current = activeChatId
 
   // Android back gesture synthesizes a click on the logo ~300ms later.
@@ -1469,14 +1482,30 @@ export default function useNavigation({
       const baseRoute = seedHome
         ? navRoute('chat', lastChatIdRef.current, null, bootPaneId)
         : initialRoute
-      currentNavStateRef.current = replaceNavEntry('base', '/shell/', baseRoute)
-      furthestNavIndexRef.current = navEntryIndex(currentNavStateRef.current) ?? 0
+      // A reload stays on the same physical shell entry. Replacing it with a
+      // fresh base erases its position (and Forward branch) while the browser
+      // still retains the surrounding entries. Explicit launch destinations
+      // instead start a new shell-relative history model as before.
+      const existing = history.state
+      const resumeEntry = !deepLink?.view && !returnView
+        && !claimedReloadDestination
+        // A base entry showing a non-chat surface still needs the HOME seed
+        // behind it, so only a chat base entry is resumed as-is.
+        && (existing?.kind === 'nav' || (existing?.kind === 'base' && !seedHome))
+        && isMobiusNavState(existing)
+        && sameRoute(existing.route, initialRoute)
+      currentNavStateRef.current = resumeEntry
+        ? existing
+        : replaceNavEntry('base', routePath, baseRoute)
+      const resumedIndex = navEntryIndex(currentNavStateRef.current) ?? 0
+      furthestNavIndexRef.current = resumedIndex
+        + (currentNavStateRef.current.hasShellForward === true ? 1 : 0)
 
       // Seed HOME as the back-stack root when this load booted into a deep
       // destination (canvas/settings) so Back always reaches the chat surface.
       // The home entry carries chatId:null so it is immune to chat-delete
       // scrubbing; handleBack resolves it to the freshest active chat.
-      if (seedHome && !seededHomeRef.current) {
+      if (!resumeEntry && seedHome && !seededHomeRef.current) {
         seededHomeRef.current = true
         try {
           pushShellEntry('nav', initialRoute)
@@ -2082,7 +2111,8 @@ export default function useNavigation({
             && !drawerOpenRef.current
             && !_anyAppHasSentinels(appSentinelCountsRef.current)
             && appLocalPopsRef.current.length === 0
-            && !isConsumedAppEntry(source)) return
+            && !isConsumedAppEntry(source)
+            && !hasShellEntryBelow(source)) return
         e.intercept({ handler() {
           currentNavStateRef.current = destination
           handleBack(destination, source)
@@ -2157,7 +2187,8 @@ export default function useNavigation({
             && !drawerOpenRef.current
             && !_anyAppHasSentinels(appSentinelCountsRef.current)
             && appLocalPopsRef.current.length === 0
-            && !isConsumedAppEntry(source)) return
+            && !isConsumedAppEntry(source)
+            && !hasShellEntryBelow(source)) return
       handleBack(destination, source)
     }
     window.addEventListener('popstate', onPopState)
@@ -2171,6 +2202,7 @@ export default function useNavigation({
     if (cancelDrawerPreparation()) return true
     const current = currentNavStateRef.current
     const hasShellTarget = navStackRef.current.length > 0
+      || hasShellEntryBelow(current)
       || drawerOpenRef.current
       || current?.kind === 'drawer'
       || current?.kind === 'dismissible'
@@ -2188,8 +2220,31 @@ export default function useNavigation({
   }, [])
 
   const navigateForward = useCallback(() => {
-    const currentIndex = navEntryIndex(currentNavStateRef.current)
-    if (currentIndex == null || currentIndex >= furthestNavIndexRef.current) return false
+    const current = currentNavStateRef.current
+    const currentIndex = navEntryIndex(current)
+    // An iframe can append untagged entries to the shared physical history.
+    // Never issue a shell shortcut while its cursor is on one of those entries.
+    if (!isMobiusNavState(history.state)
+        || navEntryId(history.state) !== navEntryId(current)) return false
+    // Where the Navigation API exposes its entries, verify the physical next
+    // entry is ours too. It can also recover a pre-marker shell branch left by
+    // an older document version. The marker alone cannot see a later iframe
+    // push that truncated the old Forward branch.
+    let nextShellEntry = null
+    if (typeof navigation !== 'undefined' && typeof navigation.entries === 'function') {
+      try {
+        const entries = navigation.entries()
+        const position = navigation.currentEntry?.index
+        if (Number.isInteger(position)) {
+          nextShellEntry = isMobiusNavState(entries[position + 1]?.getState?.())
+        }
+      } catch { /* best-effort mirror; classic state remains authoritative */ }
+    }
+    if (nextShellEntry === false || currentIndex == null || (
+      currentIndex >= furthestNavIndexRef.current
+      && current?.hasShellForward !== true
+      && nextShellEntry !== true
+    )) return false
     if (typeof navigation !== 'undefined' && navigation.canGoForward === false) return false
     try {
       history.forward()
@@ -2230,10 +2285,10 @@ export default function useNavigation({
   }, [])
 
   useEffect(() => {
-    persistActiveNavigation(localStorage, {
+    persistActiveNavigation(navigationStorage, {
       activeView, activeChatId, activeAppId,
     })
-  }, [activeView, activeChatId, activeAppId])
+  }, [activeView, activeChatId, activeAppId, navigationStorage])
 
   return {
     initialNav,

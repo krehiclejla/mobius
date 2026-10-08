@@ -1,4 +1,7 @@
 """Contracts for durable delegated tasks and restrictive child policy."""
+from sqlalchemy.orm import object_session
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 from tests.goal_fixtures import goal_run as make_goal_run, persist_goal_fixture
 
@@ -63,7 +66,7 @@ def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
   )
   for index, (status, park_reason) in enumerate(states):
     child_id = f"legacy-child-{index}"
-    db.add(models.Chat(
+    db.add(create_chat(
       id=child_id, title="Legacy task", provider="codex",
       created_by_app_id=app_id, auto_resume_on_restart=True,
       messages=[{"role": "user", "content": f"inspect {index}"}],
@@ -105,9 +108,9 @@ def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
     row = db.get(models.Delegation, f"legacy-{index}")
     child = db.get(models.Chat, f"legacy-child-{index}")
     assert row.scope == "read" and row.startup_prompt == f"inspect {index}"
-    assert child.messages[0] == {"role": "user", "content": f"inspect {index}"}
+    assert list(transcript_rows.history(child))[0] == {"role": "user", "content": f"inspect {index}"}
     if status != "running":
-      assert len(child.messages) == 1
+      assert len(list(transcript_rows.history(child))) == 1
     if status == "completed":
       assert row.interrupted_at is None
       assert derived_status(db, row)[0] == "completed"
@@ -123,7 +126,7 @@ def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
         assert db.get(models.ChatRun, f"legacy-run-{index}").status == expected
       if status == "running":
         assert db.get(models.ChatRun, f"legacy-run-{index}").status == "interrupted"
-        blocks = child.messages[-1].get("blocks") or []
+        blocks = list(transcript_rows.history(child))[-1].get("blocks") or []
         assert any("single-mode cutover" in block.get("message", "") for block in blocks)
         assert not any(block.get("resumable") for block in blocks)
       with pytest.raises(RuntimeError, match="cannot resume"):
@@ -155,8 +158,8 @@ def test_delegation_inherits_owner_tools_with_run_bound_delegation_identity(
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
   app_id = create_local_app(client, owner_auth, name="Read policy")['id']
   db.add_all([
-    models.Chat(id="parent", title="Parent", messages=[]),
-    models.Chat(id="read-child", title="Child", messages=[], created_by_app_id=app_id),
+    create_chat(id="parent", title="Parent", messages=[]),
+    create_chat(id="read-child", title="Child", messages=[], created_by_app_id=app_id),
   ])
   db.add(models.Delegation(
     id="read-policy", app_id=app_id, parent_chat_id="parent",
@@ -202,8 +205,8 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
   app_id = create_local_app(client, owner_auth, name="Resume policy")['id']
   db.add_all([
-    models.Chat(id="resume-parent", title="Parent", messages=[]),
-    models.Chat(
+    create_chat(id="resume-parent", title="Parent", messages=[]),
+    create_chat(
       id="resume-child", title="Child", messages=[],
       created_by_app_id=app_id,
     ),
@@ -273,8 +276,8 @@ def test_explicit_retry_uses_the_exact_owned_limit_park(
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
   app_id = create_local_app(client, owner_auth, name="Retry paused helper")['id']
   db.add_all([
-    models.Chat(id="retry-parent", title="Parent", messages=[]),
-    models.Chat(
+    create_chat(id="retry-parent", title="Parent", messages=[]),
+    create_chat(
       id="retry-child", title="Child", messages=[],
       created_by_app_id=app_id,
     ),
@@ -619,7 +622,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   child_policy = policy_for_chat(db, child_id)
   assert child_policy is not None and child_policy.depth == 1
   child_auth = {
-    "Authorization": f"Bearer {delegation_execution_token(db, child_policy)}"
+    "Authorization": f"Bearer {delegation_execution_token(db, child_policy, run_id='child-parent-run')}"
   }
   async def fake_models(_data_dir):
     return {
@@ -669,7 +672,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
     assert nested_parent_policy is not None
     nested_auth = {
       "Authorization": (
-        f"Bearer {delegation_execution_token(db, nested_parent_policy)}"
+        f"Bearer {delegation_execution_token(db, nested_parent_policy, run_id=f'depth-{depth}-parent-run')}"
       )
     }
     deeper = client.post("/api/delegations", json={
@@ -693,7 +696,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   assert fifth_parent_policy is not None and fifth_parent_policy.depth == 4
   fifth_parent_auth = {
     "Authorization": (
-      f"Bearer {delegation_execution_token(db, fifth_parent_policy)}"
+      f"Bearer {delegation_execution_token(db, fifth_parent_policy, run_id='depth-5-parent-run')}"
     )
   }
   fifth = client.post("/api/delegations", json={
@@ -756,6 +759,83 @@ def test_delegation_listing_exposes_run_usage_without_loading_result(
   }
 
 
+def test_delegation_listing_reads_a_fixed_number_of_queries_for_any_page_size(
+  client, owner_token, db, monkeypatch,
+):
+  """The polled helper list batches runs, parent titles, and lifecycle repair
+  instead of three queries per row, and still matches the single-row view."""
+  from sqlalchemy import event
+
+  from app.database import engine
+  from app.delegations import serialize_delegation
+
+  owner_auth = {"Authorization": f"Bearer {owner_token}"}
+  parent_chat_id = _parent_with_run(client, owner_token, db)
+
+  async def fake_start(**_kwargs):
+    return True
+
+  monkeypatch.setattr(
+    "app.routes.delegations.start_programmatic_chat_turn", fake_start,
+  )
+  created = []
+  for index, status in enumerate(("completed", "running", None)):
+    response = client.post("/api/delegations", json={
+      "parent_chat_id": parent_chat_id,
+      "task_key": f"batched-{index}",
+      "prompt": "Review only.",
+      "provider": "codex",
+      "scope": "write",
+    }, headers=owner_auth)
+    assert response.status_code == 201, response.text
+    created.append(response.json())
+    if status is not None:
+      db.add(make_goal_run(db,
+        id=f"batched-run-{index}", root_run_id=f"batched-run-{index}",
+        chat_id=response.json()["child_chat_id"], status=status,
+        provider="codex", total_tokens=10 * (index + 1),
+      ))
+  db.commit()
+
+  def selects_for(limit):
+    statements = []
+
+    def capture(_conn, _cursor, statement, *_args):
+      if statement.lstrip().upper().startswith("SELECT"):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+      response = client.get(
+        f"/api/delegations?parent_chat_id={parent_chat_id}&limit={limit}",
+        headers=owner_auth,
+      )
+    finally:
+      event.remove(engine, "before_cursor_execute", capture)
+    assert response.status_code == 200, response.text
+    return response.json()["items"], len(statements)
+
+  selects_for(3)  # first read records the lifecycle facts it repairs
+  one, one_selects = selects_for(1)
+  items, three_selects = selects_for(3)
+  assert len(one) == 1 and len(items) == 3
+  assert three_selects == one_selects
+
+  db.expire_all()
+  rows = {
+    row.id: row for row in db.query(models.Delegation).filter(
+      models.Delegation.parent_chat_id == parent_chat_id,
+    )
+  }
+  assert {item["id"] for item in items} == {row["id"] for row in created}
+  for item in items:
+    assert item == serialize_delegation(
+      db, rows[item["id"]], include_result=False,
+    )
+  assert {item["status"] for item in items} == {"completed", "running", "starting"}
+  assert all(item["parent_chat_title"] == "Parent" for item in items)
+
+
 def test_helper_without_resumable_session_needs_parent_review(
   client, owner_token, db, monkeypatch,
 ):
@@ -774,8 +854,8 @@ def test_helper_without_resumable_session_needs_parent_review(
   )
   db.add(app)
   db.flush()
-  parent = models.Chat(id="parent", title="Parent", messages=[])
-  child = models.Chat(
+  parent = create_chat(id="parent", title="Parent", messages=[])
+  child = create_chat(
     id="child", title="Child", provider="claude",
     created_by_app_id=app.id, session_id=None,
     messages=[
@@ -824,7 +904,7 @@ def test_helper_without_resumable_session_needs_parent_review(
 
   db.expire_all()
   assert prompts == []
-  final = db.get(models.Chat, child.id).messages[-1]
+  final = list(transcript_rows.history(db.get(models.Chat, child.id)))[-1]
   assert "DELEGATION_WRITE_REVIEW_REQUIRED" in str(final)
 
 
@@ -836,8 +916,8 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   )
   db.add(app)
   db.flush()
-  parent = models.Chat(id="parent", title="Parent", messages=[])
-  child = models.Chat(
+  parent = create_chat(id="parent", title="Parent", messages=[])
+  child = create_chat(
     id="child", title="Child",
     messages=[{"role": "user", "content": "Make the bounded edit."}],
     provider="claude",
@@ -879,7 +959,7 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   )
   assert "Never read or write /data/cli-auth" not in policy.system_prompt
 
-  child.messages = [
+  transcript_rows.replace_all(object_session(child), child, [
     {"role": "user", "content": "Make the bounded edit."},
     {
       "role": "assistant",
@@ -890,7 +970,7 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
         ),
       }],
     },
-  ]
+  ])
   db.add(make_goal_run(db,
     id="child-run", root_run_id="child-run", chat_id=child.id,
     status="failed", provider="claude",
@@ -917,7 +997,7 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
 
 
 def test_continuation_physical_runs_inherit_one_logical_root(db):
-  chat = models.Chat(id="rooted-chat", title="Rooted", messages=[])
+  chat = create_chat(id="rooted-chat", title="Rooted", messages=[])
   db.add(chat)
   db.commit()
 
@@ -1008,7 +1088,7 @@ def _seed_delegation(
   db.flush()
   if parent_id is None:
     parent_id = f"parent-{suffix}"
-    db.add(models.Chat(
+    db.add(create_chat(
       id=parent_id, title="Parent",
       messages=parent_messages or [], provider="claude",
       pending_question_id=parent_pending_question_id,
@@ -1017,7 +1097,7 @@ def _seed_delegation(
   messages = [{"role": "user", "content": "Do the bounded task."}]
   if result_blocks is not None:
     messages.append({"role": "assistant", "blocks": result_blocks})
-  db.add(models.Chat(
+  db.add(create_chat(
     id=child_id, title="Child", messages=messages,
     provider="claude", created_by_app_id=app.id,
   ))
@@ -1219,7 +1299,7 @@ def test_child_completion_starts_one_non_message_checkpoint_for_waiting_parent(
   )
   root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
   starts = _capture_activity_starts(monkeypatch)
-  before = list(db.get(models.Chat, parent_id).messages or [])
+  before = list(transcript_rows.history(db.get(models.Chat, parent_id)))
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
@@ -1234,7 +1314,7 @@ def test_child_completion_starts_one_non_message_checkpoint_for_waiting_parent(
     "_transition_lock_held": True,
   }]
   db.expire_all()
-  assert db.get(models.Chat, parent_id).messages == before
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == before
   assert db.get(models.Chat, parent_id).pending_messages == []
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
@@ -1266,7 +1346,7 @@ def test_running_parent_retains_result_for_next_context_without_queueing(
 
   assert starts == []
   parent = db.get(models.Chat, parent_id)
-  assert parent.messages == []
+  assert list(transcript_rows.history(parent)) == []
   assert parent.pending_messages == []
   delivery = delegations_mod.build_delegation_result_context(db, parent_id)
   assert delivery.delegation_ids == (delegation_id,)
@@ -1286,7 +1366,7 @@ def test_owner_question_remains_authoritative_over_delayed_helper_result(
 
   parent = db.get(models.Chat, parent_id)
   assert parent.pending_question_id == "owner-decision"
-  assert parent.messages == []
+  assert list(transcript_rows.history(parent)) == []
   assert parent.pending_messages == []
   assert delegations_mod.build_delegation_result_context(
     db, parent_id,
@@ -1328,7 +1408,7 @@ def test_activity_continuation_writer_changes_run_state_not_messages(db):
   )
   root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
   parent = db.get(models.Chat, parent_id)
-  before_messages = list(parent.messages or [])
+  before_messages = list(transcript_rows.history(parent))
   before_pending = list(parent.pending_messages or [])
   run_token = delegations_mod._activity_continuation_run_id(
     db, db.get(models.Delegation, delegation_id),
@@ -1345,7 +1425,7 @@ def test_activity_continuation_writer_changes_run_state_not_messages(db):
   ]
   db.expire_all()
   parent = db.get(models.Chat, parent_id)
-  assert parent.messages == before_messages
+  assert list(transcript_rows.history(parent)) == before_messages
   assert parent.pending_messages == before_pending
   physical = db.get(models.ChatRun, run_token)
   assert physical.status == "running"
@@ -1830,7 +1910,10 @@ def _drive_parent_turn(
     if provider_error is not None:
       bc.publish({"type": "error", "message": provider_error})
       return {"session_id": None, "cost_usd": None, "error": provider_error}
-    bc.publish({"type": "text", "content": response})
+    # Match the normalized provider stream: an identified delta followed by
+    # its authoritative snapshot. Anonymous provisional text is not publishable.
+    bc.publish({"type": "text", "text_item_id": "reply", "content": response})
+    bc.publish({"type": "text_final", "text_item_id": "reply", "content": response})
     if before_provider_return is not None:
       before_provider_return()
     return {
@@ -1886,7 +1969,7 @@ def test_delegated_prompt_keeps_a_leading_goal_command_verbatim(db, monkeypatch)
     db, suffix="literal-goal", child_status="running",
   )
   child = db.get(models.Chat, child_id)
-  child.messages = [{"role": "user", "content": task}]
+  transcript_rows.replace_all(object_session(child), child, [{"role": "user", "content": task}])
   db.get(models.Delegation, delegation_id).prompt_sha256 = hashlib.sha256(
     task.encode("utf-8"),
   ).hexdigest()
@@ -2215,7 +2298,7 @@ def test_failed_finalize_keeps_injected_activity_result_redeliverable(
 
   db.expire_all()
   parent = db.get(models.Chat, parent_id)
-  durable_messages = list(parent.messages or [])
+  durable_messages = list(transcript_rows.history(parent))
   delivery_after_failure = delegations_mod.build_delegation_result_context(
     db, parent_id,
   )
@@ -2303,7 +2386,7 @@ def test_stop_and_supersession_gates_keep_activity_result_redeliverable(
   )
   durable_reply = any(
     "Provider reply at the ownership race." in str(message)
-    for message in (db.get(models.Chat, parent_id).messages or [])
+    for message in (list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
   )
   assert durable_reply is (race == "stop")
   assert delegations_mod.build_delegation_result_context(
@@ -2360,7 +2443,7 @@ def test_stop_after_provider_return_before_finalize_keeps_activity_redeliverable
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
   assert any(
     "Partial response persisted after Stop." in str(message)
-    for message in (db.get(models.Chat, parent_id).messages or [])
+    for message in (list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
   )
   assert delegations_mod.build_delegation_result_context(
     db, parent_id,
@@ -2409,7 +2492,7 @@ def test_unadmitted_activity_restart_reschedules_same_physical_turn(
   assert db.query(models.ChatRun).filter(
     models.ChatRun.id == run_token,
   ).count() == 1
-  assert db.get(models.Chat, parent_id).messages == []
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == []
 
 
 def test_wake_recovery_reschedules_an_unadmitted_activity_orphan(
@@ -2606,7 +2689,7 @@ def test_stopped_or_superseded_activity_never_consumes_accepted_result(
   ).incorporated_run_id is None
   assert any(
     "Persisted partial output." in str(message)
-    for message in (db.get(models.Chat, parent_id).messages or [])
+    for message in (list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
   )
   from app.chat_activity import chat_activity_page
   assert chat_activity_page(db, parent_id)["events"][0][
@@ -2631,9 +2714,9 @@ def test_legacy_completion_carrier_is_recognized_without_rewriting_history(db):
     "kind": "delegation_result", "source_work_id": row.parent_root_run_id,
   }
   parent = db.get(models.Chat, parent_id)
-  parent.messages = [carrier]
+  transcript_rows.replace_all(object_session(parent), parent, [carrier])
   db.commit()
-  before = list(parent.messages)
+  before = list(transcript_rows.history(parent))
 
   # The turn that carries it records the result in its envelope (latched at
   # its Finalize) without rendering it a second time.
@@ -2643,7 +2726,7 @@ def test_legacy_completion_carrier_is_recognized_without_rewriting_history(db):
   assert delivery.delegation_ids == (delegation_id,)
   assert delivery.text == ""
   db.expire_all()
-  assert db.get(models.Chat, parent_id).messages == before
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == before
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
   assert run_token.startswith("delegation-wake-")
 
@@ -2713,7 +2796,7 @@ def test_legacy_committed_carrier_keeps_its_exact_restart_recovery(
     "kind": "delegation_result", "source_work_id": row.parent_root_run_id,
   }
   parent = db.get(models.Chat, parent_id)
-  parent.messages = [carrier]
+  transcript_rows.replace_all(object_session(parent), parent, [carrier])
   parent.live_assistant = {
     "id": run_token, "role": "assistant", "blocks": [], "ts": 2,
   }
@@ -2741,11 +2824,11 @@ def test_legacy_committed_carrier_keeps_its_exact_restart_recovery(
   )) is True
   assert attempts[0]["run_token"] == run_token
   db.expire_all()
-  assert db.get(models.Chat, parent_id).messages == [carrier]
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == [carrier]
 
   # The same exact orphan must not survive cutover if this parent is itself
   # a retired read helper; no parent wake can ever drive that chat again.
-  db.add(models.Chat(id="grandparent-legacy-recovery", title="Grandparent", messages=[]))
+  db.add(create_chat(id="grandparent-legacy-recovery", title="Grandparent", messages=[]))
   db.add(models.Delegation(
     id="retired-parent-legacy-recovery", app_id=row.app_id,
     parent_chat_id="grandparent-legacy-recovery", parent_root_run_id="grand-root",

@@ -1,4 +1,5 @@
 """Owner MCP connections must follow the owner's own chats only."""
+from app.chat_writer import create_chat
 
 import asyncio
 import hashlib
@@ -31,8 +32,13 @@ async def _drive_turn(chat_id, monkeypatch, *, expected_include):
   observed = []
   granted_plan = ConnectorTurnPlan()
 
-  def fake_connector_plan(_db, *, include_owner_connectors):
+  def fake_connector_plan(
+    _db, *, include_owner_connectors, owner_id, owner_epoch,
+    browser_grant_id,
+  ):
     observed.append(include_owner_connectors)
+    assert type(owner_id) is int and type(owner_epoch) is int
+    assert browser_grant_id is None
     return granted_plan if include_owner_connectors else None
 
   monkeypatch.setattr("app.connectors.build_turn_plan", fake_connector_plan)
@@ -107,7 +113,7 @@ async def test_owner_chat_keeps_owner_connections(chat, db, monkeypatch):
 @pytest.mark.asyncio
 async def test_delegated_chat_inherits_owner_connections(chat, db, monkeypatch):
   app_row = _app_row(db, "delegated")
-  parent = models.Chat(
+  parent = create_chat(
     id="grant-policy-parent", title="Parent", messages=[], provider="codex",
   )
   db.add(parent)
@@ -151,7 +157,7 @@ def test_delegated_prompt_allows_relevant_connected_tools():
 
 def test_app_chat_context_states_connections_unavailable(db):
   app_row = _app_row(db, "context")
-  row = models.Chat(
+  row = create_chat(
     id="grant-policy-context-chat",
     title="app chat",
     messages=[],

@@ -1180,11 +1180,10 @@ def process_event(event: dict, assistant_blocks: list) -> bool:
     # AssistantMessage TextBlock), emitted at item end AFTER its deltas. The
     # streamed deltas are the only other source of durable prose, so if any
     # delta was dropped in the persist path this REPLACES the accumulated
-    # block with the complete text — idempotent when nothing was lost. The
-    # trailing block is this item's text: an AssistantMessage arrives right
-    # after its own deltas (a text_boundary, if any, was already overwritten
-    # by the "text" reducer when this item's first delta landed), so replacing
-    # the trailing text block targets the correct item. Replace, never append.
+    # block with the complete text — idempotent when nothing was lost.
+    # Known item identities also distinguish final-only SDK envelopes: no
+    # delta or boundary need precede them. Only anonymous legacy items may
+    # fall back to replacing the trailing text block.
     content = event.get("content", "")
     if not content:
       return False
@@ -1246,17 +1245,25 @@ def process_event(event: dict, assistant_blocks: list) -> bool:
         break
     if (assistant_blocks
         and assistant_blocks[-1].get("type") == "text"):
-      if assistant_blocks[-1].get("content") == content:
-        return False
-      assistant_blocks[-1]["content"] = content
-      return True
+      trailing = assistant_blocks[-1]
+      if not (text_item_id and trailing.get("text_item_id")
+              and trailing["text_item_id"] != text_item_id):
+        changed = trailing.get("content") != content
+        trailing["content"] = content
+        if text_item_id and trailing.get("text_item_id") != text_item_id:
+          trailing["text_item_id"] = text_item_id
+          changed = True
+        return changed
+    final_block = {"type": "text", "content": content}
+    if text_item_id:
+      final_block["text_item_id"] = text_item_id
     if (assistant_blocks
         and assistant_blocks[-1].get("type") == "text_boundary"):
-      assistant_blocks[-1] = {"type": "text", "content": content}
+      assistant_blocks[-1] = final_block
       return True
     # No trailing text block (e.g. every delta for this item was dropped) —
     # the authoritative text is all we have, so materialise it.
-    assistant_blocks.append({"type": "text", "content": content})
+    assistant_blocks.append(final_block)
     return True
 
   if event_type == "text_boundary":

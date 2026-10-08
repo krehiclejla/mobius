@@ -6,10 +6,13 @@ import {
   set as setIdbValue,
 } from 'idb-keyval'
 import { reclaimStoredStreamSnapshots } from './streamSnapshotCache.js'
+// A guest's drafts live only in its grant's tab storage: never in the owner's
+// durable IndexedDB store, and never in the page-wide memory mirror, which is
+// not partitioned by grant.
+import { isOwnerWorkspace, sessionStore } from '../../lib/workspaceStorage.js'
 
 function availableStorage(storage) {
-  if (storage !== undefined) return storage
-  try { return globalThis.sessionStorage ?? null } catch { return null }
+  return storage !== undefined ? storage : sessionStore()
 }
 
 const DRAFT_ENVELOPE = 'mobius-composer-draft'
@@ -45,6 +48,7 @@ function rememberLiveDraft(chatId, raw, source, { advance = false } = {}) {
 }
 
 function queueDurableDraftWrite(chatId, raw) {
+  if (!isOwnerWorkspace()) return Promise.resolve()
   const id = draftId(chatId)
   let state = durableWrites.get(id)
   if (state) {
@@ -91,7 +95,7 @@ function queueDurableDraftWrite(chatId, raw) {
 
 export function composerDraftRevision(chatId) {
   if (chatId == null) return 0
-  return revisionOf(chatId)
+  return isOwnerWorkspace() ? revisionOf(chatId) : 0
 }
 
 export async function flushComposerDraftPersistence() {
@@ -102,6 +106,7 @@ export async function flushComposerDraftPersistence() {
 
 /** Clear both the live mirror and the dedicated owner-draft database on logout. */
 export async function clearDurableComposerDrafts() {
+  if (!isOwnerWorkspace()) return
   durableGeneration += 1
   liveDrafts.clear()
   draftRevisions.clear()
@@ -209,7 +214,9 @@ function encodeDraft(input, attachments) {
  */
 export function readComposerDraft(chatId, storage) {
   if (chatId == null) return { input: '', attachments: [] }
-  const useLiveMirror = storage === undefined
+  // Guest drafts use the grant-partitioned tab store directly. Never consult
+  // the owner/chat keyed live mirror when a grant changes in this document.
+  const useLiveMirror = storage === undefined && isOwnerWorkspace()
   const id = draftId(chatId)
   if (useLiveMirror && liveDrafts.has(id)) {
     return publicDraft(decodeDraft(liveDrafts.get(id).raw))
@@ -235,6 +242,7 @@ export function readComposerDraft(chatId, storage) {
  */
 export async function readComposerDraftAsync(chatId) {
   if (chatId == null) return { input: '', attachments: [] }
+  if (!isOwnerWorkspace()) return readComposerDraft(chatId)
   const id = draftId(chatId)
   const revisionAtStart = revisionOf(id)
   const current = liveDrafts.get(id)
@@ -276,8 +284,10 @@ export async function readComposerDraftAsync(chatId) {
 export function clearComposerDraft(chatId, storage) {
   if (chatId == null) return
   if (storage === undefined) {
-    rememberLiveDraft(chatId, null, 'live', { advance: true })
-    queueDurableDraftWrite(chatId, null)
+    if (isOwnerWorkspace()) {
+      rememberLiveDraft(chatId, null, 'live', { advance: true })
+      queueDurableDraftWrite(chatId, null)
+    }
   }
   const target = availableStorage(storage)
   if (!target) return
@@ -294,7 +304,7 @@ export function clearComposerDraft(chatId, storage) {
  * a chance to remove the composer.
  */
 export function persistComposerDraft(chatId, input, attachments = [], storage) {
-  const useDurableStore = storage === undefined
+  const useDurableStore = storage === undefined && isOwnerWorkspace()
   if (chatId == null) return false
   const key = `draft:${chatId}`
   const value = encodeDraft(input, attachments)
@@ -385,20 +395,22 @@ export function readComposerHandoff(chatId, storage) {
   }
 }
 
-/** Remove only markers that still belong to `input`; a newer handoff wins. */
+/** Claim one matching handoff synchronously; stale or duplicate consumers lose. */
 export function consumeComposerHandoff(
   chatId,
   input,
   { autoSend = false, storage } = {},
 ) {
   const target = availableStorage(storage)
-  if (!target || chatId == null || typeof input !== 'string') return
+  if (!target || chatId == null || typeof input !== 'string') return false
   try {
     const parsed = JSON.parse(target.getItem(COMPOSER_HANDOFF_KEY) || 'null')
     if (String(parsed?.chatId) === String(chatId)
         && parsed?.input === input
         && parsed?.autoSend === !!autoSend) {
       target.removeItem(COMPOSER_HANDOFF_KEY)
+      return true
     }
   } catch { /* unavailable browser storage */ }
+  return false
 }

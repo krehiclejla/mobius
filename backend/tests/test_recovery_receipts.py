@@ -1,4 +1,5 @@
 """A recovery receipt owns one deletion, including retry and history behavior."""
+from app.chat_writer import create_chat
 
 import asyncio
 import math
@@ -25,7 +26,7 @@ def resource(request, db, auth, monkeypatch):
   kind = request.param
   root = Path(get_settings().data_dir)
   if kind == "chat":
-    row = models.Chat(id=str(uuid4()), title="Receipt chat")
+    row = create_chat(id=str(uuid4()), title="Receipt chat")
   elif kind == "app":
     source = root / "apps" / "receipt-app"
     source.mkdir(parents=True)
@@ -50,7 +51,7 @@ def resource(request, db, auth, monkeypatch):
       id=project_id, name="Receipt project", project_type="blank",
       root_path=root_path, template_snapshot_json={},
     )
-    db.add(models.Chat(
+    db.add(create_chat(
       id=str(uuid4()), title="Receipt project chat", project_id=project_id,
     ))
   db.add(row)
@@ -73,6 +74,25 @@ def _delete(client, auth, db, resource):
   assert receipt.actions[0]["expires_at"] == (row.deleted_at + SOFT_DELETE_TTL).replace(tzinfo=UTC).isoformat()
   assert receipt.body == f"Receipt {kind}"
   return receipt
+
+
+def test_dismissing_a_deletion_notice_keeps_the_resource_recoverable(client, auth, db, resource):
+  """One × removes only the receipt; the chat, app or project stays recoverable."""
+  kind, row, url = resource
+  receipt = _delete(client, auth, db, resource)
+  receipt_id = receipt.id
+  deleted_at = row.deleted_at
+  response = client.delete(f"/api/notifications/{receipt_id}", headers=auth)
+  assert response.status_code == 200, response.text
+  assert response.json() == {"deleted": 1}
+  db.expire_all()
+  assert db.get(models.Notification, receipt_id) is None
+  assert db.get(type(row), row.id).deleted_at == deleted_at
+  assert all(n["id"] != receipt_id for n in client.get("/api/notifications", headers=auth).json())
+  recovered = client.post(f"{url}/recover", headers=auth)
+  assert recovered.status_code == 200, recovered.text
+  db.expire_all()
+  assert db.get(type(row), row.id).deleted_at is None
 
 
 @pytest.mark.parametrize("resource", ["app"], indirect=True)
@@ -101,7 +121,7 @@ def test_running_resource_delete_keeps_receipt_bound_to_owner(
 ):
   """Stop-result throwaways must not replace the authenticated owner."""
   owner = db.query(models.Owner).one()
-  chat = models.Chat(id=str(uuid4()), title="Running recovery chat")
+  chat = create_chat(id=str(uuid4()), title="Running recovery chat")
   if kind == "chat":
     row = chat
     url = f"/api/chats/{chat.id}"
@@ -211,7 +231,7 @@ def test_receipt_cannot_touch_a_recreated_same_id_resource(
   db.commit()
 
   if kind == "chat":
-    replacement = models.Chat(
+    replacement = create_chat(
       id=str(row.id), title="Recreated receipt chat", created_at=next_created_at,
     )
   elif kind == "app":
@@ -462,7 +482,7 @@ def test_recovery_waits_for_all_destructive_cleanup_before_starting_a_new_run(
       root_path=root_path, template_snapshot_json={},
     ))
   chat_ids = [str(uuid4()) for _ in range(2 if project_id else 1)]
-  db.add_all(models.Chat(id=chat_id, project_id=project_id, title="Cleanup child") for chat_id in chat_ids)
+  db.add_all(create_chat(id=chat_id, project_id=project_id, title="Cleanup child") for chat_id in chat_ids)
   db.commit()
   before_generations = {chat_id: chat_mod.current_run_generation(chat_id) for chat_id in chat_ids}
   for chat_id in chat_ids:

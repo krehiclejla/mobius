@@ -1,6 +1,9 @@
 """Typed Restart actions stay exact, at-most-once, and ahead of queued work."""
 
 from __future__ import annotations
+from sqlalchemy.orm import object_session
+from app import transcript_rows
+from app.chat_writer import create_chat
 from tests.goal_fixtures import goal_run as make_goal_run
 
 from datetime import timedelta
@@ -17,7 +20,7 @@ from app.chat_event_sink import (
 from app.chat_writer import (
   AppendRestartFeedback,
   AnswerQuestion,
-  CancelActivationWaits,
+  PrepareChatStop,
   ResolvePlatformRestartCard,
   StartContinuation,
   get_writer,
@@ -26,6 +29,22 @@ from app.database import SessionLocal
 from app.platform_restart import activation_notice, activation_wait_verdict
 from app.routes import chats_stream
 from app.timeutil import now_naive_utc
+
+
+@pytest.fixture(autouse=True)
+def isolated_restart_source(monkeypatch, tmp_path):
+  # Card tests exercise the real preflight boundary without importing the live
+  # editable platform. Broken-source rejection is covered explicitly below;
+  # the router-verdict contract lives in test_restart_util.
+  root = tmp_path / "platform"
+  app = root / "backend" / "app"
+  app.mkdir(parents=True)
+  (app / "__init__.py").write_text("", encoding="utf-8")
+  (app / "main.py").write_text("from app import routes\n", encoding="utf-8")
+  (app / "routes.py").write_text(
+    "def require_all_routers_loaded():\n  return None\n", encoding="utf-8",
+  )
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(root))
 
 
 def _requirement(action_id="platform-restart:test"):
@@ -79,7 +98,7 @@ def _install(
   if target_sha is not None:
     requirement["target_sha"] = target_sha
   with SessionLocal() as db:
-    db.add(models.Chat(
+    db.add(create_chat(
       id=chat_id, title="Restart", pending_question_id=question_id,
       messages=[{"role": "assistant", "blocks": [
         _card(question_id, wait_id, requirement),
@@ -137,13 +156,13 @@ def test_retained_restart_button_does_not_orphan_newer_question():
   newer_id = "question-newer"
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-retained")
-    chat.messages = [*chat.messages, {
+    transcript_rows.replace_all(object_session(chat), chat, [*list(transcript_rows.history(chat)), {
       "role": "assistant", "ts": 3,
       "blocks": [{
         "type": "question", "question_id": newer_id,
         "questions": [{"id": "new", "question": "New?", "options": []}],
       }],
-    }]
+    }])
     chat.pending_question_id = newer_id
     db.commit()
 
@@ -182,7 +201,7 @@ def test_restart_press_keeps_card_open_when_next_boot_would_fall_back(
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-invalid-source")
     wait = db.get(models.ChatWait, wait_id)
-    card = chat.messages[0]["blocks"][0]
+    card = list(transcript_rows.history(chat))[0]["blocks"][0]
     assert chat.pending_question_id == qid
     assert wait.action_approved_at is None
     assert card["platform_action"]["status"] == "awaiting_owner"
@@ -201,11 +220,11 @@ def test_free_text_cannot_claim_restart_but_post_stop_button_still_does():
       chat_id="restart-guard", question_id=qid,
       answers={"restart": "Restart now"},
     ))
-  assert _submit(CancelActivationWaits(chat_id="restart-guard")) == 1
+  assert _submit(PrepareChatStop(chat_id="restart-guard")) == 1
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-guard")
     wait = db.get(models.ChatWait, wait_id)
-    card = chat.messages[0]["blocks"][0]
+    card = list(transcript_rows.history(chat))[0]["blocks"][0]
     assert wait.status == "cancelled"
     assert chat.pending_question_id is None
     assert card["platform_action"]["status"] == "awaiting_owner"
@@ -235,7 +254,7 @@ def test_written_restart_response_atomically_closes_wait_and_queues_feedback():
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-feedback")
     wait = db.get(models.ChatWait, wait_id)
-    card = chat.messages[0]["blocks"][0]
+    card = list(transcript_rows.history(chat))[0]["blocks"][0]
     assert wait.status == "cancelled"
     assert wait.cancelled_at is not None
     assert chat.pending_question_id is None
@@ -289,7 +308,7 @@ def test_existing_unrelated_cid_cannot_false_acknowledge_an_open_restart_card():
   }
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-feedback-cid-collision")
-    chat.messages = [collision, *chat.messages]
+    transcript_rows.replace_all(object_session(chat), chat, [collision, *list(transcript_rows.history(chat))])
     db.commit()
 
   with pytest.raises(chat_writer.RestartCardActionConflict):
@@ -306,7 +325,7 @@ def test_existing_unrelated_cid_cannot_false_acknowledge_an_open_restart_card():
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-feedback-cid-collision")
     wait = db.get(models.ChatWait, wait_id)
-    card = chat.messages[-1]["blocks"][0]
+    card = list(transcript_rows.history(chat))[-1]["blocks"][0]
     assert wait.status == "armed"
     assert chat.pending_question_id == qid
     assert not card.get("answers")
@@ -330,7 +349,7 @@ def test_promoted_written_restart_retry_is_acknowledged_without_a_new_turn(
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-feedback-promoted")
     chat.pending_messages = []
-    chat.messages = [*chat.messages, original]
+    transcript_rows.replace_all(object_session(chat), chat, [*list(transcript_rows.history(chat)), original])
     db.commit()
 
   response = client.post(
@@ -347,7 +366,7 @@ def test_promoted_written_restart_retry_is_acknowledged_without_a_new_turn(
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-feedback-promoted")
     assert chat.pending_messages == []
-    assert [row.get("cid") for row in chat.messages].count(original["cid"]) == 1
+    assert [row.get("cid") for row in list(transcript_rows.history(chat))].count(original["cid"]) == 1
 
 
 def test_queued_written_restart_retry_is_acknowledged_while_turn_is_running(
@@ -561,10 +580,10 @@ def test_activation_continuation_precedes_and_preserves_queued_b():
   with SessionLocal() as db:
     chat = db.get(models.Chat, "restart-order")
     assert [m["content"] for m in chat.pending_messages] == ["B"]
-    assert chat.messages[-1]["cid"] == f"activation-result-{wait_id}"
-    assert chat.messages[-1]["hidden"] is True
+    assert list(transcript_rows.history(chat))[-1]["cid"] == f"activation-result-{wait_id}"
+    assert list(transcript_rows.history(chat))[-1]["hidden"] is True
     assert chat.pending_question_id is None
-    card = chat.messages[0]["blocks"][0]
+    card = list(transcript_rows.history(chat))[0]["blocks"][0]
     assert card["platform_action"]["status"] == "activated"
     assert "answers" not in card  # external proof is never a forged Yes
     run = db.get(models.ChatRun, f"activation-resume-{wait_id}")
@@ -631,7 +650,7 @@ def test_authenticated_agent_from_another_chat_dispatches_restart_once(
     qid = saved.json()["question_id"]
     with SessionLocal() as read:
       row = read.get(models.Chat, chat.id)
-      block = row.messages[-1]["blocks"][-1]
+      block = list(transcript_rows.history(row))[-1]["blocks"][-1]
       assert block["platform_action"]["version"] == 2
       assert [option["label"] for option in block["questions"][0]["options"]] == [
         "Restart now",
@@ -685,7 +704,7 @@ def test_route_sends_written_restart_feedback_without_restart_authority(
     qid = saved.json()["question_id"]
     with SessionLocal() as read:
       row = read.get(models.Chat, chat.id)
-      block = row.messages[-1]["blocks"][-1]
+      block = list(transcript_rows.history(row))[-1]["blocks"][-1]
       prompt = block["questions"][0]["question"]
       wait_id = block["platform_action"]["wait_id"]
     response = client.post(
@@ -907,7 +926,7 @@ def test_idle_written_restart_feedback_starts_exactly_one_continuation(
       assert wait.status == "cancelled"
       assert row.pending_question_id is None
       assert row.pending_messages == []
-      assert row.messages[-1]["cid"] == "restart-feedback-idle-answer"
+      assert list(transcript_rows.history(row))[-1]["cid"] == "restart-feedback-idle-answer"
   finally:
     from app.chat import discard_starting
     discard_starting(chat_id)
@@ -939,7 +958,7 @@ def test_activation_delivery_repairs_committed_but_unscheduled_run(
     assert [m["content"] for m in chat.pending_messages] == ["B"]
     assert sum(
       m.get("cid") == f"activation-result-{wait_id}"
-      for m in chat.messages
+      for m in list(transcript_rows.history(chat))
     ) == 1
     assert db.query(models.ChatRun).filter(
       models.ChatRun.id == f"activation-resume-{wait_id}",
@@ -999,9 +1018,9 @@ def test_one_ready_boot_wakes_every_linked_restart_goal(
   with SessionLocal() as db:
     third = db.get(models.ChatWait, w3)
     third.condition_json = other
-    card = db.get(models.Chat, "restart-goal-other").messages
+    card = list(transcript_rows.history(db.get(models.Chat, 'restart-goal-other')))
     card[0]["blocks"][0]["platform_action"]["requirement"] = other
-    db.get(models.Chat, "restart-goal-other").messages = card
+    transcript_rows.replace_all(object_session(db.get(models.Chat, 'restart-goal-other')), db.get(models.Chat, 'restart-goal-other'), card)
     created = max(db.get(models.ChatWait, wid).created_at for wid in (w1, w2, w3))
     db.add(models.PlatformBootSnapshot(
       boot_id="boot-shared", source_kind="platform", source_sha="a" * 40,
@@ -1075,7 +1094,7 @@ def _save_restart_card(client, chat, db, *, objective=None) -> str:
 
     asyncio.run(finish())
   with SessionLocal() as read:
-    block = read.get(models.Chat, chat.id).messages[-1]["blocks"][-1]
+    block = list(transcript_rows.history(read.get(models.Chat, chat.id)))[-1]["blocks"][-1]
     return block["questions"][0]["question"]
 
 
@@ -1093,7 +1112,7 @@ def test_each_chat_saves_its_own_restart_decision_without_a_shared_claim(
     with SessionLocal() as read:
       row = read.get(models.Chat, chat_id)
       qid = row.pending_question_id
-      card = row.messages[-1]["blocks"][-1]
+      card = list(transcript_rows.history(row))[-1]["blocks"][-1]
       wait = read.get(models.ChatWait, card["platform_action"]["wait_id"])
       assert qid == card["question_id"]
       assert wait.chat_id == chat_id
@@ -1133,7 +1152,7 @@ def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_inpu
                        objective=f"Activate {name}")
     with SessionLocal() as read:
       row = read.get(models.Chat, chat_id)
-      card = row.messages[-1]["blocks"][-1]
+      card = list(transcript_rows.history(row))[-1]["blocks"][-1]
       wait = read.get(models.ChatWait, card["platform_action"]["wait_id"])
       assert card["platform_action"]["version"] == 2
       participants[name] = (chat_id, row.pending_question_id, wait.id,
@@ -1142,15 +1161,15 @@ def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_inpu
       "role": "user", "content": "B", "cid": f"b-{chat_id}", "ts": 3,
     }))
   stopped_id, _, stopped_wait, _, _ = participants["stopped"]
-  assert _submit(CancelActivationWaits(chat_id=stopped_id)) == 1
+  assert _submit(PrepareChatStop(chat_id=stopped_id)) == 1
   input_id, input_qid, input_wait, _, _ = participants["unrelated-input"]
   newer_qid = "unrelated-owner-decision"
   with SessionLocal() as read:
     row = read.get(models.Chat, input_id)
-    row.messages = [*row.messages, {"role": "assistant", "ts": 3, "blocks": [{
+    transcript_rows.replace_all(object_session(row), row, [*list(transcript_rows.history(row)), {"role": "assistant", "ts": 3, "blocks": [{
       "type": "question", "question_id": newer_qid,
       "questions": [{"id": "later", "question": "Keep the data?", "options": []}],
-    }]}]
+    }]}])
     row.pending_question_id = newer_qid
     read.commit()
 
@@ -1178,7 +1197,7 @@ def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_inpu
   monkeypatch.setattr(restart_util.os, "kill", lambda *_args: pytest.fail("unexpected signal"))
   selected_id, qid, _, _, _ = participants[selected]
   with SessionLocal() as read:
-    card = read.get(models.Chat, selected_id).messages[-1]["blocks"][-1]
+    card = list(transcript_rows.history(read.get(models.Chat, selected_id)))[-1]["blocks"][-1]
     restart_id = card["platform_action"]["restart_option_id"]
   body = {"content": "", "hidden": True, "question_id": qid,
           "selected_options": {"restart": [restart_id]}}
@@ -1188,7 +1207,7 @@ def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_inpu
   if also_click_other:
     other_id, other_qid, _, _, _ = participants["second" if selected == "first" else "first"]
     with SessionLocal() as read:
-      other_card = read.get(models.Chat, other_id).messages[-1]["blocks"][-1]
+      other_card = list(transcript_rows.history(read.get(models.Chat, other_id)))[-1]["blocks"][-1]
       other_option = other_card["platform_action"]["restart_option_id"]
     other_answer = client.post(f"/api/chats/{other_id}/messages", headers=auth, json={
       "content": "", "hidden": True, "question_id": other_qid,
@@ -1231,8 +1250,8 @@ def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_inpu
         assert resumed.goal_id == root_id
         assert row.pending_question_id is None
         assert [m["content"] for m in row.pending_messages] == ["B"]
-        assert sum(m.get("cid") == f"activation-result-{wait_id}" for m in row.messages) == 1
-        card = next(block for message in row.messages for block in message.get("blocks", [])
+        assert sum(m.get("cid") == f"activation-result-{wait_id}" for m in list(transcript_rows.history(row))) == 1
+        card = next(block for message in list(transcript_rows.history(row)) for block in message.get("blocks", [])
                     if block.get("question_id") == participants[name][1])
         assert card["platform_action"]["status"] == "activated"
         if name != selected and not also_click_other:
@@ -1261,9 +1280,9 @@ def test_fresh_restart_card_waits_for_a_new_boot_after_the_previous_shared_resta
     requirement = {**wait.condition_json, "source_boot_id": "boot-already-ready"}
     wait.condition_json = requirement
     row = db.get(models.Chat, chat_id)
-    messages = deepcopy(row.messages)
+    messages = deepcopy(list(transcript_rows.history(row)))
     messages[0]["blocks"][0]["platform_action"]["requirement"] = requirement
-    row.messages = messages
+    transcript_rows.replace_all(object_session(row), row, messages)
     db.add(models.PlatformBootSnapshot(
       boot_id="boot-already-ready", source_kind="platform", source_sha="e" * 40,
       loaded_files_json={}, service_ready=True, captured_at=wait.created_at,

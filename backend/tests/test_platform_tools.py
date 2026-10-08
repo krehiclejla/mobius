@@ -10,7 +10,48 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import platform_tools
+from app import app_tools, platform_tools
+
+
+def test_goal_copy_guidance_separates_owner_text_from_verification_evidence():
+  control = _control_module()
+  objective = control._TOOL_DEFINITIONS['promote_goal']['inputSchema']['properties']['objective']
+  complete = control._TOOL_DEFINITIONS['update_goal']['inputSchema']['properties']['complete']
+  assert 'plain-language outcome shown to the owner' in objective['description']
+  assert 'verification criteria in tasks' in objective['description']
+  assert 'Set true after verifying the whole outcome' in complete['description']
+  assert 'evidence in task results or the chat checkpoint' in complete['description']
+  assert 'No separate success summary' in complete['description']
+  assert complete['type'] == 'boolean'
+  assert complete['enum'] == [True]
+  assert 'maxLength' not in complete
+
+
+def test_checkpoint_chat_saves_a_short_summary_and_a_cumulative_digest_uncapped():
+  control = _control_module()
+  definition = control._TOOL_DEFINITIONS["checkpoint_chat"]
+  description = definition["description"]
+  properties = definition["inputSchema"]["properties"]
+
+  assert "chat_summary replaces its short Summary" in description
+  assert "digest_entry appends one entry to its cumulative Digest" in description
+  assert set(properties) == {"title", "chat_summary", "digest_entry"}
+  assert "maxLength" not in properties["chat_summary"]
+  assert "maxLength" not in properties["digest_entry"]
+  # A save written for the old plain field names is refused, not misfiled.
+  with pytest.raises(ValueError, match="chat_summary, digest_entry"):
+    control._call_checkpoint_chat({"summary": "Facts written for the old meaning."})
+
+
+def test_notify_owner_leaves_owner_input_cards_to_their_own_notification():
+  """A saved card already notifies the owner; the tool must not invite a
+  duplicate push for a question."""
+  control = _control_module()
+  description = control._TOOL_DEFINITIONS["notify_owner"]["description"]
+  assert "question that needs them" not in description
+  assert "not for a saved question, approval, restart or secure-input card" in description
+  assert "the card sends its own notification" in description
+  assert "a finished long task" in description
 
 
 @pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])
@@ -309,6 +350,27 @@ def test_update_goal_reports_compactly_and_rejects_unknown_arguments(monkeypatch
     control._call_update_goal({"owner": "x"})
 
 
+def test_goal_report_supplies_completion_keys_without_bloating_progress_updates():
+  control = _control_module()
+  payload = {
+    "goal": {"status": "open", "revision": 1, "held_work_keys": ["test:verified"]},
+    "plan": {"tasks": [], "summary": {"can_complete": False, "completion_blockers": ["verify"]}},
+  }
+  compact = control._goal_report(payload, full=False)
+  assert "test:verified" not in compact
+  full = control._goal_report(payload, full=True)
+  assert "Completion blocked by: verify" in full
+  assert "test:verified" in full
+  payload["plan"]["summary"]["can_complete"] = True
+  ready = control._goal_report(payload, full=False)
+  assert "Ready to complete after verification" in ready
+  assert "test:verified" in ready
+  payload["goal"]["status"] = "completed"
+  settled = control._goal_report(payload, full=True)
+  assert "Ready to complete" not in settled
+  assert "test:verified" not in settled
+
+
 def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
   control = _control_module()
   monkeypatch.setenv("CHAT_ID", "chat-1")
@@ -320,6 +382,23 @@ def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
     assert ("Next action: Run the probe" in control._call_update_goal({})) is shown
 
 
+def test_defer_tool_records_a_quiet_hold_not_ready_work_or_a_terminal_outcome(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  sent = []
+  def record(method, path, body):
+    sent.append(body)
+    return {"goal": {"status": "stopped", "revision": 5,
+      "hold": {"cause": "deferred", "reason": "Tests deferred by owner"}},
+      "plan": {"tasks": [], "summary": {"ready": ["later"], "running": []}}}
+  monkeypatch.setattr(control, "_agent_api_call", record)
+  receipt = control._call_update_goal({"defer": "Tests deferred by owner"})
+  assert sent == [{"defer": "Tests deferred by owner"}]
+  assert "On hold: Tests deferred by owner" in receipt and "End normally" in receipt
+  assert "Ready:" not in receipt and "Outcome:" not in receipt
+  assert "defer" in control._TOOL_DEFINITIONS[control.UPDATE_GOAL_TOOL]["inputSchema"]["properties"]
+
+
 def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
   """Claude Code defers MCP tools behind a search round trip by default, so the
   control tools every owner turn is told to use carry the always-load meta."""
@@ -329,10 +408,11 @@ def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
   tools = control._tools_list_result()["tools"]
 
   assert tools and all(
-    tool["_meta"] == {"anthropic/alwaysLoad": True} for tool in tools
+    tool["_meta"]["anthropic/alwaysLoad"] is True for tool in tools
   )
   # The meta is added to the listing, not baked into the shared definition.
   assert "_meta" not in control._TOOL_DEFINITIONS[control.PROMOTE_GOAL_TOOL]
+  assert all(set(tool["_meta"]) == {"anthropic/alwaysLoad"} for tool in tools)
 
 
 def test_promote_goal_tool_preserves_helper_rejection(monkeypatch):
@@ -393,11 +473,24 @@ def test_control_protocol_advertises_every_run_bound_tool(monkeypatch):
     "delay_secs",
     "interval_secs",
     "deadline_secs",
+    "github_checks",
   }
   assert "question card" in (
     wait_schema["properties"]["condition_owner"]["description"]
   )
   assert wait_schema["additionalProperties"] is False
+  assert wait_schema["properties"]["github_checks"]["required"] == [
+    "repository", "pull_request", "head_sha",
+  ]
+  # Expose the owning route's existing limits before an agent spends a call
+  # discovering them in a 422 (condition_owner was previously unbounded here).
+  for name, length in (("description", 500), ("condition_owner", 160), ("command", 4000)):
+    assert wait_schema["properties"][name]["maxLength"] == length
+  for name, minimum, maximum in (("delay_secs", 60, 604800),
+                                  ("interval_secs", 60, 86400),
+                                  ("deadline_secs", 1, 604800)):
+    assert wait_schema["properties"][name]["minimum"] == minimum
+    assert wait_schema["properties"][name]["maximum"] == maximum
   assert "server restarts" in tools[platform_tools.WAIT_TOOL_NAME]["description"]
   assert "silent exit 1" in tools[platform_tools.WAIT_TOOL_NAME]["description"]
   assert "Never use a wait for an approval" in (
@@ -489,6 +582,18 @@ def test_constitution_routes_each_agent_network_to_its_owner():
   assert "other Möbius chats" in core
   assert core.index("`list_agent_peers`") < core.index("`send_agent_message`")
   assert "ordinary chat-message API" in core
+
+
+def test_bookkeeping_batch_guidance_preserves_durability_and_card_isolation():
+  core = (
+    Path(__file__).resolve().parents[2] / "skill" / "core.md"
+  ).read_text(encoding="utf-8")
+  assert "batch independent informational" in core
+  assert "already-needed tool work in the same model step" in core
+  assert "Await every\n  result and handle failures" in core
+  assert "never delay a required save just to form a batch" in core
+  assert "Owner-input cards remain separate and last" in core
+  assert "measure saved model calls and input/cache tokens" in core
 
 
 def test_delegated_control_server_advertises_only_peer_and_ownership_tools(monkeypatch):
@@ -637,6 +742,7 @@ def test_control_protocol_declares_wait_through_the_canonical_client(monkeypatch
     "description": "CI becomes green",
     "condition_owner": "GitHub checks",
     "kind": "command",
+    "github_checks": None,
     "command": "gh pr checks 123 --watch=false >/dev/null",
     "delay_secs": None,
     "interval_secs": 120,
@@ -780,6 +886,27 @@ def test_coordination_tools_validate_discovery_and_send(monkeypatch):
   assert "cannot interrupt" in invalid_broadcast["content"][0]["text"]
 
 
+def test_send_agent_message_reports_wrong_keys_and_target_shape_without_echoing_values():
+  control = _control_module()
+  with pytest.raises(ValueError) as wrong:
+    control._call_send_agent_message({"helper": "secret-helper", "message": "secret-body"})
+  assert "invalid keys: helper, message" in str(wrong.value)
+  assert "recipients (agent/chat ids), body" in str(wrong.value)
+  assert "message_agent(helper, message)" in str(wrong.value)
+  assert "secret-helper" not in str(wrong.value)
+  assert "secret-body" not in str(wrong.value)
+
+  with pytest.raises(ValueError) as target:
+    control._call_send_agent_message({"recipients": "secret-peer", "body": "note"})
+  assert "list of at most 24 agent/chat ids" in str(target.value)
+  assert "secret-peer" not in str(target.value)
+
+  send = control._TOOL_DEFINITIONS["send_agent_message"]
+  followup = control._TOOL_DEFINITIONS["message_agent"]
+  assert "finished helper's follow-up" in send["description"]
+  assert "live helper" in followup["description"]
+
+
 def test_mcp_send_passes_through_backend_compact_receipt(monkeypatch):
   control = _control_module()
   body = "x" * 4000
@@ -843,10 +970,13 @@ def test_control_stdio_process_survives_tool_errors_and_keeps_serving():
   )
 
   responses = [json.loads(line) for line in completed.stdout.splitlines()]
-  assert [response["id"] for response in responses] == [1, 2, 3]
-  assert responses[1]["result"]["isError"] is True
-  assert "missing environment" in responses[1]["result"]["content"][0]["text"]
-  assert responses[2]["result"] == {}
+  # Independent requests may finish out of order; ids, not line position,
+  # associate each response with its request. Errors must not lose the ping.
+  assert sorted(response["id"] for response in responses) == [1, 2, 3]
+  by_id = {response["id"]: response for response in responses}
+  assert by_id[2]["result"]["isError"] is True
+  assert "missing environment" in by_id[2]["result"]["content"][0]["text"]
+  assert by_id[3]["result"] == {}
   assert completed.stderr == ""
 
 
@@ -1163,6 +1293,15 @@ def test_screenshot_returns_the_image_and_the_owner_embed_line(monkeypatch, tmp_
   assert "![screenshot](/api/chats/c/media/shot.png)" in note["text"]
   refused = control._call_tool({"name": "screenshot", "arguments": {"route": "https://x"}})
   assert refused["isError"] is True
+  direct = control._call_tool({"name": "screenshot", "arguments": {"app_id": 42}})
+  assert direct["isError"] is False
+  assert calls[-1][-1] == "/shell/?app=42"
+  before = len(calls)
+  for arguments in ({}, {"route": "/", "app_id": 42}, {"app_id": "memory"},
+                    {"app_id": True}, {"app_id": 0}):
+    invalid = control._call_tool({"name": "screenshot", "arguments": arguments})
+    assert invalid["isError"] is True
+  assert len(calls) == before
 
 
 def test_screenshot_in_a_read_only_sandbox_says_why_it_cannot_capture(monkeypatch):
@@ -1254,3 +1393,27 @@ def test_builtin_delegation_guidance_is_available_without_an_app():
   assert "State read-only limits in the task" in text
   assert "read-only children" not in text
   assert "complete `delegation`" in (root / "claude.md").read_text()
+
+
+def test_completion_tool_sends_a_flag_and_returns_only_a_receipt(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  sent = []
+  def record(method, path, body):
+    sent.append(body)
+    return {"goal": {"status": "completed", "revision": 2, "result": None},
+            "plan": {"tasks": [], "summary": {"completed": 1, "total": 1}}}
+  monkeypatch.setattr(control, "_agent_api_call", record)
+  receipt = control._call_update_goal({"complete": True})
+  assert sent == [{"complete": True}]
+  assert receipt == "Goal completed, revision 2: 1/1 tasks complete."
+
+
+def test_legacy_success_text_is_readable_but_not_repeated_in_write_receipts():
+  control = _control_module()
+  payload = {"goal": {"status": "completed", "revision": 2,
+                      "result": "Historical result"}, "plan": None}
+  assert "Historical result" not in control._goal_report(payload, full=False)
+  assert "Historical result" in control._goal_report(payload, full=True)
+  payload["goal"]["status"] = "cannot_complete"
+  assert "Historical result" in control._goal_report(payload, full=False)

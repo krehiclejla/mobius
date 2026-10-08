@@ -9,6 +9,7 @@ never broadcast.
 """
 
 from __future__ import annotations
+from app.chat_writer import create_chat
 
 import asyncio
 import json
@@ -148,6 +149,9 @@ def _install_fake_client(monkeypatch, client_cls=_FakeClient) -> list:
 
   def _factory(options):
     client = client_cls(options)
+    # The runner hands Claude an anonymous prompt file that closes with the
+    # run, so read it while the client exists.
+    client.system_prompt = pathlib.Path(options.system_prompt["path"]).read_text(encoding="utf-8")
     clients.append(client)
     return client
 
@@ -1712,7 +1716,7 @@ def test_run_claude_sdk_turn_persists_session_id_before_terminal_result(
 
   db = SessionLocal()
   try:
-    db.add(models.Chat(
+    db.add(create_chat(
       id="claude-early",
       title="t",
       messages=[],
@@ -1933,6 +1937,41 @@ async def test_claude_chat_prompts_are_literal_on_new_and_resumed_turns(
 
 
 @pytest.mark.asyncio
+async def test_a_long_system_prompt_reaches_claude_whole_without_a_long_argument(
+  monkeypatch,
+):
+  """Linux refuses any single argv string of 128 KiB or more, so the prompt
+  must travel by file, whatever its size."""
+  from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+  commands: list[list[str]] = []
+
+  def _factory(options):
+    client = _FakeClient(options)
+    client.system_prompt = pathlib.Path(options.system_prompt["path"]).read_text(encoding="utf-8")
+    transport = SubprocessCLITransport(prompt="hello", options=options)
+    transport._cli_path = "claude"
+    commands.append(transport._build_command())
+    clients.append(client)
+    return client
+
+  clients: list = []
+  monkeypatch.setattr(claude_sdk_runner, "ClaudeSDKClient", _factory)
+  long_prompt = "Möbius constitution line.\n" * 8_000
+
+  await run_claude_sdk_turn(
+    user_message="hello", session_id=None, base_env={}, cwd="/tmp",
+    chat_id="long-prompt", skill_text=long_prompt, bc=_ChatBus(),
+  )
+
+  assert len(long_prompt.encode()) > 128 * 1024
+  assert clients[0].system_prompt.startswith(long_prompt)
+  assert "--system-prompt-file" in commands[0]
+  assert "--system-prompt" not in commands[0]
+  assert max(len(arg.encode()) for arg in commands[0]) < 128 * 1024
+
+
+@pytest.mark.asyncio
 async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   clients = _install_fake_client(monkeypatch)
 
@@ -1947,20 +1986,20 @@ async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   # The Claude runner appends its provider-authored concise register on top of
   # the shared base (documented amendment to system_prompts.py's contract): the
   # shared base is preserved verbatim, with the register appended after it.
-  assert options.system_prompt.startswith(
+  assert clients[0].system_prompt.startswith(
     claude_sdk_runner._system_prompt_with_register("system")
   )
-  assert "$MOBIUS_GENERATED_DIR" in options.system_prompt
-  assert "Create downloadable deliverables only when the owner explicitly requests" in options.system_prompt
-  assert options.system_prompt.startswith("system")
-  assert "# Concise register" in options.system_prompt
-  assert "# Execution lifetimes in Möbius" in options.system_prompt
-  assert "TaskOutput" not in options.system_prompt
-  assert 'until [ -e "$TMPDIR/job.exit" ]' in options.system_prompt
-  assert "confirm its saved receipt" in options.system_prompt
+  assert "$MOBIUS_GENERATED_DIR" in clients[0].system_prompt
+  assert "Create downloadable deliverables only when the owner explicitly requests" in clients[0].system_prompt
+  assert clients[0].system_prompt.startswith("system")
+  assert "# Concise register" in clients[0].system_prompt
+  assert "# Execution lifetimes in Möbius" in clients[0].system_prompt
+  assert "TaskOutput" not in clients[0].system_prompt
+  assert 'until [ -e "$TMPDIR/job.exit" ]' in clients[0].system_prompt
+  assert "confirm its saved receipt" in clients[0].system_prompt
   # Normal steering is no longer falsely described as an interruption.
-  assert "they do not interrupt running work" in options.system_prompt
-  assert "rather than inferring that" in options.system_prompt
+  assert "they do not interrupt running work" in clients[0].system_prompt
+  assert "rather than inferring that" in clients[0].system_prompt
   assert options.max_buffer_size == 10 * 1024 * 1024
   assert set(claude_sdk_runner._CLAUDE_NATIVE_SCHEDULING_TOOLS) <= set(
     options.disallowed_tools
@@ -2227,6 +2266,87 @@ def test_dispatch_assistant_empty_text_block_is_silent():
   )
   dispatch_sdk_message(msg, bus, None)
   assert bus.events == []
+
+
+def test_failed_api_attempts_surface_as_one_error_not_prose():
+  """The CLI reports each failed API attempt (here a safety refusal it retried
+  once) as a synthetic assistant message carrying `error`, then ends the turn
+  with an error result holding the same report. Only the result may surface:
+  the attempts are not model prose, so the chat shows one error block."""
+  def refusal(request_id: str) -> AssistantMessage:
+    return AssistantMessage(
+      content=[TextBlock(text=f"API Error: flagged.\n\nRequest ID: {request_id}")],
+      model="<synthetic>",
+      error="invalid_request",
+      stop_reason="refusal",
+    )
+
+  bus = _Bus()
+  session_id = None
+  for message in (refusal("req_1"), refusal("req_2")):
+    session_id, terminal = dispatch_sdk_message(message, bus, session_id)
+    assert terminal is None
+  _, terminal = dispatch_sdk_message(ResultMessage(
+    subtype="success",
+    duration_ms=20,
+    duration_api_ms=15,
+    is_error=True,
+    num_turns=1,
+    session_id="sess-1",
+    stop_reason="refusal",
+    total_cost_usd=0.0,
+    result="API Error: flagged.\n\nRequest ID: req_2",
+  ), bus, session_id)
+
+  assert [e for e in bus.events if e["type"] in ("text", "text_final")] == []
+  assert terminal["error"] == "API Error: flagged.\n\nRequest ID: req_2"
+
+
+def test_failed_api_call_keeps_the_last_real_context_size():
+  """The CLI's synthetic error message carries zeroed usage. It is not a
+  model call, so neither the live meter nor the saved context size may
+  drop to 0 after it: both keep the last real call's occupancy."""
+  bus = _Bus()
+  usage_state: dict = {}
+  real_call = AssistantMessage(
+    content=[TextBlock(text="Working on it.")],
+    model="claude-opus",
+    usage={
+      "input_tokens": 10,
+      "cache_creation_input_tokens": 200,
+      "cache_read_input_tokens": 3_000,
+      "output_tokens": 5,
+    },
+  )
+  failed_call = AssistantMessage(
+    content=[TextBlock(text="API Error: overloaded")],
+    model="<synthetic>",
+    error="server_error",
+    usage={
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0,
+    },
+  )
+  for message in (real_call, failed_call):
+    dispatch_sdk_message(message, bus, None, usage_state=usage_state)
+  _, terminal = dispatch_sdk_message(ResultMessage(
+    subtype="success",
+    duration_ms=20,
+    duration_api_ms=15,
+    is_error=True,
+    num_turns=1,
+    session_id="sess-1",
+    total_cost_usd=0.0,
+    usage={"input_tokens": 3_210, "output_tokens": 5},
+    result="API Error: overloaded",
+  ), bus, None, usage_state=usage_state)
+
+  context = [e["input_tokens"] for e in bus.events if e["type"] == "context_usage"]
+  assert context == [3_210]
+  assert terminal["usage_metrics"]["latest_model_input_tokens"] == 3_210
+  assert terminal["error"] == "API Error: overloaded"
 
 
 def test_each_root_model_call_publishes_its_live_context_occupancy():
@@ -3453,3 +3573,57 @@ async def test_failed_native_withdrawal_reaps_before_sdk_eof_only_on_failure(mon
   assert clients[0].disconnected
   assert trace == (["withdraw", "reap", "disconnect"] if withdrawal_fails
                    else ["withdraw", "disconnect", "reap"])
+
+
+def test_forwarded_claude_finals_use_sdk_envelope_identity_without_stream_indices():
+  """Real hosted shape: each completed block has a UUID, but no stream start."""
+  bus = _ChatBus()
+  first = AssistantMessage(content=[TextBlock(text="First.")], model="synthetic",
+    message_id="same-api-message", uuid="envelope-one")
+  second = AssistantMessage(content=[TextBlock(text="Second.")], model="synthetic",
+    message_id="same-api-message", uuid="envelope-two")
+  for message in (first, second, first):
+    dispatch_sdk_message(message, bus, None)
+  finals = [e for e in bus.events if e["type"] == "text_final"]
+  assert finals[0]["text_item_id"] == finals[2]["text_item_id"]
+  assert finals[0]["text_item_id"] != finals[1]["text_item_id"]
+  assert [b["content"] for b in _reduce(bus.events) if b["type"] == "text"] == ["First.", "Second."]
+
+
+def test_replayed_envelope_does_not_consume_the_next_streamed_block_identity():
+  bus = _ChatBus()
+  dispatch_sdk_message(_stream_message_start("msg"), bus, None)
+  for index in (0, 1):
+    dispatch_sdk_message(_stream_text_block_start(index), bus, None)
+  first = AssistantMessage(content=[TextBlock(text="First.")], model="synthetic",
+    message_id="msg", uuid="envelope-one")
+  second = AssistantMessage(content=[TextBlock(text="Second.")], model="synthetic",
+    message_id="msg", uuid="envelope-two")
+  for message in (first, first, second):
+    dispatch_sdk_message(message, bus, None)
+  assert [e["text_item_id"] for e in bus.events if e["type"] == "text_final"] == ["msg:0", "msg:0", "msg:1"]
+
+
+def test_forwarded_multi_block_envelope_does_not_alias_its_text_blocks():
+  bus = _ChatBus()
+  message = AssistantMessage(content=[TextBlock(text="First."), TextBlock(text="Second.")],
+    model="synthetic", message_id="msg", uuid="envelope")
+  dispatch_sdk_message(message, bus, None)
+  finals = [e for e in bus.events if e["type"] == "text_final"]
+  assert finals[0]["text_item_id"] != finals[1]["text_item_id"]
+
+
+def test_sdk_envelope_id_alone_never_manufactures_missing_message_authority():
+  bus = _ChatBus()
+  dispatch_sdk_message(AssistantMessage(content=[TextBlock(text="Text.")],
+    model="synthetic", uuid="envelope"), bus, None)
+  assert all("text_item_id" not in e for e in bus.events if e["type"] == "text_final")
+
+
+def test_claude_final_identity_cache_is_bounded_without_remembering_payloads():
+  bus = _ChatBus()
+  for n in range(1030):
+    dispatch_sdk_message(AssistantMessage(content=[TextBlock(text="not retained in identity cache")],
+      model="synthetic", message_id="msg", uuid=f"envelope-{n}"), bus, None)
+  assert len(bus._claude_final_text_items) == 1024
+  assert "not retained" not in str(bus._claude_final_text_items)

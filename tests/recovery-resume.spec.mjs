@@ -43,7 +43,7 @@ function deferred() {
   return { promise, resolve }
 }
 
-async function mount(page, { rejectFirst = false, loseFirstAck = false } = {}) {
+async function mount(page, { rejectFirst = false, loseFirstAck = false, creditPause = false, successorBeforeAck = false } = {}) {
   await page.setViewportSize({
     width: Number(process.env.MOBIUS_RECOVERY_WIDTH || 1512),
     height: Number(process.env.MOBIUS_RECOVERY_HEIGHT || 911),
@@ -53,13 +53,21 @@ async function mount(page, { rejectFirst = false, loseFirstAck = false } = {}) {
   const accepted = deferred()
   const detailRequested = deferred()
   const detailAccepted = deferred()
+  const successorObserved = deferred()
   let holdDetail = false
   let rejectDetail = false
   let runtimeGate = null
   let runtimeRequests = 0
   const attempts = []
   const unexpected = []
-  const messages = [{ role: 'user', content: 'Original question A', cid: 'original-a', ts: 1788800000100 }, partial]
+  const initialAnswer = creditPause ? {
+    ...partial,
+    blocks: [partial.blocks[0], {
+      type: 'error', message: 'Your workspace is out of credits. Add credits to continue.',
+      resumable: true, pause: { kind: 'credits', provider: 'codex' },
+    }],
+  } : partial
+  const messages = [{ role: 'user', content: 'Original question A', cid: 'original-a', ts: 1788800000100 }, initialAnswer]
   const detail = () => ({
     id: CHAT, title: 'Recovery fixture', provider: 'codex', messages,
     total: messages.length, offset: 0,
@@ -87,14 +95,23 @@ async function mount(page, { rejectFirst = false, loseFirstAck = false } = {}) {
       const message = { role: 'user', kind: 'continuation', continuation_reason: 'manual',
         content: 'continue', cid: attempts.at(-1).cid, ts: 1788800000600 }
       messages.push(message)
+      // The queue's runtime poll may observe the resumed run before this
+      // acknowledgement reaches the page.
+      if (successorBeforeAck) await successorObserved.promise
       if (loseFirstAck && attempts.length === 1) return route.abort('connectionreset')
       return route.fulfill({ status: 202, json: { status: 'started', message, run_id: 'resumed-a' } })
     }
     if (req.method() !== 'GET' && req.method() !== 'HEAD') {
-      if (url.pathname.includes('upload')) return route.fulfill({ json: {
+      // Restored panes announce their presence and request ephemeral frame
+      // capabilities. Mock these too; they are not chat/draft mutations.
+      if (url.pathname === '/api/auth/app-token'
+          || /^\/api\/events\/system\/[^/]+\/visible-apps$/.test(url.pathname)) {
+        return route.fulfill({ json: {} })
+      }
+      if (url.pathname.includes('upload')) return route.fulfill({ json: [{
         name: 'draft-note.txt', filename: 'draft-note.txt', size: 16,
         mime_type: 'text/plain', url: `${path}/uploads/draft-note.txt`,
-      } })
+      }] })
       unexpected.push(`${req.method()} ${url.pathname}`)
       return route.fulfill({ json: {} })
     }
@@ -106,7 +123,10 @@ async function mount(page, { rejectFirst = false, loseFirstAck = false } = {}) {
       }
       if (holdDetail) { detailRequested.resolve(); await detailAccepted.promise }
       if (rejectDetail) return route.fulfill({ status: 503, json: { detail: 'Fixture transcript unavailable' } })
-      return route.fulfill({ json: detail() })
+      const observedSuccessor = resumed && url.pathname === `${path}/runtime`
+      await route.fulfill({ json: detail() })
+      if (observedSuccessor) successorObserved.resolve()
+      return
     }
     if (url.pathname === `${path}/stream`) return route.fulfill({ status: 204, body: '' })
     if (url.pathname === '/api/chats') return route.fulfill({ json: [detail()] })
@@ -173,8 +193,34 @@ async function sampleGeometry(page, prefix = 'Paragraph 28:') {
   }, prefix)
 }
 
+for (const width of [1512, 390]) {
+  test(`workspace credits pause offers an explicit Resume at ${width}px without touching other work`, async ({ page }) => {
+    const state = await mount(page, { creditPause: true })
+    await page.setViewportSize({ width, height: 844 })
+    const card = state.surface.locator('.chat__text--parked')
+    await expect(card).toContainText('Credits needed')
+    await expect(card).toContainText('Your progress is saved')
+    await expect(card.getByRole('button', { name: 'Resume', exact: true })).toBeEnabled()
+    await expect(card.getByRole('button', { name: /auto-continue/ })).toHaveCount(0)
+    await expect(card.locator('[role="alert"]')).toHaveCount(0)
+    expect(state.attempts).toEqual([])
+    await card.getByRole('button', { name: 'Resume', exact: true }).click()
+    await state.requested.promise
+    expect(state.attempts).toHaveLength(1)
+    expect(state.attempts[0]).toMatchObject({ continuation: 'manual', resume_run_id: 'interrupted-a' })
+    expect(state.attempts[0].attachments || []).toHaveLength(0)
+    expect(state.attempts[0].content).toBe('')
+    await expect(state.composer).toHaveValue(draft)
+    await expect(state.attachment).toBeVisible()
+    state.accepted.resolve()
+    await expect(card).toHaveCount(0)
+    await expect(state.composer).toHaveValue(draft)
+    expect(state.unexpected).toEqual([])
+  })
+}
+
 test('Resume waits for acknowledgement without changing draft, attachment, queue, or reading position', async ({ page }) => {
-  const state = await mount(page)
+  const state = await mount(page, { successorBeforeAck: true })
   const resume = state.surface.getByRole('button', { name: 'Resume', exact: true })
   await resume.evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }))
   await state.surface.locator('.chat__scroll').hover()

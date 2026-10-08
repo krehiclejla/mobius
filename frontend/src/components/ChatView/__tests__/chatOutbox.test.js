@@ -167,6 +167,38 @@ test('principal keys survive owner token renewal but bind embedded chat capabili
   assert.equal(outboxPrincipalKey('opaque'), null)
 })
 
+test('shared-browser queued intent is not adopted by owner or another grant/session', () => {
+  const owner = outboxPrincipalKey(tokenFor())
+  const grantA = outboxPrincipalKey(tokenFor({
+    browser_grant: 'grant-A', browser_session: 'session-A',
+  }))
+  const grantARenewed = outboxPrincipalKey(tokenFor({
+    browser_grant: 'grant-A', browser_session: 'session-A', exp: 999,
+  }))
+  const grantB = outboxPrincipalKey(tokenFor({
+    browser_grant: 'grant-B', browser_session: 'session-B',
+  }))
+  const grantANewSession = outboxPrincipalKey(tokenFor({
+    browser_grant: 'grant-A', browser_session: 'session-C',
+  }))
+  assert.ok(grantA)
+  assert.equal(grantA, grantARenewed)
+  assert.notEqual(grantA, owner)
+  assert.notEqual(grantA, grantB)
+  assert.notEqual(grantA, grantANewSession)
+  assert.equal(storedIntentOwnership(owner, grantA), 'preserve')
+  assert.equal(storedIntentOwnership(grantA, owner), 'preserve')
+  assert.equal(storedIntentOwnership(grantA, grantB), 'preserve')
+  assert.equal(storedIntentOwnership(grantA, grantANewSession), 'preserve')
+  assert.equal(storedIntentOwnership(grantA, grantARenewed), 'owned')
+  assert.equal(outboxPrincipalKey(tokenFor({ browser_grant: 'grant-A' })), null)
+  // Tokens minted before the grant epoch was retired still carry it; it is ignored.
+  assert.equal(outboxPrincipalKey(tokenFor({
+    browser_grant: 'grant-A', browser_grant_epoch: 3, browser_session: 'session-A',
+  })), grantA)
+  assert.deepEqual(JSON.parse(grantA).slice(2), ['browser_shared', 'grant-A', 'session-A'])
+})
+
 test('a queued intent survives to disk and is listable only by its principal', async () => {
   await enqueue({ chatId: 'c1', cid: 'x1', type: 'message', body: { content: 'hi', cid: 'x1' } })
   assert.equal((await list()).length, 1)

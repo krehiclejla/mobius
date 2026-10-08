@@ -82,9 +82,18 @@ test('Archive, Archived, open-chat Restore and Undo keep the same transcript and
   await row.click({ button: 'right' })
   await page.getByRole('menuitem', { name: 'Archive', exact: true }).click()
   await expect(surface.getByRole('region', { name: 'Archived chat' })).toBeVisible()
-  const toast = page.locator('.toast').filter({ hasText: 'Chat archived' })
-  await expect(toast.getByRole('button', { name: 'Undo' })).toBeVisible()
-  await toast.getByRole('button', { name: 'Undo' }).click()
+  const preview = page.getByRole('region', { name: 'Notifications', exact: true })
+  await expect(preview).toHaveCount(0)
+  await page.getByRole('button', { name: /^Notifications(?:,|$)/ }).click()
+  const notice = preview.locator('.notifications__row-item').filter({
+    hasText: 'Chat archived',
+    has: page.getByRole('button', { name: 'Undo', exact: true }),
+  })
+  await expect(notice).toHaveCount(1)
+  await notice.getByRole('button', { name: 'Undo', exact: true }).click()
+  await expect(notice).toHaveCount(0)
+  await expect(preview.getByText('Undone', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Close notifications', exact: true }).click()
   await expect(surface.getByRole('region', { name: 'Archived chat' })).toHaveCount(0)
   await expect.poll(async () => (await readRow()).archived_at).toBeNull()
   await expect(row).toBeVisible()

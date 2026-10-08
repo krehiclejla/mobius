@@ -350,8 +350,37 @@ clear_stale_browser_profile_lock() {
 
   current_host="$(hostname)"
   if [ "$owner_host" = "$current_host" ] && kill -0 "$owner_pid" 2>/dev/null; then
-    # Never disturb a browser that still owns this profile in this container.
-    return 0
+    # A Chromium PID can be reused after an unclean exit. Presence alone does
+    # not establish profile ownership: verify the exact browser root and its
+    # user-data-dir before retaining the lock. Unreadable process state is
+    # uncertain, so leave the lock untouched rather than risk a live profile.
+    if python3 - "$owner_pid" "$AGENT_BROWSER_PROFILE" <<'PYOWNER'
+import os
+from pathlib import Path
+import sys
+
+pid, profile = sys.argv[1:]
+try:
+  args = (Path('/proc') / pid / 'cmdline').read_bytes().split(b'\0')
+except FileNotFoundError:
+  raise SystemExit(1)
+except OSError:
+  raise SystemExit(0)
+args = [a.decode('utf-8', errors='surrogateescape') for a in args if a]
+if not args:
+  raise SystemExit(1)
+browser = Path(args[0]).name in {'chrome', 'chromium', 'chromium-browser'}
+directory = next((arg.split('=', 1)[1] for arg in args
+                  if arg.startswith('--user-data-dir=')), None)
+if directory is None and '--user-data-dir' in args:
+  index = args.index('--user-data-dir')
+  directory = args[index + 1] if index + 1 < len(args) else None
+raise SystemExit(0 if browser and directory and
+                 os.path.abspath(directory) == os.path.abspath(profile) else 1)
+PYOWNER
+    then
+      return 0
+    fi
   fi
 
   # Chromium records its singleton owner as <hostname>-<pid>. The per-chat
@@ -364,6 +393,24 @@ clear_stale_browser_profile_lock() {
       rm -f "${AGENT_BROWSER_PROFILE}/${artifact}"
     fi
   done
+}
+
+recover_singleton_contention() {
+  grep -q 'Failed to create a ProcessSingleton for your profile directory' \
+    "$BROWSER_ERROR_FILE" || return 0
+  [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ] || \
+    die "browser profile contention persisted after one isolated reset"
+  # Chromium explicitly refused this exact profile rather than merely
+  # failing a command. Reset its verified owners once, then start a fresh
+  # authenticated capture; never bypass the mounted-frame/freshness gates.
+  if python3 "$(dirname "${BASH_SOURCE[0]}")/agent_browser_session_reset.py" \
+      "$AGENT_BROWSER_PROFILE"; then
+    clear_stale_browser_profile_lock
+    cleanup
+    export MOBIUS_SCREENSHOT_RECOVERY_COUNT=1
+    exec bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+  fi
+  die "browser profile contention could not be reset safely"
 }
 
 CONTENT_ONLY=0
@@ -520,7 +567,9 @@ if [ "$CURRENT_PAGE" -eq 0 ]; then
   # Start the browser, then wait narrowly for its command socket before applying
   # viewport state. A cold launch can return before that socket is connectable.
   browser_command 5 open "${API_BASE_URL}/api/browser-bootstrap" >/dev/null || true
+  recover_singleton_contention
   if ! browser_set_viewport_retry; then
+    recover_singleton_contention
     die "browser did not become ready for viewport configuration"
   fi
 

@@ -54,6 +54,7 @@ from app import (
   github_auth,
   models,
   providers,
+  transcript_rows,
 )
 from app.config import get_settings
 from app.broadcast import get_system_broadcast
@@ -198,7 +199,7 @@ from app.deps import (
   Principal,
   get_agent_run_principal,
   get_principal,
-  require_nondelegated_owner_control,
+  require_installation_owner_control,
   require_nondelegated_owner_or_app_control,
   reject_cross_site,
 )
@@ -2669,10 +2670,12 @@ def _source_chat_metadata(app_id: int, source_root: str) -> list[dict]:
     # without edit previews; streaming bounds Python's transcript working set.
     # Full sidecars remain authoritative even when a preview omitted a path.
     candidates = db.query(models.Chat).options(load_only(
-      models.Chat.id, models.Chat.messages,
+      models.Chat.id,
     ), selectinload(models.Chat.live_snapshot)).filter(
       models.Chat.deleted_at.is_(None),
-      or_(cast(models.Chat.messages, Text).contains('"edit_preview"'),
+      or_(models.Chat.id.in_(transcript_rows.chats_with_flag(
+        db, transcript_rows.EDIT_PREVIEW, '"edit_preview"',
+      )),
           models.Chat.live_snapshot.has(
             cast(models.ChatLiveAssistant.snapshot, Text).contains('"edit_preview"'))),
     ).yield_per(20)
@@ -5698,7 +5701,7 @@ _HUMAN_REQUIRED_TITLE = "Your contribution needs you"
 
 def _require_autopilot_agent(principal: Principal) -> None:
   """Mutation rounds run under the owner's agent credential, never an app JWT."""
-  require_nondelegated_owner_control(principal)
+  require_installation_owner_control(principal)
   if principal.app_id is not None:
     raise HTTPException(
       status_code=403,

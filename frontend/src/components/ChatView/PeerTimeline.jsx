@@ -12,9 +12,9 @@ import {
   retryChatActivity,
 } from './chatActivityQueries.js'
 import { groupTimelineRows } from './timelineRowGrouping.js'
-import { peerRecordTool, peerTime, foldPeerActivity } from './peerTimeline.js'
+import { activityEventsFromPages, peerRecordTool, peerTime, foldPeerActivity } from './peerTimeline.js'
 
-export function usePeerTimeline(chatId, messages, enabled, activeTools, activeMirrorIndex = -1) {
+export function usePeerTimeline(chatId, messages, enabled, activeTools) {
   const query = useInfiniteQuery({
     queryKey: chatActivityQueryKey(chatId),
     initialPageParam: null,
@@ -23,7 +23,7 @@ export function usePeerTimeline(chatId, messages, enabled, activeTools, activeMi
     enabled, staleTime: CHAT_ACTIVITY_STALE_TIME, retry: retryChatActivity,
   })
   const pages = query.data?.pages
-  const events = useMemo(() => [...new Map((pages || []).flatMap(p => p.events).map(event => [event.id, event])).values()], [pages])
+  const events = useMemo(() => activityEventsFromPages(pages), [pages])
   const oldestLoaded = events.length ? Math.min(...events.map(event => peerTime(event.created_at))) : Infinity
   const windowStart = messages[0]?.ts ?? Infinity
   const { hasNextPage, isFetching, isError, fetchNextPage } = query
@@ -37,13 +37,12 @@ export function usePeerTimeline(chatId, messages, enabled, activeTools, activeMi
         messages,
         projectChatActivity(messages, events, chatId, activeTools),
         chatId,
-        activeMirrorIndex,
       ),
       // Source identity for the scroll handover; streaming projection alone
       // must not schedule pre-paint geometry reads on every token.
       activityEvents: events,
     }),
-    [messages, events, chatId, activeTools, activeMirrorIndex],
+    [messages, events, chatId, activeTools],
   )
 }
 

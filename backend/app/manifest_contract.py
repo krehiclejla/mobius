@@ -1,7 +1,8 @@
 """Dependency-free manifest contract shared by install and preflight."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 import json
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 import posixpath
 import re
@@ -21,15 +22,18 @@ RECOGNIZED_CAPABILITIES = (
 )
 SKILLS_COUNT_MAX = 5
 MANIFEST_MAX_BYTES = 64 * 1024
-ENTRY_MAX_BYTES = 1024 * 1024
-SEED_MAX_BYTES = 4 * 1024 * 1024
-SEEDS_COUNT_MAX = 64
-SEEDS_TOTAL_MAX = 32 * 1024 * 1024
-STATIC_ASSET_MAX_BYTES = 16 * 1024 * 1024
-STATIC_ASSETS_COUNT_MAX = 256
-STATIC_ASSETS_TOTAL_MAX = 64 * 1024 * 1024
-SOURCE_FILES_TOTAL_MAX = 8 * 1024 * 1024
-ICON_MAX_BYTES = 12 * 1024 * 1024
+# The one size bound for an app package: every file its manifest declares
+# (entry, job, source files, static assets, storage seeds, icon), summed per
+# declaration by `package_bytes`. Install holds a whole package from an
+# untrusted host in memory to review, digest and write it, so the total is the
+# real safety bound, and no single file or file kind has its own cap. Store
+# publication bounds both its whole tree and this declared sum by the same
+# number, so every app the Store accepts is installable. The Store host
+# preserves releases up to 64 MiB too. What the shell can load is a separate,
+# smaller bound on the compiled module
+# (`app_compile_contract.COMPILED_MODULE_MAX_BYTES`): large data belongs in
+# `static_assets`, fetched at runtime, rather than imported into the bundle.
+PACKAGE_MAX_BYTES = 64 * 1024 * 1024
 SKILL_MAX_BYTES = 256 * 1024
 SYSTEM_PROMPT_MAX_BYTES = 256 * 1024
 PROJECT_TEMPLATES_COUNT_MAX = 12
@@ -357,6 +361,61 @@ def static_asset_entries(value) -> dict[str, str]:
   _fail("Manifest `static_assets` must be an object or array.")
 
 
+def package_input_paths(manifest: Mapping) -> Iterator[str]:
+  """Yield every repo-relative file declared by a validated manifest.
+
+  Order is entry, icon, schedule job, source_files, static-asset sources, then
+  file seeds. Collections keep declaration order; separate destinations using
+  the same source each count. List-form static assets count each path once.
+  Static destinations and inline JSON seeds are not source files. mobius.json
+  itself is excluded: its bytes have a separate manifest cap. Other file-backed
+  features (services, setup, prompts, skills) must appear in source_files.
+  """
+  schedule = manifest.get("schedule")
+  static_sources = static_asset_entries(manifest.get("static_assets") or {}).values()
+  declared = (
+    manifest.get("entry"),
+    manifest.get("icon"),
+    schedule.get("job") if isinstance(schedule, Mapping) else None,
+    *(manifest.get("source_files") or []),
+    *static_sources,
+    *(manifest.get("storage_seeds") or {}).values(),
+  )
+  for rel in declared:
+    if isinstance(rel, str) and rel:
+      yield rel
+
+
+def package_bytes(manifest: Mapping, size_of: Callable[[str], int]) -> int:
+  """Sum declared inputs per written destination, including source aliases.
+
+  Each alias consumes the budget again because each destination is written
+  separately. Install, local apply, validation and publication use this same
+  sum. Inline seeds are bounded by the manifest cap. `size_of` returns 0 for a
+  missing file; the caller's content validation reports that missing input.
+  """
+  return sum(size_of(rel) for rel in package_input_paths(manifest))
+
+
+def size_on_disk(root: Path, rel: str) -> int:
+  """A declared file's size from its metadata, or 0 when it is not a file."""
+  path = root / rel
+  return path.stat().st_size if path.is_file() else 0
+
+
+def package_bytes_on_disk(root: Path, manifest: Mapping) -> int:
+  """`package_bytes` for a source tree, from file metadata before any read."""
+  return package_bytes(manifest, lambda rel: size_on_disk(root, rel))
+
+
+def package_limit_message(declared: int) -> str:
+  """The one refusal every path gives for a package over the bound."""
+  return (
+    f"This app declares {declared} bytes of files, more than the "
+    f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit."
+  )
+
+
 def _validate_running_label(running_label, field: str) -> None:
   if (
     not isinstance(running_label, str)
@@ -384,7 +443,7 @@ def validate_agent_tools(tools, *, has_service: bool) -> None:
     field = f"tools[{index}]"
     if not isinstance(tool, Mapping) or not (
       {"name", "description", "input_schema"} <= set(tool)
-      <= {"name", "description", "input_schema", "always_load"}
+      <= {"name", "description", "input_schema", "always_load", "result_independent"}
     ):
       _fail(
         f"Manifest `{field}` must contain `name`, `description`, and "
@@ -392,6 +451,11 @@ def validate_agent_tools(tools, *, has_service: bool) -> None:
       )
     if not isinstance(tool.get("always_load", False), bool):
       _fail(f"Manifest `{field}.always_load` must be true or false.")
+    # Retired: `result_independent` once routed calls through a hidden reply
+    # channel. Published manifests may still carry it, so it stays valid and
+    # has no effect; every tool call is an ordinary result-bearing call.
+    if not isinstance(tool.get("result_independent", False), bool):
+      _fail(f"Manifest `{field}.result_independent` must be true or false.")
     name = tool["name"]
     if not isinstance(name, str) or _AGENT_TOOL_NAME.fullmatch(name) is None:
       _fail(f"Manifest `{field}.name` must match `^[a-z][a-z0-9_]{{0,39}}$`.")
@@ -561,7 +625,7 @@ def validate_manifest_contract(manifest) -> None:
   if manifest.get("icon") is not None:
     validate_repo_relative_path(manifest["icon"], "icon")
 
-  for field in ("offline_capable", "embeds_agent"):
+  for field in ("offline_capable", "embeds_agent", "shell_shortcuts"):
     if field in manifest and not isinstance(manifest[field], bool):
       _fail(f"Manifest `{field}` must be a boolean.")
 
@@ -799,12 +863,10 @@ def validate_manifest_contract(manifest) -> None:
       validate_repo_relative_path(value, f"storage_seeds.{sub}")
 
   static_assets = manifest.get("static_assets", {})
+  # No file-count caps for static assets, seeds, or source files: the manifest
+  # byte cap bounds how many paths can be listed, and PACKAGE_MAX_BYTES bounds
+  # what they add up to.
   static_assets_entries = static_asset_entries(static_assets)
-  if len(static_assets_entries) > STATIC_ASSETS_COUNT_MAX:
-    _fail(
-      "Manifest has too many static_assets "
-      f"(max {STATIC_ASSETS_COUNT_MAX})."
-    )
   for dest, src in static_assets_entries.items():
     validate_repo_relative_path(dest, f"static_assets.{dest}")
     validate_repo_relative_path(src, f"static_assets.{dest}")
@@ -818,8 +880,6 @@ def validate_manifest_contract(manifest) -> None:
   if source_files is not None:
     if not isinstance(source_files, list):
       _fail("Manifest `source_files` must be an array.")
-    # No file-count cap: the manifest byte cap bounds how many paths can be
-    # listed, and fetch enforces the per-file and total source byte caps.
     schedule = manifest.get("schedule")
     declared_job = schedule.get("job") if isinstance(schedule, Mapping) else None
     seen_sources: set[str] = set()

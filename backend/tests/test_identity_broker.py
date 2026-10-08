@@ -51,7 +51,7 @@ def test_served_tree_loses_group_write_after_boot_writers_before_validation():
   user-private-group umask; the broker check then forced the baked floor on
   every later boot. Normalize after the last writer, before validation."""
   source = ENTRYPOINT_PATH.read_text()
-  normalize = source.index("chmod -R go-w /data/platform")
+  normalize = source.index("find /data/platform ! -type l -perm /022 -exec chmod go-w {} +")
   # The image's boot transaction (activate, guard, revert) is every writer.
   assert source.index("if ! _platform_boot activate 2>&1; then") < normalize
   assert source.index("elif _platform_boot revert 2>&1") < normalize
@@ -66,16 +66,19 @@ def test_broker_and_app_consumers_share_the_root_owned_socket():
   # The test runtime deliberately overrides the broker path so it cannot reach
   # a host-owned socket. Verify the production default from the module source.
   assert socket in BROKER_PATH.read_text(encoding="utf-8")
-  for relative in (
-    "app/runtime_identity.py",
-    "app/contribution_broker.py",
-    "app/community_broker.py",
-    "app/providers.py",
-    "scripts/entrypoint.sh",
-  ):
+  for relative in ("app/runtime_identity.py", "scripts/entrypoint.sh"):
     source = (backend / relative).read_text(encoding="utf-8")
     assert socket in source
     assert "/data/run/mobius-identity-broker.sock" not in source
+  # App broker clients resolve the socket only through runtime_identity.
+  for relative in (
+    "app/providers.py",
+    "app/contribution_broker.py",
+    "app/community_broker.py",
+  ):
+    source = (backend / relative).read_text(encoding="utf-8")
+    assert "MOBIUS_IDENTITY_BROKER_SOCKET" not in source
+    assert "mobius-identity-broker.sock" not in source
 
 
 @pytest.fixture()
@@ -1494,7 +1497,7 @@ def test_inference_body_ceiling_distinguishes_local_and_upstream_rejection(
         "limit_bytes": 64,
       }
       assert len(seen) == 1
-      assert "origin=local_broker status=413 declared_bytes=65 limit_bytes=64" in caplog.text
+      assert "origin=local_broker status=413 request_bytes=65 limit_bytes=64" in caplog.text
       assert "do-not-log" not in caplog.text
   finally:
     server.shutdown()
@@ -1522,3 +1525,98 @@ def test_malformed_body_length_is_not_classified_as_oversized(length):
   with pytest.raises(ValueError, match="invalid content length") as caught:
     handler._body(maximum=64)
   assert not isinstance(caught.value, broker_module.RequestBodyTooLarge)
+
+
+@pytest.mark.parametrize('text', [
+  'Latin: č ć ž š đ; 中文; العربية; 😀; e\u0301',
+  'Literal escape: \\u010d; quote: "; control: \n\t\x00',
+  'Lone surrogate: \ud800; low: \udfff; valid: 😀',
+])
+def test_web_tool_rewrite_preserves_unicode_without_ascii_expansion(text):
+  request = {
+    'input': [{'role': 'user', 'content': text}],
+    'tools': [{'type': 'namespace', 'name': 'web', 'tools': [
+      {'type': 'function', 'name': 'run', 'description': text,
+       'parameters': {'type': 'object', 'properties': {text: {'type': 'string'}}}},
+    ]}],
+  }
+  encoded, changed, bare = broker_module._flatten_web_tool(json.dumps(request).encode())
+  assert changed and bare
+  expected = dict(request, tools=[dict(request['tools'][0]['tools'][0], name='mobius_web_run')])
+  assert json.loads(encoded) == expected
+  assert encoded == json.dumps(expected, ensure_ascii=False, separators=(',', ':')).encode(
+    'utf-8', errors='backslashreplace',
+  )
+  assert broker_module._flatten_web_tool(encoded) == (encoded, False, False)
+
+
+def test_web_tool_rewrite_keeps_multibyte_history_within_real_inference_envelope():
+  request = {
+    'input': [{'role': 'user', 'content': 'é' * 2_700_000}],
+    'tools': [{'type': 'namespace', 'name': 'web', 'tools': [
+      {'type': 'function', 'name': 'run', 'parameters': {'type': 'object'}},
+    ]}],
+  }
+  body = json.dumps(request, ensure_ascii=False, separators=(',', ':')).encode()
+  rewritten, changed, _ = broker_module._flatten_web_tool(body)
+  assert changed
+  assert len(body) < broker_module.MAX_INFERENCE_BODY
+  assert len(rewritten) < broker_module.MAX_INFERENCE_BODY
+  assert json.loads(rewritten)['input'] == request['input']
+
+
+@pytest.mark.parametrize('headroom', [-1, 0, 1])
+def test_inference_final_byte_limit_runs_after_real_web_rewrite(monkeypatch, caplog, headroom):
+  request = {
+    'input': [{'role': 'user', 'content': 'private fixture'}],
+    'tools': [{'type': 'namespace', 'name': 'web', 'tools': [
+      {'type': 'function', 'name': 'run'},
+    ]}],
+  }
+  body = json.dumps(request, separators=(',', ':')).encode()
+  rewritten, changed, _ = broker_module._flatten_web_tool(body)
+  maximum = len(rewritten) + headroom
+  assert changed and len(body) < maximum
+  monkeypatch.setattr(broker_module, 'MAX_INFERENCE_BODY', maximum)
+  seen = []
+
+  class FakeBroker:
+    def proxy(self, *, body, **_kwargs):
+      seen.append(body)
+      return httpx.Response(200, headers={'Content-Type': 'application/json'},
+                            stream=httpx.ByteStream(b'{"ok":true}'))
+
+  server = broker_module._TcpServer(('127.0.0.1', 0), broker_module._Handler)
+  server.broker = FakeBroker()
+  server.is_unix = False
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  try:
+    with httpx.Client(base_url=f'http://127.0.0.1:{server.server_address[1]}', trust_env=False) as client:
+      response = client.post('/v1/responses', content=body)
+    if headroom < 0:
+      assert response.status_code == 413
+      assert seen == []
+      assert response.json() == {
+        'error': 'request body is too large', 'code': 'request_body_too_large',
+        'origin': 'local_broker', 'request_bytes': len(rewritten),
+        'limit_bytes': maximum, 'stage': 'rewritten', 'received_bytes': len(body),
+      }
+      assert f'request_bytes={len(rewritten)}' in caplog.text
+      assert 'private fixture' not in caplog.text
+    else:
+      assert response.status_code == 200
+      assert seen == [rewritten]
+  finally:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+def test_shared_inbox_broker_exposes_only_exact_response_route():
+  path = "/api/instance/v1/browser-access/shared/respond"
+  assert broker_module._managed_upstream_path("POST", "/managed" + path) == path
+  assert broker_module.BROKER_ROUTE_EPOCH >= 7
+  for method, suffix in (("GET", ""), ("DELETE", ""), ("POST", "/other"),
+                         ("POST", "?subject=other"), ("POST", "/../grants")):
+    assert broker_module._managed_upstream_path(method, "/managed" + path + suffix) is None

@@ -5,6 +5,7 @@ import {
   runAgentRepair,
   writeRefreshedRecoveryAttempt,
 } from '../lib/errorRecovery.js'
+import { sharedBrowserShellHref } from '../lib/sharedBrowserWorkspace.js'
 
 /**
  * "Ask the agent to fix it" for one failure of one surface: owns that
@@ -89,7 +90,7 @@ export default function useAgentRepair({
         prompt,
       })
       if (controllerRef.current === controller && !controller.signal.aborted) {
-        window.location.assign(result.path)
+        window.location.assign(sharedBrowserShellHref(result.path))
       }
     } catch (error) {
       // Loading the client can fail before the shared runner records an attempt.

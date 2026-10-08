@@ -1,4 +1,5 @@
 import { moduleVersionKey } from './appVersion.js'
+import { isSharedBrowserRoute, sharedBrowserCacheBuster } from './sharedBrowserWorkspace.js'
 
 export const APP_MODULE_MAX_BYTES = 8 * 1024 * 1024
 
@@ -19,6 +20,10 @@ export function appModuleRequestUrl(
   url.searchParams.set('token', String(token || ''))
   url.searchParams.set('v', moduleVersionKey(frameVersion))
   if (retry > 0) url.searchParams.set('_', String(retry))
+  // Older workers cache app modules with token removed from the key. A fresh
+  // per-request guest lane cannot alias an owner module or a prior guest's
+  // offline copy after revocation. The nonce is not an authority or secret.
+  if (isSharedBrowserRoute()) url.searchParams.set('shared_browser', sharedBrowserCacheBuster())
   return url.href
 }
 
@@ -52,7 +57,10 @@ export async function fetchAppModuleBytes({
   const url = appModuleRequestUrl(baseUrl, { token, frameVersion, retry })
   let response
   try {
-    response = await fetchImpl(url, { credentials: 'same-origin' })
+    response = await fetchImpl(url, {
+      credentials: 'same-origin',
+      ...(isSharedBrowserRoute() ? { headers: { 'X-Mobius-Shared-Browser': '1' } } : {}),
+    })
   } catch {
     throw new AppModuleBrokerError('The app module could not be reached.', {
       code: 'network',

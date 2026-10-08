@@ -170,11 +170,15 @@ class AppOut(BaseModel):
   # opened. The shell renders the same quiet activity dot used for chats.
   has_unseen_activity: bool = False
   unseen_activity_version: int | None = None
+  # Unread count the app itself reports for its sidebar row; 0 shows nothing.
+  badge_count: int = 0
   cross_app_access: ShareLevel = "none"
   share_with_apps: ShareLevel = "none"
   offline_capable: bool = False
   # The app embeds an agent chat — surfaced as a badge. See models.App.
   embeds_agent: bool = False
+  # Shell shortcuts reach this app's frame. See models.App.shell_shortcuts.
+  shell_shortcuts: bool = True
   # Install authority — see models.App.manage_apps for the contract.
   manage_apps: bool = False
   # GitHub data/reviewed-submit access — see models.App.github_access.
@@ -691,6 +695,9 @@ class SendMessage(BaseModel):
   # Exact physical run shown by Resume; stale recovery controls cannot start
   # a new continuation after automatic recovery has already advanced it.
   resume_run_id: str | None = None
+  # Goal Resume names the durable obligation, not an unrelated chat tail.
+  resume_goal_id: str | None = Field(default=None, min_length=1, max_length=64)
+  resume_goal_revision: int | None = Field(default=None, ge=0)
   attachments: list[dict] | None = None
   timezone: str | None = None
   viewport: dict | None = None
@@ -748,6 +755,12 @@ class SendMessage(BaseModel):
 
   @model_validator(mode="after")
   def validate_continuation(self):
+    goal_target = self.resume_goal_id is not None or self.resume_goal_revision is not None
+    if goal_target and (
+      self.resume_goal_id is None or self.resume_goal_revision is None
+      or self.continuation != "manual" or self.resume_run_id is not None
+    ):
+      raise ValueError("Goal Resume requires one exact Goal id and revision")
     if (
       self.continuation == "manual"
       and self.content.strip()

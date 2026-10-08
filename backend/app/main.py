@@ -36,6 +36,7 @@ from sqlalchemy import inspect as inspect_database
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from app.chat_logging import get_logger as get_chat_logger
 from app.config import get_settings
 from app.database import (
   Base,
@@ -45,7 +46,9 @@ from app.database import (
   reset_database_request_label,
   set_database_request_label,
 )
-from app.schema_migrations import mapped_schema_gaps, run_migrations
+from app.schema_migrations import (
+  ensure_transcript_triggers, mapped_schema_gaps, run_migrations,
+)
 from app.http_caching import strip_range
 from app.frontend_assets import (
   baked_frontend_dir,
@@ -68,7 +71,8 @@ from app.response_policy import (
   static_embed_csp,
 )
 from app.storage_io import ParentIsFile, atomic_write
-from app import activity, models
+from app.account_browser_access import SharedAccessError
+from app import activity, models, tracing
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
 # uvicorn boot. See the
@@ -76,7 +80,7 @@ from app import activity, models
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
   app_tools_router,
-  auth_router,
+  auth_router, browser_access_router,
   app_chat_router,
   chat_continuity_router, chat_embed_router, chat_logs_router, chat_router,
   chats_router, chats_stream_router,
@@ -231,6 +235,8 @@ def _init_db():
     try:
       Base.metadata.create_all(bind=engine)
       run_migrations(engine)
+      # The previous release's change detection depends on these triggers.
+      ensure_transcript_triggers(engine)
       gaps = mapped_schema_gaps(engine)
       if gaps:
         # A mapped column with no migration fails at first query, not at
@@ -292,6 +298,10 @@ async def lifespan(app):
   )
   database_boot = await run_startup_plan(startup_context)
   _set_database_boot_state(database_boot)
+  if database_boot.serviceable:
+    # A database that failed its boot check is left untouched for Recovery.
+    from app.database import open_wal_anchor
+    open_wal_anchor()
   from app.runtime_supervisors import RuntimeSupervisors
   supervisors = RuntimeSupervisors(
     settings=settings,
@@ -360,6 +370,10 @@ async def lifespan(app):
       stop_writer()
     except Exception as exc:
       _log.error("chat writer stop failed: %s", exc, exc_info=True)
+    # Last database user out: closing the anchor lets SQLite checkpoint the
+    # log on the way down.
+    from app.database import close_wal_anchor
+    close_wal_anchor()
 
 settings = get_settings()
 
@@ -385,6 +399,9 @@ app = FastAPI(
   lifespan=lifespan,
 )
 
+# Opt-in, off unless <data_dir>/tracing.json enables it; see app.tracing.
+tracing.configure(app, engine)
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -392,6 +409,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.exception_handler(IntegerOutOfRange)
 async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
   return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(SharedAccessError)
+async def _shared_access_error_handler(_request: Request, exc: SharedAccessError):
+  # Shared-access failures the Connect app branches on carry a stable code.
+  return JSONResponse(
+    status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code},
+  )
 
 
 @app.exception_handler(ParentIsFile)
@@ -745,6 +770,10 @@ class _DatabaseRequestContextMiddleware:
       reset_database_request_label(token)
 
 
+def _matched_route(scope) -> str:
+  return getattr(scope.get("route"), "path", None) or "<unmatched>"
+
+
 class _RequestErrorTelemetryMiddleware:
   """Aggregate failed responses by matched route without retaining raw URLs.
 
@@ -753,10 +782,31 @@ class _RequestErrorTelemetryMiddleware:
   so a retry loop remains observable without amplifying its CPU or disk cost.
   FastAPI leaves the matched route template and path params in the ASGI scope;
   those templates contain no user paths or query values.
+
+  Unhandled exceptions also leave their traceback in the chat log (uvicorn's
+  own report reaches only the container's stdout), once per route and
+  exception type per window so a crash loop cannot flood the log.
   """
+
+  _TRACEBACK_WINDOW_SEC = 60
+  _TRACEBACK_KEY_CAP = 512
 
   def __init__(self, app):
     self.app = app
+    self._traceback_logged_at: dict[tuple[str, str], float] = {}
+
+  def _log_traceback(self, route: str, exc: Exception) -> None:
+    key = (route, type(exc).__qualname__)
+    now = time.monotonic()
+    last = self._traceback_logged_at.get(key)
+    if last is not None and now - last < self._TRACEBACK_WINDOW_SEC:
+      return
+    if len(self._traceback_logged_at) >= self._TRACEBACK_KEY_CAP:
+      self._traceback_logged_at.clear()
+    self._traceback_logged_at[key] = now
+    get_chat_logger().error(
+      "unhandled exception in route %s", route, exc_info=exc,
+    )
 
   async def __call__(self, scope, receive, send):
     if scope["type"] != "http":
@@ -771,13 +821,15 @@ class _RequestErrorTelemetryMiddleware:
 
     try:
       return await self.app(scope, receive, _send)
-    except Exception:
+    except Exception as exc:
       status = status or 500
+      self._log_traceback(
+        f"{scope.get('method', '?')} {_matched_route(scope)}", exc,
+      )
       raise
     finally:
       if status is not None and status >= 400:
-        matched = scope.get("route")
-        route = getattr(matched, "path", None) or "<unmatched>"
+        route = _matched_route(scope)
         raw_app_id = (scope.get("path_params") or {}).get("app_id")
         try:
           app_id = int(raw_app_id) if raw_app_id is not None else None
@@ -996,6 +1048,7 @@ app.include_router(public_storage_router)
 app.include_router(public_apps_router)
 app.include_router(local_services_router)
 app.include_router(connect_router)
+app.include_router(browser_access_router)
 app.include_router(client_error_router)
 app.include_router(client_signal_router)
 app.include_router(community_router)

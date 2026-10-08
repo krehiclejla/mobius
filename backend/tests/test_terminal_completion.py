@@ -12,6 +12,8 @@ simulation (the `reconcile_interrupted_chats` pure function, exactly as
 The conftest `fresh_db` fixture starts a real writer actor per test bound to
 the test DB, so `get_writer()` is the real path throughout.
 """
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 import asyncio
 import importlib
@@ -71,7 +73,7 @@ def _seed_chat(chat_id, messages=None, pending=None, running=None,
 
   db = SessionLocal()
   try:
-    chat = models.Chat(
+    chat = create_chat(
       id=chat_id, title="t",
       messages=messages if messages is not None else [],
       pending_messages=pending if pending is not None else [],
@@ -106,7 +108,7 @@ def _load(chat_id):
       models.ChatRun.status == "running",
     ).first() is not None
     return None if chat is None else {
-      "messages": list(chat.messages or []),
+      "messages": list(transcript_rows.history(chat)),
       "pending_messages": list(chat.pending_messages or []),
       "running": running,
     }
@@ -188,7 +190,8 @@ def _patch_claude_runner(monkeypatch, *, text="partial answer"):
   blocks to commit) then return a clean result."""
   async def fake_runner(*, bc, **kwargs):
     if text is not None:
-      bc.publish({"type": "text", "content": text})
+      bc.publish({"type": "text", "text_item_id": "reply", "content": text})
+      bc.publish({"type": "text_final", "text_item_id": "reply", "content": text})
     return {"session_id": "sess", "cost_usd": 0.0}
 
   import app.claude_sdk_runner as csr
@@ -625,16 +628,24 @@ def test_promote_ack_timeout_leaves_marker_then_reconcile_resolves(
   # (the promote) which is what we're latching.
   _patch_claude_runner(monkeypatch, text=None)
 
-  # Deterministic small ACK bound: the promote commit is latched longer than
-  # this, so await_ack trips its asyncio.wait_for timeout in the failure
-  # branch BEFORE we release the latch.
-  monkeypatch.setattr(chat_writer, "ACK_TIMEOUT_SECS", 0.2)
+  # Only promotion is fault-injected. Setup, finalization and the simulated
+  # restart must keep their normal deadline even on a busy CI runner.
+  orig_promote_call = chat_queue.promote_pending_messages_locked
+
+  async def short_promote_timeout(*args, **kwargs):
+    with monkeypatch.context() as patch:
+      patch.setattr(chat_writer, "ACK_TIMEOUT_SECS", 0.2)
+      return await orig_promote_call(*args, **kwargs)
+
+  monkeypatch.setattr(chat_queue, "promote_pending_messages_locked", short_promote_timeout)
 
   writer = get_writer()
   release = threading.Event()
+  entered = threading.Event()
   orig_promote = writer._promote_pending
 
   def latched_promote(db, cmd):
+    entered.set()
     release.wait(timeout=10)  # block the actor inside the commit
     return orig_promote(db, cmd)
 
@@ -660,6 +671,7 @@ def test_promote_ack_timeout_leaves_marker_then_reconcile_resolves(
 
   # The caller saw the timeout: no continuation scheduled, transport error
   # surfaced, marker LEFT set.
+  assert entered.is_set(), "the timeout must exercise the latched promotion"
   assert scheduled == [], "a timed-out promote must NOT schedule a continuation"
   assert "queued_turn_starting" not in published
   assert "error" in published

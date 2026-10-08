@@ -1,3 +1,5 @@
+import { localStore } from './workspaceStorage.js'
+
 const STORAGE_PREFIX = 'mobius:app-frame-storage:'
 const TOKEN_PREFIX = 'mobius:app-token:'
 const LEGACY_MIGRATION_PREFIX = 'mobius:app-frame-storage-migrated:v1:'
@@ -16,8 +18,7 @@ const LEGACY_KEYS_BY_SLUG = {
 }
 
 function storageOrNull(storage) {
-  if (storage) return storage
-  try { return typeof localStorage !== 'undefined' ? localStorage : null } catch { return null }
+  return storage || localStore()
 }
 
 function appPrefix(appId) {

@@ -10,6 +10,7 @@ from typing import Protocol, runtime_checkable
 class RunnerKind(str, Enum):
   """Concrete runner categories tracked per chat."""
 
+  COMPACTION = "compaction"
   SUBPROCESS = "subprocess"
   CLAUDE_SDK = "claude_sdk"
   CODEX_SDK = "codex_sdk"

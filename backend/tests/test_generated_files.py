@@ -1,3 +1,5 @@
+from app import transcript_rows
+from app.chat_writer import create_chat
 import asyncio
 import hashlib
 from concurrent.futures import Future
@@ -15,9 +17,9 @@ from app import chat_event_sink
 from app import models
 from app.broadcast import ChatBroadcast
 from app.chat_event_sink import ChatEventSink
-from app.chat_media import fix_forward_chat_media
 from app.chat_retention import purge_expired_chat_tombstones
 from app.config import get_settings
+from app.schema_migrations import _move_chat_media_out_of_generated
 from app.agent_activity import EMPTY_AGENT_ACTIVITY_BINDING
 
 
@@ -213,7 +215,7 @@ def test_serve_generated_file_rejects_post_record_symlink_escape(
   client, db, auth, chat,
 ):
   settings = get_settings()
-  second_chat = models.Chat(
+  second_chat = create_chat(
     id=str(uuid.uuid4()), title="Second test chat", messages=[],
     agent_settings_json={"model": "claude-opus-4-8"},
   )
@@ -324,7 +326,7 @@ def test_route_serves_held_inode_when_recorded_path_is_swapped(
 
 
 def test_generated_file_row_is_scoped_to_its_chat(client, db, auth, chat):
-  second_chat = models.Chat(
+  second_chat = create_chat(
     id=str(uuid.uuid4()), title="Second test chat", messages=[],
     agent_settings_json={"model": "claude-opus-4-8"},
   )
@@ -676,7 +678,7 @@ def test_generated_file_timeout_preserves_late_writer_commit(
     settings.data_dir, chat.id,
   ).iterdir()] == [row.path]
   db.refresh(chat)
-  assistant = chat.messages[-1]
+  assistant = list(transcript_rows.history(chat))[-1]
   assert assistant["role"] == "assistant"
   assert [block["type"] for block in assistant["blocks"]] == [
     "text", "error", "generated_files",
@@ -760,7 +762,7 @@ def test_deliverables_namespace_survives_legacy_media_fix_forward(db, chat):
   stored_name = _stored_file(chat, content=b"stable")
   _write_row(db, chat, name="report.pdf", path=stored_name)
 
-  assert fix_forward_chat_media(db, settings.data_dir) == 0
+  _move_chat_media_out_of_generated(db.get_bind())
   assert (
     gf.stored_dir(settings.data_dir, chat.id) / stored_name
   ).read_bytes() == b"stable"

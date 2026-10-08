@@ -15,6 +15,7 @@ import {
   appFrameCacheMaxForDeviceMemory,
   deriveRenderedAppIds,
 } from './appFrameCache.js'
+import { isOwnerWorkspace } from '../../lib/workspaceStorage.js'
 
 /** Own mounted app-frame identity, bounded recency, warming, and eviction. */
 export default function useAppFrameCache({
@@ -29,6 +30,7 @@ export default function useAppFrameCache({
   retireAppHistory,
   tombstoneRoute,
   dispatchWorkspace,
+  storage = globalThis.localStorage,
 }) {
   const [appCacheMax] = useState(() => appFrameCacheMaxForDeviceMemory(
     typeof navigator === 'undefined' ? undefined : navigator.deviceMemory,
@@ -86,7 +88,7 @@ export default function useAppFrameCache({
 
   const [initialAppLru] = useState(() => {
     try {
-      return parseStoredAppLru(localStorage.getItem(APP_LRU_STORAGE_KEY))
+      return parseStoredAppLru(storage.getItem(APP_LRU_STORAGE_KEY))
     } catch {
       return []
     }
@@ -94,17 +96,20 @@ export default function useAppFrameCache({
   useEffect(() => {
     if (renderedAppIds.length === 0) return
     try {
-      const stored = parseStoredAppLru(localStorage.getItem(APP_LRU_STORAGE_KEY))
-      localStorage.setItem(
+      const stored = parseStoredAppLru(storage.getItem(APP_LRU_STORAGE_KEY))
+      storage.setItem(
         APP_LRU_STORAGE_KEY,
         JSON.stringify(mergeAppLru(renderedAppIds, stored)),
       )
     } catch {
       // Storage unavailable: mounted identity remains correct in memory.
     }
-  }, [renderedAppIds])
+  }, [renderedAppIds, storage])
 
   const warmAppCode = useCallback(async (app) => {
+    // Guest modules must be fetched live through the broker, not seeded into
+    // the owner's token-stripped offline app-code key by speculative warming.
+    if (!isOwnerWorkspace()) return
     try {
       const token = await queryClient.fetchQuery({
         queryKey: appQueries.token.key(app.id),

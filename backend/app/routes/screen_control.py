@@ -18,13 +18,22 @@ from app.deps import (
   Principal,
   authorize_current_owner_input_detached,
   get_agent_principal,
+  get_principal,
   get_current_owner_for_owner_input,
   reject_cross_site,
 )
 from app.screen_control import registry
 
 
-router = APIRouter(prefix="/api/screen-control", tags=["screen-control"])
+def _installation_screen(principal: Principal = Depends(get_principal)):
+  # Shared navigation is not consent to view/control the installation owner’s
+  # browser. Preserve existing agent/human gates within this separate feature.
+  if principal.browser is not None:
+    raise HTTPException(403, "Screen sharing requires the installation owner.")
+
+
+router = APIRouter(prefix="/api/screen-control", tags=["screen-control"],
+                   dependencies=[Depends(_installation_screen)])
 
 _RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 _KEEPALIVE_SECONDS = 15

@@ -50,6 +50,7 @@ from app.codex_events import (
   _thinking_event,
   _codex_thinking_segment_id,
   _extract_rate_limit_reset,
+  _rate_limit_credits_depleted,
   _model_dump,
   _reasoning_summary_setting,
   _stamp_tool_use_id,
@@ -69,6 +70,7 @@ from app.codex_events import (
   _codex_user_error,
   _agent_message_phase,
   _codex_terminal_error,
+  _codex_size_failure,
   # Compatibility import for existing internal callers; implementation lives
   # beside the Codex event/observability code it supports.
   _skill_names_in_command,
@@ -1958,6 +1960,7 @@ async def _run_codex_sdk_turn(
       # api_error_status=429 — instead of the 30-minute error-text fallback.
       rate_limit_resets_at: int | None = None
       rate_limit_reached = False
+      credits_depleted = False
 
       async for notification in turn.stream():
         payload = notification.payload
@@ -2187,9 +2190,10 @@ async def _run_codex_sdk_turn(
           continue
 
         if isinstance(payload, sdk["AccountRateLimitsUpdatedNotification"]):
-          _reset, _reached = _extract_rate_limit_reset(
-            getattr(payload, "rate_limits", None)
-          )
+          snapshot = getattr(payload, "rate_limits", None)
+          _reset, _reached = _extract_rate_limit_reset(snapshot)
+          if _rate_limit_credits_depleted(snapshot):
+            credits_depleted = True
           if _reset is not None:
             rate_limit_resets_at = _reset
           if _reached:
@@ -2257,9 +2261,17 @@ async def _run_codex_sdk_turn(
               message or "Codex error",
             )
             continue
+          size_failure = _codex_size_failure(payload.error)
+          if size_failure:
+            return with_usage({
+              "session_id": current_session_id,
+              "cost_usd": None,
+              "error": str(message or "The provider rejected the request size."),
+              **size_failure,
+            })
           # When a preceding AccountRateLimitsUpdatedNotification told us a quota
           # window actually reached its cap, surface a STRUCTURED limit terminal
-          # rather than raising: api_error_status=429 lets chat._is_limit_terminal
+          # rather than raising: api_error_status=429 lets classify_provider_error
           # detect the kill without string-matching, and the captured reset epoch
           # gives an exact park/resume time. This is the Codex analog of Claude's
           # api_error_status/resets_at terminal. Absent that structured signal we
@@ -2273,6 +2285,8 @@ async def _run_codex_sdk_turn(
             })
             if rate_limit_resets_at is not None:
               limit_result["rate_limit_resets_at"] = rate_limit_resets_at
+            if credits_depleted:
+              limit_result["credits_depleted"] = True
             return limit_result
           raise RuntimeError(str(message or "Codex error"))
 
@@ -2289,6 +2303,8 @@ async def _run_codex_sdk_turn(
       })
       if terminal_status is not None:
         result["terminal_status"] = terminal_status
+      if error_text:
+        result.update(_codex_size_failure(getattr(completed_turn, "error", None)))
       if final_message_phase is not None:
         result["final_message_phase"] = final_message_phase
       # Carry any reset the SDK reported this turn, so a limit surfaced in the

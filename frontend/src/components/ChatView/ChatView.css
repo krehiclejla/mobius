@@ -6,7 +6,8 @@
    ║   pass quietly violates one, regression-hunt these first.  ║
    ║                                                            ║
    ║   1. `.chat__foot` is `position: absolute`, offset above   ║
-   ║      env(safe-area-inset-bottom),                           ║
+   ║      `--chat-foot-safe-bottom` (bottom safe area; 0 above  ║
+   ║      the keyboard; a quarter of it on installed iOS),      ║
    ║      with `pointer-events: none` — chat content scrolls    ║
    ║      *behind* the composer. Visible footer controls must   ║
    ║      opt back in through the allow-list beside the foot;   ║
@@ -14,8 +15,8 @@
    ║                                                            ║
    ║   2. `--composer-h` is published by the scroll controller's║
    ║      ResizeObserver on `.chat__foot`. `.chat__list`        ║
-   ║      reserves --composer-h + the same full safe-area       ║
-   ║      expression + 16px so the last message clears the      ║
+   ║      reserves --composer-h + the same safe-area value      ║
+   ║      + 16px so the last message clears the                  ║
    ║      pill and gesture area as it grows                     ║
    ║      (chips, queue tray, multi-line input).                ║
    ║                                                            ║
@@ -103,6 +104,14 @@
      keeps a pending attachment and a sent one the same square. */
   --attach-card: 96px;
   --chat-status-font-size: 12px;
+  /* The composer's gap above the bottom edge, shared by the foot, the
+     transcript clearance and the fade. The shell sets --chat-foot-bottom-inset
+     to 0 while fitted above a keyboard (chat-only for now); otherwise this is
+     the platform's share of the device bottom safe area. */
+  --chat-foot-safe-bottom: var(
+    --chat-foot-bottom-inset,
+    calc(env(safe-area-inset-bottom, 0px) * var(--chat-foot-inset-reserve, 1))
+  );
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -185,12 +194,12 @@
   /* Bottom padding clears the absolutely-positioned `.chat__foot`.
      Tracks the foot's measured height via the `--composer-h` CSS
      var (written by the scroll controller's ResizeObserver), the
-     full device safe-area gap below the foot (the SAME env()
-     expression as `.chat__foot`'s `bottom` — keep them in sync),
+     safe-area gap below the foot (the SAME `--chat-foot-safe-bottom`
+     as `.chat__foot`'s `bottom`),
      plus a small breathing-room margin so chips/queue tray growing
      the foot keeps the last message clear of the pill. Fallback
      80px is for the first paint before the RO fires. */
-  padding: 8px 6px calc(var(--composer-h, 80px) + env(safe-area-inset-bottom, 0px) + 16px);
+  padding: 8px 6px calc(var(--composer-h, 80px) + var(--chat-foot-safe-bottom) + 16px);
   display: flex;
   flex-direction: column;
   gap: 24px;
@@ -923,6 +932,11 @@
   margin-top: var(--activity-row-gap, 4px);
 }
 .chat__text--assistant + .chat__text--assistant { margin-top: 0.75rem; }
+
+/* Lifecycle cards and the prose that follows are separate reading blocks. */
+.chat__goal-history + .chat__text--assistant {
+  margin-top: 16px;
+}
 
 .chat__tool {
   border-radius: 10px;
@@ -2293,12 +2307,14 @@
   --chat-foot-card-gap: 6px;
   --chat-foot-pad-block: 8px;
   position: absolute;
-  /* Interactive controls must stay wholly inside the device safe rectangle.
-     Android Chrome paints the shell's gesture backdrop in the unsafe band;
-     dipping the composer into that band makes the backdrop clip the pill.
-     Keep the same full inset in `.chat__list`'s bottom padding so composer
+  /* Android Chrome paints the shell's gesture backdrop in the unsafe band;
+     dipping the composer into that band makes the backdrop clip the pill, so
+     the full inset applies there. Installed iOS keeps only a quarter of its
+     Home-indicator area clear (see the rule below `.chat__foot::before`).
+     The keyboard covers the indicator, so the shell zeroes the gap while
+     fitted above it. `.chat__list` reserves the same value, so composer
      placement and transcript clearance remain one geometry contract. */
-  bottom: env(safe-area-inset-bottom, 0px);
+  bottom: var(--chat-foot-safe-bottom);
   left: 0;
   right: 0;
   padding: var(--chat-foot-pad-block) 12px;
@@ -2331,7 +2347,7 @@
   left: 0;
   right: 0;
   top: -100px;
-  bottom: calc(0px - env(safe-area-inset-bottom, 0px));
+  bottom: calc(0px - var(--chat-foot-safe-bottom));
   background: linear-gradient(
     to bottom,
     transparent 0%,
@@ -2342,6 +2358,24 @@
   );
   pointer-events: none;
   z-index: -1;
+}
+
+/* Installed iOS: a deliberate product decision, not a tuning leftover. The
+   closed-keyboard composer matches the Android Möbius position (pill ~17 pt
+   above the edge on a portrait iPhone) rather than UIKit's native rest on the
+   full 34 pt safe area. It was chosen on a physical iPhone next to Android:
+   the full inset and 0.5 both read as too high. It was kept after review
+   (PR #1632), which asked for the native position. The Home indicator
+   occupies only the lowest few points, so a quarter of the inset keeps the
+   pill clear of it. Do not change this value or restore the full inset
+   without the product owner's sign-off. Android and browser tabs keep the
+   full inset; while the keyboard is up, the shell zeroes the gap entirely. */
+@supports (-webkit-touch-callout: none) {
+  @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
+    .chat {
+      --chat-foot-inset-reserve: 0.25;
+    }
+  }
 }
 
 /* In the embedded composer the app sheet owns the safe area, so there is no
@@ -4053,6 +4087,13 @@
   color: var(--muted);
 }
 
+/* Waiting uses the same bordered surface as the Goal panel. */
+.chat__handoff-slot {
+  list-style: none;
+  padding: 0;
+  margin-top: 10px;
+}
+
 .chat__waits {
   max-width: 720px;
   margin: 0 auto var(--chat-foot-rail-gap);
@@ -4087,6 +4128,8 @@
   gap: 9px;
   min-width: 0;
   padding: 7px 12px;
+  min-height: 44px;
+  flex-wrap: wrap;
   border: 0;
   background: transparent;
   color: inherit;
@@ -4106,26 +4149,42 @@
 }
 
 .chat__wait-text {
+  flex: 1 1 160px;
   min-width: 0;
-  overflow: hidden;
   color: var(--text);
   font-size: var(--chat-status-font-size);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .chat__wait-meta {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   margin-left: auto;
   color: var(--muted);
   font-size: 12px;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
+
+.chat__panel-chevron { flex: 0 0 auto; }
+button[aria-expanded="true"] > .chat__panel-chevron,
+details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
+
+.chat__wait-description {
+  margin: 0;
+  padding: 0 12px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.chat__wait-action { padding: 0 12px 10px; }
+.chat__wait-cancel:disabled { opacity: .55; cursor: default; }
+.chat__wait-error { color: var(--danger); font-size: 12px; margin: 8px 0 0; }
 
 .chat__wait-details {
   display: flex;
-  align-items: flex-end;
-  gap: 16px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
   padding: 10px 12px 12px;
   border-top: 1px solid var(--border-light);
   animation: progress-rail-in 0.16s ease both;
@@ -4221,12 +4280,12 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 30px;
+  min-height: 44px;
   padding: 5px 9px;
   border: 1px solid var(--border-light);
   border-radius: 9px;
   background: transparent;
-  color: var(--muted);
+  color: var(--text);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -4234,9 +4293,9 @@
 
 @media (hover: hover) and (pointer: fine) {
   .chat__wait-cancel:hover {
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border-light));
-    background: color-mix(in srgb, var(--danger) 8%, transparent);
-    color: var(--danger);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border-light));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    color: var(--accent);
   }
 }
 
@@ -4247,7 +4306,9 @@
 
 @media (max-width: 560px) {
   .chat__wait-meta {
-    display: none;
+    order: 1;
+    flex-basis: 100%;
+    margin-left: 23px;
   }
 
   .chat__wait-details {
@@ -4264,6 +4325,8 @@
     align-self: flex-start;
   }
 }
+.chat__goal-result { margin: 0 10px 8px; color: var(--text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
+
 .chat__goal-plan {
   flex: 1 0 100%;
   display: flex;
@@ -4296,6 +4359,8 @@
 }
 
 .chat__goal-history--failed { --lifecycle-tone: var(--danger); }
+.chat__goal-history--cancelled { --lifecycle-tone: var(--muted); }
+.chat__goal-history-reason { color: var(--text); font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
 .chat__wait-history { --lifecycle-tone: var(--accent); }
 .chat__wait-history--attention { --lifecycle-tone: var(--warning, #d8922f); }
 .chat__wait-history--stopped { --lifecycle-tone: var(--muted); }
@@ -4359,17 +4424,29 @@
   font-size: 11px;
 }
 
-.chat__goal-history-details { margin-top: 5px; }
-
-.chat__goal-history-details > summary {
-  width: fit-content;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
+/* Keep the receipt scannable without shortening or rewriting its saved Goal. */
+.chat__goal-history-objective--preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
 
-.chat__goal-history-details[open] > summary { color: var(--text); }
+/* The whole receipt header discloses its plan, like the active Waiting header. */
+.chat__goal-history-details { grid-column: 1 / -1; width: 100%; min-width: 0; }
+.chat__goal-history-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  list-style: none;
+  cursor: pointer;
+  border-radius: 7px;
+}
+.chat__goal-history-summary::-webkit-details-marker { display: none; }
+.chat__goal-history-summary > .chat__goal-history-copy { flex: 1; }
+.chat__goal-history-summary > .chat__panel-chevron { margin-top: 7px; color: var(--muted); }
+.chat__goal-history-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.chat__goal-history-details[open] .chat__goal-history-objective { display: block; }
 
 .chat__goal-task {
   display: grid;
@@ -4423,9 +4500,13 @@
   color: var(--green);
 }
 
-.chat__goal-task--failed .chat__goal-task-marker,
-.chat__goal-task--blocked .chat__goal-task-marker {
+.chat__goal-task--failed .chat__goal-task-marker {
   border-color: var(--danger);
+}
+
+.chat__goal-task--blocked .chat__goal-task-marker {
+  border-color: var(--muted);
+  border-style: dashed;
 }
 
 .chat__goal-task--cancelled {
@@ -4763,8 +4844,9 @@
 
 .chat__progress-identity { display: inline-block; vertical-align: -2px; margin-right: 5px; flex-shrink: 0; }
 
-/* Tool-only continuation rows share one activity rhythm across message boundaries. */
-.chat__msg:has(> .chat__tools:last-child, > .chat__assistant-copy-surface > .chat__tools:last-child)
+/* Only the outer transcript owns the 24px conversation gap being cancelled.
+   Nested reply rows already own their compact spacing; never pull them upward. */
+.chat__list > .chat__msg:has(> .chat__tools:last-child, > .chat__assistant-copy-surface > .chat__tools:last-child)
   + .chat__msg:has(> .chat__tools:first-child, > .chat__assistant-copy-surface > .chat__tools:first-child) {
   margin-block-start: calc(var(--activity-row-gap, 4px) - 24px);
 }

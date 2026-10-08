@@ -1,3 +1,5 @@
+import { localStore } from './workspaceStorage.js'
+
 export const DEVICE_STORAGE = 'device.storage'
 
 const KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/
@@ -11,8 +13,7 @@ function capabilityError(name, message, code) {
 }
 
 function browserStorage(explicit) {
-  if (explicit !== undefined) return explicit
-  try { return globalThis.localStorage || null } catch { return null }
+  return explicit !== undefined ? explicit : localStore()
 }
 
 function storageNamespace(identity) {

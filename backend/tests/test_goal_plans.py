@@ -1,4 +1,6 @@
 """Durable Goal-plan validation, ordering, progress, and route contracts."""
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 from tests.goal_fixtures import goal_run as make_goal_run
 
@@ -116,12 +118,12 @@ def test_terminal_goal_history_projects_onto_final_assistant_message(
 
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("summarized", [False, True])
+@pytest.mark.parametrize("complete", [True, "Verified exact result"])
 def test_completed_card_stays_at_successful_completion_not_later_segment(
-  client, owner_token, db, compact, summarized,
+  client, owner_token, db, compact, summarized, complete,
 ):
   auth = {"Authorization": f"Bearer {owner_token}"}
   base = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
-  complete = "Verified exact result"
   completion = {
     "type": "tool", "tool": "mobius_control:update_goal",
     "input": f"complete={complete}" if summarized else json.dumps({"complete": complete}),
@@ -151,7 +153,7 @@ def test_completed_card_stays_at_successful_completion_not_later_segment(
   db.flush()
   goal = db.get(models.ChatGoal, "anchor-goal")
   goal.status = "completed"
-  goal.result = complete
+  goal.result = complete if isinstance(complete, str) else None
   db.commit()
 
   payload = client.get(f"/api/chats/{chat_id}?limit=20&compact={str(compact).lower()}", headers=auth).json()
@@ -170,7 +172,7 @@ def test_completed_card_stays_at_successful_completion_not_later_segment(
   latest_page = client.get(f"/api/chats/{chat_id}?limit=1", headers=auth).json()["messages"]
   assert "goal_summaries" not in latest_page[0]
   db.refresh(db.get(models.Chat, chat_id))
-  saved = db.get(models.Chat, chat_id).messages[0]["blocks"]
+  saved = list(transcript_rows.history(db.get(models.Chat, chat_id)))[0]["blocks"]
   assert saved == blocks, "placement is a projection, never a transcript rewrite"
 
 
@@ -360,7 +362,7 @@ def test_current_turn_promotes_atomically_without_a_goal_message(
     chat = db.query(models.Chat).filter(models.Chat.id == chat_id).one()
     assert all(
       "/goal" not in str(message.get("content", ""))
-      for message in chat.messages
+      for message in list(transcript_rows.history(chat))
     )
 
     retry = client.post(
@@ -593,12 +595,8 @@ def test_completed_plan_clear_dismisses_without_interrupting_final_response(
   assert persisted_run.ended_at is None
 
 
-def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
-  """Who moves next is chat state the client already has, not Goal state.
-
-  An open card, an armed Wait, or a running helper must not change how the
-  Goal itself presents: idle unfinished work is simply paused.
-  """
+def test_idle_goal_lifecycle_is_stable_while_exact_handoffs_are_projected(db, chat):
+  """A handoff describes the next move without rewriting Goal lifecycle."""
   from app.chat_waits import declare_wait
   from app.goal_plans import presented_goal
 
@@ -610,8 +608,9 @@ def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
   db.add(goal_run)
   db.commit()
   expected = {
-    "id": "idle-goal-id", "objective": "Ship it", "status": "paused",
+    "id": "idle-goal-id", "revision": 0, "objective": "Ship it", "status": "paused",
     "resumable": True,
+    "handoff": {"kind": "none", "reason": None},
   }
   assert presented_goal(db, chat.id) == expected
 
@@ -621,7 +620,53 @@ def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
     delay_secs=60, created_by_run_id=goal_run.id,
   )
   db.commit()
-  assert presented_goal(db, chat.id) == expected
+  assert presented_goal(db, chat.id) == {
+    **expected, "handoff": {"kind": "owner_input", "reason": "saved_card"},
+  }
+
+
+def test_retained_goal_does_not_inherit_unrelated_question_wait_or_park(db, chat):
+  from app.chat_waits import declare_wait
+  from app.goal_plans import presented_goal
+  base = datetime.now(UTC)
+  db.add(make_goal_run(db, id="retained-source", chat_id=chat.id,
+    goal_id="retained", goal_objective="Original outcome", status="completed",
+    provider="codex", started_at=base))
+  db.add(make_goal_run(db, id="unrelated-source", chat_id=chat.id,
+    status="completed", provider="codex", started_at=base + timedelta(seconds=1)))
+  chat.pending_question_id = "unrelated-card"
+  db.commit()
+  declare_wait(db, chat_id=chat.id, created_by_run_id="unrelated-source",
+    description="Unrelated work", kind="timer", delay_secs=60)
+  assert presented_goal(db, chat.id)["handoff"] == {"kind": "none", "reason": None}
+  source = db.get(models.ChatRun, "unrelated-source")
+  source.status, source.park_reason = "parked", "memory"
+  db.commit()
+  assert presented_goal(db, chat.id)["handoff"]["kind"] == "none"
+  goal = db.get(models.ChatGoal, "retained")
+  goal.status = "stopped"
+  db.commit()
+  held = presented_goal(db, chat.id)
+  assert held["pause_reason"] == "unknown"
+  assert held["handoff"] == {"kind": "recovery", "reason": "unknown_stop"}
+
+
+def test_exact_goal_wait_does_not_borrow_an_unrelated_question_action(db, chat):
+  from app.chat_waits import declare_wait
+  from app.goal_plans import presented_goal
+  base = datetime.now(UTC)
+  db.add(make_goal_run(db, id="original-source", chat_id=chat.id, goal_id="original",
+    goal_objective="Original outcome", status="completed", provider="codex", started_at=base))
+  db.add(make_goal_run(db, id="other-source", chat_id=chat.id,
+    status="completed", provider="codex", started_at=base + timedelta(seconds=1)))
+  db.commit()
+  wait = declare_wait(db, chat_id=chat.id, created_by_run_id="original-source",
+    description="Original work", kind="timer", delay_secs=60)
+  assert presented_goal(db, chat.id)["handoff"]["kind"] == "automatic"
+  wait.status = "met"
+  chat.pending_question_id = "other-card"
+  db.commit()
+  assert presented_goal(db, chat.id)["handoff"] == {"kind": "blocked", "reason": "other_work"}
 
 
 def test_legacy_queued_goal_clear_is_retired_without_opening_a_turn(db, chat):
@@ -673,7 +718,7 @@ def test_goal_promotion_rejects_delegation_and_app_scope_tokens(
   # parent-only boundary Goal promotion must enforce explicitly.
   from app.delegations import RunPolicy, delegation_execution_token
 
-  parent = models.Chat(
+  parent = create_chat(
     id="goal-scope-parent", title="Parent", messages=[],
     pending_messages=[], provider="codex",
   )
@@ -1247,10 +1292,10 @@ def test_plan_projects_recursive_delegation_ownership_without_transcripts(
   )
   db.add(app)
   db.flush()
-  child_b = models.Chat(
+  child_b = create_chat(
     id="child-b", title="B", messages=[], created_by_app_id=app.id,
   )
-  child_x = models.Chat(
+  child_x = create_chat(
     id="child-x", title="X", messages=[], created_by_app_id=app.id,
   )
   db.add_all([child_b, child_x])
@@ -1311,10 +1356,10 @@ def test_resumed_goal_projects_only_latest_delegation_attempt_per_task(
   )
   db.add(app)
   db.flush()
-  old_child = models.Chat(
+  old_child = create_chat(
     id="goal-old-child", title="Old", messages=[], created_by_app_id=app.id,
   )
-  new_child = models.Chat(
+  new_child = create_chat(
     id="goal-new-child", title="New", messages=[], created_by_app_id=app.id,
   )
   db.add_all([old_child, new_child])
@@ -1456,7 +1501,7 @@ def test_running_parent_defers_to_its_running_child_leaf(client, owner_token, db
 def test_helper_without_a_goal_is_unfiled_and_cannot_name_a_task(db):
   from app.goal_plans import GoalPlanError, helper_plan_task
 
-  db.add(models.Chat(id="plain-chat", title="Plain", messages=[]))
+  db.add(create_chat(id="plain-chat", title="Plain", messages=[]))
   db.commit()
   assert helper_plan_task(db, "plain-chat", None) is None
   with pytest.raises(GoalPlanError, match="no active Goal plan"):

@@ -534,6 +534,26 @@
   text-overflow: ellipsis;
 }
 
+.drawer__item-text--unread {
+  font-weight: 600;
+}
+
+/* An app's own unread count, e.g. Social's unread messages. Matches the
+   notification bell's count so the two read as one system. */
+.drawer__badge {
+  flex-shrink: 0;
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-fg, #fff);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 19px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .drawer__app-icon {
   width: 28px;
   height: 28px;
@@ -1011,6 +1031,21 @@
   background: var(--danger);
 }
 
+/* An execution needing recovery is not a failed Goal or a saved question. */
+.drawer__recovery-icon {
+  box-sizing: border-box;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
+  margin-right: 0;
+  color: var(--text);
+  border: 1px solid var(--text-dim);
+  border-radius: 2px;
+}
+
 /* Respect prefers-reduced-motion. The streaming dot no longer needs an
    override here — it is static for everyone now (see above). */
 @media (prefers-reduced-motion: reduce) {
@@ -1076,12 +1111,4 @@
 .drawer__tab-separator {
   color: var(--border);
   user-select: none;
-}
-
-.drawer__list-caption {
-  margin: 6px 12px 4px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 16px;
-  font-variant-numeric: tabular-nums;
 }

@@ -24,6 +24,7 @@ Locks in the contracts of the limit-park feature:
   (g) A planned restart reuses the same exact-run state with a due-now time;
       crashes, unanswered questions, and app-owned work stay manual.
 """
+from app.chat_writer import create_chat
 
 from tests.goal_fixtures import goal_run as make_goal_run, persist_goal_fixture
 
@@ -90,7 +91,7 @@ def _seed_chat(
 ):
   db = SessionLocal()
   try:
-    db.add(models.Chat(
+    db.add(create_chat(
       id=chat_id,
       title="t",
       messages=(
@@ -162,7 +163,7 @@ def _chat_row(chat_id: str):
     from app.run_state import has_running_run
     return {
       "running_status": "running" if has_running_run(db, chat_id) else None,
-      "messages": materialized_messages(row),
+      "messages": list(materialized_messages(row)),
       "pending": list(row.pending_messages or []),
     }
   finally:
@@ -344,6 +345,80 @@ def test_park_exit_non_limit_error_stays_plain():
   kwargs = chat_mod._park_exit(sink, {"error": "syntax error"}, "syntax error")
   assert kwargs == {"parked": False}
   assert sink.events[-1] == {"type": "error", "message": "syntax error"}
+
+
+@pytest.mark.parametrize("error", [
+  "quota exceeded",
+  "model overloaded, try again",
+  "You've hit your weekly limit · resets 1:40am",
+])
+def test_park_exit_parks_on_shared_usage_limit_kind(error):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {"error": error}, error)["parked"] is True
+
+
+@pytest.mark.parametrize("error", [
+  # Out of credits does not reset by itself, even when it mentions a quota.
+  "insufficient_quota: You exceeded your current quota",
+  "Credit balance is too low",
+  # A request id that happens to contain 429 is not a rate limit.
+  "request id req_14290 failed",
+])
+def test_park_exit_does_not_park_non_limits(error):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {"error": error}, error) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": error}
+
+
+@pytest.mark.parametrize("error", [
+  "payload too large",
+  "unexpected status 413 Payload Too Large",
+  "context_length_exceeded",
+  "request_body_too_large",
+])
+def test_park_exit_treats_shared_size_refusals_as_oversized(error):
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, {"error": error}, error)
+  assert kwargs == {"parked": False, "oversized": True}
+  assert "too large to send" in sink.events[-1]["message"]
+
+
+@pytest.mark.parametrize("runner_result", [
+  None,
+  {},
+  # Codex may first report the depleted credits as a reached rate limit.
+  {"api_error_status": 429, "rate_limit_resets_at": "2099-05-08T12:34:00Z"},
+])
+def test_exhausted_workspace_credits_is_a_manual_credits_pause(runner_result):
+  text = "Your workspace is out of credits. Add credits to continue."
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, runner_result, text, provider_id="codex")
+  assert kwargs == {"parked": False}
+  assert sink.events[-1] == {
+    "type": "error",
+    "message": text,
+    "resumable": True,
+    "pause": {"kind": "credits", "provider": "codex"},
+  }
+
+
+def test_structured_credits_flag_pauses_whatever_the_wording():
+  # The workspace-member variant and the runner's fallback wording carry no
+  # exact sentence; the runner's structured flag still makes it a credits pause.
+  text = "Codex usage limit reached."
+  sink = _Sink()
+  result = {"api_error_status": 429, "credits_depleted": True}
+  assert chat_mod._park_exit(sink, result, text, provider_id="codex") == {
+    "parked": False,
+  }
+  assert sink.events[-1]["pause"] == {"kind": "credits", "provider": "codex"}
+
+
+def test_other_credit_failures_stay_plain_errors():
+  text = "Payment failed: card declined. Add credits to continue."
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {}, text) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": text}
 
 
 def test_model_capacity_parks_for_a_short_automatic_retry():
@@ -731,7 +806,10 @@ def test_owner_message_queues_behind_future_limit_park(
   assert response.json()["status"] == "queued"
   assert scheduled == []
   assert _run_row("rt-park-owner-queue")["status"] == "parked"
-  assert _chat_row(cid)["pending"] == [{
+  pending = _chat_row(cid)["pending"]
+  accepted_at = pending[0].pop("_owner_input_at")
+  assert datetime.fromisoformat(accepted_at).tzinfo == UTC
+  assert pending == [{
     "role": "user",
     "content": "also check the weekly limit",
     "ts": response.json()["ts"],
@@ -1027,7 +1105,7 @@ def _delegated_limit_park(
     db.add(app)
     db.flush()
     parent_id = f"{cid}-parent"
-    db.add(models.Chat(
+    db.add(create_chat(
       id=parent_id, title="Parent", messages=[], provider="codex",
     ))
     child = db.get(models.Chat, cid)
@@ -1294,7 +1372,7 @@ def test_sweep_auto_resumes_an_active_delegation_under_its_original_identity(
       db.add(app)
       db.flush()
       app_id = app.id
-    db.add(models.Chat(
+    db.add(create_chat(
       id="sweep-delegation-parent", title="Parent", messages=[],
       provider="codex",
     ))
@@ -3168,9 +3246,9 @@ def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
   )
   sink = _Sink()
   for _ in range(3):
-    assert chat_mod._park_exit(sink, {"error": message}, message) == {
-      "parked": False,
-    }
+    disposition = chat_mod._park_exit(sink, {"error": message}, message)
+    assert disposition["parked"] is False
+    assert disposition.get("oversized", False) == ("request body is too large" in message)
   assert all("pause" not in event for event in sink.events)
   assert all(message in event["message"] for event in sink.events)
 
@@ -3180,11 +3258,11 @@ def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
   ({"api_error_status": 413}, None),
   ({}, "Request Entity Too Large"),
 ])
-def test_oversized_request_preserves_reason_and_offers_remedy_without_retry(
+def test_oversized_request_preserves_reason_and_requests_changed_context_recovery(
   result, message,
 ):
   sink = _Sink()
-  assert chat_mod._park_exit(sink, result, message) == {"parked": False}
+  assert chat_mod._park_exit(sink, result, message) == {"parked": False, "oversized": True}
   assert len(sink.events) == 1
   event = sink.events[0]
   assert "pause" not in event
@@ -3429,3 +3507,41 @@ def test_provider_limit_continuation_does_not_claim_quota_recovered():
   assert source["hidden"] is True
   assert "Provider availability is not yet confirmed" in source["content"]
   assert "usage is available" not in source["content"]
+
+
+@pytest.mark.asyncio
+async def test_setup_failure_is_saved_as_a_resumable_error_in_the_transcript(
+  owner_token, monkeypatch,
+):
+  del owner_token
+  cid = "setup-failure-visible"
+  _seed_chat(cid)
+  _seed_run(cid, "rt-setup-failure")
+
+  async def admitted(_data_dir):
+    pass
+
+  setup_started = False
+
+  async def broken_impl(*_args, **_kwargs):
+    nonlocal setup_started
+    setup_started = True
+    raise AttributeError("'Chat' object has no attribute 'messages'")
+
+  # Exercise setup recovery, not the host's storage/memory admission policy.
+  monkeypatch.setattr(chat_mod, "require_agent_turn_admission", admitted)
+  monkeypatch.setattr(chat_mod, "_run_chat_impl", broken_impl)
+  await chat_mod.run_chat(
+    [], chat_id=cid, session_id=None, provider_id="codex",
+    run_gen=chat_mod.current_run_generation(cid), run_token="rt-setup-failure",
+  )
+
+  assert setup_started, "injected setup failure must be reached"
+  assert _run_row("rt-setup-failure")["status"] == "failed"
+  tail = _chat_row(cid)["messages"][-1]
+  assert tail["role"] == "assistant"
+  error = tail["blocks"][-1]
+  assert error["type"] == "error"
+  assert "AttributeError" in error["message"]
+  assert "has no attribute 'messages'" not in error["message"]
+  assert error["resumable"] is True

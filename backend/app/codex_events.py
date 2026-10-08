@@ -95,6 +95,23 @@ def _extract_rate_limit_reset(snapshot) -> tuple[int | None, bool]:
   return best_reset, reached
 
 
+_CREDITS_DEPLETED_REACHED_TYPES = frozenset({
+  "workspace_owner_credits_depleted",
+  "workspace_member_credits_depleted",
+})
+
+
+def _rate_limit_credits_depleted(snapshot) -> bool:
+  """Whether a RateLimitSnapshot says the cap reached is depleted credits.
+
+  Credits do not refill at a reset time, unlike the other reached types.
+  """
+  reached_type = getattr(snapshot, "rate_limit_reached_type", None)
+  return getattr(reached_type, "value", reached_type) in (
+    _CREDITS_DEPLETED_REACHED_TYPES
+  )
+
+
 def _model_dump(value: Any) -> Any:
   """Turns provider SDK objects into plain JSON-safe values."""
   return json_safe(value)
@@ -966,6 +983,24 @@ def _turn_items(turn: Any) -> list[Any]:
     item.root if hasattr(item, "root") else item
     for item in items
   ]
+
+
+def _codex_size_failure(error: Any) -> dict:
+  """Preserve confirmed size failures independently of provider prose.
+
+  The SDK owns this union: only its context-window code and HTTP 413 may
+  request changed-context recovery. Other statuses retain existing handling.
+  """
+  info = getattr(getattr(error, "codex_error_info", None), "root", None)
+  if _enum_wire_value(info) == "contextWindowExceeded":
+    return {"context_window_exceeded": True}
+  for variant in (
+    "http_connection_failed", "response_stream_connection_failed",
+    "response_stream_disconnected", "response_too_many_failed_attempts",
+  ):
+    if getattr(getattr(info, variant, None), "http_status_code", None) == 413:
+      return {"api_error_status": 413}
+  return {}
 
 
 def _codex_terminal_error(

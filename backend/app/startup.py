@@ -20,7 +20,6 @@ from app.storage_io import atomic_write
 
 
 class StartupState(Protocol):
-  media_migration_failed: bool
   reconciliation_failed: bool
 
 
@@ -328,18 +327,6 @@ def _backfill_prompt_snapshots(context: StartupContext) -> None:
     )
 
 
-def _fix_forward_chat_media(context: StartupContext) -> None:
-  from app.chat_media import fix_forward_chat_media
-
-  context.app.state.media_migration_failed = False
-  try:
-    with SessionLocal() as db:
-      fix_forward_chat_media(db, context.settings.data_dir)
-  except Exception:
-    context.app.state.media_migration_failed = True
-    raise
-
-
 def _read_restart_authorization(context: StartupContext) -> None:
   from app.restart_ledger import authorized_restart_nonce
 
@@ -509,6 +496,17 @@ def _start_chat_writer(_context: StartupContext) -> None:
   from app.chat_writer import start_writer
 
   start_writer()
+
+
+def _start_transcript_conversion(_context: StartupContext) -> None:
+  """Convert chats the previous release wrote, in the background.
+
+  Readiness never waits for it: until a chat converts, its readers read its
+  legacy value, and its first write converts it inline (transcript_rows).
+  """
+  from app.chat_writer import start_transcript_conversion
+
+  start_transcript_conversion()
 
 
 def _backfill_active_assistant_identities(context: StartupContext) -> None:
@@ -689,6 +687,7 @@ DATABASE_STARTUP_TASKS = (
   # failures still fail open exactly as they did when the writer started near
   # the end of the plan.
   StartupTask("start chat writer", _start_chat_writer),
+  StartupTask("start transcript conversion", _start_transcript_conversion),
   StartupTask(
     "backfill active assistant identities",
     _backfill_active_assistant_identities,
@@ -696,7 +695,6 @@ DATABASE_STARTUP_TASKS = (
   StartupTask("purge expired chat tombstones", _purge_expired_chats),
   StartupTask("backfill session links", _backfill_session_links),
   StartupTask("backfill prompt snapshots", _backfill_prompt_snapshots),
-  StartupTask("fix forward chat media", _fix_forward_chat_media),
   # A checkout that cannot be placed relative to its update must not resume
   # work (images without the boot transaction reach this path).
   StartupTask(

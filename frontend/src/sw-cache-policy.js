@@ -438,6 +438,10 @@ export function requiresLiveShellList(request) {
   return request.cache === 'no-store' && isShellListUrl(new URL(request.url))
 }
 
+export function isSharedBrowserRequest(request) {
+  return request?.headers?.get?.('X-Mobius-Shared-Browser') === '1'
+}
+
 // The offline projection is the complete list. A scoped read such as
 // `/api/chats?ids=…` is live-only: caching it would add a stale entry per id set.
 export function isShellListUrl(url) {

@@ -54,18 +54,6 @@ const walkthroughCss = readFileSync(
   new URL('../../Walkthrough/WalkthroughOverlay.css', import.meta.url), 'utf8',
 )
 
-test('onboarding discovery delegates access review and installation to App Store', () => {
-  const guide = readFileSync(new URL('../../Walkthrough/WalkthroughOverlay.jsx', import.meta.url), 'utf8')
-  const discovery = readFileSync(new URL('../../Walkthrough/WalkthroughStore.jsx', import.meta.url), 'utf8')
-  assert.match(shell, /<WalkthroughOverlay[\s\S]*?onOpenApp=\{openAppWithIntent\}/)
-  assert.match(guide, /onOpenApp\(storeAppId, `app:\$\{id\}`\)/)
-  assert.match(discovery, /findAppStoreApp\(apps\)/)
-  assert.match(shell, /const walkthroughStoreApp = showWalkthrough \? findAppStoreApp\(apps\)/)
-  assert.match(shell, /storeActive=\{activeView === 'canvas' && walkthroughStoreApp != null/)
-  assert.match(discovery, /Review in App Store/)
-  assert.doesNotMatch(discovery, /\/apps\/(?:preview|install)/)
-})
-
 test('the workspace menu avoids an oversized border-and-shadow card', () => {
   const rule = css.match(/\.workspace__menu\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(rule, /border:\s*1px/)
@@ -130,8 +118,8 @@ test('an implicit home tab does not engage the single-pane tab strip', () => {
 test('the canonical workspace snapshot survives a closed PWA relaunch', () => {
   assert.match(
     shell,
-    /useWorkspaceSession\(\{\s*storage: localStorage,\s*legacyStorage: sessionStorage,\s*\}\)/,
-    'the durable snapshot remains canonical while the one-time session migration stays available',
+    /useWorkspaceSession\(\{\s*storage: isSharedBrowserAccess \? sharedWorkspaceStorage : localStorage,\s*legacyStorage: sharedBrowserAccess \? null : sessionStorage,\s*\}\)/,
+    'owner durability and one-time migration remain canonical; guest storage is separate',
   )
   assert.doesNotMatch(
     shell,
@@ -219,6 +207,10 @@ test('genuine hidden failures have durable red drawer attention while restart pa
   assert.match(failureRule, /border-radius:\s*50%/)
   assert.match(failureRule, /background:\s*var\(--danger\)/)
   assert.doesNotMatch(failureRule, /transform:/)
+  assert.match(drawer, /recovery \? \([\s\S]*?className="drawer__recovery-icon"/)
+  const recoveryRule = drawerCss.match(/\.drawer__recovery-icon\s*\{[\s\S]*?\}/)?.[0] || ''
+  assert.match(recoveryRule, /border:/)
+  assert.doesNotMatch(recoveryRule, /--danger/)
 })
 
 test('post-drag click suppression is source-scoped and expires on fresh input', () => {
@@ -392,12 +384,12 @@ test('builder mode has no extra top-right pane affordance', () => {
   assert.doesNotMatch(css, /\.workspace__pane-chip|\.workspace__sheet/)
 })
 
-test('workspace mutations update the undo slot silently, with no toast', () => {
+test('workspace mutations update the undo slot silently, with no notice', () => {
   // The reducer still mints an undo slot every mutation (its own tests lock
   // that), but the shell no longer surfaces a "Moved X · Undo" / agent-placement
-  // toast — the owner found them noisy. Recovery is the Cmd/Ctrl+Z chord.
+  // notice — the owner found them noisy. Recovery is the Cmd/Ctrl+Z chord.
   assert.doesNotMatch(shell, /wsUndo:\s*true/)
-  assert.doesNotMatch(shell, /message:\s*slot\.toast/)
+  assert.doesNotMatch(shell, /notifyShell\([^)]*(?:Moved|arranged)/)
   // The chord itself must remain.
   assert.match(shell, /dispatchWorkspace\(\{ type: 'UNDO_LAST' \}\)/)
 })
@@ -950,7 +942,7 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
   )
   assert.match(
     drawer,
-    /needsOwnerInput \? \([\s\S]*?drawer__owner-input-dot[\s\S]*?: streaming \? \([\s\S]*?drawer__streaming-dot[\s\S]*?: waiting \? \([\s\S]*?drawer__waiting-icon[\s\S]*?: attention \? \([\s\S]*?drawer__attention-dot/,
+    /ownerRequired \? \([\s\S]*?drawer__owner-input-dot[\s\S]*?: streaming \? \([\s\S]*?drawer__streaming-dot[\s\S]*?: waiting \? \([\s\S]*?drawer__waiting-icon[\s\S]*?: attentionDot \? \([\s\S]*?drawer__attention-dot/,
     'owner input and active work must precede durable waiting and unseen completion',
   )
   assert.match(drawer, /drawer__attention-diamond drawer__owner-input-dot/)
@@ -1241,7 +1233,7 @@ test('shell generations advertise one explicit update without intercepting navig
   assert.match(shell, /markShellUpdateAvailable\(\)/)
   assert.match(shell, /updateAvailable=\{shellUpdateAvailable\}/)
   assert.match(shell, /onUpdateNow=\{applyShellUpdate\}/)
-  assert.doesNotMatch(shell, /showToast\('A Möbius update is ready\.'/)
+  assert.doesNotMatch(shell, /notifyShell\('A Möbius update is ready\.'/)
   assert.doesNotMatch(shell, /requestShellReload|beforeNavigateRef/)
 })
 
@@ -1251,10 +1243,10 @@ test('the builder no-full-screen invariant scopes to DESTINATIONS, not transient
   // review remains modal while its backdrop is scoped to the Settings pane.
   const navSrc = readFileSync(new URL('../../../hooks/useNavigation.js', import.meta.url), 'utf8')
   assert.match(navSrc, /DESTINATIONS, NOT DIALOGS/)
-  // The first-use coach remains modeless while update review is pane-scoped.
-  assert.match(walkthrough, /role="region"/)
+  // The first-use guide is a modal dialog: focus stays inside it and the page behind is inert.
+  assert.match(walkthrough, /role="dialog"/)
+  assert.match(walkthrough, /aria-modal="true"/)
   assert.match(walkthrough, /aria-label="Dismiss welcome"/)
-  assert.doesNotMatch(walkthrough, /aria-modal="true"/)
   const urmCss = readFileSync(
     new URL('../../SettingsView/UpdateReviewModal.css', import.meta.url), 'utf8',
   )
@@ -1527,7 +1519,7 @@ function harness() {
   const archiveActionsRef = { current: new Map() }
   const archiveRequestsRef = { current: new Map() }
   const calls = []
-  const toasts = []
+  const notices = []
   const refreshes = []
   const requests = []
   const request = archived => {
@@ -1553,10 +1545,10 @@ function harness() {
       rows = withPendingChatArchives([{ ...server }], archiveActionsRef.current)
       chatsRef.current = rows
     },
-    showToast(message, options) { toasts.push({ message, options }) },
+    notifyShell(message, options) { notices.push({ message, options }) },
   }
   return {
-    act: makeCallback(deps), calls, toasts, refreshes, requests,
+    act: makeCallback(deps), calls, notices, refreshes, requests,
     get row() { return rows[0] },
     fullRead(row) {
       rows = withPendingChatArchives([row], archiveActionsRef.current)
@@ -1586,8 +1578,8 @@ test('rapid archive then restore serializes writes; first failure cannot undo la
   await second
   assert.deepEqual(h.refreshes, ['a'])
   assert.equal(h.row.archived_at, null, 'last scoped read reflects committed server state')
-  assert.equal(h.toasts.length, 1)
-  assert.equal(h.toasts[0].options.action.label, 'Undo')
+  assert.equal(h.notices.length, 1)
+  assert.equal(h.notices[0].options.action.label, 'Undo')
 })
 
 test('failed last intent refreshes server truth and successful archive retains Undo', async () => {
@@ -1597,13 +1589,13 @@ test('failed last intent refreshes server truth and successful archive retains U
   h.requests[0].resolve({ ok: true })
   await first
   assert.equal(h.row.archived_at, 'server-archive')
-  assert.equal(h.toasts[0].options.action.label, 'Undo')
+  assert.equal(h.notices[0].options.action.label, 'Undo')
   const second = h.act('a', false)
   await tick()
   h.requests[1].resolve({ ok: false })
   await second
   assert.equal(h.row.archived_at, 'server-archive', 'failed restore uses authoritative scoped row')
-  assert.match(h.toasts[1].message, /Couldn’t restore/)
+  assert.match(h.notices[1].message, /Couldn’t restore/)
 })
 
 test('Undo reverses a committed archive without creating another Undo', async () => {
@@ -1612,11 +1604,11 @@ test('Undo reverses a committed archive without creating another Undo', async ()
   await tick()
   h.requests[0].resolve({ ok: true })
   await first
-  h.toasts[0].options.action.onAction()
+  h.notices[0].options.action.onAction()
   await tick()
   assert.deepEqual(h.calls, ['archive', 'restore'])
   h.requests[1].resolve({ ok: true })
   await tick()
   assert.equal(h.row.archived_at, null)
-  assert.equal(h.toasts.length, 1)
+  assert.equal(h.notices.length, 1)
 })

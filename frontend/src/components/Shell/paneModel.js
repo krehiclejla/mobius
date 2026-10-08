@@ -1131,8 +1131,8 @@ function edgeSplitMove(ws, src, tab, tabKey, paneId, edge) {
   // no-op: the source empties and collapses, leaving one pane in the same spot
   // with a fresh id — a rename, not a move. Refuse it so a drawer-drag of an
   // already-open sole item (whose source carries no paneId, so the drag layer's
-  // single-source guard misses it) can't churn the pane id or raise a false
-  // "Moved" toast (finding: sole-item drawer-drag rename).
+  // single-source guard misses it) cannot churn the pane id or burn an
+  // undo snapshot (finding: sole-item drawer-drag rename).
   if (src.id === paneId && src.tabs.length <= 1) return ws
   const newPaneId = `p${ws.nextId}`
   const splitId = `s${ws.nextId + 1}`
@@ -1751,14 +1751,9 @@ export function initialWorkspaceState(ws) {
   return { ws, undo: null }
 }
 
-// Single-slot-undo reducer over the workspace. state = { ws, undo } where undo
-// is { ws, label, toast } | null. `toast` is the 6s toast message this slot
-// should surface (null = undoable but silent, e.g. a divider resize). A FRESH
-// undo object is minted on every set, so its IDENTITY changing is the signal the
-// UI binds its "Undo" toast to: when the slot is replaced or cleared, the old
-// toast's Undo would revert a DIFFERENT mutation than it names, so the UI
-// retracts/replaces it on any identity change (design §3.5 — a toast's Undo must
-// never revert a mutation it does not describe).
+// Single-slot undo keeps the previous workspace and the mutation's label.
+// Each mutation replaces the slot, so Undo can never revert an older change.
+// Workspace changes are silent; the shell exposes the keyboard undo action.
 //
 // The slot only ever holds the IMMEDIATELY-preceding mutation. This is the
 // invariant that keeps Undo honest: a snapshot carried across an intervening
@@ -1829,7 +1824,7 @@ export function workspaceReducer(state, action) {
       return {
         ws: closed,
         undo: {
-          ws, label: closeLabel, toast: closeLabel,
+          ws, label: closeLabel,
           restoreViewMode: autoReturned, reopenable: true,
         },
       }
@@ -1852,7 +1847,7 @@ export function workspaceReducer(state, action) {
       return {
         ws: closed,
         undo: {
-          ws, label: paneLabel, toast: paneLabel,
+          ws, label: paneLabel,
           restoreViewMode: autoReturned, reopenable: true,
         },
       }
@@ -1864,25 +1859,25 @@ export function workspaceReducer(state, action) {
       const next = closeOtherTabs(ws, action.tabKey)
       if (next === ws) return state
       const label = action.label || 'Closed other tabs'
-      return { ws: next, undo: { ws, label, toast: label, reopenable: true } }
+      return { ws: next, undo: { ws, label, reopenable: true } }
     }
     case 'CLOSE_TABS_TO_RIGHT': {
       const next = closeTabsToRight(ws, action.tabKey)
       if (next === ws) return state
       const label = action.label || 'Closed tabs to the right'
-      return { ws: next, undo: { ws, label, toast: label, reopenable: true } }
+      return { ws: next, undo: { ws, label, reopenable: true } }
     }
     case 'CLOSE_TABS_TO_LEFT': {
       const next = closeTabsToLeft(ws, action.tabKey)
       if (next === ws) return state
       const label = action.label || 'Closed tabs to the left'
-      return { ws: next, undo: { ws, label, toast: label, reopenable: true } }
+      return { ws: next, undo: { ws, label, reopenable: true } }
     }
     case 'MOVE_TAB': {
       const next = moveTab(ws, action.tabKey, action.target)
       if (next === ws) return state
       const moveLabel = action.label || 'Moved tab'
-      return { ws: next, undo: { ws, label: moveLabel, toast: moveLabel } }
+      return { ws: next, undo: { ws, label: moveLabel } }
     }
     case 'OPEN_TAB_AT': {
       // A drag drop from a drawer row (open the item AT the zone) or a strip tab
@@ -1907,7 +1902,7 @@ export function workspaceReducer(state, action) {
       const dropLabel = action.label || 'Moved tab'
       return {
         ws: next,
-        undo: { ws, label: dropLabel, toast: dropLabel, restoreViewMode: !!action.flipViewMode },
+        undo: { ws, label: dropLabel, restoreViewMode: !!action.flipViewMode },
       }
     }
     case 'SET_ACTIVE': {
@@ -1921,9 +1916,9 @@ export function workspaceReducer(state, action) {
     case 'SET_RATIO': {
       const next = setRatio(ws, action.splitId, action.ratio)
       if (next === ws) return state
-      // Undoable via Cmd/Z but SILENT (toast:null) — a divider drag is a
+      // Undoable via Cmd/Z — a divider drag is a
       // continuous control, not a discrete "one tap from repaired" mutation.
-      return { ws: next, undo: { ws, label: action.label || 'Resized', toast: null } }
+      return { ws: next, undo: { ws, label: action.label || 'Resized' } }
     }
     case 'PRUNE': {
       const next = prune(ws, {
@@ -1941,15 +1936,12 @@ export function workspaceReducer(state, action) {
       // normalized workspace, the SAME reference on a no-op.
       const next = action.resolve(ws)
       if (next === ws) return state
-      // An agent rearrangement is especially undoable AND must be announced
-      // (design §3.5): it gets its OWN named toast rather than silently
-      // overwriting a live drag's toast slot.
+      // Placement replaces the previous undo snapshot just like a user move.
       return {
         ws: next,
         undo: {
           ws,
           label: 'Workspace placement',
-          toast: action.toast === undefined ? 'Agent arranged your workspace' : action.toast,
         },
       }
     }

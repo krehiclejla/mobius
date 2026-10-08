@@ -31,8 +31,8 @@ const NotificationCenter = forwardRef(function NotificationCenter(
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [updateNoticeSeen, setUpdateNoticeSeen] = useState(false)
   const {
-    state: { open, unreadCount, newCount },
-    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
+    state: { open, unreadCount, newCount, sessionNotices, announcement },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated, addNotice, runNoticeAction },
     meta: { rootRef, bellRef },
   } = useNotificationCenter(queryClient)
   const updateNoticeActive = updateAvailable && typeof onUpdateNow === 'function'
@@ -74,7 +74,8 @@ const NotificationCenter = forwardRef(function NotificationCenter(
     onCreated,
     openSearch,
     toggleShortcuts,
-  }), [onCreated, openSearch, reconcile, toggleShortcuts])
+    addNotice,
+  }), [addNotice, onCreated, openSearch, reconcile, toggleShortcuts])
 
   const toggleSearch = useCallback(() => {
     close()
@@ -103,6 +104,9 @@ const NotificationCenter = forwardRef(function NotificationCenter(
 
   return (
     <div ref={rootRef} className="notification-center">
+      <span className="notification-center__announcement" role="status" aria-live="polite" aria-atomic="true">
+        {announcement && <span key={announcement.id}>{announcement.title}</span>}
+      </span>
       <GlobalSearchButton
         buttonRef={searchButtonRef}
         active={searchOpen}
@@ -127,6 +131,8 @@ const NotificationCenter = forwardRef(function NotificationCenter(
           updateAvailable={updateNoticeActive}
           onUpdateNow={applyUpdate}
           onUpdateLater={deferUpdate}
+          sessionNotices={sessionNotices}
+          onNoticeAction={runNoticeAction}
         />
       )}
       {searchOpen && (

@@ -61,6 +61,7 @@ import {
   isCacheableAppAssetResponse,
   SHELL_DATA_CACHE,
   isShellListUrl,
+  isSharedBrowserRequest,
   requiresLiveShellList,
   SHELL_DOCUMENT_POLICY_REVISION,
   packagedAssetCacheLane,
@@ -590,16 +591,16 @@ function appCodeHandler(cacheName, { gated }) {
 // launch renders chrome + drawer instead of throwing. SWR: serve
 // cache, revalidate when online. Owner-scoped; wiped on logout.
 registerRoute(
-  ({ url }) =>
+  ({ url, request }) =>
     url.origin === self.location.origin &&
-    url.pathname === '/api/theme',
+    url.pathname === '/api/theme' && !isSharedBrowserRequest(request),
   new StaleWhileRevalidate({ cacheName: SHELL_DATA_CACHE }),
 )
 
 // Catch-up requires the network, but successful responses still replenish the
 // ordinary offline list. Keep this before the fallback-capable viewing route.
 registerRoute(
-  ({ url, request }) => url.origin === self.location.origin && requiresLiveShellList(request),
+  ({ url, request }) => url.origin === self.location.origin && !isSharedBrowserRequest(request) && requiresLiveShellList(request),
   new LiveShellList({ cacheName: SHELL_DATA_CACHE }),
 )
 
@@ -631,7 +632,7 @@ registerRoute(
 // next refetch. NetworkFirst returns the live list when online and still
 // falls back to the cached list offline (cold-drawer render preserved).
 registerRoute(
-  ({ url }) => url.origin === self.location.origin && isShellListUrl(url),
+  ({ url, request }) => url.origin === self.location.origin && !isSharedBrowserRequest(request) && isShellListUrl(url),
   new NetworkFirst({
     cacheName: SHELL_DATA_CACHE,
     // KEPT at 5s deliberately. Workbox returns a cache fallback as a
@@ -652,7 +653,7 @@ registerRoute(
 // NetworkFirst+304 trap that once left the module uncached and blanked the
 // in-shell iframe offline.
 registerRoute(
-  ({ url }) => isAppCodeRoute(url.pathname),
+  ({ url, request }) => isAppCodeRoute(url.pathname) && !isSharedBrowserRequest(request),
   appCodeHandler(OFFLINE_APPS_CACHE, { gated: false }),
 )
 

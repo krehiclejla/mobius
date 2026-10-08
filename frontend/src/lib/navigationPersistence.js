@@ -1,3 +1,5 @@
+import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+
 const ACTIVE_CHAT_KEY = 'moebius_active_chat'
 const ACTIVE_VIEW_KEY = 'moebius_active_view'
 const ACTIVE_APP_KEY = 'moebius_active_app'
@@ -27,7 +29,7 @@ export function consumeReturnView(storage = globalThis.sessionStorage) {
 
 export function parseShellDeepLink(location = globalThis.location) {
   const path = location?.pathname || ''
-  if (/^\/shell\/?$/.test(path)) {
+  if (/^\/shell\/?$/.test(path) || isSharedBrowserRoute(path)) {
     try {
       const params = new URLSearchParams(location?.search || '')
       const app = params.get('app')

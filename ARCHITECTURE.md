@@ -143,8 +143,9 @@ overlap handed over with **Fix with an agent**) and every combined source-and-co
 update are *prepared*, not applied: the answer is committed on the reviewed
 release and recorded in `.platform-prepared-update.json`. The live checkout
 keeps serving its snapshot, and nothing edited afterwards enters the update.
-A restart-only update is checked with the same startup check boot runs and is
-swapped in by the shutdown drain: it pauses every chat, saves the live state as
+A restart-only update must pass the candidate startup check
+(`restart_util.run_candidate_startup_check`) and is swapped in by the shutdown
+drain: it pauses every chat, saves the live state as
 one commit under `refs/mobius/update-late`, and points the checkout at the
 prepared commit, crash-safe through the reconcile marker.
 
@@ -231,7 +232,7 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | `codex_sdk_runner.py` | Codex SDK turn runner (Thread/TurnHandle + steer) |
 | `codex_appserver.py` | Small helper module: `codex_sdk_runner.py` imports its one surviving function, `_extract_bash_command`, which pulls the bash command string out of a shell tool item. The SDK runner does its own event/tool classification locally. |
 | `chat.py` | `run_chat()` background task: spawns the turn, publishes events, routes persistence through the actor |
-| `chat_writer.py` | Single-writer chat-persistence actor — one thread owns the DB session + a FIFO command queue; ALL `Chat.messages` / `Chat.pending_messages` mutations route through it (do not write those columns directly) |
+| `chat_writer.py` | Single-writer chat-persistence actor — one thread owns the DB session + a FIFO command queue; ALL transcript-row / `Chat.pending_messages` mutations route through it (do not write those records directly) |
 | `chat_queue.py` | Per-chat queue lock + turn-end `drain_and_release` / `promote_pending_messages_locked` + the `TerminalDisposition` state machine; the awaited bridge between `chat.py` and the writer actor |
 | `broadcast.py` | `ChatBroadcast` per-chat in-memory event bus; decouples the turn runner from SSE clients |
 | `events.py` | Pure data transforms accumulating streaming events into the persisted message structure |
@@ -263,7 +264,7 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 
 | File | Role |
 |------|------|
-| `memory.py` | `build_memory_block()` — assembles only bounded recent-chat Digests; graph/app data is never injected here |
+| `memory.py` | `build_memory_block()` — assembles only recent-chat Summaries; graph/app data is never injected here |
 | `skills.py` | Skill enumeration (flat `<name>.md` + external-convention `<name>/SKILL.md` dirs), dependency-free frontmatter parsing, provenance labels (`seed`/`agent`/`app:<slug>`/`installed:<source>`), and `write_index()` — the generated `shared/skills/skills-index.md` both providers Read (regenerated on boot, app-skill sync, and skill install/uninstall) |
 | `activity.py` | Append-only JSONL platform-activity log (app_open, app_install, storage_write, …) |
 | `self_reminders.py` | Agent self-scheduling: append-only store of relational check-ins |
@@ -550,7 +551,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 
 ## In-product agent context — three layers
 
-The in-product agent is a first-class reader of this code, and its behavior has three layers. (1) **Base constitution** — the live platform checkout's `skill/core.md`; `chat._read_skill_text()` caches only this tracked platform text for the process lifetime, so edits and platform updates take effect after a server restart. `/app/skill/core.md` is only the image-baked degraded-boot fallback when the live checkout is unavailable. (2) **Installed-app contributions** — any app's manifest may declare one root-level `system_prompt` markdown file; install review is the consent. When a chat starts its first turn, live (`deleted_at IS NULL`) app fragments are composed in stable id order with its effective base constitution and stored as one content-addressed prompt snapshot. Every later turn, provider switch, and compaction uses those exact bytes. Install, update, and uninstall affect chats started afterwards, while an existing chat keeps the prompt it began with. (3) **On-demand skills** — `/data/shared/skills/*.md`; platform skills reconcile against `.seed-skills.json` at server start, preserving local changes, while app-owned skills arrive through manifests and are deactivated/restored with their owner app. Independently of optional apps, every chat maintains its name, a bounded `## Digest`, and an uncapped cumulative `## Summary` under `/data/shared/memory/chats/<id>/index.md`. New sessions receive only recent descriptions + Digests. The working agent writes that note through its run-bound `checkpoint_chat` tool; there is no turn-end summarizer. Compaction prefers the chat's cumulative Summary. The optional Memory app owns graph instructions, its skill, reader, seeds, builder, Git publisher, and retrieval telemetry; no router/fact note is injected. Uninstall changes future chat prompts and removes the skill/jobs while leaving existing prompt snapshots and core chat summaries intact.
+The in-product agent is a first-class reader of this code, and its behavior has three layers. (1) **Base constitution** — the live platform checkout's `skill/core.md`; `chat._read_skill_text()` caches only this tracked platform text for the process lifetime, so edits and platform updates take effect after a server restart. `/app/skill/core.md` is only the image-baked degraded-boot fallback when the live checkout is unavailable. (2) **Installed-app contributions** — any app's manifest may declare one root-level `system_prompt` markdown file; install review is the consent. When a chat starts its first turn, live (`deleted_at IS NULL`) app fragments are composed in stable id order with its effective base constitution and stored as one content-addressed prompt snapshot. Every later turn, provider switch, and compaction uses those exact bytes. Install, update, and uninstall affect chats started afterwards, while an existing chat keeps the prompt it began with. (3) **On-demand skills** — `/data/shared/skills/*.md`; platform skills reconcile against `.seed-skills.json` at server start, preserving local changes, while app-owned skills arrive through manifests and are deactivated/restored with their owner app. Independently of optional apps, every chat maintains its name, a short `## Summary`, and a cumulative `## Digest` under `/data/shared/memory/chats/<id>/index.md`. New sessions receive only recent descriptions + Summaries. The working agent writes that note through its run-bound `checkpoint_chat` tool; there is no turn-end summarizer. Compaction prefers the chat's cumulative Digest. The optional Memory app owns graph instructions, its skill, reader, seeds, builder, Git publisher, and retrieval telemetry; no router/fact note is injected. Uninstall changes future chat prompts and removes the skill/jobs while leaving existing prompt snapshots and core chat summaries intact.
 
 Platform skill reconciliation is a server startup step, not part of the source
 updater or the image. The served checkout applies its own
@@ -1201,27 +1202,39 @@ column remains only as an internal latch: it defaults on and is cleared solely
 by `delegations.mark_cancelled`, so a cancelled delegated child cannot
 resurrect itself when the boot sweep claims restart parks.
 
-### A Goal is a note, a checklist, and Done
+### A Goal owns an outcome; attempts own execution
 
-`ChatGoal` owns the stable objective, revision-checked plan, checkpoint, next
-step, and explicit outcome. `ChatRun.goal_id` attaches each execution attempt
-to that record. A failed, interrupted, or cleanly ended attempt cannot complete
-or fail the obligation. Stop and dismissal are explicit; a deliberate Resume
-can reopen stopped work but stale deliveries cannot. Migration 0063 copies
-historical plans without deleting run snapshots and leaves uncertain work open.
+`ChatGoal` owns the original objective, revision-checked checklist, checkpoint,
+next step, and explicit Completed / Cannot complete / Cancelled outcome.
+`ChatRun.goal_id` attaches an execution attempt without replacing that obligation.
+Task edits and terminal settlement share one transaction: a refusal saves neither.
+A green checklist alone is not completion, and an interruption is not capitulation.
 
-The writer admits Goal identity and the attempt in the same transaction.
-Execution turns are not a budget, and an unfinished Goal never schedules its
-own next turn. Goal work moves only through what already wakes a chat: owner
-input, a Wait result, a helper result, peer or activation delivery, and
-restart or usage-limit recovery. A turn that ends cleanly needs no Goal
-handoff: nothing checks it, and an idle unfinished Goal is simply the owner's
-turn. The Goal record reports only its own lifecycle (`active` while a turn
-runs, `paused` while idle or stopped, `completed`); who moves next is derived
-from chat state the client already holds — an open card, armed Waits, running
-helpers — never from a per-Goal ownership query. Retired automatic-continuation
-bookkeeping (`goal_plan_revision_at_admission`, the `automatic_remaining`
-column) is inert historical schema.
+The writer records a deliberate Stop or quiet card answer as a Goal hold before
+interrupting execution. `hold_json` identifies the actor, exact action/card and
+attempt, and time. Generic `FinishRun` never manufactures Goal intent. Absent or
+invalid historical attribution remains held but neutral: **Interrupted**, never
+**Paused by you**. Dismissal and verified terminal outcomes remain distinct.
+Migrations 0081/0082 add nullable provenance without rewriting historical intent.
+
+Resume uses the existing acknowledged continuation path. A Goal action carries
+its exact ID and revision; a reply action carries its physical run ID. Neither is
+queued behind activation or allowed to bypass a saved question. Receipt retries
+acknowledge only the original target. Named `update_goal` can attach later owner
+work to a retained Goal, preserving its objective and checklist. Reopening a hold
+requires durable owner-admission evidence, not a different run ID or guessed text.
+`owner_input_at` records direct/queued acceptance; physical recovery inherits that
+time rather than renewing authority. Unknown holds accept new owner input, not
+inherited recovery. Automatic results and parks cannot override held/settled work.
+
+An unfinished Goal retains responsibility until a truthful outcome, answerable
+saved card, or genuine automatic wake. The existing writer/continuation runner
+admits one bounded settlement pass after a clean unhanded ending; another such
+ending records a visible technical recovery failure, not a fabricated outcome.
+No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
+Goal labels derive only from that Goal's cards, Waits, helpers and eligible parks;
+chat-wide handoff guards conflicting actions without borrowing another task's
+question. Retired revision-budget columns remain inert historical schema.
 
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired
@@ -1286,6 +1299,16 @@ the carrier as its next turn, whose completed Finalize records it. Until a cut
 or completed Finalize, the result is owed. Stop drops a queued carrier, because
 the Delegation row still owes the result and the next owner turn's context
 carries it.
+
+A helper's delivered result is its latest assistant message's last text block,
+plus that message's latest error so a failed or stopped helper stays actionable.
+Earlier text blocks in the same message are progress narration, split off by
+tool calls or by separate provider items; they stay in the child transcript as
+evidence but are not replayed to the parent. As with Claude Code and Codex
+subagents, a helper's final message is its report, and the helper system
+prompt tells it to write that report last, after any tool calls. One status still reads
+report content: a failed run whose text carries the write-review marker
+projects as `needs_review`.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
@@ -1361,11 +1384,11 @@ serializer), and the FULL output is fetched only when the block is expanded (`GE
 
 Each chat maintains a **growing per-chat note** at
 `/data/shared/memory/chats/<chat-id>/index.md` — a one-line name (frontmatter
-`description`, mirroring the chat title), a short `## Digest`, and an uncapped
-cumulative `## Summary`. The **working agent authors it** as it works through
-the run-bound `checkpoint_chat` MCP tool: `title` renames the chat unless the
-owner locked a name, `digest` replaces the Digest, and `summary` appends one
-timestamped Summary entry. `POST /api/chat/continuity/checkpoints` admits only
+`description`, mirroring the chat title), a short replaceable `## Summary`, and
+an append-only full `## Digest`. The **working agent authors it** as it works
+through the run-bound `checkpoint_chat` MCP tool: `title` renames the chat
+unless the owner locked a name, `chat_summary` replaces the Summary, and
+`digest_entry` appends one timestamped Digest entry. Neither layer has a length cap. `POST /api/chat/continuity/checkpoints` admits only
 the chat's live run (`AuthorizeCheckpoint` in the writer actor), then rewrites
 the file atomically under the chat's transition lock
 (`backend/app/chat_continuity.py`). There is no summarizer model, second store,
@@ -1374,9 +1397,9 @@ transcript remains the source of truth. This note is **core continuity** — it
 exists and is useful even when the Memory app is not installed. Its consumers:
 
 - **Short-term continuity into new chats.** A fresh chat opens with only the gist and
-  bounded Digest from the ~10 most-recently-modified chats
+  whole Summary of the 10 most recently active chats
   (`backend/app/memory.py`); the fenced path lets the agent deliberately open a
-  relevant full note. Facts and cumulative Summaries are not injected.
+  relevant full note. Facts and full Digests are not injected.
 - **Knowledge graph (installed Memory app).** The app requests structurally
   redacted chat text through its declared API permission, writes a complete graph to
   a same-filesystem staging tree, and atomically advances a JSON `.ready` pointer to
@@ -1386,7 +1409,7 @@ exists and is useful even when the Memory app is not installed. Its consumers:
   (`backend/scripts/init_chat_summaries.py`).
 - **Reflection.** Without the Memory app, the per-chat summaries are what Reflection
   reads.
-- **Compaction + provider switch.** The cumulative Summary is the source for compacting a
+- **Compaction + provider switch.** The full Digest is the source for compacting a
   long chat and for the provider-switch handoff below — preferred over a from-scratch
   default compaction.
 
@@ -1413,7 +1436,7 @@ remains as a rolling-upgrade bridge for older clients that compact and then
 PATCH the provider.
 
 The incoming provider runs a disposable, tool-free synthesis turn over the complete
-running `## Summary` plus the complete current transcript. Large sources are folded
+cumulative `## Digest` plus the complete current transcript. Large sources are folded
 through bounded progressive synthesis turns so no middle interval is silently
 omitted. The writer actor then stores that portable brief, changes
 provider/settings, clears the outgoing session, and supersedes outgoing
@@ -1588,6 +1611,17 @@ foreign run authority, and native-question overlap.
 
 ## Chat persistence — single-writer actor
 
+Transcripts are position-addressed `ChatMessage` rows; `transcript_rows.py`
+is the transaction-local read/write primitive. Optional message IDs never
+replace `(chat_id, seq)`. Creation goes through `chat_writer.create_chat`.
+While the previous release's `chats.messages` column exists, the commit hook
+in `transcript_rows.py` rewrites it from the rows of every chat changed in the
+transaction, so that release can always be rolled back to; chats it wrote are
+converted on demand or in the background, never before readiness. Search
+entries and purge cleanup are schema triggers. See
+`TRANSCRIPT_STORAGE_DESIGN.md`.
+
+
 All chat-domain mutations — transcript writes, run-markers, question rows, answers, finalize, error-persist — route through the single-writer actor in `chat_writer.py` as **domain commands** (`PersistTranscript`, `QuestionCommit`, `Finalize`, `PersistError`, `AnswerQuestion`, `Barrier`, `DrainAndStop`). Every command allocates an ack `Future`, but only the strict paths (`QuestionCommit`, `Finalize`, `AnswerQuestion`, `Barrier`, `DrainAndStop`) *await* it (commit-before-ack); `PersistTranscript` and `PersistError` are submitted fire-and-forget — `PersistTranscript` additionally coalesces rapid streaming snapshots, while `PersistError` does not coalesce. One dedicated thread owns the SQLAlchemy session and a FIFO command queue; async callers submit a command and await its `Future`. The blocking `db.commit()` (which SQLite's `busy_timeout` can stall up to 5s) thus never runs on the event loop, and the actor never touches asyncio or `ChatBroadcast` (those stay loop-owned).
 
 Streaming state lives in its own `chat_live_assistants` row, exposed on a Chat instance as `live_assistant`: `PersistTranscript`/`PersistError` replace only that bounded snapshot. A separate column on `chats` is insufficient: SQLite rewrites the overflow payload of a row even when only a small column changes. The snapshot writer does not update the historical row unless the active assistant identity actually changes. Read routes overlay that current assistant on immutable history. `QuestionCommit` merges the card into history before broadcast, `Finalize` performs the terminal merge and clears the live value, and startup reconciliation performs the same merge after a crash. This keeps one-second crash-resilient snapshots without quadratic transcript rewrites as chats grow. The live table has one primary-key row per chat, cleared in the same transaction as finalization/recovery and reclaimed with the chat's existing retention lifecycle. Migration `0045_chat_live_assistants` copies prior snapshots in SQL and drops the old column; it does not decode whole histories in Python, change save cadence, or introduce a concurrency cap.
@@ -1716,6 +1750,27 @@ On narrow layouts the drawer is modeled as a *virtual route*: opening it pushes 
 
 The mobile design satisfies a few hard desiderata — no "two drawers" artifact during Chrome-Android swipe-back, the 250ms slide stays visible, one back-press exits the PWA from home, and closing the drawer (overlay tap / X) must never navigate. Three load-bearing invariants in `useNavigation.js` enforce this: (1) **`navTo` consumes the existing drawer-sentinel rather than pushing** when the drawer is open (it pushes one `'nav'` entry only if the drawer was closed), so an in-app nav reuses the drawer's history slot instead of growing the stack — keeping history pinned to a pre-drawer snapshot and killing the BFCache artifact; (2) **every close path funnels through `history.back()` → `handleBack`**, whose drawer-first guard (`if (drawerOpenRef && drawerPushedRef) { close; return }`) prevents over-popping `navStackRef`; (3) **`drawerPushedRef` is a ref, not state** (mutated synchronously in the same task as the history call) and is the single source of truth for "is a drawer-sentinel above the current entry." Activating the already-current destination is a close/no-op and must not create a duplicate history edge. Every shell-pushed entry is tagged `{__mobiusNav:true, kind}` via `navHistory.js` and written to *both* the classic History store and the Navigation API entry (`updateCurrentEntry`); both back handlers ignore untagged pops so sandboxed-iframe phantom entries can't over-pop — do not drop the tag from any push site or genuine sentinels read as phantoms and back-nav dies. Mini-apps install their own back-targets via the `moebius:nav-push` postMessage protocol (per-app counts in `appSentinelCountsRef`, capped at 20), consumed before navStack pops; `Shell.deleteChat` must scrub `navStackRef` of the deleted chat's entries or back lands on a 404'd chat. Three architectures were tried and rejected (per-nav pushState, `flushSync`-before-pushState, perpetual single-sentinel) — read `tests/navigation.spec.mjs` before changing anything.
 
+Ordinary reloads preserve a matching tagged chat/app route and its shell index,
+rather than reclassifying the current entry as a new base. A base entry that
+shows a non-chat surface is still replaced and gets the HOME seed behind it, so
+Back after reload reaches chat instead of leaving Möbius. Each shell push marks
+its tagged source with `hasShellForward`, so even a popstate-only browser can
+recover the Forward edge after reload without a second persisted history stack.
+Where available, the Navigation API's next entry verifies that Forward remains
+inside shell-owned history. Explicit launch destinations still establish their
+own base; a fresh push discards the previous Forward branch.
+
+New Chat's provisional row ownership outlives its visible presentation. Leaving
+releases the keyboard lease, not the creation session: Back/Forward must restore
+its composer without reading a not-yet-created row as a deletion. An off-screen
+allocation may publish success or failure but never redirect the workspace;
+an off-screen id conflict is remembered and applies the same silent rotation
+when its chat is visible again. A queued first Send waits for that chat to be
+materialized, visible, and runtime-ready; handing it over retires the creation
+session. Consuming
+its durable handoff is a one-shot claim shared by retained/remounted views, not
+merely a component-local request token.
+
 Transient shell surfaces that should dismiss on browser Back use the same owner
 through `useHistoryDismiss`. Opening one pushes a tagged `kind:'dismissible'`
 entry before the surface paints. An explicit close (X, backdrop, Escape)
@@ -1779,7 +1834,7 @@ Every mini-app ships a `mobius.json`; the dependency-free source of truth is `ba
 
 Published apps should generate one random UUID once and declare it as `package_id` (for example `urn:uuid:550e8400-e29b-41d4-a716-446655440000`). It remains unchanged across product, manifest-id, repository-path, and owner renames. GitHub-backed packages are additionally bound to GitHub's immutable numeric repository identity, so a repository rename or transfer only changes the fetch locator. Moving code into a different repository is an explicit trust transfer: the old trusted manifest declares the same `package_id` plus `moved_to: {"manifest_url": "https://.../mobius.json"}`. Existing installs accept the new repository only after fetching and verifying that declaration from their current source; a separate fork generates a new package id. A reviewed service uses its own stable `service.id`, independent of both the package's current `id` and installed slug. Manifests that declare both `package_id` and `service` must declare `service.id` explicitly.
 
-Optional fields the parser recognizes include `package_id`, `moved_to`, `previous_id`, `icon`, colors/display, `offline_capable`, `embeds_agent`, `offline`, `permissions`, `storage_seeds`, `static_assets`, `source_files`, `skills`, `system_prompt`, `schedule`, and `agent_activities`. `previous_id` and `previous_manifest_url` remain bounded migration aids for installs that predate permanent package identities; they are not the steady-state identity model. Decorative-only fields such as `author`, `license`, and `homepage` are not validated or stored. Three gotchas: (1) **`runtime` (`imports`/`esm_deps`) is informational**; dependency resolution is governed by the pinned self-contained compiler in `app_compile_contract.py`. (2) **`storage_seeds` value type is a switch**: a string is a repo-relative file the installer fetches; a non-string is stored inline as JSON. (3) **`schedule.job` has dual semantics** — with an exactly five-field `schedule.default` it installs recurring cron; without it the script is an on-demand build hook. In either mode the script declares its interpreter with an absolute shebang; the platform never guesses from its filename or executable bit. `static_assets` caps at 256 files / 16 MB each / 64 MB total and logical destination `x` is materialized at source path `static/x`.
+Optional fields the parser recognizes include `package_id`, `moved_to`, `previous_id`, `icon`, colors/display, `offline_capable`, `embeds_agent`, `offline`, `permissions`, `storage_seeds`, `static_assets`, `source_files`, `skills`, `system_prompt`, `schedule`, `agent_activities`, and `shell_shortcuts` (`false` stops the app frame capturing the shell's keyboard shortcuts, for apps such as editors that need those chords). `previous_id` and `previous_manifest_url` remain bounded migration aids for installs that predate permanent package identities; they are not the steady-state identity model. Decorative-only fields such as `author`, `license`, and `homepage` are not validated or stored. Three gotchas: (1) **`runtime` (`imports`/`esm_deps`) is informational**; dependency resolution is governed by the pinned self-contained compiler in `app_compile_contract.py`. (2) **`storage_seeds` value type is a switch**: a string is a repo-relative file the installer fetches; a non-string is stored inline as JSON. (3) **`schedule.job` has dual semantics** — with an exactly five-field `schedule.default` it installs recurring cron; without it the script is an on-demand build hook. In either mode the script declares its interpreter with an absolute shebang; the platform never guesses from its filename or executable bit. Logical `static_assets` destination `x` is materialized at source path `static/x`. One 64 MiB `PACKAGE_MAX_BYTES` bounds every file a package declares (entry, icon, job, source files, static assets and file seeds), summed per declaration because each is written separately (`manifest_contract.package_bytes`): HTTP and Git installs charge that sum, local apply and `validate-app.py` check it from file sizes, and Store publication bounds both it and its whole tree, so every published app is installable. Beyond the 64 KiB manifest cap and the skill and system-prompt caps that bound agent context, no declared file or file kind has its own size or count cap; Store publication also limits a release to 250 files. The compile contract refuses a compiled module larger than the 8 MiB the shell loads, so large data belongs in `static_assets`, fetched at runtime.
 
 `agent_activities` is the app-neutral presentation contract for scripts an app
 asks the chat agent to run. Each activity declares an id, a repo-relative
@@ -1823,3 +1878,95 @@ cover it deterministically.
 
 - **Build / test / run commands and the dev loop:** `CONTRIBUTING.md`. (The #1 deploy gotcha — a stale `/data/platform/frontend/dist` masking a fresh image — is covered under *Frontend serving priority* above.)
 - **Subsystem deep-dives are inlined above** as their own sections: *Stop-chat contract*, *AskUserQuestion interception*, *Chat persistence — single-writer actor*, *Navigation back-stack + drawer model*, *Service worker + offline*, and *Mini-app manifest (mobius.json)*. (The chat-persistence v2 design + staged-rollout notes remain internal/gitignored — the as-built contract is the section above.)
+
+### Trusted shared-browser access
+
+Connect manages per-recipient access to this instance, not screen mirroring or
+isolated accounts. `browser_access.py` owns grants (until explicitly revoked)
+and hashed renewal sessions (30-day idle window). Owners share by inviting a
+mobius.you handle: account grants pin a verified issuer and subject. The feature
+requires the configured HTTPS origin.
+
+Link invitations (`kind="invitation"`: an owner-labelled grant plus a hashed,
+one-use, one-day link) are retired: nothing creates or re-issues them.
+Existing link grants still list, keep their sessions and revoke like account
+grants, and a link issued before the upgrade can still be redeemed until it
+expires. Recipients are re-invited by handle.
+
+`routes/browser_access.py` owns grant listing, account invitations, revocation
+and the same-origin cookie exchange. A 15-minute bearer stays in memory; the
+renewal credential is HttpOnly/Secure/SameSite=Strict and path-confined to the
+session routes. Signing in atomically retires the previous session presented by
+its cookie.
+Only a sign-in (invite redemption or account finalization) writes that cookie,
+with a long fixed lifetime; renewal returns a bearer and never rewrites it, so a
+late renewal response cannot overwrite a newer sign-in. The server-side idle
+expiry is the authority. When two tabs sign this browser in, the last one wins
+and the other tab notices at its next renewal. Independent browsers may hold
+separate sessions.
+This never replaces the installation owner's login. `/shell/shared` owns an
+independent query cache and grant/tab-scoped navigation and drafts. Leaving ends
+that browser session, while revoking the recipient ends all their sessions.
+
+Every bearer descendant retains one `BrowserLineage`: the `browser_grant`, and
+for browser-derived app, embedded-chat and media tokens also the originating
+session. `browser_access.is_live` is the single rule every resolver, stream,
+writer admission, delegation, app service and Connect replay uses; it checks the
+live grant/session rather than trusting JWT expiry. Revocation is terminal
+(nothing clears `revoked_at`), so the grant id alone is sufficient lineage.
+Guest-started agent runs and child delegations retain durable grant lineage;
+renewing or resuming work cannot manufacture installation-owner authority.
+Turn-issued MCP broker capabilities also carry owner/grant lineage; upload and
+response streams stop forwarding after their authority is revoked. Guest event
+streams and broker exchanges share `access_signal.until_revoked`: committed
+writes to access tables advance one in-process revision, and an open stream
+rechecks liveness in a worker thread only when it moves (or after a 30-second
+safety interval for out-of-process writes), so idle streams close on revocation
+and busy ones cost no query per event. Bytes already
+forwarded to a remote service cannot be recalled.
+Installation identity, credential, access administration and lifecycle controls
+remain separately gated; ordinary readable owner-input cards retain their
+existing participant-answer contract.
+
+Revocation commits access denial first, then cancels attributed app-service
+invocations, chat runs, queued input and Connect commands. Rejected queued input
+keeps its content and identity. A remote stop is not claimed until confirmed:
+202 means access is revoked but some work is still stopping. Cancellation state
+survives Connect reconnection. This is trusted full workspace access, not a
+hostile-tenant sandbox: it cannot undo copied data, completed writes, publication,
+external actions or deliberate persistent machine changes. No screen relay,
+private-network tunnel or automatic grant expiry is included in this version.
+
+#### Account-linked shared access
+
+`account_browser_access.py` owns a separate guest PKCE flow, never the owner's
+runtime-enrollment receipt. Connect registers a local account grant with the
+configured issuer using the existing managed broker or linked-account bearer.
+The issuer derives the owner and origin from that credential, lists active
+registrations in Shared with me, and issues one-use, identity-only proofs after
+recipient sign-in and explicit consent. Directory entries are discovery, not
+authorization. A lost registration response retries the reserved grant ID;
+revocation or account replacement racing registration cannot activate it.
+
+The callback verifies issuer, audience, subject, origin, grant, nonce and proof
+expiry, then redirects with a non-secret pending ID. It never writes the refresh
+cookie: a cross-site callback cannot receive the old SameSite=Strict cookie.
+The shared shell removes the marker and finalizes with a same-origin POST. That
+transaction consumes the browser-bound proof,
+rechecks local permission, and retires the previous browser session. Failed proof
+validation leaves that prior session unchanged. Verified proof admission expires
+within 60 seconds; old pending rows are pruned on subsequent starts.
+
+Local validation pins the issuer, runtime origin and grantor credential generation
+(or managed instance ID and owner subject). Changing those bindings invalidates
+existing account-derived sessions and credentials; Connect lists such grants as
+`inactive`, and inviting the same handle again replaces them. One live grant
+exists per handle. Revoke and unlink share `browser_access.end_grant`. Unlink commits revocation of
+all account grants before attempting descendant stops and issuer cleanup; partial
+cleanup retains the link for an explicit retry. Legacy link-invitation grants
+are not revoked by account unlink. Issuer-side link loss blocks discovery and new proofs;
+it does not independently push revocation into an otherwise valid local session.
+
+This protocol adds no new owner account and does not distribute owner passwords.
+Deploy both issuer and runtime implementations before offering account sharing;
+source-only tests do not activate the feature on a running installation.

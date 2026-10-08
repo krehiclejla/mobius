@@ -113,17 +113,17 @@ test('activation presents a confirmed running transcript while stream catch-up r
   )
   assert.match(
     initialLoad,
-    /if \(reused\) \{[\s\S]*updateChatRuntimeCache[\s\S]*applyMessagesToView\(msgs, detailCache\.offset\)[\s\S]*settleRuntime\(runtime, msgs\)[\s\S]*return/,
+    /if \(reused\) \{[\s\S]*updateChatRuntimeCache[\s\S]*applyMessagesToView\(msgs, detailCache\.offset\)[\s\S]*settleRuntime\(runtime, msgs, msgs\)[\s\S]*return/,
     'the fast path must reconcile a retained hidden owner before revealing it',
   )
   assert.match(
     chatView,
-    /const settleRuntime = \(runtime, visibleMessages\) => \{[\s\S]*setArmedWaits\(Array\.isArray\(runtime\.waits\) \? runtime\.waits : \[\]\)/,
+    /const settleRuntime = \(runtime, visibleMessages, authoritativeMessages\) => \{[\s\S]*setArmedWaits\(Array\.isArray\(runtime\.waits\) \? runtime\.waits : \[\]\)/,
     'every activation must hydrate the composer wait card from current runtime truth',
   )
   assert.match(
     chatView,
-    /const settleRuntime = \(runtime, visibleMessages\) => \{[\s\S]*retireUnownedRuntimeStream\(\{[\s\S]*running,[\s\S]*pendingQuestionId: runtime\.pending_question_id/,
+    /const settleRuntime = \(runtime, visibleMessages, authoritativeMessages\) => \{[\s\S]*retireUnownedRuntimeStream\(\{[\s\S]*running,[\s\S]*pendingQuestionId: runtime\.pending_question_id/,
     'opening a completed hidden chat must retire any stale failed stream from its previous run',
   )
   assert.match(
@@ -152,7 +152,7 @@ test('activation presents a confirmed running transcript while stream catch-up r
     /runtime\.requested_anchor_found === false[\s\S]*if \(runtimeAnchorMatch\)[\s\S]*CHAT_READING_ANCHOR_NOT_FOUND[\s\S]*retireSavedReadingPosition\(chatId\)[\s\S]*anchorRetired = true/,
     'only an authoritative absent row retires the saved coordinate')
   assert.match(initialLoad,
-    /if \(activationCacheEntryState !== 'missing' && !anchorRetired\) \{[\s\S]*applyMessagesToView\(refreshed\.messages, refreshed\.offset\)[\s\S]*settleRuntime\(runtime, refreshed\.messages\)[\s\S]*return[\s\S]*const renderFrames = coldTranscriptRenderFrames/,
+    /if \(activationCacheEntryState !== 'missing' && !anchorRetired\) \{[\s\S]*applyMessagesToView\(refreshed\.messages, refreshed\.offset\)[\s\S]*settleRuntime\(runtime, refreshed\.messages, msgs\)[\s\S]*return[\s\S]*const renderFrames = coldTranscriptRenderFrames/,
     'a complete warm window, including nested-coordinate validation, must settle atomically before the cold prefix scheduler')
   assert.match(chatView,
     /cacheIsSafeFallback[\s\S]*CHAT_READING_ANCHOR_NOT_FOUND[\s\S]*applyMessagesToView\(\[\], 0\)[\s\S]*setLoadError\(!cacheIsSafeFallback && retry == null\)/,
@@ -221,7 +221,7 @@ test('a fresh empty chat settles before interruptible transcript work', () => {
   )?.[1] || ''
   assert.match(
     emptyBody,
-    /applyMessagesToView\(\[\], refreshed\.offset\)[\s\S]*settleRuntime\(runtime, \[\]\)[\s\S]*return/,
+    /applyMessagesToView\(\[\], refreshed\.offset\)[\s\S]*settleRuntime\(runtime, \[\], msgs\)[\s\S]*return/,
     'the full empty ChatView must become ready without waiting for transcript scheduling',
   )
   assert.doesNotMatch(emptyBody, /startTransition/,
@@ -338,12 +338,13 @@ test('direct chat actions hand focus to the destination composer', () => {
   assert.match(startUserNewChatPresentation,
     /if \(pendingNewChatRef\.current\) \{[\s\S]*newChatRequestSeqRef\.current \+= 1[\s\S]*pendingNewChatRef\.current = null[\s\S]*setPendingNewChatToken\(0\)/,
     'an explicit New Chat must invalidate an older deferred null-slot result')
-  assert.match(shell,
-    /const requestEmptySingleNewChat = useCallback\(\(\) => \{[\s\S]*?if \(newChatPresentationRef\.current\) return/,
-    'a stale list refresh must not restart automatic allocation over the explicit presentation')
-  assert.match(shell,
-    /const hadNewChatPresentationRef = useRef\(false\)[\s\S]*hadPresentation = hadNewChatPresentationRef\.current[\s\S]*if \(!hadPresentation \|\| newChatPresentation != null\) return[\s\S]*ws\.viewMode !== 'single' \|\| ws\.singleScreen != null[\s\S]*requestEmptySingleNewChat\(\)/,
-    'retiring an explicit presentation must return an otherwise-empty Standard slot to automatic repair')
+  const emptySlotRepair = shell.match(
+    /const requestEmptySingleNewChat = useCallback\(\(\) => \{([\s\S]*?)\n  \},/,
+  )?.[1] || ''
+  assert.match(emptySlotRepair, /if \(!single \|\| ws\.singleScreen != null\) return/,
+    'a concrete destination, including a provisional chat, prevents automatic allocation')
+  assert.doesNotMatch(emptySlotRepair, /newChatPresentationRef/,
+    'an off-screen pending creation cannot strand an unrelated empty Standard slot')
   assert.match(startUserNewChatPresentation,
     /const openIntent = newChatIntentRef\.current[\s\S]*const openIntentDraft = openIntent \? readComposerDraft\(openIntent\.chatId\) : null[\s\S]*const visibleSingleChatId = ws\.viewMode === 'single'[\s\S]*const savedIntentIsElsewhere = openIntent != null[\s\S]*visibleSingleChatId !== String\(openIntent\.chatId\)[\s\S]*!savedIntentIsElsewhere[\s\S]*visibleSingleChatId === String\(activeChatIdRef\.current\)/,
     'only the chat in the actual Standard slot can be reused, and never over a durable New Chat intent')
@@ -395,7 +396,7 @@ test('direct chat actions hand focus to the destination composer', () => {
     /beforeRestoreRouteRef\.current = \(route\) => \{[\s\S]*route\?\.view !== 'chat'[\s\S]*focusSelectedChatComposer\(route\.chatId\)/,
     'Back and Forward must use the same destination-composer focus handoff')
   assert.match(shell, /const beforeRestoreRouteRef = useRef\(null\)/)
-  assert.match(shell, /beforeRestoreRouteRef,\s*\}\)/)
+  assert.match(shell, /beforeRestoreRouteRef,\s*navigationStorage:[\s\S]*?routePath:[\s\S]*?\}\)/)
   assert.match(
     navigationSource,
     /if \(itemRoute\) \{\s*beforeRestoreRouteRef\?\.current\?\.\(itemRoute\)\s*applyModeDestination\(itemRoute\)/,

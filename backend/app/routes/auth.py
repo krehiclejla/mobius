@@ -42,7 +42,7 @@ from app.deps import (
   get_owner_app_or_chat_embed_for_models,
   get_owner_or_delegated_owner_for_app_token, reject_cross_site,
   require_chat_embed_operation,
-  require_nondelegated_owner_control,
+  require_installation_owner_control,
 )
 from app.timeutil import now_naive_utc
 from app.routes.shell_install_pass import router as shell_install_pass_router
@@ -559,6 +559,7 @@ def create_app_token_endpoint(
     app_nonce=app.token_nonce,
     delegation_id=delegation_id,
     delegation_chat=delegation_chat,
+    browser=principal.browser,
   )
   return {"token": token}
 
@@ -642,7 +643,7 @@ def set_model_connection_enabled(
   principal: Principal = Depends(get_principal),
 ):
   from app.providers import update_agent_settings
-  require_nondelegated_owner_control(principal)
+  require_installation_owner_control(principal)
   _app_model_connection(provider_id, principal)
   data_dir = get_settings().data_dir
   if not update_agent_settings(data_dir, lambda current: {

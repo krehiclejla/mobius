@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../../api/client.js'
 import { notificationQueries } from '../../hooks/queries.js'
+import useSessionNotices from './useSessionNotices.js'
 
 // Owns the small amount of state behind the shell notification preview. Keeping
 // this out of Shell is deliberate: notifications can grow into an app later
@@ -13,9 +14,10 @@ export default function useNotificationCenter(queryClient) {
   openRef.current = open
 
   const unreadQuery = notificationQueries.unreadCount.useQuery()
-  const unreadCount = unreadQuery.data ?? 0
   const newQuery = notificationQueries.newCount.useQuery()
-  const newCount = newQuery.data ?? 0
+  const session = useSessionNotices(open)
+  const unreadCount = (unreadQuery.data ?? 0) + session.unreadCount
+  const newCount = (newQuery.data ?? 0) + session.newCount
 
   const acknowledgeNew = useCallback(async () => {
     await queryClient.cancelQueries({ queryKey: notificationQueries.newCount.key })
@@ -28,38 +30,51 @@ export default function useNotificationCenter(queryClient) {
   }, [queryClient])
 
   const markAllRead = useCallback(async () => {
+    const noticeIds = session.rows.map(row => row.id)
     await api.notifications.readAll()
+    session.markRead(noticeIds)
     await Promise.all([
       notificationQueries.list.invalidate(queryClient),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient])
+  }, [queryClient, session.markRead, session.rows])
 
   const markRead = useCallback(async (notificationId) => {
+    if (session.rows.some(row => row.id === notificationId)) {
+      session.markRead([notificationId])
+      return
+    }
     await api.notifications.read(notificationId)
     await Promise.all([
       notificationQueries.list.invalidate(queryClient),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient])
+  }, [queryClient, session.markRead, session.rows])
 
   const clearAll = useCallback(async () => {
+    // Arrivals during the remote sweep belong to the next history.
+    const noticeIds = session.rows.map(row => row.id)
     await api.notifications.clearAll()
+    session.clearAll(noticeIds)
     await Promise.all([
       queryClient.resetQueries({ queryKey: notificationQueries.list.key }),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient])
+  }, [session.clearAll, session.rows, queryClient])
 
   const dismiss = useCallback(async (notificationId) => {
+    if (session.rows.some(row => row.id === notificationId)) {
+      session.dismiss(notificationId)
+      return
+    }
     await api.notifications.dismiss(notificationId)
     await queryClient.resetQueries({ queryKey: notificationQueries.list.key })
     notificationQueries.unreadCount.invalidate(queryClient)
     notificationQueries.newCount.invalidate(queryClient)
-  }, [queryClient])
+  }, [session.dismiss, queryClient, session.rows])
 
   useEffect(() => {
     if (!open) return undefined
@@ -97,8 +112,8 @@ export default function useNotificationCenter(queryClient) {
   }, [acknowledgeNew, queryClient])
 
   return {
-    state: { open, unreadCount, newCount },
-    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
+    state: { open, unreadCount, newCount, sessionNotices: session.rows, announcement: session.announcement },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated, addNotice: session.addNotice, runNoticeAction: session.runAction },
     meta: { rootRef, bellRef },
   }
 }

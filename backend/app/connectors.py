@@ -218,17 +218,28 @@ def _broker_fernet() -> Fernet:
   return Fernet(key)
 
 
-def mint_broker_capability(connector_id: int, capability_id: str) -> str:
+def mint_broker_capability(
+  connector_id: int, capability_id: str, *,
+  owner_id: int | None = None, owner_epoch: int | None = None,
+  browser_grant_id: str | None = None,
+) -> str:
   """Mint one short-lived, connector-scoped credential for a provider turn."""
   if not isinstance(capability_id, str) or len(capability_id) < 32:
     raise ConnectorError("The MCP connection has no broker identity.")
-  payload = json.dumps(
-    {
-      "connector_id": connector_id,
-      "capability_id": capability_id,
-    },
-    separators=(",", ":"),
-  ).encode()
+  if (owner_id is None) != (owner_epoch is None):
+    raise ConnectorError("Incomplete broker owner lineage.")
+  if browser_grant_id is not None and owner_id is None:
+    raise ConnectorError("A browser broker capability needs an owner lineage.")
+  payload_dict = {"connector_id": connector_id, "capability_id": capability_id}
+  if owner_id is not None:
+    if type(owner_id) is not int or type(owner_epoch) is not int:
+      raise ConnectorError("Invalid broker owner lineage.")
+    payload_dict.update(owner_id=owner_id, owner_epoch=owner_epoch)
+  if browser_grant_id is not None:
+    if not isinstance(browser_grant_id, str) or not browser_grant_id:
+      raise ConnectorError("Invalid broker browser lineage.")
+    payload_dict.update(browser_grant_id=browser_grant_id)
+  payload = json.dumps(payload_dict, separators=(",", ":")).encode()
   return _broker_fernet().encrypt(payload).decode()
 
 
@@ -236,7 +247,8 @@ def verify_broker_capability(
   token: str,
   connector_id: int,
   capability_id: str,
-) -> None:
+  *, db=None,
+) -> dict:
   """Fail closed unless ``token`` is live and scoped to this connection."""
   try:
     payload = json.loads(
@@ -252,6 +264,34 @@ def verify_broker_capability(
     or payload.get("capability_id") != capability_id
   ):
     raise ConnectorError("The MCP broker capability is not valid for this connection.")
+  validate_broker_lineage(db, payload)
+  return payload
+
+
+def validate_broker_lineage(db, payload: dict) -> None:
+  """Recheck a bound capability's owner epoch and browser grant at broker use."""
+  has_owner = "owner_id" in payload or "owner_epoch" in payload
+  has_guest = "browser_grant_id" in payload or "browser_grant_epoch" in payload
+  if not has_owner and not has_guest:
+    return  # Previously issued owner capabilities remain valid for their TTL.
+  owner_id = payload.get("owner_id")
+  owner_epoch = payload.get("owner_epoch")
+  if (type(owner_id) is not int or type(owner_epoch) is not int
+      or owner_id <= 0 or owner_epoch < 0 or db is None):
+    raise ConnectorError("The MCP broker capability owner is unavailable.")
+  owner = db.get(models.Owner, owner_id)
+  if owner is None or owner.token_epoch != owner_epoch:
+    raise ConnectorError("The MCP broker capability owner is unavailable.")
+  if has_guest:
+    # Capabilities minted before the grant epoch retired also carry
+    # browser_grant_epoch; it is ignored (revocation is terminal).
+    from app.browser_access import BrowserLineage, is_live
+    try:
+      browser = BrowserLineage(payload.get("browser_grant_id"))
+    except ValueError as exc:
+      raise ConnectorError("The MCP broker browser grant is unavailable.") from exc
+    if not is_live(db, browser, owner_id):
+      raise ConnectorError("The MCP broker browser grant is unavailable.")
 
 
 # ── Pure naming/auth helpers ─────────────────────────────────────
@@ -765,15 +805,23 @@ def build_turn_plan(
   db,
   *,
   include_owner_connectors: bool,
+  owner_id: int | None,
+  owner_epoch: int | None,
+  browser_grant_id: str | None,
 ) -> ConnectorTurnPlan | None:
   """Snapshot allowed, enabled rows while ``db`` is still live.
 
-  The policy decision is a required argument so a new child-run caller cannot
-  accidentally inherit the owner's remote services. A future delegated grant
-  can opt in at the call site that owns that policy.
+  The policy and physical-run lineage are required arguments so a new caller
+  cannot accidentally mint an unbound broker token. A future delegated grant
+  can opt in only at the call site that owns that policy.
   """
   if db is None or not include_owner_connectors:
     return None
+  if owner_id is not None or browser_grant_id is not None:
+    validate_broker_lineage(db, {
+      "owner_id": owner_id, "owner_epoch": owner_epoch,
+      **({"browser_grant_id": browser_grant_id} if browser_grant_id is not None else {}),
+    })
   rows = (
     db.query(models.Connector)
     .filter(
@@ -790,7 +838,11 @@ def build_turn_plan(
     try:
       server_key = f"mobius_connector_{row.id}_{slugify(row.slug)}"
       broker_url = _broker_url(row.id)
-      capability = mint_broker_capability(row.id, row.capability_id)
+      capability = mint_broker_capability(
+        row.id, row.capability_id,
+        owner_id=owner_id, owner_epoch=owner_epoch,
+        browser_grant_id=browser_grant_id,
+      )
       env_var = f"MOBIUS_CONNECTOR_CAPABILITY_{row.id}_{slugify(row.slug).upper()}"
 
       claude_servers[server_key] = {

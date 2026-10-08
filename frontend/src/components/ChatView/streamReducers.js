@@ -262,8 +262,17 @@ export function replaceTextItem(prev, content, {
       }
       break
     }
-    updated[trailingIdx] = { ...trailing, content }
-    return updated
+    // A final-only envelope may have no preceding delta or boundary. Distinct
+    // known identities are separate items; retain the legacy trailing repair
+    // only when one side lacks identity, adopting the final's id if available.
+    if (!(textItemId && trailing.text_item_id && trailing.text_item_id !== textItemId)) {
+      updated[trailingIdx] = {
+        ...trailing,
+        content,
+        ...(textItemId ? { text_item_id: textItemId } : {}),
+      }
+      return updated
+    }
   }
   // Provider item ids are best-effort. Codex request_user_input has been
   // observed to interrupt after a prefix and then complete that SAME message

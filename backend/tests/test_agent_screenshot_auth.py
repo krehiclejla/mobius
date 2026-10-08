@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -96,6 +97,16 @@ def _fake_browser(tmp_path: Path) -> tuple[Path, Path]:
     "fi\n"
     "case \"$1\" in\n"
     "  open)\n"
+    "    if [ \"${FAKE_SINGLETON_LOCK_ALWAYS:-0}\" = 1 ]; then\n"
+    "      echo 'Failed to create a ProcessSingleton for your profile directory' >&2\n"
+    "      exit 1\n"
+    "    fi\n"
+    "    if [ \"${FAKE_SINGLETON_LOCK_ONCE:-0}\" = 1 ] "
+    "&& [ ! -e \"$FAKE_SINGLETON_LOCK_MARKER\" ]; then\n"
+    "      : > \"$FAKE_SINGLETON_LOCK_MARKER\"\n"
+    "      echo 'Failed to create a ProcessSingleton for your profile directory' >&2\n"
+    "      exit 1\n"
+    "    fi\n"
     "    if [ \"${FAKE_BOOTSTRAP_INTERCEPT_ONCE:-0}\" = 1 ] "
     "&& [ \"$2\" = http://mobius.test/api/browser-bootstrap ] "
     "&& [ ! -e \"$FAKE_BOOTSTRAP_INTERCEPT_MARKER\" ]; then\n"
@@ -196,6 +207,8 @@ def _run_helper(
   profile_locked: bool = False,
   subprocess_timeout: float | None = None,
   profile_lock_target: str | None = None,
+  singleton_lock_once: bool = False,
+  singleton_lock_always: bool = False,
   profile_lock_artifacts: tuple[str, ...] = (
     "SingletonLock", "SingletonCookie", "SingletonSocket",
   ),
@@ -226,6 +239,9 @@ def _run_helper(
     fake_png_width = fake_png_height = 1
   env = {
     **os.environ,
+    "CHAT_ID": "",
+    "AGENT_BROWSER_CONFIG": "",
+    "BASH_ENV": "",
     "PATH": f"{tmp_path}:{os.environ['PATH']}",
     "TMPDIR": str(tmp_path),
     "AGENT_TOKEN": "test-token",
@@ -267,6 +283,9 @@ def _run_helper(
     "FAKE_BOOTSTRAP_INTERCEPT_ONCE": "1" if bootstrap_intercept_once else "0",
     "FAKE_BOOTSTRAP_INTERCEPT_MARKER": str(tmp_path / "bootstrap-intercepted"),
     "FAKE_PUBLIC_APP": "true" if public_app else "false",
+    "FAKE_SINGLETON_LOCK_ONCE": "1" if singleton_lock_once else "0",
+    "FAKE_SINGLETON_LOCK_ALWAYS": "1" if singleton_lock_always else "0",
+    "FAKE_SINGLETON_LOCK_MARKER": str(tmp_path / "singleton-lock-once"),
   }
   args = ["bash", str(script)]
   if content_only:
@@ -318,7 +337,7 @@ def test_stale_foreign_container_profile_lock_is_repaired_before_launch(tmp_path
   )
 
 
-def test_live_local_profile_lock_is_preserved(tmp_path: Path):
+def test_recycled_local_profile_lock_pid_is_cleared(tmp_path: Path):
   profile = tmp_path / "browser-profile"
   result, output, marker, _ = _run_helper(
     tmp_path,
@@ -329,10 +348,75 @@ def test_live_local_profile_lock_is_preserved(tmp_path: Path):
   assert result.returncode == 0, result.stderr
   assert output.exists()
   assert marker.exists()
-  assert all(
+  assert not any(
     (profile / artifact).is_symlink()
     for artifact in ("SingletonLock", "SingletonCookie", "SingletonSocket")
   )
+
+
+def test_live_local_chromium_profile_lock_is_preserved(tmp_path: Path):
+  profile = tmp_path / "browser-profile"
+  owner = subprocess.Popen(
+    ["bash", "-c", "exec -a chrome python3 -c 'import time; time.sleep(30)' "
+     '"--user-data-dir=$1"', "bash", str(profile)],
+  )
+  try:
+    # Wait for exec to replace bash so the lock target names the live browser.
+    for _ in range(100):
+      if (Path("/proc") / str(owner.pid) / "cmdline").read_bytes().startswith(b"chrome\0"):
+        break
+      time.sleep(0.01)
+    result, output, marker, _ = _run_helper(
+      tmp_path, auth_ok=True,
+      profile_lock_target=f"{socket.gethostname()}-{owner.pid}",
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.exists() and marker.exists()
+    assert all((profile / artifact).is_symlink() for artifact in (
+      "SingletonLock", "SingletonCookie", "SingletonSocket",
+    ))
+  finally:
+    owner.terminate()
+    owner.wait(timeout=5)
+
+
+def test_singleton_contention_resets_exact_profile_once_then_verifies_capture(tmp_path: Path):
+  result, output, marker, browser_log = _run_helper(
+    tmp_path, auth_ok=True, singleton_lock_once=True, record_resets=True,
+    route="/shell/?app=42",
+  )
+
+  assert result.returncode == 0, result.stderr
+  assert output.exists() and marker.exists()
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 1
+  commands = browser_log.read_text().splitlines()
+  assert sum("open http://mobius.test/api/browser-bootstrap" in c for c in commands) >= 2
+  assert any(c.startswith("wait --fn ") and 'iframe[data-app-id="42"]' in c for c in commands)
+
+
+def test_repeated_singleton_contention_fails_after_one_reset(tmp_path: Path):
+  result, output, marker, _ = _run_helper(
+    tmp_path, auth_ok=True, singleton_lock_always=True, record_resets=True,
+  )
+  assert result.returncode != 0
+  assert "contention persisted after one isolated reset" in result.stderr
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 1
+  assert not output.exists() and not marker.exists()
+
+
+def test_unreadable_profile_owner_state_does_not_authorize_lock_removal(monkeypatch):
+  # Execute the embedded ownership probe, forcing the OS permission boundary;
+  # root-hosted tests cannot reproduce EACCES merely by chmod'ing a fixture.
+  probe = SCRIPT.read_text().split("<<'PYOWNER'\n", 1)[1].split("\nPYOWNER", 1)[0]
+
+  def unreadable(_path):
+    raise PermissionError("cannot inspect process")
+
+  monkeypatch.setattr(Path, "read_bytes", unreadable)
+  monkeypatch.setattr(sys, "argv", ["-", "123", "/tmp/profile"])
+  with pytest.raises(SystemExit) as stopped:
+    exec(compile(probe, str(SCRIPT), "exec"), {})
+  assert stopped.value.code == 0  # retain the lock when ownership is unknown
 
 
 def test_unfamiliar_profile_lock_is_preserved(tmp_path: Path):
@@ -1036,7 +1120,7 @@ def test_content_mode_suppresses_modals_without_dom_surgery():
   standalone = STANDALONE.read_text(encoding="utf-8")
 
   assert "querySelectorAll('.wt__overlay, #install-backdrop')" not in helper
-  assert "const showWalkthrough = !visualContentOnly" in shell
+  assert "const showWalkthrough = !isSharedBrowserAccess && !visualContentOnly" in shell
   assert "!visualContentOnly && (" in standalone
 
 

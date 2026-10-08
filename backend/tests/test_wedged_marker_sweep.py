@@ -7,6 +7,9 @@ reap ONLY a definitively-finished turn — never a live turn, and never the
 is_alive-false terminal window where `_complete_turn` is still finalizing (that
 window is distinguished by a still-running broadcast).
 """
+from sqlalchemy.orm import object_session
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -34,7 +37,7 @@ def _seed(chat_id, *, age_secs=200, pending=None,
     started = datetime.now(UTC).replace(tzinfo=None) - timedelta(
       seconds=age_secs
     )
-    c = models.Chat(
+    c = create_chat(
       id=chat_id, title="t", messages=messages or [],
       live_assistant=live_assistant, pending_messages=pending or [],
       session_id="sess", provider="claude",
@@ -70,7 +73,7 @@ def _state(chat_id):
         else None
       ),
       list(c.pending_messages or []),
-      list(c.messages or []),
+      list(transcript_rows.history(c)),
       c.live_assistant,
     )
   finally:
@@ -198,7 +201,7 @@ def test_wedged_candidate_query_does_not_load_transcripts():
   db = SessionLocal()
   try:
     chat = db.get(models.Chat, "wedged-projection")
-    chat.messages = [{"role": "assistant", "content": "x" * 1_000_000}]
+    transcript_rows.replace_all(object_session(chat), chat, [{"role": "assistant", "content": "x" * 1_000_000}])
     db.commit()
   finally:
     db.close()
@@ -296,40 +299,3 @@ def test_sweep_never_tears_down_a_live_runner_however_quiet(runner):
   assert "quiet-live" not in swept
   assert (handle.stop_calls, handle.force_calls) == (0, 0)
   assert _state("quiet-live")[0] == "running"
-
-
-def test_limit_error_text_classifier():
-  f = chat_mod._is_limit_error_text
-  assert f("Error: rate limit exceeded")
-  assert f("usage limit reached, resets at ...")
-  assert f("HTTP 429 Too Many Requests")
-  assert f("model overloaded, try again")
-  assert f("quota exceeded")
-  assert not f("some ordinary failure")
-  assert not f("connection reset by peer")
-  assert not f(None)
-  assert not f("")
-
-
-def test_limit_classifier_matches_real_prod_strings():
-  # The actual Anthropic limit strings seen in prod chat.log — bug C is
-  # pointless if these don't classify (they lack the bare "rate limit" marker).
-  f = chat_mod._is_limit_error_text
-  assert f("You've hit your weekly limit · resets Jul 4, 3am (UTC)")
-  assert f("You've hit your session limit · resets 2:20am (UTC)")
-  assert f(
-    "API Error: Server is temporarily limiting requests "
-    "(not your usage limit) · Rate limited"
-  )
-  # A generic error that merely mentions "limit" but isn't a rate/usage kill
-  # must NOT park (no reset window, no rate/usage/weekly/session marker).
-  assert not f("ValueError: list index out of range (limit check)")
-  assert not f("Execution interrupted.")
-
-
-def test_limit_terminal_classifier_uses_api_error_status():
-  f = chat_mod._is_limit_terminal
-  assert f({"api_error_status": 429, "error": None})
-  assert f({"api_error_status": None, "error": "rate limit hit"})
-  assert not f({"api_error_status": 200, "error": "some other error"})
-  assert not f({"error": None})
