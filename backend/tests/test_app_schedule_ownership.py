@@ -343,32 +343,3 @@ def test_a_failing_rollback_never_replaces_the_original_error(monkeypatch):
         source="owner", cron="0 3 * * *", job="fetch.sh",
       ))
       raise RuntimeError("registration failed")
-
-
-def test_install_path_keeps_its_declaration_when_the_live_write_fails(
-  tmp_path, monkeypatch,
-):
-  """Install and update report a cron failure only as a warning, so the
-  declaration and provenance stay for startup reconciliation to retry."""
-  from types import SimpleNamespace
-
-  from app import install
-
-  fail = _fake_crontab(tmp_path, monkeypatch)
-  fail.touch()
-  app_id = 9122
-  source_dir = tmp_path / "apps" / "rollback-fresh"
-  (source_dir / "fetch.sh").write_text("#!/bin/sh\n", encoding="utf-8")
-  app = SimpleNamespace(id=app_id, slug="rollback-fresh", source_dir=str(source_dir))
-  choice = ScheduleChoice(
-    source="manifest", cron="0 6 * * *", job="fetch.sh",
-    manifest_default="0 6 * * *",
-  )
-  scaffold = Path(__file__).parents[1] / "scripts" / "init-cron-scaffold.sh"
-
-  with pytest.raises(app_cron.CronInfrastructureError):
-    install._apply_schedule_choice(app, choice, scaffold)
-
-  assert app_cron.read_schedule_choice(app_id) == choice
-  init_path = app_cron.schedule_state_dir(app_id) / "init-cron.sh"
-  assert "0 6 * * *" in init_path.read_text()

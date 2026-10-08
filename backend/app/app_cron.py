@@ -116,15 +116,6 @@ def schedule_choice_rollback(app_id: int):
   apply that time. Both files are therefore restored to their prior state:
   the recorded choice and the durable declaration, deleted if absent before.
 
-  Use this only where a failure is reported to the actor as "not saved" (the
-  owner schedule route). Install and update keep the declaration-first retry
-  contract of ``register_cron``: their failure is a warning, and startup
-  reconciliation must still find the declaration.
-
-  If the live crontab was already written when a later step fails, the
-  restored declaration and the live entry disagree until the next startup
-  reconciliation replaces the live entry.
-
   A failure of the rollback itself is logged and never replaces the original
   error.
   """
@@ -210,9 +201,7 @@ def register_cron(
   The scaffold atomically records the complete durable declaration before it
   installs the live crontab entry. A failed durable write therefore cannot
   change live behavior, while a later live-write failure leaves a declaration
-  that startup reconciliation can retry safely. The owner schedule route is
-  the one caller that undoes this (``schedule_choice_rollback``), because it
-  reports the save as failed.
+  that startup reconciliation can retry safely.
 
   ``app_id`` is passed to the common job runner as the target application.
   ``timezone`` and ``zone_cron`` form one inseparable wall-clock identity: the
