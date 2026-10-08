@@ -3143,29 +3143,26 @@ def _apply_schedule_choice(
   """Record who chose the schedule, then register it.
 
   Provenance is written first so a failed or interrupted registration can
-  never leave a declaration whose origin a later update must guess, and the
-  rollback restores provenance and the durable declaration when registration
-  fails, so neither describes a schedule that was never saved.
+  never leave a declaration whose origin a later update must guess.
   """
   from app import cron_tz
 
-  with app_cron.schedule_choice_rollback(app.id):
-    app_cron.record_schedule_choice(app.id, choice)
-    job_path = Path(app.source_dir) / choice.job
-    if choice.timezone is None:
-      app_cron.register_cron(
-        app.slug, choice.cron, job_path, app.id, scaffold=scaffold,
-      )
-      return
+  app_cron.record_schedule_choice(app.id, choice)
+  job_path = Path(app.source_dir) / choice.job
+  if choice.timezone is None:
     app_cron.register_cron(
-      app.slug,
-      cron_tz.materialize_zone_cron(choice.cron, choice.timezone),
-      job_path,
-      app.id,
-      timezone=choice.timezone,
-      zone_cron=choice.cron,
-      scaffold=scaffold,
+      app.slug, choice.cron, job_path, app.id, scaffold=scaffold,
     )
+    return
+  app_cron.register_cron(
+    app.slug,
+    cron_tz.materialize_zone_cron(choice.cron, choice.timezone),
+    job_path,
+    app.id,
+    timezone=choice.timezone,
+    zone_cron=choice.cron,
+    scaffold=scaffold,
+  )
 
 
 async def converge_manifest_schedule_zones(
@@ -3190,10 +3187,14 @@ async def converge_manifest_schedule_zones(
         zone = _manifest_default_timezone(choice.cron, owner_zone)
         if zone == choice.timezone:
           continue
-        await asyncio.to_thread(
-          _apply_schedule_choice,
-          app, dataclasses.replace(choice, timezone=zone), scaffold,
-        )
+        try:
+          await asyncio.to_thread(
+            _apply_schedule_choice,
+            app, dataclasses.replace(choice, timezone=zone), scaffold,
+          )
+        except Exception:
+          app_cron.record_schedule_choice(app.id, choice)
+          raise
     except Exception:
       log.exception("schedule zone: app %s could not be moved", app.id)
 
