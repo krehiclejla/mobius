@@ -229,3 +229,36 @@ def test_ancestry_does_not_attach_older_helper_to_recycled_parent_pid(tmp_path):
   scan = RESET.scan_browser_processes(chat_id="a", proc_root=tmp_path)
   assert scan.complete
   assert _pids(scan) == [100, 103, 104]
+
+
+
+def _write_browser(proc_root, pid, *, pss_kb, exe="/opt/chrome", **process):
+  """A process as Chrome leaves it: real executable, possibly rewritten argv."""
+  _write_process(proc_root, pid, **process)
+  (proc_root / str(pid) / "exe").symlink_to(exe)
+  (proc_root / str(pid) / "smaps_rollup").write_text(
+    f"Rss:  {pss_kb * 2} kB\nPss:  {pss_kb} kB\n")
+
+
+def test_browser_memory_counts_helpers_chrome_renamed_and_untagged(tmp_path):
+  # Chrome collapses a helper's argv into one string and drops CHAT_ID; the
+  # renderer still belongs to the chat through zygote -> tagged root.
+  _write_browser(tmp_path, 100, pss_kb=100, args=("/opt/chrome",),
+                 environment={"CHAT_ID": "a"})
+  _write_browser(tmp_path, 101, pss_kb=10, ppid=100,
+                 args=("/opt/chrome --type=zygote --user-data-dir=/p/chat-a",))
+  _write_browser(tmp_path, 102, pss_kb=2_000_000, ppid=101,
+                 args=("/opt/chrome --type=renderer",))
+  # A named session belongs to no chat, and a non-browser is never counted.
+  _write_browser(tmp_path, 200, pss_kb=9000, args=("/opt/chrome",))
+  _write_browser(tmp_path, 300, pss_kb=9000, exe="/usr/bin/python3",
+                 environment={"CHAT_ID": "a"})
+  assert RESET.browser_memory_by_chat(proc_root=tmp_path) == {
+    "a": 2_000_110 * 1024}
+
+
+def test_browser_memory_ancestry_skips_recycled_parent_pid(tmp_path):
+  _write_browser(tmp_path, 100, pss_kb=10, start_ticks=50,
+                 environment={"CHAT_ID": "a"})
+  _write_browser(tmp_path, 101, pss_kb=5000, ppid=100, start_ticks=20)
+  assert RESET.browser_memory_by_chat(proc_root=tmp_path) == {"a": 10 * 1024}

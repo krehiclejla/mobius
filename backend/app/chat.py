@@ -3600,19 +3600,74 @@ async def _close_turn_browser(chat_id: str, run_gen: int | None) -> None:
       and not registry.is_alive(chat_id)
     )
     if owns or stopped:
-      # Shield and JOIN cleanup on cancellation: releasing the gate while a
-      # worker thread still sends signals would endanger the successor.
-      task = asyncio.create_task(_close_browser_session(chat_id))
+      await _join_browser_close(chat_id)
+
+
+async def _join_browser_close(chat_id: str) -> None:
+  """Run browser teardown to completion; call only under the lifecycle lock.
+
+  Shield and JOIN cleanup on cancellation: releasing the gate while a worker
+  thread still sends signals would endanger the successor.
+  """
+  task = asyncio.create_task(_close_browser_session(chat_id))
+  try:
+    await asyncio.shield(task)
+  except asyncio.CancelledError:
+    while not task.done():
       try:
         await asyncio.shield(task)
       except asyncio.CancelledError:
-        while not task.done():
-          try:
-            await asyncio.shield(task)
-          except asyncio.CancelledError:
-            continue
-        task.result()
-        raise
+        continue
+    task.result()
+    raise
+
+
+async def reap_unowned_browsers(*, memory_budget_bytes: int | None) -> dict:
+  """Close agent browsers no live turn owns, then hold chat browsers to a budget.
+
+  Turn teardown is the normal close path, but it never runs for a turn whose
+  server process died (an OOM kill or restart): its Chrome keeps running in
+  the container with no owner and can hold memory at the limit across server
+  restarts. This sweep closes such browsers through the same teardown, under
+  the same per-chat lifecycle lock an incoming turn crosses before it starts.
+  If the remaining chat browsers still exceed the budget, the largest are
+  closed even while their turn runs: a failed browser step is recoverable,
+  the container OOM-killing the server is not.
+  """
+  log = _get_logger()
+  usage = await asyncio.to_thread(browser_processes.browser_memory_by_chat)
+  orphans: dict[str, int] = {}
+  for chat_id, size in usage.items():
+    if registry.is_alive(chat_id):
+      continue
+    async with _browser_lifecycle_lock(chat_id):
+      if registry.is_alive(chat_id):
+        continue
+      await _join_browser_close(chat_id)
+    orphans[chat_id] = size
+    log.warning(
+      "agent-browser orphan closed chat_id=%s bytes=%d", chat_id, size,
+    )
+
+  remaining = {c: b for c, b in usage.items() if c not in orphans}
+  total = sum(remaining.values())
+  guarded: dict[str, int] = {}
+  if memory_budget_bytes and total > memory_budget_bytes:
+    for chat_id, size in sorted(
+      remaining.items(), key=lambda item: item[1], reverse=True,
+    ):
+      if total <= memory_budget_bytes:
+        break
+      async with _browser_lifecycle_lock(chat_id):
+        await _join_browser_close(chat_id)
+      log.warning(
+        "agent-browser memory guard closed chat_id=%s bytes=%d "
+        "total=%d budget=%d",
+        chat_id, size, total, memory_budget_bytes,
+      )
+      total -= size
+      guarded[chat_id] = size
+  return {"orphans_closed": orphans, "guard_closed": guarded}
 
 
 async def _terminal_setup_error_cleanup(

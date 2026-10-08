@@ -168,6 +168,58 @@ def scan_browser_processes(*, chat_id: str | None = None,
                             tuple(records[pid][0] for pid in ordered))
 
 
+def _pss_bytes(pid: int, proc_root: Path = PROC_ROOT) -> int:
+  """Proportional set size, so pages Chrome processes share count once."""
+  try:
+    for line in (proc_root / str(pid) / 'smaps_rollup').read_text().splitlines():
+      if line.startswith('Pss:'):
+        return int(line.split()[1]) * 1024
+  except (OSError, IndexError, ValueError):
+    pass
+  return 0
+
+
+def browser_memory_by_chat(*, proc_root: Path = PROC_ROOT) -> dict[str, int]:
+  """Live agent-browser memory per launching chat.
+
+  Processes are recognised by executable, not argv: Chrome rewrites its
+  helpers' command lines into one string, and those helpers (renderers, GPU)
+  hold most of the memory. They also lack the inherited CHAT_ID, so each
+  process belongs to the CHAT_ID of its nearest tagged browser ancestor.
+  Browsers no chat owns (named sessions) are not reported. This only sizes
+  and nominates; the exact-owner reset re-scans before any signal is sent.
+  """
+  try:
+    entries = [entry for entry in proc_root.iterdir() if entry.name.isdigit()]
+  except OSError:
+    return {}
+  records: dict[int, tuple[int, int, str | None]] = {}
+  for entry in entries:
+    try:
+      if Path(os.readlink(entry / 'exe')).name not in DAEMONS | BROWSERS:
+        continue
+      parent, ticks = _process_state(int(entry.name), proc_root)
+      owner = next((raw[len(b'CHAT_ID='):].decode('utf-8', errors='surrogateescape')
+                    for raw in (entry / 'environ').read_bytes().split(b'\0')
+                    if raw.startswith(b'CHAT_ID=')), None) or None
+    except (OSError, ValueError, IndexError):
+      continue
+    records[int(entry.name)] = (parent, ticks, owner)
+  usage: dict[str, int] = {}
+  for pid, (parent, ticks, owner) in records.items():
+    seen = {pid}
+    while owner is None and parent in records and parent not in seen:
+      seen.add(parent)
+      grandparent, parent_ticks, parent_owner = records[parent]
+      # Same recycled-PID guard as scan_browser_processes.
+      if parent_ticks > ticks:
+        break
+      owner, parent, ticks = parent_owner, grandparent, parent_ticks
+    if owner is not None:
+      usage[owner] = usage.get(owner, 0) + _pss_bytes(pid, proc_root)
+  return usage
+
+
 def terminate_processes(processes: tuple[ProcessIdentity, ...], *,
                         wait_seconds: float = 1.0,
                         proc_root: Path = PROC_ROOT) -> None:
