@@ -477,10 +477,7 @@ def codex_turn_thread_config(
       name for name in control.get("env_vars", [])
       if not is_per_turn_env(name)
     ]
-    # Extend, never replace: the control config's own fixed switches (such as
-    # MOBIUS_IMAGE_VIEWER) must survive the per-turn identity.
     control["env"] = {
-      **(control.get("env") or {}),
       CALLER_ENV_FILE_ENV: str(env_file.path),
       "MOBIUS_RUN_MARKER": turn_env.get("MOBIUS_RUN_MARKER", ""),
     }

@@ -605,6 +605,28 @@ export function attachGeneratedFile(prev, event) {
   return updated
 }
 
+const VIEWED_SNAPSHOT_NAME = /^viewed-[a-f0-9]{64}\.(?:png|jpg|gif|webp)$/
+
+/**
+ * Applies a `viewed_image` event: the chat snapshot of exactly the image a
+ * finished ViewImage sent to the model. Codex records that image only after
+ * the view completes, so the runner binds it when the turn ends. Exact id
+ * only, so a snapshot can never land on a different view; idempotent under
+ * catch-up replay.
+ */
+export function attachViewedImage(prev, event) {
+  const name = event?.viewed_image_media
+  const toolUseId = event?.tool_use_id
+  if (!toolUseId || typeof name !== 'string' || !VIEWED_SNAPSHOT_NAME.test(name)) return prev
+  const i = prev.findLastIndex(
+    it => it.type === 'tool' && it.tool === 'ViewImage' && it.tool_use_id === toolUseId,
+  )
+  if (i < 0 || prev[i].viewed_image_media === name) return prev
+  const updated = [...prev]
+  updated[i] = { ...prev[i], viewed_image_media: name }
+  return updated
+}
+
 /**
  * Applies a `tool_sources` event to the search block that produced it.
  * Sources are small metadata, so they stay inline on the tool item.

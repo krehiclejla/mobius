@@ -662,28 +662,8 @@ async def _record_collab_child_links(
     log.debug("codex collab child-link recording failed", exc_info=True)
 
 
-def _is_control_image_view(item: Any, sdk: dict[str, Any]) -> bool:
-  """Whether this item is the Möbius view_image call that replaces Codex's own."""
-  from app.platform_tools import CONTROL_SERVER_NAME, VIEW_IMAGE_TOOL_NAME
-  mcp_cls = sdk.get("McpToolCallThreadItem")
-  return (
-    mcp_cls is not None
-    and isinstance(item, mcp_cls)
-    and item.server == CONTROL_SERVER_NAME
-    and item.tool == VIEW_IMAGE_TOOL_NAME
-  )
-
-
 def _tool_start_event(item: Any, sdk: dict[str, Any]) -> dict[str, Any] | None:
   """Builds one Möbius `tool_start` event from a typed item."""
-  if _is_control_image_view(item, sdk):
-    arguments = _model_dump(item.arguments)
-    path = arguments.get("path") if isinstance(arguments, dict) else ""
-    return {
-      "type": "tool_start",
-      "tool": "ViewImage",
-      "input": _format_json(path if isinstance(path, str) else ""),
-    }
   image_view_cls = sdk.get("ImageViewThreadItem")
   if image_view_cls is not None and isinstance(item, image_view_cls):
     return {
@@ -828,13 +808,7 @@ def _tool_completed_events(
     failed = status == "failed" or bool(error)
     # A tool-level refusal arrives as a failed call with its explanation in
     # result.content, not a transport error. Keep that body even when failed.
-    result = getattr(item, "result", None)
-    if _is_control_image_view(item, sdk):
-      # The chat snapshot holds the picture; keep its base64 out of the
-      # stored transcript so a view is not saved twice.
-      from app.viewed_images import without_image_data
-      result = without_image_data(_model_dump(result))
-    content = error or _format_json(result)
+    content = error or _format_json(getattr(item, "result", None))
     return [
       {
         "type": "tool_output",

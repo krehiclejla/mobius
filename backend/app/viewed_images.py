@@ -1,27 +1,29 @@
-"""Chat-owned snapshots of the images an agent views.
+"""Chat-owned snapshots of the images a Codex agent views.
 
-A viewed path names a mutable file (often under the global ``/tmp``), so it
-cannot prove which bytes the provider saw. The image tool therefore reads the
-file once and returns the bytes to the provider as its result. When the call
-completes, the runner stores that very payload under the viewing chat's media
-as an immutable content-addressed snapshot, and the owner's preview serves it.
-
-Standard library only (Pillow is used when present): the control MCP server loads this file directly rather
-than importing the backend application.
+Codex's native image viewer reports only a path, and a path (often under the
+global ``/tmp``) is mutable and shared, so it cannot prove which bytes the
+model saw. Codex does record that proof: the view call's output, holding the
+exact image it sent to the model (after its own downscaling), is appended to
+the thread's rollout. That record is written after the view item completes and
+before the turn completes, so the runner binds a turn's views once the turn
+ends. It reads only the rollout lines this turn appended, stores each view's
+recorded image under the viewing chat's media as an immutable
+content-addressed snapshot, and the owner's preview serves that snapshot.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
+import glob
 import hashlib
+import json
 import os
 import re
-import stat
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Iterable
 
-MAX_VIEWED_IMAGE_BYTES = 20 * 1024 * 1024
-MAX_MODEL_EDGE = 2048
 _SIGNATURES = (
   (b"\x89PNG\r\n\x1a\n", "image/png"),
   (b"\xff\xd8\xff", "image/jpeg"),
@@ -30,10 +32,14 @@ _SIGNATURES = (
 )
 _EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
 SNAPSHOT_NAME = re.compile(r"^viewed-[0-9a-f]{64}\.(?:png|jpg|gif|webp)$")
+_THREAD_ID = re.compile(r"^[A-Za-z0-9-]{1,128}$")
+_DATA_URL = re.compile(r"^data:(image/[a-z]+);base64,")
+# Cheap pre-filter: only output records are parsed, never every turn line.
+_OUTPUT_MARKER = b'"function_call_output"'
 
 
 def image_type(data: bytes) -> str | None:
-  """The raster type the bytes really are, never the type the name claims."""
+  """The raster type the bytes really are, never the type a name claims."""
   for signature, mime in _SIGNATURES:
     if data.startswith(signature):
       return mime
@@ -48,61 +54,6 @@ def snapshot_name(data: bytes, mime: str) -> str:
 
 def chat_media_dir(data_dir: str | os.PathLike, chat_id: str) -> Path:
   return Path(data_dir) / "chats" / chat_id / "media"
-
-
-def _fit_for_model(data: bytes, mime: str) -> tuple[bytes, str]:
-  """Shrink an oversized raster the way Codex's own viewer does.
-
-  A long edge above ``MAX_MODEL_EDGE`` adds tokens and bytes the model cannot
-  use. Pillow is optional here; any failure keeps the original bytes, which
-  the size cap already bounds.
-  """
-  try:
-    import io
-    from PIL import Image
-    with Image.open(io.BytesIO(data)) as image:
-      if max(image.size) <= MAX_MODEL_EDGE:
-        return data, mime
-      image.thumbnail((MAX_MODEL_EDGE, MAX_MODEL_EDGE))
-      out = io.BytesIO()
-      if mime == "image/jpeg":
-        image.convert("RGB").save(out, "JPEG", quality=90)
-        return out.getvalue(), mime
-      image.save(out, "PNG")
-      return out.getvalue(), "image/png"
-  except Exception:
-    return data, mime
-
-
-def read_viewed_image(path: str) -> tuple[bytes, str]:
-  """Read one regular raster image in a single bounded read, or raise ValueError.
-
-  The descriptor is opened non-blocking and checked after opening, so a FIFO
-  or device path is refused instead of holding the worker.
-  """
-  if not isinstance(path, str) or not os.path.isabs(path):
-    raise ValueError("path must be an absolute file path")
-  try:
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
-  except OSError as exc:
-    raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from exc
-  try:
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-      raise ValueError(f"{path} is not a regular file")
-    with os.fdopen(fd, "rb") as handle:
-      fd = -1
-      data = handle.read(MAX_VIEWED_IMAGE_BYTES + 1)
-  except OSError as exc:
-    raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from exc
-  finally:
-    if fd >= 0:
-      os.close(fd)
-  if len(data) > MAX_VIEWED_IMAGE_BYTES:
-    raise ValueError("image is larger than 20 MB")
-  mime = image_type(data)
-  if mime is None:
-    raise ValueError(f"{path} is not a PNG, JPEG, GIF, or WebP image")
-  return _fit_for_model(data, mime)
 
 
 def store_snapshot(media_dir: Path, data: bytes, mime: str) -> str:
@@ -129,50 +80,120 @@ def store_snapshot(media_dir: Path, data: bytes, mime: str) -> str:
   return name
 
 
-def _payload_images(result: Any) -> list[dict]:
-  content = result.get("content") if isinstance(result, dict) else None
-  return [
-    block for block in content or ()
-    if isinstance(block, dict) and block.get("type") == "image"
+def rollout_path(codex_home: str | os.PathLike, thread_id: str) -> Path | None:
+  """Codex writes ``sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl``."""
+  if not isinstance(thread_id, str) or not _THREAD_ID.fullmatch(thread_id):
+    return None
+  matches = glob.glob(str(
+    Path(codex_home) / "sessions" / "*" / "*" / "*" / f"rollout-*-{thread_id}.jsonl"
+  ))
+  return Path(matches[0]) if len(matches) == 1 else None
+
+
+@dataclass(frozen=True)
+class TurnMark:
+  """Where one turn's records begin in its thread's rollout.
+
+  A thread's first turn may create the rollout, so a missing file marks the
+  start of the file it later becomes.
+  """
+  codex_home: str
+  thread_id: str
+  path: Path | None
+  offset: int
+
+  @classmethod
+  def capture(cls, codex_home: str | os.PathLike, thread_id: str) -> "TurnMark":
+    path = rollout_path(codex_home, thread_id)
+    offset = 0
+    if path is not None:
+      try:
+        offset = path.stat().st_size
+      except OSError:
+        path = None
+    return cls(str(codex_home), thread_id, path, offset)
+
+  def turn_records(self) -> Iterable[bytes]:
+    """The rollout lines appended since the mark, filtered to call outputs."""
+    path = self.path or rollout_path(self.codex_home, self.thread_id)
+    if path is None:
+      return
+    offset = self.offset if self.path is not None else 0
+    with open(path, "rb") as handle:
+      if os.fstat(handle.fileno()).st_size < offset:
+        return  # the file was replaced; its new lines cannot be attributed
+      handle.seek(offset)
+      for line in handle:
+        if line.endswith(b"\n") and _OUTPUT_MARKER in line:
+          yield line
+
+
+def _recorded_image(output: object) -> tuple[bytes, str] | None:
+  """The one image a view's recorded output carried to the model."""
+  if not isinstance(output, list):
+    return None
+  urls = [
+    part.get("image_url") for part in output
+    if isinstance(part, dict) and part.get("type") == "input_image"
   ]
-
-
-def snapshot_result(
-  data_dir: str | os.PathLike, chat_id: str, result: Any,
-) -> str:
-  """Store the image the provider received as this chat's snapshot; name it.
-
-  ``result`` is the tool's MCP result. The bytes are decoded and hashed once
-  from that payload, so the snapshot is exactly what the model saw, whatever
-  happens to the viewed path afterwards. Anything that is not one valid image
-  yields ``""`` and the view has no preview.
-  """
-  images = _payload_images(result)
-  if len(images) != 1:
-    return ""
+  if len(urls) != 1 or not isinstance(urls[0], str):
+    return None
+  header = _DATA_URL.match(urls[0])
+  if header is None:
+    return None
   try:
-    data = base64.b64decode(images[0].get("data") or "", validate=True)
-  except (ValueError, TypeError):
-    return ""
+    data = base64.b64decode(urls[0][header.end():], validate=True)
+  except (binascii.Error, ValueError):
+    return None
   mime = image_type(data)
-  if mime is None or mime != images[0].get("mimeType"):
-    return ""
-  try:
-    return store_snapshot(chat_media_dir(data_dir, chat_id), data, mime)
-  except OSError:
-    return ""
+  return (data, mime) if mime is not None and mime == header.group(1) else None
 
 
-def without_image_data(result: Any) -> Any:
-  """The result with each image's base64 replaced, for the stored transcript.
+def recorded_view_images(
+  mark: TurnMark, call_ids: Iterable[str],
+) -> dict[str, tuple[bytes, str]]:
+  """Each view's image exactly as this turn's rollout recorded it."""
+  wanted = set(call_ids)
+  found: dict[str, tuple[bytes, str]] = {}
+  for line in mark.turn_records():
+    try:
+      record = json.loads(line)
+    except ValueError:
+      continue
+    payload = record.get("payload") if isinstance(record, dict) else None
+    if (
+      record.get("type") != "response_item"
+      or not isinstance(payload, dict)
+      or payload.get("type") != "function_call_output"
+    ):
+      continue
+    call_id = payload.get("call_id")
+    if call_id in wanted and call_id not in found:
+      image = _recorded_image(payload.get("output"))
+      if image is not None:
+        found[call_id] = image
+    if len(found) == len(wanted):
+      break
+  return found
 
-  The snapshot already holds the bytes, so keeping them in the tool output
-  would store every view twice.
+
+def bind_turn_views(
+  data_dir: str | os.PathLike,
+  chat_id: str,
+  mark: TurnMark,
+  call_ids: Iterable[str],
+) -> dict[str, str]:
+  """Store this turn's viewed images as chat snapshots; name each by call.
+
+  A view whose recorded image is missing or invalid gets no snapshot and so
+  no served preview. Failing to read or write never fails the turn.
   """
-  if not _payload_images(result):
-    return result
-  return {**result, "content": [
-    {**block, "data": ""}
-    if isinstance(block, dict) and block.get("type") == "image" else block
-    for block in result["content"]
-  ]}
+  try:
+    images = recorded_view_images(mark, call_ids)
+    media = chat_media_dir(data_dir, chat_id)
+    return {
+      call_id: store_snapshot(media, data, mime)
+      for call_id, (data, mime) in images.items()
+    }
+  except OSError:
+    return {}

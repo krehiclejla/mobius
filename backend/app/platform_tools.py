@@ -33,10 +33,6 @@ SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 MESSAGE_AGENT_TOOL_NAME = "message_agent"
 STOP_AGENT_TOOL_NAME = "stop_agent"
 LIST_AGENTS_TOOL_NAME = "list_agents"
-# Codex's native image viewer is switched off in favor of this tool, which
-# binds each view to a chat-owned snapshot of the bytes the provider received
-# (app/viewed_images.py). Claude's Read result already carries those bytes.
-VIEW_IMAGE_TOOL_NAME = "view_image"
 # Möbius-owned helpers replace the providers' built-in helper tools for every
 # agent, including helpers themselves (nesting).
 HELPER_TOOL_NAMES = (
@@ -114,18 +110,6 @@ def expected_control_tool_names(
   return OWNER_CONTROL_TOOL_NAMES
 
 
-def codex_control_tool_names(
-  *, top_level: bool, coordination_enabled: bool = True,
-) -> tuple[str, ...]:
-  """The same tools plus view_image, which replaces Codex's native viewer."""
-  return (
-    *expected_control_tool_names(
-      top_level=top_level, coordination_enabled=coordination_enabled,
-    ),
-    VIEW_IMAGE_TOOL_NAME,
-  )
-
-
 def claude_control_servers(*, enabled: bool) -> dict[str, dict[str, Any]]:
   """Return Claude's stdio configuration for ordinary owner turns."""
   if not enabled:
@@ -162,7 +146,7 @@ def codex_turn_mcp_config(
     if isinstance(configured, dict):
       servers.update(configured)
   if control_enabled:
-    tool_names = codex_control_tool_names(
+    tool_names = expected_control_tool_names(
       top_level=top_level,
       coordination_enabled=coordination_enabled,
     )
@@ -180,8 +164,6 @@ def codex_turn_mcp_config(
         name: {"approval_mode": "approve"}
         for name in (*tool_names, *app_tool_names)
       },
-      # A fixed, non-secret switch: the server offers view_image only here.
-      "env": {"MOBIUS_IMAGE_VIEWER": "1"},
       # Codex intentionally starts stdio MCP children with a minimal
       # environment. Forward only the run-bound names this trusted local
       # control needs; unlike an `env` mapping, `env_vars` keeps their values

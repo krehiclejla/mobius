@@ -65,7 +65,6 @@ from app.codex_events import (
   _record_collab_child_links,
   _tool_start_event,
   _tool_completed_events,
-  _is_control_image_view,
   _enum_wire_value,
   _codex_user_error,
   _agent_message_phase,
@@ -164,11 +163,6 @@ def _codex_config_overrides() -> list[str]:
   overrides.append("tools.experimental_request_user_input.enabled=false")
   # One provider turn per Möbius admission; never enable a competing loop.
   overrides.append("features.goals=false")
-  # The native viewer reports only a path whose bytes can change after the
-  # read. Möbius's view_image owns the read instead (platform_tools.py).
-  # Codex 0.159 names this switch `features.view_image`; a `tools.view_image`
-  # key is ignored (`codex features list` shows the difference).
-  overrides.append("features.view_image=false")
   overrides += CODEX_NATIVE_HELPERS_OFF
   return overrides
 
@@ -1863,6 +1857,12 @@ async def _run_codex_sdk_turn(
         "session_id": current_session_id,
       })
 
+      # Codex records each view's model-bound image in the rollout after the
+      # view item completes; bind those views once the turn has completed.
+      view_mark = await asyncio.to_thread(
+        viewed_images.TurnMark.capture, env["CODEX_HOME"], current_session_id,
+      )
+      image_view_ids: list[str] = []
       turn = await thread.turn(
         user_message,
         cwd=cwd,
@@ -2119,22 +2119,13 @@ async def _run_codex_sdk_turn(
               deltas = command_output_deltas.pop(item_id, []) if item_id else []
               if deltas and not getattr(item, "aggregated_output", None):
                 streamed_command_output = "".join(deltas)
-            control_image = _is_control_image_view(item, sdk)
-            snapshot_name = ""
-            if control_image:
-              # Decode, hash and store the returned payload once. The preview
-              # is the chat snapshot of exactly what the provider received.
-              snapshot_name = await asyncio.to_thread(
-                viewed_images.snapshot_result,
-                runtime_data_dir, chat_id, _model_dump(getattr(item, "result", None)),
-              )
             for event in _tool_completed_events(
               item, sdk, streamed_command_output=streamed_command_output,
             ):
-              if control_image and event.get("type") == "tool_end":
-                event["viewed_image_media"] = snapshot_name
               image_view_cls = sdk.get("ImageViewThreadItem")
               if image_view_cls is not None and isinstance(item, image_view_cls):
+                if event.get("type") == "tool_end" and getattr(item, "id", None):
+                  image_view_ids.append(item.id)
                 # Bind the completed view to its bytes without retaining a
                 # copy. An empty value prevents later same-name substitution.
                 event["viewed_image_sha256"] = await asyncio.to_thread(
@@ -2241,6 +2232,17 @@ async def _run_codex_sdk_turn(
 
         if isinstance(payload, sdk["TurnCompletedNotification"]):
           completed_turn = payload.turn
+          if image_view_ids:
+            snapshots = await asyncio.to_thread(
+              viewed_images.bind_turn_views,
+              runtime_data_dir, chat_id, view_mark, image_view_ids,
+            )
+            for view_id, snapshot in snapshots.items():
+              bc.publish({
+                "type": "viewed_image",
+                "tool_use_id": view_id,
+                "viewed_image_media": snapshot,
+              })
           break
 
         if (
