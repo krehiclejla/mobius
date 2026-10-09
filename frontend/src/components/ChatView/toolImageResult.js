@@ -2,7 +2,7 @@
 
 const CHAT_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/(uploads|media)\/([^/]+)$/
 const GENERATED_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/deliverables\/inbox\/([^/]+)$/
-const VIEWED_SNAPSHOT_NAME = /^viewed-[a-f0-9]{64}\.(?:png|jpg|gif|webp)$/
+export const VIEWED_SNAPSHOT_NAME = /^viewed-[a-f0-9]{64}\.(?:png|jpg|gif|webp)$/
 const SCRATCH_IMAGE_PATH = /^\/data\/agent-scratch\/([^/]+)\/(.+)$/
 const INLINE_IMAGE_TYPES = new Set([
   'image/png',

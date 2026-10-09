@@ -33,6 +33,7 @@ import {
   enrichMessageSource,
 } from './messageSources.js'
 import { toolBlockFailed } from './toolResultFormat.js'
+import { VIEWED_SNAPSHOT_NAME } from './toolImageResult.js'
 
 // Tool names whose tool events describe an AskUserQuestion-style
 // call: Claude's AskUserQuestion and Codex's request_user_input.
@@ -613,8 +614,6 @@ export function attachGeneratedFile(prev, event) {
   updated[i] = { ...block, files: [...existing, entry] }
   return updated
 }
-
-const VIEWED_SNAPSHOT_NAME = /^viewed-[a-f0-9]{64}\.(?:png|jpg|gif|webp)$/
 
 /**
  * Applies a `viewed_image` event: the chat snapshot of exactly the image a
