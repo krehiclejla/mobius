@@ -1109,7 +1109,13 @@ def _park_pending_update(repo: Path, receipt: dict) -> list[str]:
       merge_base=override,
     )
   else:
-    merge = app_git.merge_upstream(repo)
+    try:
+      merge = app_git.merge_upstream(repo)
+    except app_git.GitTransferTimeout as exc:
+      raise install.git_source_error(
+        "The installed version was left unchanged.",
+        exc,
+      ) from exc
   if merge.status != "conflict" or not merge.conflict_paths:
     raise _conflict_state_changed()
   worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1621,8 +1627,10 @@ async def update_candidate_preview(
     except (
       OSError, subprocess.SubprocessError, RuntimeError, TypeError, ValueError,
     ) as exc:
-      raise HTTPException(
-        409, "This app does not have a usable Git update source.",
+      raise install.git_source_error(
+        "The installed version was left unchanged.",
+        exc,
+        failure="This app does not have a usable Git update source.",
       ) from exc
   upstream_diff = await asyncio.to_thread(
     _diff_preview_trees, previous_source, candidate.runtime_tree,
