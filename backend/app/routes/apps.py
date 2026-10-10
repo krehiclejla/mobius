@@ -31,6 +31,9 @@ from app import (
   icon_cache, models, project_git, providers, schemas,
   source_dirs, workspace_files,
 )
+from app.manifest_identity import (
+  requested_manifest_source, stored_manifest_fetch_url,
+)
 from app.app_identity import (
   reject_if_source_dir_taken as _reject_if_source_dir_taken,
   validate_source_dir as _validate_source_dir,
@@ -780,6 +783,7 @@ async def preview_app_install(
       manifest_url=body.manifest_url,
       manifest=body.manifest,
       raw_base=body.raw_base,
+      db=db,
     )
   )
   source = body.manifest_url if body.manifest_url is not None else raw_base
@@ -1326,6 +1330,15 @@ def _update_candidate_matches_installed(
   )
 
 
+def _update_manifest_source(
+  installed_manifest_url: str, manifest_url: str | None,
+) -> str:
+  """Use explicit discovery URLs unchanged, or fetch the stored identity."""
+  if manifest_url is not None:
+    return requested_manifest_source(manifest_url)[0]
+  return stored_manifest_fetch_url(installed_manifest_url)
+
+
 @router.get(
   "/{app_id}/update-check",
   response_model=schemas.UpdateCheckOut,
@@ -1383,6 +1396,7 @@ async def update_check(
   local_version = app.version
   target_app_id = app.id
   installed_manifest_url = app.manifest_url
+  installed_package_id = app.package_id
   source_dir = app.source_dir
   installed_source_revision = app.upstream_commit
   installed_contract = app.capability_contract
@@ -1462,10 +1476,8 @@ async def update_check(
   # A catalog-aware caller supplies the mutable discovery locator explicitly.
   # Direct/unlisted installs fall back to the stored canonical identity key,
   # whose raw manifest lives at <base>/mobius.json.
-  fetch_manifest_url = (
-    manifest_url
-    if manifest_url is not None
-    else install._canonical_base(installed_manifest_url) + "/mobius.json"
+  fetch_manifest_url = _update_manifest_source(
+    installed_manifest_url, manifest_url,
   )
   # This lock owns both FETCH_HEAD and the response's linearization point. A
   # concurrent install cannot advance ``upstream`` or create a receipt between
@@ -1476,6 +1488,10 @@ async def update_check(
       # The summary fetch enforces the same root-Git origin guard as install.
       candidate = await asyncio.to_thread(
         install.fetch_git_package_summary, repo, fetch_manifest_url,
+      )
+      install.validate_manifest_address(
+        candidate.manifest, manifest_url or installed_manifest_url,
+        package_id=installed_package_id,
       )
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,
@@ -1591,6 +1607,7 @@ async def update_candidate_preview(
 
   app = live_app_or_404(db, app_id)
   installed_manifest_url = app.manifest_url
+  installed_package_id = app.package_id
   source_dir = app.source_dir
   upstream_commit = app.upstream_commit
   installed_contract = app.capability_contract
@@ -1605,10 +1622,8 @@ async def update_candidate_preview(
   # Release the request session before upstream network I/O, matching the
   # update-check route's connection-pool discipline.
   db.close()
-  fetch_manifest_url = (
-    manifest_url
-    if manifest_url is not None
-    else install._canonical_base(installed_manifest_url) + "/mobius.json"
+  fetch_manifest_url = _update_manifest_source(
+    installed_manifest_url, manifest_url,
   )
   async with fs_locks.source_dir_lock(str(repo)):
     try:
@@ -1616,6 +1631,10 @@ async def update_candidate_preview(
         repo,
         fetch_manifest_url,
         strict=True,
+      )
+      install.validate_manifest_address(
+        candidate.manifest, manifest_url or installed_manifest_url,
+        package_id=installed_package_id,
       )
       if manifest_url is not None and not _update_candidate_matches_installed(
         installed_manifest_url, manifest_url, candidate.manifest,
@@ -2536,7 +2555,10 @@ async def update_app(
               ),
             },
           )
-      app.published_manifest_url = body.published_manifest_url or None
+      app.published_manifest_url = (
+        requested_manifest_source(body.published_manifest_url)[0]
+        if body.published_manifest_url else None
+      )
     if body.manage_skills is not None:
       # Downgrade-only: the owner can revoke skills authority here (effective
       # on the app's next request — the gate reads the live row), but a grant

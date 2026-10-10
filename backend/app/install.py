@@ -34,10 +34,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
@@ -59,8 +60,9 @@ from app import (
   models,
 )
 from app import app_cron
+from app.build_admission import BuildLeaseUnavailable
 from app.app_capabilities import contract_and_digest
-from app.app_source_check import check_app_source
+from app.app_source_check import SourceCheckResult, check_app_source
 from app.compiler import (
   CompileError,
   compile_jsx,
@@ -69,13 +71,23 @@ from app.compiler import (
   unlink_app_bundle,
 )
 from app.config import get_settings
+from app.manifest_identity import (
+  MANIFEST_ID_MARKER as _MANIFEST_ID_MARKER,
+  canonical_manifest_base as _canonical_base,
+  canonical_manifest_identity_key as _canonical_identity_key,
+  requested_manifest_source,
+  require_bound_manifest as _require_bound_manifest,
+  stored_manifest_fetch_url,
+)
 from app.manifest_contract import (
+  EXECUTABLE_MANIFEST_FIELDS,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
   SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
+  package_input_paths,
   package_bytes,
   package_limit_message,
   python_lock,
@@ -301,7 +313,7 @@ def _derive_repo_ref(manifest_url: str) -> tuple[str, str] | None:
   them. The caller (`install_from_manifest`) treats a `None` return as
   not-clone-eligible and keeps the already-fetched HTTP entry.
   """
-  parsed = urlparse(manifest_url)
+  parsed = urlparse(requested_manifest_source(manifest_url)[0])
   parts = [unquote(part) for part in parsed.path.split("/") if part]
   if (
     parsed.scheme != "https"
@@ -327,22 +339,6 @@ def _normalize_raw_base(raw_base: str) -> str:
   if parsed.query or parsed.fragment:
     raise HTTPException(400, "`raw_base` must not include query or fragment.")
   return base if base.endswith("/") else base + "/"
-
-
-def _canonical_base(url_or_base: str) -> str:
-  """The canonical base of a manifest URL: fragment, query string, a trailing
-  `/mobius.json`, and a trailing slash all stripped.
-
-  Strip BOTH fragment and query string. Without ?-strip, two paste-a-URL flows
-  for the same app (with vs without `?utm_source=…`) would canonicalise to
-  different keys and split the app into two App rows on the second install.
-  The identity key is `<base>#manifest-id=<id>`, so this base is ALSO the prefix
-  to match installed rows on regardless of the manifest id — callers that need
-  to ask "is this URL's app installed?" LIKE `<base>#manifest-id=%`."""
-  base = url_or_base.split("#", 1)[0].split("?", 1)[0]
-  if base.endswith("/mobius.json"):
-    base = base[: -len("/mobius.json")]
-  return base.rstrip("/")
 
 
 def _trusted_catalog_repo_base(url_or_base: str) -> str | None:
@@ -522,7 +518,7 @@ def _find_ref_independent_catalog_row(
   repository = _github_root_manifest_identity(canonical_manifest_url)
   if repository is None:
     return None
-  suffix = f"#manifest-id={manifest_id}"
+  suffix = f"{_MANIFEST_ID_MARKER}{manifest_id}"
   candidates = (
     db.query(models.App)
     .filter(models.App.manifest_url.like(f"%{suffix}"))
@@ -713,7 +709,7 @@ def _catalog_identity_matches(
   candidate_identity = _canonical_identity_key(candidate_url, manifest_id)
   if candidate_identity == existing_identity:
     return True
-  suffix = f"#manifest-id={manifest_id}"
+  suffix = f"{_MANIFEST_ID_MARKER}{manifest_id}"
   existing_repo = _github_root_manifest_identity(existing_identity)
   candidate_repo = _github_root_manifest_identity(candidate_identity)
   return bool(
@@ -751,18 +747,6 @@ def pending_conflict_update_matches_app(
   return _trusted_origin_catalog_identity_matches(
     app, raw_base, manifest_id,
   )
-
-
-def _canonical_identity_key(url_or_base: str, manifest_id: str) -> str:
-  """Single canonical shape for the `manifest_url` column.
-
-  The two install paths (inline-manifest install with `raw_base`, and
-  URL install with `manifest_url=.../mobius.json`) used to write
-  visibly different strings into `App.manifest_url` for the same
-  underlying app. Re-installing via the other path then missed the
-  update branch and created a duplicate row. The fragment is purely a
-  marker — it's never dereferenced over the wire."""
-  return f"{_canonical_base(url_or_base)}#manifest-id={manifest_id}"
 
 
 async def _http_get(
@@ -1301,6 +1285,93 @@ def committed_conflict_marker_paths(
   if found.returncode > 1:
     return None
   return [p.removeprefix(f"{ref}:") for p in found.stdout.split("\0") if p]
+
+
+def _update_package_paths(
+  source_dir: str | Path, incoming_manifest: dict,
+) -> set[str] | None:
+  """Protect declarations on either side and installed static destinations.
+
+  None protects every path when the local package contract cannot be read.
+  """
+  try:
+    raw = app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b""
+    if len(raw) > _MANIFEST_MAX_BYTES:
+      return None
+    local_manifest = json.loads(raw)
+    validate_manifest_contract(local_manifest)
+  except (
+    OSError, subprocess.SubprocessError, UnicodeDecodeError,
+    json.JSONDecodeError, ManifestContractError, RecursionError,
+  ):
+    return None
+  paths = {"mobius.json"}
+  for side in (incoming_manifest, local_manifest):
+    paths.update(package_input_paths(side))
+    paths.update(
+      f"static/{dest}" for dest in static_asset_entries(side.get("static_assets"))
+    )
+  return paths
+
+
+async def _kept_local_bundle_unchanged(
+  tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
+  upstream: Mapping[str, bytes], kept_local: Sequence[str],
+) -> bool:
+  """Retain ancillary conflicts only when they cannot change the served bundle.
+
+  Compile both alternatives in the same root so generated paths cannot create
+  spurious differences. Non-JavaScript runtimes are not covered by this proof.
+  Source completeness also protects URL references that are not bundle inputs.
+  """
+  if EXECUTABLE_MANIFEST_FIELDS.intersection(manifest):
+    return False
+  source_check = await asyncio.to_thread(
+    _source_completeness, tree, manifest, static_assets,
+  )
+  if source_check.errors:
+    return False
+  with tempfile.TemporaryDirectory(prefix="mobius-ancillary-check-") as temp:
+    root = Path(temp).resolve() / "source"
+    output = Path(temp) / "bundle.js"
+
+    def write_kept_tree() -> str:
+      inputs = dict(tree)
+      inputs.update({
+        f"static/{dest}": static_assets[dest]
+        for dest in static_asset_entries(manifest.get("static_assets"))
+      })
+      for rel, data in inputs.items():
+        path = root / rel
+        _assert_within(root, path, f"package input {rel}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+      return entry.read_text(encoding="utf-8")
+
+    def write_upstream_alternative() -> tuple[bytes, str]:
+      kept_bundle = output.read_bytes()
+      output.unlink()
+      for rel in kept_local:
+        path = root / rel
+        _assert_within(root, path, f"package input {rel}")
+        if rel in upstream:
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_bytes(upstream[rel])
+        else:
+          path.unlink(missing_ok=True)
+      return kept_bundle, entry.read_text(encoding="utf-8")
+
+    try:
+      entry = root / manifest["entry"]
+      source = await asyncio.to_thread(write_kept_tree)
+      await compile_jsx(source, source_path=entry, out_path=output)
+      kept_bundle, source = await asyncio.to_thread(write_upstream_alternative)
+      await compile_jsx(source, source_path=entry, out_path=output)
+      return kept_bundle == await asyncio.to_thread(output.read_bytes)
+    except BuildLeaseUnavailable as exc:
+      raise HTTPException(503, "JavaScript builder is busy; retry the update.") from exc
+    except (RuntimeError, OSError, UnicodeError, KeyError, HTTPException):
+      return False
 
 
 def committed_pending_resolution(
@@ -2240,14 +2311,30 @@ def _regenerate_skills_index(skills_dir: Path) -> None:
     log.warning("skills index regeneration failed", exc_info=True)
 
 
+def _source_completeness(
+  tree: Mapping[str, bytes], manifest: dict, static_assets: Mapping[str, bytes],
+) -> SourceCheckResult:
+  """Check imports using caller-selected static bytes (opaque on publication)."""
+  files = {rel: data.decode("utf-8", "replace") for rel, data in tree.items()}
+  files.update({
+    f"static/{dest}": data.decode("utf-8", "replace")
+    for dest, data in static_assets.items()
+  })
+  return check_app_source(
+    files,
+    entry=manifest["entry"],
+    source_files=manifest.get("source_files") or [],
+    job=(manifest.get("schedule") or {}).get("job"),
+    static_assets=(f"static/{dest}" for dest in static_assets),
+  )
+
+
 def _check_source_completeness(
   *,
   app_name: str,
   manifest: dict,
   source_tree: dict[str, bytes],
-  entry_key: str,
-  static_dests: list[str],
-  job_name: str | None,
+  static_assets: Mapping[str, bytes],
 ) -> None:
   """Assert the source tree the manifest declares is self-contained.
 
@@ -2266,22 +2353,13 @@ def _check_source_completeness(
   ``source_tree`` IS the whole declared tree (entry + every fetched
   ``source_files`` entry + the job script), so it is the sole source of bytes.
   Static-asset dests are recorded below their installer-owned ``static/``
-  directory so source checks see the exact path compilation sees. For example,
+  directory so source checks see the exact path compilation sees. Their bytes
+  remain opaque on publication, as generated assets may contain import-like
+  strings. For example,
   logical destination ``logo.js`` is importable as ``./static/logo.js``.
   """
-  files: dict[str, str] = {
-    rel: data.decode("utf-8", "replace") for rel, data in source_tree.items()
-  }
-  static_source_paths = [f"static/{dest}" for dest in static_dests]
-  for path in static_source_paths:
-    files.setdefault(path, "")
-
-  result = check_app_source(
-    files,
-    entry=entry_key,
-    source_files=manifest.get("source_files") or [],
-    job=job_name,
-    static_assets=static_source_paths,
+  result = _source_completeness(
+    source_tree, manifest, {dest: b"" for dest in static_assets},
   )
   for warning in result.warnings:
     log.warning(
@@ -2296,24 +2374,49 @@ def _check_source_completeness(
     )
 
 
+def validate_manifest_address(
+  manifest: dict, manifest_url: str | None, *,
+  db: Session | None = None, package_id: str | None = None,
+) -> None:
+  """Bind a stored address to its manifest or installed permanent package."""
+  if manifest_url is None:
+    return
+  _, bound_id = requested_manifest_source(manifest_url)
+  if bound_id is None:
+    return
+  if db is not None:
+    existing = _find_install_identity_row(
+      db, source_url=manifest_url, manifest_id=bound_id,
+    )
+    package_id = existing.package_id if existing is not None else None
+  try:
+    _require_bound_manifest(manifest, bound_id, package_id)
+  except ValueError as exc:
+    raise HTTPException(409, str(exc)) from exc
+
+
 async def _fetch_and_validate_manifest(
   cli: httpx.AsyncClient,
   *,
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
+  db: Session | None = None,
 ) -> tuple[dict, str]:
   """Load one manifest and return it with its normalized asset base.
 
   Preview and install intentionally share this exact boundary.  The preview is
   therefore not a second, weaker interpretation that can drift from what the
-  installer eventually applies.
+  installer eventually applies. Stored identity addresses are normalized and
+  bound here, before any package assets are fetched.
   """
   if (manifest_url is None) == (manifest is None):
     raise HTTPException(
       400, "Provide exactly one of `manifest_url` or `manifest`.",
     )
+  requested_url = manifest_url
   if manifest_url is not None:
+    manifest_url = requested_manifest_source(manifest_url)[0]
     raw = await _http_get(cli, manifest_url, _MANIFEST_MAX_BYTES)
     try:
       loaded = json.loads(raw)
@@ -2330,6 +2433,7 @@ async def _fetch_and_validate_manifest(
     raise HTTPException(400, "Manifest root must be a JSON object.")
 
   _validate_manifest(manifest)
+  validate_manifest_address(manifest, requested_url, db=db)
   return manifest, _normalize_raw_base(raw_base)
 
 
@@ -2338,6 +2442,7 @@ async def preview_manifest_capabilities(
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
+  db: Session | None = None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
   async with httpx.AsyncClient(
@@ -2349,6 +2454,7 @@ async def preview_manifest_capabilities(
       manifest_url=manifest_url,
       manifest=manifest,
       raw_base=raw_base,
+      db=db,
     )
   contract, digest = contract_and_digest(loaded)
   return loaded, normalized_base, contract, digest
@@ -2820,6 +2926,7 @@ async def _fetch_install_candidate(
   expected_app_id: int | None,
   expected_upstream_commit: str | None,
   expected_candidate_digest: str | None,
+  db: Session | None = None,
 ) -> InstallCandidate:
   """Fetch every install input once and enforce all review/replay guards."""
   async with httpx.AsyncClient(
@@ -2831,8 +2938,11 @@ async def _fetch_install_candidate(
       manifest_url=manifest_url,
       manifest=manifest,
       raw_base=raw_base,
+      db=db,
     )
-    source_url = manifest_url if manifest_url is not None else raw_base
+    source_url = (
+      requested_manifest_source(manifest_url)[0] if manifest_url else raw_base
+    )
     source_identity = None
     predecessor_source_identity = None
     canonical_source_url = raw_base
@@ -2994,7 +3104,9 @@ async def _fetch_install_candidate(
   )
 
 
-async def fetch_install_candidate(manifest_url: str) -> InstallCandidate:
+async def fetch_install_candidate(
+  manifest_url: str, *, db: Session | None = None,
+) -> InstallCandidate:
   """Fetch the exact package the installer would use, without installing it."""
   return await _fetch_install_candidate(
     manifest_url=manifest_url,
@@ -3005,6 +3117,7 @@ async def fetch_install_candidate(manifest_url: str) -> InstallCandidate:
     expected_app_id=None,
     expected_upstream_commit=None,
     expected_candidate_digest=None,
+    db=db,
   )
 
 
@@ -3024,14 +3137,16 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  old_manifest_url = _canonical_base(existing.manifest_url) + "/mobius.json"
   async with httpx.AsyncClient(
     timeout=_HTTP_TIMEOUT,
     follow_redirects=False,
   ) as cli:
+    # The old row's own address is fetched without the stored id binding:
+    # trust here comes from `package_id` + `moved_to`, and a `package_id` app
+    # may have changed its manifest id without `previous_id`.
     old_manifest, _ = await _fetch_and_validate_manifest(
       cli,
-      manifest_url=old_manifest_url,
+      manifest_url=stored_manifest_fetch_url(existing.manifest_url),
       manifest=None,
       raw_base=None,
     )
@@ -3905,9 +4020,7 @@ async def _activate_install_source(
         # declare; checking that merged tree makes every later synthetic
         # fallback misdiagnose those preserved edits as a broken release.
         source_tree=plan.published_source_tree,
-        entry_key=plan.entry_key,
-        static_dests=list(plan.static_assets),
-        job_name=plan.job_name,
+        static_assets=plan.static_assets,
       )
 
   _write_static_assets(
@@ -4080,8 +4193,9 @@ async def install_from_manifest(
     reviewed_app = db.get(models.App, reviewed_id)
     if reviewed_app is None or not app_git.is_repo(reviewed_app.source_dir):
       raise HTTPException(409, "Reviewed app source is no longer available.")
-    reviewed_source_url = manifest_url or (
-      _normalize_raw_base(raw_base or "") + "mobius.json"
+    reviewed_source_url = (
+      requested_manifest_source(manifest_url)[0] if manifest_url
+      else (_normalize_raw_base(raw_base or "") + "mobius.json")
     )
     try:
       has_manifest = await asyncio.to_thread(
@@ -4112,6 +4226,7 @@ async def install_from_manifest(
         expected_app_id=expected_app_id,
         expected_upstream_commit=expected_upstream_commit,
         expected_candidate_digest=expected_candidate_digest,
+        db=db,
       )
       git_candidate = None
     else:
@@ -4139,6 +4254,7 @@ async def install_from_manifest(
           },
         ) from exc
       candidate = git_candidate.candidate
+      validate_manifest_address(candidate.manifest, manifest_url, db=db)
     if git_candidate is not None and manifest is not None and manifest != candidate.manifest:
       raise HTTPException(409, "Pending update manifest changed.")
     if (
@@ -4190,6 +4306,7 @@ async def install_from_manifest(
       expected_app_id=expected_app_id,
       expected_upstream_commit=expected_upstream_commit,
       expected_candidate_digest=expected_candidate_digest,
+      db=db,
     )
 
   # Phase 2: immutable identity/update decision. No writes occur here.
@@ -4687,19 +4804,6 @@ async def _install_candidate(
               app_git.LOCAL_BRANCH,
               resolved_commit,
             )
-            if merge.status == "conflict":
-              raise HTTPException(
-                409,
-                detail={
-                  "code": "resolution_behind_local_edits",
-                  "message": (
-                    "The app was edited while this update was being resolved, "
-                    "and those edits overlap the resolution. Finish it in the "
-                    "update's resolver chat."
-                  ),
-                  "conflict_paths": merge.conflict_paths,
-                },
-              )
           elif git_merge_base_override is not None:
             merge = await asyncio.to_thread(
               app_git.merge_refs,
@@ -4729,12 +4833,17 @@ async def _install_candidate(
             # same owner-gated resolver instead of overwriting local work.
             # JSON manifests can reconcile serialization drift and disjoint
             # edits structurally. Other files retain the APP_VERSION-only
-            # rule. Any remaining overlap leaves the whole update untouched
-            # for the owner to resolve.
+            # rule. Remaining overlaps need the owner unless a path outside
+            # a complete package can safely keep the owner's version.
+            package_paths = await asyncio.to_thread(
+              _update_package_paths, git_source_dir, manifest,
+            )
             benign = await asyncio.to_thread(
               app_git.resolve_benign_conflict,
               git_source_dir, merge.conflict_paths,
-              merge_base=git_merge_base_override,
+              merge_base=None if resolved_commit else git_merge_base_override,
+              package_paths=package_paths,
+              incoming=resolved_commit or app_git.UPSTREAM_BRANCH,
             )
             resolved_source = None
             if benign is not None:
@@ -4742,28 +4851,65 @@ async def _install_candidate(
                 rel: data for rel, data in benign.tree.items()
                 if rel not in _MERGED_NON_SOURCE
               }
+              if benign.kept_local:
+                upstream_tree = await asyncio.to_thread(
+                  app_git.read_ref_tree, git_source_dir,
+                  resolved_commit or app_git.UPSTREAM_BRANCH,
+                )
+                if not await _kept_local_bundle_unchanged(
+                  resolved_source, manifest, static_assets_fetched,
+                  upstream_tree, benign.kept_local,
+                ):
+                  resolved_source = None
             if resolved_source is not None and entry_key in resolved_source:
               source_tree = resolved_source
               divergence = "clean_merge"
               merge_applied = True
               warnings.append(
-                "auto-resolved a benign update conflict "
-                "(no semantic overlap between local edits and upstream)"
+                "auto-resolved an update conflict"
               )
+              if benign.kept_local:
+                warnings.append(
+                  "kept local edits to files outside the app package "
+                  "(upstream edits dropped): "
+                  + ", ".join(benign.kept_local)
+                )
               reconciliation = app_git.ReconciliationReceipt(
                 proven_present=reconciliation.proven_present,
                 local_only_paths=reconciliation.local_only_paths,
                 new_upstream_paths=reconciliation.new_upstream_paths,
                 compatible_paths=reconciliation.compatible_paths,
                 provenance_refs_used=reconciliation.provenance_refs_used,
+                kept_local_paths=benign.kept_local,
               )
-              # Exec bits come from the same merged tree the resolution was
-              # built on, mirroring the clean-merge branch above.
+              # Resolved package files use merge modes; ancillary files keep
+              # the owner's local mode as well as their bytes.
               git_exec_paths = await asyncio.to_thread(
                 app_git.read_tree_exec_paths,
                 git_source_dir, benign.tree_oid,
               )
+              if benign.kept_local:
+                local_exec_paths = await asyncio.to_thread(
+                  app_git.read_tree_exec_paths, git_source_dir, app_git.LOCAL_BRANCH,
+                )
+                git_exec_paths = (
+                  git_exec_paths.difference(benign.kept_local)
+                  | local_exec_paths.intersection(benign.kept_local)
+                )
             else:
+              if resolved_commit is not None:
+                raise HTTPException(
+                  409,
+                  detail={
+                    "code": "resolution_behind_local_edits",
+                    "message": (
+                      "The app was edited while this update was being resolved, "
+                      "and those edits overlap the resolution. Finish it in the "
+                      "update's resolver chat."
+                    ),
+                    "conflict_paths": merge.conflict_paths,
+                  },
+                )
               # Never rebase local. The app stays served with its current
               # bundle + source; the new upstream is recorded for a later
               # agent-resolution pass. Switch to conflict mode below.
@@ -4878,6 +5024,10 @@ async def _install_candidate(
         dropped_source_paths |= await asyncio.to_thread(
           _read_upstream_source_paths, git_source_dir, app_git.LOCAL_BRANCH,
         ) - set(source_tree)
+
+      # The served merge result owns deletions, not the new upstream alone:
+      # an upstream deletion may conflict with an owner edit we retained.
+      dropped_source_paths -= set(source_tree)
 
       # The disk-write phase runs INSIDE the same held lock for the Git path so
       # no source commit interleaves between the merge decision and the write; a
@@ -5027,6 +5177,8 @@ async def _install_candidate(
       app_id=app.id,
       slug=app.slug,
       source=source,
+      **({"kept_local_paths": list(reconciliation.kept_local_paths)}
+         if reconciliation.kept_local_paths else {}),
     )
 
     # Success: drop any .bak snapshots we made — the new bundle is

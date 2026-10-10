@@ -147,6 +147,8 @@ class ReconciliationReceipt:
   compatible_paths: tuple[str, ...] = ()
   unresolved_conflict_paths: tuple[str, ...] = ()
   provenance_refs_used: tuple[str, ...] = ()
+  # Ancillary conflicts kept locally, dropping the incoming edit.
+  kept_local_paths: tuple[str, ...] = ()
 
   def as_dict(self) -> dict[str, list[str]]:
     return {
@@ -156,6 +158,7 @@ class ReconciliationReceipt:
       "compatible_paths": list(self.compatible_paths),
       "unresolved_conflict_paths": list(self.unresolved_conflict_paths),
       "provenance_refs_used": list(self.provenance_refs_used),
+      "kept_local_paths": list(self.kept_local_paths),
     }
 
 
@@ -3805,10 +3808,10 @@ _APP_VERSION_RE = re.compile(
 
 
 def read_blob(source_dir: str | Path, ref: str, rel: str) -> bytes | None:
-  """Raw bytes of `rel` at `ref`, or None if the path is absent there."""
+  """Raw blob bytes of `rel` at `ref`, or None for absent/non-file paths."""
   repo = Path(source_dir)
   proc = subprocess.run(
-    ["git", "-C", str(repo), "cat-file", "-p", f"{ref}:{rel}"],
+    ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{rel}"],
     capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
   )
   return proc.stdout if proc.returncode == 0 else None
@@ -3998,32 +4001,37 @@ class BenignResolution:
   APP_VERSION taken from upstream); `tree_oid` is the merge-tree oid it was built
   from, so the caller can read exec bits off the same tree the clean-merge path
   uses (`read_tree_exec_paths`) rather than approximating from a branch.
+  `kept_local` names conflicting paths outside the package that keep the
+  local version as is.
   """
   tree: dict[str, bytes]
   tree_oid: str
+  kept_local: tuple[str, ...] = ()
 
 
 def resolve_benign_conflict(
   source_dir: str | Path, conflict_paths: list[str],
   *, merge_base: str | None = None,
+  package_paths: set[str] | None = None,
+  incoming: str = UPSTREAM_BRANCH,
 ) -> BenignResolution | None:
-  """Full merged source tree with every BENIGN conflict auto-resolved, or None
-  when any conflicting file carries a genuine overlap.
+  """Reconcile package conflicts or keep local ancillary paths, else None.
 
-  Call only after `merge_upstream` verdicted a conflict. We PROVE each conflict
-  is benign rather than assume it: JSON manifests get a structural three-way
-  merge (serialization drift and disjoint edits reconcile; true overlap does
-  not), and other source files get the narrow APP_VERSION-only line resolution.
-  If every conflicting file resolves, we return the whole merged tree
-  (non-conflict files carry their clean three-way merge; conflicting files carry
-  the reconciled result). If any file still carries a real clash we return None
-  and the caller falls back to the owner-resolver flow. Fail-safe by
-  construction: a genuine local edit is never silently dropped, because a
-  residual conflict aborts the whole attempt.
+  Call after a merge with ``incoming`` reports a conflict. Try each narrow
+  per-file merge first (structural JSON or APP_VERSION-only line resolution).
+  Residual conflicts outside ``package_paths`` retain local bytes/deletions;
+  package conflicts still need the owner-resolver flow. The returned tree
+  includes all clean merges, and ``kept_local`` reports dropped upstream edits.
+  The caller must establish source completeness before accepting kept paths.
 
   Pass ``merge_base`` when the caller's merge verdict used an explicit base
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
+
+  If the per-file merge fails, a path outside ``package_paths`` can keep its
+  local version, including a local deletion of a base file. Synthetic conflict
+  paths absent from both local and base trees need the resolver. None protects
+  every path.
   """
   repo = Path(source_dir)
   if not conflict_paths:
@@ -4039,7 +4047,7 @@ def resolve_benign_conflict(
   if merge_base is not None:
     args.extend(("--merge-base", merge_base))
   proc = _run(
-    repo, *args, LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
+    repo, *args, LOCAL_BRANCH, incoming, check=False,
   )
   if proc.returncode != 1:
     return None
@@ -4057,27 +4065,40 @@ def resolve_benign_conflict(
   base_ref = merge_base
   if base_ref is None:
     base_proc = _run(
-      repo, "merge-base", LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
+      repo, "merge-base", LOCAL_BRANCH, incoming, check=False,
     )
     base_ref = base_proc.stdout.strip() if base_proc.returncode == 0 else ""
   if not base_ref:
     return None
-  resolved: dict[str, bytes] = {}
+  resolved: dict[str, bytes | None] = {}
+  kept_local: list[str] = []
   for rel in merge_conflicts:
     ours = read_blob(repo, LOCAL_BRANCH, rel)
-    theirs = read_blob(repo, UPSTREAM_BRANCH, rel)
-    # A deletion on either side is not a benign shape; leave it to the owner.
-    if ours is None or theirs is None:
-      return None
-    merged = _resolve_benign_conflict_file(
-      rel, read_blob(repo, base_ref, rel), ours, theirs,
+    theirs = read_blob(repo, incoming, rel)
+    base = read_blob(repo, base_ref, rel)
+    merged = (
+      _resolve_benign_conflict_file(rel, base, ours, theirs)
+      if ours is not None and theirs is not None else None
     )
-    if merged is None:
+    if merged is not None:
+      resolved[rel] = merged
+    elif (
+      package_paths is not None and rel not in package_paths
+      and (ours is not None or base is not None)
+    ):
+      resolved[rel] = ours
+      kept_local.append(rel)
+    else:
       return None
-    resolved[rel] = merged
   full = read_merged_tree(repo, tree_oid)
-  full.update(resolved)
-  return BenignResolution(tree=full, tree_oid=tree_oid)
+  for rel, data in resolved.items():
+    if data is None:
+      full.pop(rel, None)
+    else:
+      full[rel] = data
+  return BenignResolution(
+    tree=full, tree_oid=tree_oid, kept_local=tuple(kept_local),
+  )
 
 
 # Smells
