@@ -188,6 +188,52 @@ def test_a_replaced_rollout_binds_nothing(tmp_path, chat):
   assert _bind(tmp_path, chat.id, mark, "call_1") == {}
 
 
+def test_a_rollout_regrown_past_the_mark_binds_nothing(tmp_path, chat):
+  # Truncated and rewritten in place, at least as long as before, with a
+  # matching output starting exactly at the captured offset.
+  rollout = _rollout(tmp_path)
+  _append(rollout, _output("old", "x" * 200))
+  mark = viewed_images.TurnMark.capture(tmp_path, THREAD)
+  _append(rollout, _image_output("call_1", PNG))
+  with rollout.open("r+b") as handle:
+    handle.seek(0)
+    handle.write(b"y" * (mark.offset - 1) + b"\n")
+
+  assert _bind(tmp_path, chat.id, mark, "call_1") == {}
+
+
+def test_a_rollout_replaced_by_another_file_binds_nothing(tmp_path, chat):
+  # Same bytes before the mark, but a different file at the path.
+  rollout = _rollout(tmp_path)
+  _append(rollout, _output("old", "x" * 200))
+  mark = viewed_images.TurnMark.capture(tmp_path, THREAD)
+  replacement = tmp_path / "replacement.jsonl"
+  replacement.write_bytes(rollout.read_bytes())
+  _append(replacement, _image_output("call_1", PNG))
+  replacement.replace(rollout)
+
+  assert _bind(tmp_path, chat.id, mark, "call_1") == {}
+
+
+def test_malformed_rollout_records_are_skipped_without_failing_the_turn(tmp_path, chat):
+  rollout = _rollout(tmp_path)
+  mark = viewed_images.TurnMark.capture(tmp_path, THREAD)
+  with rollout.open("a") as handle:
+    for line in (
+      '"function_call_output"',
+      '["function_call_output"]',
+      '{"type": "response_item", "payload": ["function_call_output"]}',
+    ):
+      handle.write(line + "\n")
+  for call_id in (["call_1"], {"call_1": 1}, 7):
+    _append(rollout, {"type": "response_item", "payload": {
+      "type": "function_call_output", "call_id": call_id, "output": [],
+    }})
+  _append(rollout, _image_output("call_1", PNG))
+
+  assert set(_bind(tmp_path, chat.id, mark, "call_1")) == {"call_1"}
+
+
 def test_unsafe_thread_ids_never_reach_the_filesystem(tmp_path):
   _rollout(tmp_path)
   for thread_id in ("", "*", "../x", f"{THREAD}/..", None):

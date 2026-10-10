@@ -17,12 +17,12 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from app.providers import PROVIDERS
-from app.viewed_images import SNAPSHOT_NAME
 from app.tool_sources import (
   MAX_TOOL_SOURCES,
   enrich_tool_source,
   normalize_tool_sources,
 )
+from app.viewed_images import SNAPSHOT_NAME
 
 
 # The canonical terminal subagent statuses the persisted block stores, matching

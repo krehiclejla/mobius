@@ -95,37 +95,62 @@ class TurnMark:
   """Where one turn's records begin in its thread's rollout.
 
   A thread's first turn may create the rollout, so a missing file marks the
-  start of the file it later becomes.
+  start of the file it later becomes. Otherwise the mark remembers the file's
+  identity and the bytes just before the offset: a rollout replaced or
+  truncated and regrown since the mark fails that check, because its lines
+  past the offset cannot be attributed to this turn.
   """
   codex_home: str
   thread_id: str
   path: Path | None
   offset: int
+  file_id: tuple[int, int] | None = None
+  prefix_digest: str = ""
 
   @classmethod
   def capture(cls, codex_home: str | os.PathLike, thread_id: str) -> "TurnMark":
     path = rollout_path(codex_home, thread_id)
-    offset = 0
     if path is not None:
       try:
-        offset = path.stat().st_size
+        with open(path, "rb") as handle:
+          stat = os.fstat(handle.fileno())
+          return cls(
+            str(codex_home), thread_id, path, stat.st_size,
+            (stat.st_dev, stat.st_ino), _prefix_digest(handle, stat.st_size),
+          )
       except OSError:
-        path = None
-    return cls(str(codex_home), thread_id, path, offset)
+        pass
+    return cls(str(codex_home), thread_id, None, 0)
 
   def turn_records(self) -> Iterable[bytes]:
     """The rollout lines appended since the mark, filtered to call outputs."""
     path = self.path or rollout_path(self.codex_home, self.thread_id)
     if path is None:
       return
-    offset = self.offset if self.path is not None else 0
     with open(path, "rb") as handle:
-      if os.fstat(handle.fileno()).st_size < offset:
-        return  # the file was replaced; its new lines cannot be attributed
-      handle.seek(offset)
+      if self.path is not None:
+        stat = os.fstat(handle.fileno())
+        if (
+          (stat.st_dev, stat.st_ino) != self.file_id
+          or stat.st_size < self.offset
+          or _prefix_digest(handle, self.offset) != self.prefix_digest
+        ):
+          return
+      handle.seek(self.offset)
       for line in handle:
         if line.endswith(b"\n") and _OUTPUT_MARKER in line:
           yield line
+
+
+# Enough of the bytes before a mark that a regrown file matching them by
+# chance is not a practical concern; Codex's lines carry timestamps and ids.
+_PREFIX_WINDOW = 4096
+
+
+def _prefix_digest(handle, offset: int) -> str:
+  start = max(0, offset - _PREFIX_WINDOW)
+  handle.seek(start)
+  return hashlib.sha256(handle.read(offset - start)).hexdigest()
 
 
 def _recorded_image(output: object) -> tuple[bytes, str] | None:
@@ -160,15 +185,15 @@ def recorded_view_images(
       record = json.loads(line)
     except ValueError:
       continue
-    payload = record.get("payload") if isinstance(record, dict) else None
-    if (
-      record.get("type") != "response_item"
-      or not isinstance(payload, dict)
-      or payload.get("type") != "function_call_output"
-    ):
+    # A valid JSON line of any other shape is skipped, never allowed to fail
+    # the completed turn.
+    if not isinstance(record, dict) or record.get("type") != "response_item":
+      continue
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "function_call_output":
       continue
     call_id = payload.get("call_id")
-    if call_id in wanted and call_id not in found:
+    if isinstance(call_id, str) and call_id in wanted and call_id not in found:
       image = _recorded_image(payload.get("output"))
       if image is not None:
         found[call_id] = image
