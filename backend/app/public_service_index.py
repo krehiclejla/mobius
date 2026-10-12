@@ -9,7 +9,10 @@ bucket and allowance.
 A committed change to an app or a service alias in this process discards the
 snapshot, so an applied, removed, or re-accepted service (including a raised
 allowance) counts from its next request. A change written by another process
-is picked up within ``OUT_OF_PROCESS_RECHECK_SECONDS``.
+is picked up within ``OUT_OF_PROCESS_RECHECK_SECONDS``, or sooner when the
+door resolves a service that no longer matches its entry and calls
+``discard``; the door then also charges the service's current bucket, so a
+stale entry never decides which reviewed cap applies.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ PROBE_BUCKET = "unknown"
 _PENDING_KEY = "mobius_public_services_changed"
 
 _lock = threading.Lock()
+_rebuild_lock = threading.Lock()
 _generation = 0
 _snapshot: tuple[int, float, dict[str, tuple[str, int]]] | None = None
 
@@ -47,18 +51,39 @@ def bucket(app, service: dict) -> tuple[str, int]:
 def lookup(db: Session, service_id: str) -> tuple[str, int] | None:
   """The bucket and allowance of the public service ``service_id`` names."""
   global _snapshot
+  index = _current()
+  if index is not None:
+    return index.get(service_id)
+  # One rebuild at a time: requests that find the snapshot stale while another
+  # rebuilds wait for it and reuse its result instead of scanning again.
+  with _rebuild_lock:
+    index = _current()
+    if index is None:
+      with _lock:
+        generation = _generation
+      index = _build(db)
+      with _lock:
+        # A change committed while building leaves this snapshot already stale.
+        _snapshot = (generation, time.monotonic(), index)
+  return index.get(service_id)
+
+
+def discard() -> None:
+  """Drop the snapshot after finding it out of date, so the next request rebuilds."""
+  global _snapshot
+  with _lock:
+    _snapshot = None
+
+
+def _current() -> dict[str, tuple[str, int]] | None:
   with _lock:
     generation, current = _generation, _snapshot
   if (
     current is not None and current[0] == generation
     and time.monotonic() - current[1] < OUT_OF_PROCESS_RECHECK_SECONDS
   ):
-    return current[2].get(service_id)
-  index = _build(db)
-  with _lock:
-    # A change committed while building leaves this snapshot already stale.
-    _snapshot = (generation, time.monotonic(), index)
-  return index.get(service_id)
+    return current[2]
+  return None
 
 
 def _build(db: Session) -> dict[str, tuple[str, int]]:

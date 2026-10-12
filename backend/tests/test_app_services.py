@@ -775,3 +775,84 @@ def test_withdrawn_public_service_stops_resolving_at_once(
   fresh_public_door.clear()
   assert client.get("/api/app-services/closing-service/status").status_code == 404
   assert fresh_public_door == []
+
+
+def _stale_snapshot(entries):
+  """What another process's unseen change leaves: a current-looking snapshot."""
+  import time as clock
+  from app import public_service_index
+
+  with public_service_index._lock:
+    public_service_index._snapshot = (
+      public_service_index._generation, clock.monotonic(), dict(entries),
+    )
+
+
+def test_stale_snapshot_never_decides_the_accepted_cap(
+  client, auth, db, fresh_public_door,
+):
+  from app import public_service_index
+
+  app = _service_app(db, access="public", slug="lowered-service")
+  for _ in range(60):
+    assert client.get("/api/app-services/lowered-service/status").status_code == 201
+
+  # Another process lowered the cap from 600; this process still has 600 cached.
+  _stale_snapshot({"lowered-service": (str(app.id), 600)})
+  assert client.get("/api/app-services/lowered-service/status").status_code == 429
+  assert public_service_index.lookup(db, "lowered-service") == (str(app.id), 60)
+
+
+def test_moved_alias_is_charged_to_its_current_service(
+  client, auth, db, fresh_public_door,
+):
+  from app import public_service_index
+
+  former = _service_app(db, access="public", slug="former-service")
+  current = _service_app(db, access="public", slug="current-service", aliases=("moved",))
+  _stale_snapshot({
+    "former-service": (str(former.id), 60),
+    "current-service": (str(current.id), 60),
+    "moved": (str(former.id), 60),
+  })
+
+  assert client.get("/api/app-services/moved/status").status_code == 201
+  assert public_service_index.lookup(db, "moved") == (str(current.id), 60)
+  for _ in range(59):
+    assert client.get("/api/app-services/former-service/status").status_code == 201
+  # The one stale charge came off the former service; its own ids keep the rest.
+  assert client.get("/api/app-services/former-service/status").status_code == 429
+  # The moved request also counted once against the service it reached.
+  for _ in range(59):
+    assert client.get("/api/app-services/current-service/status").status_code == 201
+  assert client.get("/api/app-services/current-service/status").status_code == 429
+
+
+def test_concurrent_stale_lookups_rebuild_the_snapshot_once(monkeypatch):
+  import threading
+  import time as clock
+  from app import public_service_index
+
+  builds = []
+  started = threading.Event()
+
+  def slow_build(_db):
+    builds.append(1)
+    started.set()
+    clock.sleep(0.2)
+    return {"svc": ("1", 60)}
+
+  monkeypatch.setattr(public_service_index, "_build", slow_build)
+  monkeypatch.setattr(public_service_index, "_snapshot", None)
+  results = []
+  threads = [
+    threading.Thread(target=lambda: results.append(public_service_index.lookup(None, "svc")))
+    for _ in range(8)
+  ]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  assert builds == [1]
+  assert results == [("1", 60)] * 8

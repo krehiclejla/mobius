@@ -220,8 +220,19 @@ async def public_app_service(
   _admit_public_request(request, *public)
   app = _service_app(db, slug)
   if app is None:
+    public_service_index.discard()
     raise HTTPException(404, "Public app service not found.")
-  app_services.service_contract(app, access="public")
+  try:
+    service = app_services.service_contract(app, access="public")
+  except HTTPException:
+    public_service_index.discard()
+    raise
+  current = public_service_index.bucket(app, service)
+  if current != public:
+    # Another process changed this service after the snapshot: the accepted
+    # contract decides the cap, and the next request reads a fresh snapshot.
+    public_service_index.discard()
+    _admit_public_request(request, *current)
   owner = db.query(models.Owner).first()
   if owner is None:
     raise HTTPException(503, "Owner setup is incomplete.")
