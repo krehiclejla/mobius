@@ -702,3 +702,33 @@ def test_public_door_counts_probes_of_non_public_services(client, db, monkeypatc
     assert client.get("/api/app-services/private-probe/status").status_code == 404
     assert client.get("/api/app-services/missing-probe/status").status_code == 404
   assert client.get("/api/app-services/private-probe/status").status_code == 429
+
+
+def test_public_door_refuses_an_exhausted_caller_before_the_database(
+  client, auth, db, monkeypatch,
+):
+  from limits.storage import MemoryStorage
+  from limits.strategies import FixedWindowRateLimiter
+  from app.routes import app_services as routes
+
+  monkeypatch.setattr(routes, "_public_window", FixedWindowRateLimiter(MemoryStorage()))
+  monkeypatch.setattr(routes, "_known_public", {})
+  _service_app(db, access="public", slug="busy-service")
+  lookups = []
+  resolve = routes._service_app
+  monkeypatch.setattr(
+    routes, "_service_app", lambda session, slug: lookups.append(slug) or resolve(session, slug),
+  )
+
+  for _ in range(60):
+    assert client.get("/api/app-services/busy-service/status").status_code == 201
+  for _ in range(60):
+    assert client.get("/api/app-services/random-probe/status").status_code == 404
+  lookups.clear()
+
+  for index in range(20):
+    refused = client.get("/api/app-services/busy-service/status")
+    assert refused.status_code == 429
+    assert int(refused.headers["Retry-After"]) >= 1
+    assert client.get(f"/api/app-services/probe-{index}/status").status_code == 429
+  assert lookups == []

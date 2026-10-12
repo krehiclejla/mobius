@@ -26,20 +26,50 @@ _limiter = Limiter(key_func=get_remote_address, key_style="endpoint")
 # The anonymous door counts each caller per public service, against that
 # service's accepted allowance (60 a minute unless its manifest declares more).
 _public_window = FixedWindowRateLimiter(MemoryStorage())
+# Service ids that last resolved to a public service, with that service's
+# bucket and allowance, so a caller already over its limit is refused before
+# the database lookup. Only resolved public services are remembered, so
+# probes of made-up ids cannot grow it.
+_known_public: dict[str, tuple[str, int]] = {}
+_PROBE_BUCKET = "unknown"
 
 
-def _admit_public_request(request: Request, app: models.App | None, service: dict) -> None:
-  allowance = RateLimitItemPerMinute(app_services.public_requests_per_minute(service))
-  caller = get_remote_address(request)
-  bucket = str(app.id) if app is not None else "unknown"
-  if _public_window.hit(allowance, caller, bucket):
-    return
+def _public_bucket(app: models.App | None, service: dict) -> tuple[str, int]:
+  if app is None:
+    return _PROBE_BUCKET, app_services.public_requests_per_minute({})
+  return str(app.id), app_services.public_requests_per_minute(service)
+
+
+def _refuse(allowance, caller: str, bucket: str):
   reset_at, _ = _public_window.get_window_stats(allowance, caller, bucket)
   raise HTTPException(
     429,
     f"Rate limit exceeded: {allowance.amount} per 1 minute",
     headers={"Retry-After": str(max(1, int(reset_at - time.time()) + 1))},
   )
+
+
+def _refuse_exhausted_caller(request: Request, service_id: str) -> None:
+  """Refuse, without touching the database, a caller already over its limit.
+
+  This only reads the count; the request is counted after resolution, against
+  the accepted allowance. A stale remembered allowance names a different
+  counter, so it can let a request through to that check but never refuses
+  one wrongly.
+  """
+  bucket, per_minute = _known_public.get(service_id) or _public_bucket(None, {})
+  allowance = RateLimitItemPerMinute(per_minute)
+  caller = get_remote_address(request)
+  if not _public_window.test(allowance, caller, bucket):
+    _refuse(allowance, caller, bucket)
+
+
+def _admit_public_request(request: Request, app: models.App | None, service: dict) -> None:
+  bucket, per_minute = _public_bucket(app, service)
+  allowance = RateLimitItemPerMinute(per_minute)
+  caller = get_remote_address(request)
+  if not _public_window.hit(allowance, caller, bucket):
+    _refuse(allowance, caller, bucket)
 
 
 def _reject_json_constant(value: str):
@@ -211,6 +241,7 @@ async def public_app_service(
   request: Request,
   db: Session = Depends(get_db),
 ):
+  _refuse_exhausted_caller(request, slug)
   app = _service_app(db, slug)
   try:
     if app is None:
@@ -218,8 +249,10 @@ async def public_app_service(
     service = app_services.service_contract(app, access="public")
   except HTTPException:
     # Probes of missing or non-public services share one default bucket.
+    _known_public.pop(slug, None)
     _admit_public_request(request, None, {})
     raise
+  _known_public[slug] = _public_bucket(app, service)
   _admit_public_request(request, app, service)
   owner = db.query(models.Owner).first()
   if owner is None:
