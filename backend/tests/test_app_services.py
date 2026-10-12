@@ -669,26 +669,20 @@ def test_public_door_counts_each_caller_per_service_against_its_allowance():
   def request(host):
     return SimpleNamespace(client=SimpleNamespace(host=host), headers={}, scope={})
 
-  quiet = SimpleNamespace(id=9101)
-  live = SimpleNamespace(id=9102)
   for _ in range(60):
-    routes._admit_public_request(request("198.51.100.7"), quiet, {"access": "public"})
+    routes._admit_public_request(request("198.51.100.7"), "9101", 60)
   with pytest.raises(HTTPException) as refused:
-    routes._admit_public_request(request("198.51.100.7"), quiet, {"access": "public"})
+    routes._admit_public_request(request("198.51.100.7"), "9101", 60)
   assert refused.value.status_code == 429
   assert int(refused.value.headers["Retry-After"]) >= 1
 
   # Another service keeps its own count, and may have accepted a larger allowance.
   for _ in range(300):
-    routes._admit_public_request(
-      request("198.51.100.7"), live, {"access": "public", "public_requests_per_minute": 300},
-    )
+    routes._admit_public_request(request("198.51.100.7"), "9102", 300)
   with pytest.raises(HTTPException):
-    routes._admit_public_request(
-      request("198.51.100.7"), live, {"access": "public", "public_requests_per_minute": 300},
-    )
+    routes._admit_public_request(request("198.51.100.7"), "9102", 300)
   # Another caller is counted apart.
-  routes._admit_public_request(request("198.51.100.8"), quiet, {"access": "public"})
+  routes._admit_public_request(request("198.51.100.8"), "9101", 60)
 
 
 def test_public_door_counts_probes_of_non_public_services(client, db, monkeypatch):
@@ -704,31 +698,80 @@ def test_public_door_counts_probes_of_non_public_services(client, db, monkeypatc
   assert client.get("/api/app-services/private-probe/status").status_code == 429
 
 
-def test_public_door_refuses_an_exhausted_caller_before_the_database(
-  client, auth, db, monkeypatch,
-):
+@pytest.fixture
+def fresh_public_door(monkeypatch):
   from limits.storage import MemoryStorage
   from limits.strategies import FixedWindowRateLimiter
   from app.routes import app_services as routes
 
   monkeypatch.setattr(routes, "_public_window", FixedWindowRateLimiter(MemoryStorage()))
-  monkeypatch.setattr(routes, "_known_public", {})
-  _service_app(db, access="public", slug="busy-service")
   lookups = []
   resolve = routes._service_app
   monkeypatch.setattr(
     routes, "_service_app", lambda session, slug: lookups.append(slug) or resolve(session, slug),
   )
+  return lookups
 
+
+def _set_public_allowance(db, app, per_minute):
+  contract = dict(app.capability_contract)
+  contract["service"] = {**contract["service"], "public_requests_per_minute": per_minute}
+  app.capability_contract = contract
+  db.commit()
+
+
+def test_public_door_refuses_over_limit_callers_and_probes_without_a_lookup(
+  client, auth, db, fresh_public_door,
+):
+  _service_app(db, access="public", slug="busy-service")
   for _ in range(60):
     assert client.get("/api/app-services/busy-service/status").status_code == 201
-  for _ in range(60):
-    assert client.get("/api/app-services/random-probe/status").status_code == 404
-  lookups.clear()
+  for index in range(60):
+    assert client.get(f"/api/app-services/probe-{index}/status").status_code == 404
+  assert fresh_public_door == ["busy-service"] * 60
 
+  fresh_public_door.clear()
   for index in range(20):
     refused = client.get("/api/app-services/busy-service/status")
     assert refused.status_code == 429
     assert int(refused.headers["Retry-After"]) >= 1
-    assert client.get(f"/api/app-services/probe-{index}/status").status_code == 429
-  assert lookups == []
+    assert client.get(f"/api/app-services/late-probe-{index}/status").status_code == 429
+  assert fresh_public_door == []
+
+
+def test_public_service_applied_after_probe_exhaustion_uses_its_own_bucket(
+  client, auth, db, fresh_public_door,
+):
+  for index in range(61):
+    client.get(f"/api/app-services/probe-{index}/status")
+  assert client.get("/api/app-services/probe-x/status").status_code == 429
+
+  _service_app(db, access="public", slug="fresh-service")
+  assert client.get("/api/app-services/fresh-service/status").status_code == 201
+
+
+def test_raised_public_allowance_applies_to_the_next_request(
+  client, auth, db, fresh_public_door,
+):
+  app = _service_app(db, access="public", slug="growing-service")
+  for _ in range(60):
+    assert client.get("/api/app-services/growing-service/status").status_code == 201
+  assert client.get("/api/app-services/growing-service/status").status_code == 429
+
+  _set_public_allowance(db, app, 600)
+  assert client.get("/api/app-services/growing-service/status").status_code == 201
+
+
+def test_withdrawn_public_service_stops_resolving_at_once(
+  client, auth, db, fresh_public_door,
+):
+  app = _service_app(db, access="public", slug="closing-service")
+  assert client.get("/api/app-services/closing-service/status").status_code == 201
+
+  contract = dict(app.capability_contract)
+  contract["service"] = {**contract["service"], "access": "self"}
+  app.capability_contract = contract
+  db.commit()
+  fresh_public_door.clear()
+  assert client.get("/api/app-services/closing-service/status").status_code == 404
+  assert fresh_public_door == []
