@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.events import process_event
 
 from tests.test_codex_sdk_runner import (
+  platform_hook_discovery,  # noqa: F401 - autouse fixture for runner fakes
   _FakeBroadcast,
   _FakeThread,
   _FakeTurnCompletedNotification,
