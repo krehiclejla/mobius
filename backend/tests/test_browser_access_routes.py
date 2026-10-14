@@ -302,7 +302,7 @@ async def test_revocation_cancels_only_attributed_service_queue(db, monkeypatch)
   monkeypatch.setattr(app_services, "service_contract", lambda *a, **kw: {})
   released = []
   monkeypatch.setattr(app_services, "hold_runtime", lambda *_: SimpleNamespace(close=lambda: released.append(True)))
-  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), owner,
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), owner,
     {"actor": {"browser_grant_id": grant.id}}))
   await asyncio.wait_for(queued.wait(), 1)
   revoke_grant(db, grant.id, owner.id)

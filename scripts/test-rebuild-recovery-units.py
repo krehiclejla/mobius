@@ -48,17 +48,17 @@ elif (root / "allow-recovery").exists():
 ''')
         worker.chmod(0o755)
         source = (Path(__file__).parent / "install-rebuild-helper.sh").read_text()
-        start = source.index("cat >/etc/systemd/system/mobius-rebuild.service")
-        end = source.index("chmod 0644 /etc/systemd/system/mobius-rebuild.service", start)
+        start = source.index('cat >"$STAGE/mobius-rebuild.service"')
+        end = source.index("for unit in mobius-rebuild.service", start)
         units = source[start:end].replace("/usr/local/libexec/mobius-rebuild-host", str(worker))
-        units = units.replace("/etc/systemd/system/", f"{root}/").replace("mobius-rebuild", prefix)
+        units = units.replace("mobius-rebuild", prefix)
         # Scale only the timer interval; the Python contract test checks the
         # installed production budget, and systemd's dispatch semantics remain real.
         # Four seconds also stays below the normal 5-starts/10-seconds service
         # limit; a one-second test timer would itself exhaust that limit.
         units = units.replace("OnBootSec=30", "OnBootSec=4").replace("OnUnitInactiveSec=30", "OnUnitInactiveSec=4")
         subprocess.run(["bash", "-eu", "-c", units], check=True, timeout=10,
-                       env={**os.environ, "DATA_SOURCE": str(data)})
+                       env={**os.environ, "STAGE": str(root), "DATA_SOURCE": str(data)})
         try:
             for name in names:
                 destination = Path("/run/systemd/system") / name

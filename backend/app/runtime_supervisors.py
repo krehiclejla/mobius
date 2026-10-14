@@ -91,6 +91,8 @@ class RuntimeSupervisors:
     self._frontend_handler = None
     self._database_services_started = False
     self._database_services_error: str | None = None
+    from app.app_update_batches import AppUpdateBatches
+    self.app_updates = AppUpdateBatches(settings.data_dir)
 
   def _spawn(self, name: str, coroutine) -> None:
     self._tasks[name] = asyncio.create_task(
@@ -131,6 +133,11 @@ class RuntimeSupervisors:
         )
 
     self._spawn("boot-file-cache-reclaim", reclaim())
+
+  def retry_bootstrap_apps(self, outcome) -> None:
+    """Keep retrying default apps that failed only transiently at boot."""
+    from app.bootstrap import retry_bootstrap_apps
+    self._spawn("bootstrap-apps-retry", retry_bootstrap_apps(outcome))
 
   async def start_process_services(self) -> None:
     """Start services that are safe without a serviceable database."""
@@ -239,6 +246,8 @@ class RuntimeSupervisors:
           "required runtime supervisors were not started: "
           + ", ".join(sorted(missing))
         )
+      # Settles any batch a stopped server left running, then admits new ones.
+      await self.app_updates.start()
       self._database_services_started = True
       self._database_services_error = None
     except Exception as exc:
@@ -621,6 +630,8 @@ class RuntimeSupervisors:
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""
+    # First, so each running update settles while the owners it uses still run.
+    await self.app_updates.stop()
     tasks = list(self._tasks.values())
     for task in tasks:
       task.cancel()

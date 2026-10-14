@@ -3,8 +3,8 @@ import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import React from 'react'
 import { renderWithModels } from './modelRegistryRender.js'
-import { createServer } from 'vite'
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
+const vite = await createSsrRenderServer()
 const { default: SubagentChips } = await vite.ssrLoadModule('/src/components/ChatView/SubagentChips.jsx')
 const { default: HelperResultCard, HelperResultGroupCard } = await vite.ssrLoadModule('/src/components/ChatView/HelperResultCard.jsx')
 const priorWindow = globalThis.window

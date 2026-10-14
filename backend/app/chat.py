@@ -38,6 +38,7 @@ from app import (
   questions,
   run_state,
   schemas,
+  settled,
   skills as skills_platform,
 )
 from app.broadcast import (
@@ -875,11 +876,15 @@ def reconcile_startup_chats(
         from app.chat_waits import (
           safe_startup_writer_orphan as safe_wait_startup_writer_orphan,
         )
-        from app.delegations import safe_parent_wake_startup_writer_orphan
+        from app.delegations import (
+          safe_helper_answer_startup_writer_orphan,
+          safe_parent_wake_startup_writer_orphan,
+        )
         if (
           safe_parent_wake_startup_writer_orphan(
             db, chat, running_runs[0],
           )
+          or safe_helper_answer_startup_writer_orphan(db, chat, running_runs[0])
           or safe_wait_startup_writer_orphan(db, chat, running_runs[0])
           or safe_auto_resume_startup_orphan(db, chat, running_runs[0])
         ):
@@ -1362,11 +1367,15 @@ async def sweep_wedged_runs(db: Session) -> list[str]:
             models.Chat.deleted_at.is_(None),
           ).first()
           if chat is not None:
-            from app.delegations import safe_parent_wake_startup_writer_orphan
+            from app.delegations import (
+              safe_helper_answer_startup_writer_orphan,
+              safe_parent_wake_startup_writer_orphan,
+            )
             from app.chat_waits import safe_startup_writer_orphan
             if (
               safe_startup_writer_orphan(db, chat, physical)
               or safe_parent_wake_startup_writer_orphan(db, chat, physical)
+              or safe_helper_answer_startup_writer_orphan(db, chat, physical)
               or safe_auto_resume_startup_orphan(db, chat, physical)
             ):
               continue
@@ -1490,11 +1499,13 @@ async def sweep_idle_pending_chats(db: Session) -> list[str]:
             if chat is None:
               continue
             pending = list(chat.pending_messages or [])
+            from app.delegations import queued_answer_held
             from app.run_state import has_running_run
             if (
               has_running_run(db, chat_id)
               or not _pending_head_is_stale(pending, now_ms)
               or programmatic_start_blocker(db, chat_id)
+              or queued_answer_held(db, chat_id, pending)
               or not mark_starting(chat_id)
             ):
               continue
@@ -3620,20 +3631,12 @@ async def _close_turn_browser(chat_id: str, run_gen: int | None) -> None:
 async def _join_browser_close(chat_id: str) -> bool:
   """Run browser teardown to completion; call only under the lifecycle lock.
 
-  Shield and JOIN cleanup on cancellation: releasing the gate while a worker
+  A cancelled caller waits for the teardown: releasing the gate while a worker
   thread still sends signals would endanger the successor.
   """
-  task = asyncio.create_task(_close_browser_session(chat_id))
-  try:
-    return await asyncio.shield(task)
-  except asyncio.CancelledError:
-    while not task.done():
-      try:
-        await asyncio.shield(task)
-      except asyncio.CancelledError:
-        continue
-    task.result()
-    raise
+  return await settled.settle(
+    _close_browser_session(chat_id), what=f"Browser close for chat {chat_id}",
+  )
 
 
 async def reap_unowned_browsers(*, memory_budget_bytes: int | None) -> dict:
@@ -5096,13 +5099,14 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
+  side_question_cids: tuple[str, ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
 
   A failed acknowledgement conservatively leaves provider availability limited
-  and repeats an already-seen peer note or Wait result on a later turn; it
-  never records success before the provider call has actually returned
-  successfully.
+  and repeats an already-seen peer note, Wait result or added side question
+  on a later turn; it never records success before the provider call has
+  actually returned successfully.
   """
   if not chat_id or not run_token:
     return
@@ -5117,6 +5121,7 @@ async def _acknowledge_provider_success(
         delivered_through.message_id if delivered_through is not None else None
       ),
       wait_results=wait_results,
+      side_question_cids=side_question_cids,
     )))
     if wait_results:
       from app.chat_waits import (
@@ -5702,8 +5707,8 @@ async def _run_chat_impl_with_db(
   # child tasks keep running. Re-attach their immutable ids/statuses to every
   # ordinary parent turn so a resumed agent waits on the existing child rather
   # than launching a duplicate. Delegated children attach to their own
-  # descendants through the guarded helper instead of inheriting this block.
-  if run_policy is None and chat_id and run_token:
+  # descendants through their delegated assignment instead of inheriting this block.
+  if chat_id and run_token:
     from app.delegations import active_parent_context
     delegation_context = active_parent_context(db, chat_id, run_token)
     if delegation_context:
@@ -5725,11 +5730,38 @@ async def _run_chat_impl_with_db(
     if waits_context:
       user_message = f"{waits_context}\n\n{user_message}"
 
-  if chat_id and run_policy is None:
-    from app.goals import resume_context
-    goal_context = resume_context(db, run_token)
+  # Side questions the owner added to the chat ("/btw", then Add to chat)
+  # reach the agent once: on this turn, recorded delivered only when the
+  # provider call succeeds (AcknowledgeProviderSuccess), like Wait results.
+  side_question_cids: tuple[str, ...] = ()
+  if run_policy is None and chat_row is not None:
+    from app.side_questions import owed_side_questions_context
+    try:
+      owed_side_rows = [
+        body for _seq, body in transcript_rows.owed_side_questions(db, chat_row)
+        if isinstance(body, dict) and isinstance(body.get("cid"), str)
+      ]
+    except Exception:
+      # Advisory context: an unreadable row must not cost the owner's turn.
+      # The answers stay owed and ride the next turn instead.
+      log.exception("owed side questions unreadable chat_id=%s", chat_id)
+      owed_side_rows = []
+    if owed_side_rows:
+      user_message = (
+        f"{owed_side_questions_context(owed_side_rows)}\n\n{user_message}"
+      )
+      side_question_cids = tuple(body["cid"] for body in owed_side_rows)
+
+  goal_brief_refresh = None
+  if chat_id:
+    from app.goals import compaction_brief_refresh, turn_goal_brief
+    goal_context = turn_goal_brief(db, chat_id, run_token, delegated=run_policy is not None)
     if goal_context:
       user_message = f"{user_message}\n\n{goal_context}"
+    if goal_context or (run_policy is None and run_token):
+      goal_brief_refresh = compaction_brief_refresh(
+        chat_id, run_token, delegated=run_policy is not None,
+      )
 
   # Per-turn time context (EVERY turn, not just the first) so the agent has a
   # clock + a sense of recency (how long since the user last wrote). Prepended
@@ -5918,20 +5950,25 @@ async def _run_chat_impl_with_db(
   # request; live app state is never recomposed for an established chat.
   runner_agent_settings = agent_settings
   custom_prompt = _custom_system_prompt(chat_overrides)
-  from app.system_prompts import exact_prompt_for_chat, prompt_for_chat
+  from app.system_prompts import (
+    compose_system_prompt_off_loop, exact_prompt_for_chat, prompt_for_chat,
+  )
   try:
-    system_prompt = (
-      exact_prompt_for_chat(
+    if run_policy is not None:
+      system_prompt = exact_prompt_for_chat(
         chat_row, run_policy.system_prompt, db, persist=True,
       )
-      if run_policy is not None
-      else prompt_for_chat(
-        chat_row,
-        custom_prompt if custom_prompt else _read_skill_text(),
-        db,
-        persist=True,
+    else:
+      base_prompt = custom_prompt if custom_prompt else _read_skill_text()
+      # Composing reads each app's fragment from Git, so a chat that has no
+      # snapshot yet composes off the event loop.
+      composed = (
+        None if chat_row.system_prompt_snapshot_id
+        else await compose_system_prompt_off_loop(base_prompt, db)
       )
-    )
+      system_prompt = prompt_for_chat(
+        chat_row, base_prompt, db, persist=True, composed=composed,
+      )
     db.commit()
   except Exception:
     log.exception("failed to snapshot system prompt chat_id=%s", chat_id)
@@ -6185,6 +6222,7 @@ async def _run_chat_impl_with_db(
         connector_plan=connector_turn_plan,
         coordination_enabled=coordination_tools_enabled,
         helper_host_key=helper_host_key,
+        goal_brief_refresh=goal_brief_refresh,
       )
       new_session_id = runner_result.get("session_id")
       err = runner_result.get("error")
@@ -6194,6 +6232,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -6363,6 +6402,7 @@ async def _run_chat_impl_with_db(
           connector_plan=connector_turn_plan,
           helper_host_key=helper_host_key,
           data_dir=settings.data_dir,
+          goal_brief_refresh=goal_brief_refresh,
         )
       else:
         runner_result = await run_claude_sdk_turn(
@@ -6378,6 +6418,7 @@ async def _run_chat_impl_with_db(
           run_policy=run_policy,
           connector_plan=connector_turn_plan,
           coordination_enabled=coordination_tools_enabled,
+          goal_brief_refresh=goal_brief_refresh,
         )
       new_session_id = runner_result.get("session_id")
       err = runner_result.get("error")
@@ -6387,6 +6428,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

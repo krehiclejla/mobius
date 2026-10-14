@@ -147,8 +147,60 @@ When the partner asks to share a local-first app as a repo, make the existing so
 1. Keep `mobius.json` at the repo root with stable `id`, `name`, `version`, `description`, `entry`, `icon`, complete `source_files`, any `static_assets`, permissions, and offline flags.
 2. Keep runtime data, tokens, logs, generated reports, and local caches out of the repo; source plus declared static assets only.
 3. Initialize git in the app source if needed: `git init -b main`, commit, push to GitHub, and keep the package at repo root on `main` or a tag. Root packages give the installer a real `origin` clone and clean PR-friendly diffs; repo subdirs and branch names with slashes fall back to synthetic upstream tracking.
-4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally.
+4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally. Exit 3 (`INCONCLUSIVE`, or `build_stalled` from apply) means the machine was too busy to finish the build, not that the source is wrong: retry later instead of editing.
 5. Smoke-install from the raw GitHub `mobius.json` URL on a clean instance or under a test slug before calling it shareable.
+
+### Store listing — what the App Store shows before anyone installs
+
+Publishing from the App Store's **Publish** tab makes the app's last applied
+source public, and the Store refuses it without a listing. The listing is part
+of the app's source, so it is reviewed, versioned and published with the code:
+
+```json
+"icon": "icon.png",
+"store": {
+  "tagline": "One line on what it does for the owner (at most 120 bytes).",
+  "description": "Plain text: what it does, who it is for, what stays private (at most 4000 bytes).",
+  "hero": "static/store/hero.png",
+  "screenshots": [
+    {"src": "static/store/main.png", "alt": "What the image shows, concretely.", "label": "Optional short caption"}
+  ]
+}
+```
+
+- `icon` and every listing image must be committed files; listing images live
+  under `static/store/`. `hero` is optional; 1–5 screenshots are required,
+  each with concrete `alt` text (at most 300 bytes) and an optional `label`
+  (at most 120 bytes).
+- Every listing image, the icon included, must be a real PNG, JPEG or WebP
+  file of at most 6 MB, 8192 px on its longest side, and 32 million pixels in
+  all (so 8192x8192 is too large; 5000x5000 fits). The file extension alone
+  does not count. Images saved through the Store editor lose their EXIF,
+  location and text metadata.
+- Publishing makes the whole source public, so before it does, every
+  committed PNG, JPEG and WebP (not only listing art) is checked for hidden
+  metadata: EXIF and GPS, XMP, PNG text chunks, C2PA provenance, JPEG
+  comments and thumbnails, and bytes after the image ends. The preview's
+  `details` item names every such file. Clean one by re-saving its pixels,
+  e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); icc = im.info.get('icc_profile'); im.info.clear(); im.save('f.jpg', quality=95, icc_profile=icc)"`
+  (turning it upright first, since the orientation tag goes with the rest,
+  and keeping its colour profile;
+  the same works for PNG and WebP without `quality`), or remove it if
+  nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
+  exactly `Software` (the tool that wrote it) are allowed; any other text key
+  (`Author`, `Comment`, `Description`, XMP...) is not.
+- Screenshots must be truthful and private: capture the app's real UI in an
+  empty, demo, or fixture state, never the owner's own records, names,
+  accounts, chats, or machines. Build a small demo state if the app has none.
+- Apply the app so the listing is in its accepted source, then check it with
+  `mapi "/api/community/publications/github/preview?app_id=<id>"`. Its
+  `checklist` names every unmet item at once, and `ready` is true only when
+  `listing` is exactly what the Store will publish.
+- The owner can also write the listing by hand in the Store's Publish tab,
+  which saves it into this same source. An older app with no `mobius.json`
+  needs an agent to create one first, preserving its existing permissions,
+  capabilities, and any schedule; a listing save will not guess that contract.
+- Publishing itself stays the owner's action in the Store.
 
 **Don't hand-bump a version constant in app source.** If an app carries its released version inline (e.g. `const APP_VERSION = '1.2.0'`), leave that line alone — the catalog/installer sets it per release, not your edits. Bumping it locally guarantees a merge conflict on the *next* update: your bump and the new release's bump land on the same line, so every update stops to ask the owner to reconcile a version number. Git already tracks your edits — you never need a version bump to record them. (This is the single most common avoidable update conflict.)
 
@@ -259,7 +311,9 @@ manifest, layered by how always-on they are:
 - **A system-prompt fragment (always-on, while installed).**
   `"system_prompt": "<name>.md"` (also a root-level `source_files` entry) —
   the file is appended to the base system prompt for EVERY chat, but ONLY while
-  the app is installed; uninstall removes it. Use it for a short,
+  the app is installed; uninstall removes it. Chats read it from the app's
+  last applied version, so an edit reaches chats started after the next
+  apply, never while it is still being written. Use it for a short,
   always-relevant default the agent should carry without being asked, and keep
   it tight — it costs tokens on every session. Memory ships `memory-core.md`;
   Pages ships `pages-core.md`. Max 256 KB.
@@ -835,6 +889,35 @@ useEffect(() => {
   can show status without reading transcripts.
 - Keep the chat as the interaction surface; it gives the user a persistent
   transcript, normal agent tooling, and follow-up questions in one place.
+
+---
+
+## Pausing work while the app is hidden
+
+The shell keeps recently used apps loaded but hidden so switching back is
+instant. A hidden app frame's `document.hidden` stays `false` unless the whole
+browser tab is hidden, so a timer gated only on `document.hidden` keeps
+polling, animating, or playing audio for an app nobody can see. Gate that work
+on the runtime's combined signal instead:
+
+```jsx
+useEffect(() => {
+  let timer = null
+  const stop = window.mobius.onVisibilityChange((visible) => {
+    clearInterval(timer)
+    if (!visible) return
+    refresh() // catch up at once on return, then resume the cadence
+    timer = setInterval(refresh, 5000)
+  })
+  return () => { clearInterval(timer); stop() }
+}, [])
+```
+
+`window.mobius.visible` is `true` only while the shell shows this frame and the
+tab is visible. `onVisibilityChange(cb)` calls `cb(visible)` immediately and on
+every change, and returns an unsubscribe function. A Store app that may run on
+an older Möbius checks `window.mobius.runtimeFeatures?.frameVisibility` and
+otherwise falls back to `document.hidden` with `visibilitychange`.
 
 ---
 

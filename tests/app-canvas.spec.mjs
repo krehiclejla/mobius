@@ -926,6 +926,99 @@ test.describe('AppCanvas: iframe-mount contract', () => {
       .toHaveValue(/crashed with this error/, { timeout: 8000 })
     expect(chatsCreated).toBe(1)
   })
+
+  test('cleared builder chat sends a stale frame crash report to a new chat without reloading', async ({ page }) => {
+    const appId = 78
+    const formerChatId = 'former-builder'
+    let chatId = formerChatId
+    let appsFetches = 0
+    let framesFetched = 0
+    let chatsCreated = 0
+    await page.setViewportSize({ width: 412, height: 915 })
+    await page.addInitScript(() => localStorage.setItem('token', 'mock-owner-token'))
+    await setupShellBasics(page)
+    await page.route(/\/api\/apps\/$/, route => {
+      if (route.request().method() !== 'GET') return route.fallback()
+      appsFetches += 1
+      return route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([{
+          id: appId, name: chatId ? 'AssociatedToy' : 'ClearedToy', slug: 'clearedtoy',
+          description: 'test', compiled_path: `/data/compiled/app-${appId}.js`,
+          chat_id: chatId, source_dir: null, created_at: '1000',
+          updated_at: chatId ? '1000' : '2000', frame_version: 'same-frame',
+        }]),
+      })
+    })
+    await page.route(/\/api\/auth\/app-token$/, route => route.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'mock-app-token' }),
+    }))
+    await page.route(new RegExp(`/api/apps/${appId}/frame`), route => {
+      framesFetched += 1
+      return route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        body: mockFrameHTML(appId),
+      })
+    })
+    await page.route(/\/api\/chats(?:\?.*)?$/, route => {
+      if (route.request().method() === 'POST') {
+        chatsCreated += 1
+        return route.fulfill({
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: 'fresh-report', title: 'New chat', ...emptyChatPage(),
+          }),
+        })
+      }
+      return route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([{
+          id: formerChatId, title: 'Former builder', has_messages: true,
+          running: false, created_at: '1000', updated_at: '1000',
+        }]),
+      })
+    })
+    await page.route(/\/api\/chats\/fresh-report(?:\?.*)?$/, route => route.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'fresh-report', title: 'New chat', ...emptyChatPage() }),
+    }))
+    await page.route(/\/api\/chats\/[^/]+\/stream$/, route =>
+      route.fulfill({ status: 204, body: '' }))
+
+    await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
+    await page.waitForSelector('iframe.canvas--live[data-frame-version="same-frame"]', {
+      state: 'attached', timeout: 30000,
+    })
+    await expect(page.locator('.canvas-loading')).toBeHidden({ timeout: 8000 })
+    const frame = await waitForContentFrame(page, 'iframe.canvas--live')
+    const initialFramesFetched = framesFetched
+    chatId = ''
+    const beforeRefetch = appsFetches
+    await frame.evaluate(() => window.parent.postMessage(
+      { type: 'moebius:open-app', appId: 'no-such-app' }, window.location.origin,
+    ))
+    await expect.poll(() => appsFetches).toBeGreaterThan(beforeRefetch)
+    await expect(page.getByText('ClearedToy')).toBeVisible({ timeout: 8000 })
+    expect(framesFetched).toBe(initialFramesFetched)
+
+    // The still-mounted document retains the former chat_id embedded when it
+    // was served. The current app row's explicit clear must override it.
+    await frame.evaluate(([id, staleChatId]) => window.parent.postMessage({
+      type: 'moebius:app-error', appId: String(id), chatId: staleChatId,
+      error: 'stale-frame crash',
+    }, window.location.origin), [appId, formerChatId])
+    await expect(page.getByRole('textbox', { name: 'Message Möbius…' }))
+      .toHaveValue(/ClearedToy.*crashed with this error/, { timeout: 8000 })
+    expect(chatsCreated).toBe(1)
+    expect(framesFetched).toBe(initialFramesFetched)
+  })
 })
 
 // These scenarios run the compiled navigation runtime inside a controlled frame,

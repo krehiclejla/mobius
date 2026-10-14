@@ -13,6 +13,7 @@ import {
   liveAppToken, resolveLatchedToken,
 } from '../../lib/appToken.js'
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
+import { acquireAudioSession } from '../../lib/audioSession.js'
 import { validNavLocationText } from '../../lib/appNavLocation.js'
 import { readAppNavLocation, writeValidatedAppNavLocation } from '../../lib/appNavLocationStore.js'
 import {
@@ -371,6 +372,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   onAppFocus, onImmersive, onIntentDelivered, onAppError, onHostRequest,
   onMediaSession, onShellShortcut,
 }, hostRef) {
+  // Before app code can play: app frames cannot set the page's audio session.
+  useLayoutEffect(() => acquireAudioSession('playback'), [])
+
   const queryClient = useQueryClient()
   const [serviceSurface, setServiceSurface] = useState(null)
   const [cameraPreview, setCameraPreview] = useState(null)

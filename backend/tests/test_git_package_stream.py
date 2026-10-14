@@ -90,7 +90,7 @@ def test_every_declared_input_still_changes_the_exact_digest(repo, field):
   assert install.package_content_digest_from_git(repo, commit) == after
 
 
-@pytest.mark.parametrize("missing", ["index.jsx", "cards.js", "large.bin", "seed.json", "fetch.sh", "icon.png"])
+@pytest.mark.parametrize("missing", ["index.jsx", "cards.js", "large.bin", "seed.json", "fetch.sh"])
 def test_missing_declared_files_fail_closed_in_both_paths(repo, missing):
   tree = _tree()
   tree.pop(missing)
@@ -99,6 +99,15 @@ def test_missing_declared_files_fail_closed_in_both_paths(repo, missing):
     install.package_content_digest_from_tree(tree)
   with pytest.raises(install.PackageContentError):
     install.package_content_digest_from_git(repo, commit)
+
+
+def test_missing_optional_icon_digests_identically_in_both_paths(repo):
+  tree = _tree()
+  tree.pop("icon.png")
+  commit = _commit(repo, tree)
+  expected = install.package_content_digest_from_tree(tree)
+  assert install.package_content_digest_from_git(repo, commit) == expected
+  assert expected != install.package_content_digest_from_tree(_tree())
 
 
 @pytest.mark.parametrize("body", [b"broken json", b'{"id":"invalid"}'])

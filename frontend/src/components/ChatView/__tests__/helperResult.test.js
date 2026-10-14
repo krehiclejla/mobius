@@ -3,8 +3,8 @@ import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import React from 'react'
 import { renderWithModels } from './modelRegistryRender.js'
-import { createServer } from 'vite'
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
+const vite = await createSsrRenderServer()
 const { default: Card } = await vite.ssrLoadModule('/src/components/ChatView/HelperResultCard.jsx')
 const priorWindow = globalThis.window
 globalThis.window = { location: new URL('https://mobius.test/shell') }
@@ -46,4 +46,13 @@ test('failed, reviewable and stopped helpers say how they ended', () => {
   assert.match(render({ status: 'needs_review' }), /· Needs review/)
   assert.match(render({ status: 'cancelled' }), /· Stopped/)
   assert.match(render({ status: 'failed' }), /chat__subagent-dot--failed/)
+})
+
+test('a helper paused on its question waits for its coordinating agent, not the owner, and has not finished or failed', () => {
+  const html = render({ status: 'needs_input' })
+  assert.match(html, /· Waiting for coordinating agent/)
+  assert.doesNotMatch(html, /Needs an answer|Waiting for you/)
+  assert.doesNotMatch(html, /Helper finished|Failed|Stopped/)
+  assert.doesNotMatch(html, /chat__subagent-dot--(done|failed)/)
+  assert.doesNotMatch(html, /chat__helper-working/)
 })
