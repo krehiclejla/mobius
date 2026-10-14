@@ -6,7 +6,36 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-ROLLDOWN_TIMEOUT_SECS = 30
+# A Rolldown build that outlives this wall limit is stopped, so a runaway or
+# hung build cannot hold the shared build lease indefinitely. Machine load
+# alone can stretch a correct build a long way: an overloaded 2-vCPU, 1 GB
+# instance has turned a sub-second build into more than 30 s. A stop is
+# therefore reported as an environment stall, never as a source error. The
+# limit covers only Rolldown itself; the lease wait and Git snapshot before
+# it are outside, so it bounds rather than guarantees fitting the apply
+# tool's 120 s request deadline.
+ROLLDOWN_WALL_LIMIT_SECS = 60
+
+
+class RolldownStalled(RuntimeError):
+  """Rolldown did not finish within its wall-time limit and was stopped.
+
+  An environment outcome (an overloaded or memory-starved machine, or a hung
+  build), never a verdict on the app source.
+  """
+
+  def __init__(self) -> None:
+    super().__init__(
+      f"The build environment stalled: Rolldown did not finish within "
+      f"{ROLLDOWN_WALL_LIMIT_SECS} s and was stopped. The machine is likely "
+      "overloaded or short of memory; the app source was not judged. Retry "
+      "when the machine is less busy before changing code."
+    )
+
+  def detail(self) -> dict[str, str]:
+    """The one refusal shape every HTTP caller answers with (status 503)."""
+    return {"code": "build_stalled", "message": str(self)}
+
 
 # The largest compiled module the shell will load: it refuses anything bigger
 # (`APP_MODULE_MAX_BYTES` in frontend/src/lib/appModuleBroker.js; keep them
@@ -49,7 +78,7 @@ COMPILED_RUNTIME_ABI = 1
 # compiled-runtime change that remains host-compatible. Keep ABI for actual
 # host/runtime incompatibilities: a revision-only rollout is safe while the
 # live checkout and backend process briefly run different generations.
-COMPILED_RUNTIME_ARTIFACT_REVISION = 9
+COMPILED_RUNTIME_ARTIFACT_REVISION = 10
 COMPILED_RUNTIME_GLOBAL = "__mobiusCompiledRuntime"
 COMPILED_RUNTIME_BANNER = (
   f"/* mobius-compiled-runtime-abi:{COMPILED_RUNTIME_ABI};"

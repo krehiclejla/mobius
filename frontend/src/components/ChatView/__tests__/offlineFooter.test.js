@@ -106,8 +106,8 @@ test('the composer accepts an offline send so it can queue in the durable outbox
   // offline). Gating it on offline silently swallowed offline taps.
   assert.match(
     chatInputBar,
-    /aria-label="Send"[\s\S]{0,700}?disabled=\{hasUploading \|\| submissionBlocked\}/,
-    'the Send button must gate only on uploads / provider-switch, not offline',
+    /aria-label=\{holdsQueuedEdit \? 'Save queued message' : 'Send'\}[\s\S]{0,700}?disabled=\{!holdsQueuedEdit && \(\(hasUploading && !resendsHistory\) \|\| submissionBlocked\)\}/,
+    'the Send button must gate only on uploads the send would take / provider-switch, not offline',
   )
   assert.doesNotMatch(
     chatInputBar,

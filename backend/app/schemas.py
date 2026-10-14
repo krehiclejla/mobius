@@ -11,6 +11,7 @@ from pydantic import (
   model_validator,
 )
 
+from app.manifest_contract import MAX_STORE_SCREENSHOTS, STORE_LISTING_IMAGE_MAX_BYTES
 from app.manifest_identity import requested_manifest_source
 from app.providers import PROVIDERS, _model_belongs_to_other_provider
 
@@ -100,6 +101,56 @@ class AppApply(BaseModel):
   # accepting local UI source. This explicit opt-in accepts the local manifest
   # as the package authority for this revision without discarding provenance.
   accept_local_package: bool = False
+
+
+class StoreListingImageIn(BaseModel):
+  """Keep a tracked source image (``path``) or upload new bytes."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  path: str | None = Field(default=None, max_length=512)
+  data_base64: str | None = None
+
+  @field_validator("data_base64")
+  @classmethod
+  def _bounded_upload(cls, value: str | None) -> str | None:
+    # Checked here, before decoding, so a too-large image gets a clear
+    # message; the bound also keeps a full listing under the body cap.
+    if value is not None and len(value) > -(-STORE_LISTING_IMAGE_MAX_BYTES // 3) * 4:
+      raise ValueError(
+        f"Each image must be at most {STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
+      )
+    return value
+
+  @model_validator(mode="after")
+  def _one_source(self):
+    if (self.path is None) == (self.data_base64 is None):
+      raise ValueError("Give either path or data_base64.")
+    return self
+
+
+class StoreListingScreenshotIn(StoreListingImageIn):
+  alt: str = Field(default="", max_length=2000)
+  label: str | None = Field(default=None, max_length=1000)
+
+
+class StoreListingIn(BaseModel):
+  """The whole Store listing as the owner wants it saved.
+
+  ``icon`` and ``hero`` differ on null because one is required and the other
+  optional: a null ``icon`` keeps the app's current icon, while a null
+  ``hero`` removes the banner.
+  """
+
+  model_config = ConfigDict(extra="forbid")
+
+  tagline: str = Field(default="", max_length=1000)
+  description: str = Field(default="", max_length=20_000)
+  icon: StoreListingImageIn | None = None
+  hero: StoreListingImageIn | None = None
+  screenshots: list[StoreListingScreenshotIn] = Field(
+    default_factory=list, max_length=MAX_STORE_SCREENSHOTS,
+  )
 
 
 class AppResolveUpdate(BaseModel):
@@ -505,6 +556,26 @@ class UpdateCandidatePreviewOut(BaseModel):
   source_digest: str = Field(
     min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$",
   )
+  # Mirrors update-check's pending_update_state so the Store can surface a
+  # conflict warning during review rather than letting the install attempt
+  # fail or silently re-create the resolver.
+  pending_update_state: Literal[
+    "none", "needs_resolution", "replay_pending", "unknown",
+  ] = "none"
+
+
+class UpdateCandidateRejection(BaseModel):
+  """Why install would refuse a discovered update candidate for this app.
+
+  ``identity_mismatch``: the candidate is not this installed package under
+  install's identity rule (another or no installed row, a changed permanent
+  ``package_id``, or a rename install does not accept).
+  ``repository_moved``: the candidate lives in another repository than the
+  app's Git origin, so discovery does not fetch it; reinstalling from the
+  Store follows a move the new repository proves.
+  """
+  code: Literal["identity_mismatch", "repository_moved"]
+  message: str
 
 
 class UpdateCheckOut(BaseModel):
@@ -543,6 +614,9 @@ class UpdateCheckOut(BaseModel):
   candidate_source_digest: str | None = Field(
     default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$",
   )
+  # Set, with `update_available` null, when the fetched candidate is one that
+  # install would refuse for this app; null for every other unknown.
+  candidate_rejected: UpdateCandidateRejection | None = None
   checked_at: datetime
 
 
@@ -675,6 +749,10 @@ class ChatCompactRequest(BaseModel):
   """Optional owner guidance for one manual chat compaction."""
 
   instructions: str | None = Field(default=None, max_length=4000)
+  # An explicit request identity opts into manual, resumable batches. Old
+  # bodyless clients retain their bounded one-request compaction contract.
+  batch_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+  recovery_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
   @field_validator("instructions")
   @classmethod

@@ -1,10 +1,10 @@
 /* Stable historical source inputs skip repeated extraction after pagination. */
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
 globalThis.window = { location: { origin: 'http://localhost', href: 'http://localhost/shell/' } }
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 const { sameMessageSourcesProps } = await vite.ssrLoadModule('/src/components/ChatView/MessageSources.jsx')
 after(() => vite.close())
 

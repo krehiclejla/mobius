@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app import app_cron, app_jobs, fs_locks, models, schemas
+from app import app_cron, app_jobs, fs_locks, models, schemas, settled
 from app.config import get_settings
 from app.database import get_db
 from app.deps import (
@@ -605,7 +605,7 @@ async def update_app_schedule(
     recheck_app_identity(db, app_id, expected_nonce)
     app = live_app_or_404(db, app_id)
     async with fs_locks.source_dir_lock(app.source_dir):
-      return await app_cron.run_schedule_mutation(
+      return await settled.run_settled(
         _update_app_schedule_unlocked, app, body,
       )
 

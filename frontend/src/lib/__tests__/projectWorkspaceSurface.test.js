@@ -3,16 +3,9 @@ import assert from 'node:assert/strict'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from './ssrRenderServer.mjs'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  // Bundle the SDK UI dependency during SSR; its package intentionally uses
-  // extensionless internal imports that native Node ESM does not resolve.
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: ArtifactWorkspace } = await vite.ssrLoadModule('/src/components/Projects/ArtifactWorkspace.jsx')
 const { projectQueries } = await vite.ssrLoadModule('/src/hooks/queries.js')
 const { default: ProjectWorkspace } = await vite.ssrLoadModule(

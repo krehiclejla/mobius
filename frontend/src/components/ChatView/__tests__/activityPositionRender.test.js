@@ -3,9 +3,9 @@ import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import React from 'react'
 import { renderWithModels } from './modelRegistryRender.js'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 globalThis.window = { location: { origin: 'http://localhost', href: 'http://localhost/shell/' }, innerWidth: 420 }
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/AssistantReply.jsx')
 const { assistantReplyGroups } = await vite.ssrLoadModule('/src/components/ChatView/assistantReplies.js')
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')

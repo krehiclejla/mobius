@@ -2,9 +2,9 @@
    whichever provider reported them. */
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false } })
+const vite = await createSsrRenderServer()
 after(() => vite.close())
 const { toolCallLabel, effectiveToolName, toolActivityIcon } = await vite.ssrLoadModule('/src/components/ChatView/toolActivityLabel.js')
 const { toolGroupSummary, toolGroupPastSummary } = await vite.ssrLoadModule('/src/components/ChatView/groupBlocks.js')
@@ -87,6 +87,13 @@ test('app and screenshot tools name their target', () => {
   assert.equal(toolCallLabel(tool('mcp__mobius_control__apply_app', 'source_dir=/data/apps/notes')), 'Applied app notes')
   assert.equal(toolCallLabel(tool('mcp__mobius_control__notify_owner', 'title=Ready, body=Built')), 'Notified you: Ready')
   assert.equal(toolActivityIcon(effectiveToolName(tool('mcp__mobius_control__screenshot', ''))), 'image')
+})
+
+test('a screenshot taken by app id names the app instead of ending at "of"', () => {
+  assert.equal(toolCallLabel(tool('mcp__mobius_control__screenshot', 'app_id=9')), 'Took a screenshot of app 9')
+  assert.equal(toolCallLabel(tool('mobius_control:screenshot', JSON.stringify({ app_id: 15 }))), 'Took a screenshot of app 15')
+  assert.equal(toolCallLabel(tool('mcp__mobius_control__screenshot', 'app_id=9', 'running')), 'Taking a screenshot of app 9')
+  assert.equal(toolCallLabel(tool('mcp__mobius_control__screenshot', '')), 'Took a screenshot')
 })
 
 test("an installed app's own tool reads as app work, not an identifier", () => {

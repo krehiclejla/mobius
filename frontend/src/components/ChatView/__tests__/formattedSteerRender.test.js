@@ -2,20 +2,20 @@
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { renderWithModels } from './modelRegistryRender.js'
 
 const location = { origin: 'http://localhost', href: 'http://localhost/shell/' }
 globalThis.window = { location, innerWidth: 900 }
 globalThis.location = location
-const vite = await createServer({ appType: 'custom', logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui', 'dompurify'] },
+const vite = await createSsrRenderServer({
+  noExternal: ['dompurify'],
   // SSR has no DOM; image fixtures use safe source URLs, not sanitizer behavior.
   plugins: [{ name: 'dompurify-ssr-stub', enforce: 'pre',
     resolveId: id => id === 'dompurify' ? '\0dompurify-stub' : null,
     load: id => id === '\0dompurify-stub'
-      ? 'export default { sanitize: value => String(value) }' : null }] })
+      ? 'export default { sanitize: value => String(value) }' : null }],
+})
 after(() => vite.close())
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 const { default: Reply } = await vite.ssrLoadModule('/src/components/ChatView/AssistantReply.jsx')
@@ -214,7 +214,7 @@ function copyWholeFragment(msg, visibleText) {
   const paragraph = { nodeType: 1, tagName: 'P', childNodes:
     msg.content.includes('![diagram]') ? [image, strong] : [strong] }
   const fragment = { nodeType: 11, childNodes: [paragraph] }
-  const block = { dataset: { assistantMarkdownBlock: '0' }, contains: () => true }
+  const block = { dataset: { markdownBlock: '0' }, contains: () => true }
   const range = {
     startContainer: block, endContainer: block, commonAncestorContainer: block,
     startOffset: 0, endOffset: 1, collapsed: false,
@@ -231,7 +231,8 @@ function copyWholeFragment(msg, visibleText) {
   const payload = new Map()
   const clipboardData = { setData: (type, value) => payload.set(type, value), getData: type => payload.get(type) || '' }
   let prevented = false
-  onCopy({ currentTarget: { ownerDocument, querySelectorAll: () => [block] }, clipboardData,
+  // The whole modeled selection lives inside this surface, like the real DOM.
+  onCopy({ currentTarget: { ownerDocument, querySelectorAll: () => [block], contains: node => node === block }, clipboardData,
     preventDefault: () => { prevented = true } })
   assert.equal(prevented, true)
   return { html, clipboardData }

@@ -17,7 +17,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.deps import authorize_app_module_token, get_current_owner
 from app.http_caching import strip_range
-from app.net_utils import MAX_REDIRECTS, validate_url_safe
+from app.net_utils import MAX_REDIRECTS, pinned_client, validate_url_safe
 from app.resource_access import live_app, live_app_or_404
 
 
@@ -73,14 +73,16 @@ async def _open_device_asset_range(
 ) -> tuple[httpx.AsyncClient, httpx.Response, int | None]:
   """Open one exact public byte range without retaining it on the server."""
   current_url = url
-  client = httpx.AsyncClient(
-    follow_redirects=False,
+  client = pinned_client(
     timeout=httpx.Timeout(60.0, connect=20.0),
   )
   expected_end = offset + length - 1
   try:
     for hop in range(MAX_REDIRECTS + 1):
-      pinned_url, host_header, sni_host = validate_url_safe(current_url)
+      # getaddrinfo blocks; resolve off the event loop.
+      pinned_url, host_header, sni_host = await asyncio.to_thread(
+        validate_url_safe, current_url,
+      )
       request = client.build_request(
         "GET",
         pinned_url,

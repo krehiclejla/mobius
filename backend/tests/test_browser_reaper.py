@@ -238,3 +238,38 @@ def test_guard_does_not_close_successor_generation_nominated_before_lock(reaper)
 
   assert asyncio.run(scenario()) == {"orphans_closed": {}, "guard_closed": {}}
   assert reaper["closed"] == []
+
+
+def test_cancelled_browser_close_waits_and_the_cancel_wins_over_its_failure(
+  monkeypatch, caplog,
+):
+  async def scenario():
+    started, finish, finished = asyncio.Event(), asyncio.Event(), []
+
+    async def close(chat_id):
+      started.set()
+      await finish.wait()
+      finished.append(chat_id)
+      raise RuntimeError("signal failed")
+
+    monkeypatch.setattr(chat, "_close_browser_session", close)
+    lock = chat._browser_lifecycle_lock("closing")
+
+    async def join():
+      async with lock:
+        return await chat._join_browser_close("closing")
+
+    task = asyncio.create_task(join())
+    await started.wait()
+    for _ in range(2):
+      task.cancel("handoff")
+      await asyncio.sleep(0)
+      assert not task.done() and lock.locked()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError, match="^handoff$"):
+      await task
+    assert finished == ["closing"] and not lock.locked()
+
+  asyncio.run(scenario())
+  assert "Browser close for chat closing failed after its caller was cancelled" in caplog.text
+  assert "signal failed" in caplog.text
