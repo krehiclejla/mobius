@@ -16,6 +16,10 @@ import { dirname, join } from 'node:path'
 
 import { PREPAINT_SRC } from '../applyTheme.js'
 
+test('pre-paint source parses as JavaScript', () => {
+  assert.doesNotThrow(() => new Function(PREPAINT_SRC))
+})
+
 const here = dirname(fileURLToPath(import.meta.url))
 const frontendRoot = join(here, '..', '..', '..')  // src/lib/__tests__ -> frontend
 

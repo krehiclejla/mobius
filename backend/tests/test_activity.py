@@ -544,10 +544,11 @@ def test_read_endpoint_requires_since(client, auth):
 def test_read_endpoint_rejects_app_token(client, owner_token):
   """App-scoped JWTs cannot read the cross-app activity feed. The
   service-token is a full owner JWT, which DOES pass."""
-  from app import auth as auth_mod
-  app_jwt = auth_mod.create_access_token({
-    "sub": "test", "scope": "app", "app_id": 99,
-  })
+  owner_headers = {"Authorization": f"Bearer {owner_token}"}
+  app_id = create_local_app(client, owner_headers, name="Activity fixture")["id"]
+  minted = client.post("/api/auth/app-token", json={"app_id": app_id}, headers=owner_headers)
+  assert minted.status_code == 200, minted.text
+  app_jwt = minted.json()["token"]
   r = client.get(
     "/api/admin/activity",
     params={"since": datetime.now(timezone.utc).isoformat()},
@@ -783,7 +784,9 @@ async def test_bootstrap_install_emits_with_source_bootstrap(db, monkeypatch):
   # ourselves to mirror what install_from_manifest does.
   captured = []
 
-  async def _fake_install(db, manifest_url, manifest, raw_base, source="url"):
+  async def _fake_install(
+    db, manifest_url, manifest, raw_base, source="url", prepared=None,
+  ):
     from app import app_git
     from app.install import InstallResult
 
@@ -809,7 +812,10 @@ async def test_bootstrap_install_emits_with_source_bootstrap(db, monkeypatch):
     )
 
   expected_count = len(bootstrap._CORE_BOOTSTRAP_APPS)
-  with patch("app.bootstrap.install_from_manifest", _fake_install):
+  from unittest.mock import AsyncMock
+  with patch("app.bootstrap.install_from_manifest", _fake_install), patch(
+    "app.bootstrap.prepare_package", AsyncMock(return_value=None),
+  ):
     await ensure_bootstrap_apps_installed(db)
 
   assert captured == ["bootstrap"] * expected_count

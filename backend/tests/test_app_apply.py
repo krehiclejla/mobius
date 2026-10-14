@@ -1,5 +1,7 @@
 """Explicit mini-app source application."""
+from app.chat_writer import create_chat
 
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -7,10 +9,9 @@ from unittest.mock import call, patch
 
 import pytest
 
-from app import app_apply, app_git, icon_assets, models
+from app import app_apply, app_git, applied_app_runtime, icon_assets, models
 from app.config import get_settings
 from app.database import SessionLocal
-from app.manifest_contract import STATIC_ASSETS_COUNT_MAX
 
 
 def _source(slug: str = "demo") -> Path:
@@ -126,7 +127,7 @@ def test_new_app_compile_does_not_hold_sqlite_write_lock(
       # five-second busy timeout. WAL permits this write while the apply owns
       # only its preflight read transaction; an early App INSERT does not.
       concurrent.connection().exec_driver_sql("PRAGMA busy_timeout=50")
-      concurrent.add(models.Chat(
+      concurrent.add(create_chat(
         id=concurrent_chat_id,
         title="Concurrent chat",
         messages=[],
@@ -148,6 +149,56 @@ def test_new_app_compile_does_not_hold_sqlite_write_lock(
     assert verify.get(models.Chat, concurrent_chat_id) is not None
   finally:
     verify.close()
+
+
+@pytest.mark.parametrize("mode", ["created", "updated"])
+def test_apply_holds_no_sqlite_write_lock_across_its_awaits(
+  client, auth, monkeypatch, mode,
+):
+  """No awaited apply phase may run inside the row's write transaction.
+
+  An async route that commits waits on SQLite inside the event loop, so a
+  write lock held across an await stalls both requests until the busy timeout
+  fails the unrelated one. Environment preparation is the last awaited phase,
+  after compilation, the Git commit and runtime staging.
+  """
+  source = _source()
+  if mode == "updated":
+    assert _apply(client, auth, source).status_code == 200
+    (source / "index.jsx").write_text(
+      "export default function App() { return <div>second</div> }\n"
+    )
+  concurrent_chat_id = f"chat-created-during-app-{mode}"
+  prepare_env = app_apply.app_python_env.prepare_env
+  write_errors = []
+
+  def prepare_env_while_chat_is_created(*args, **kwargs):
+    concurrent = SessionLocal()
+    try:
+      # Fail promptly instead of waiting out the live five-second timeout.
+      concurrent.connection().exec_driver_sql("PRAGMA busy_timeout=50")
+      concurrent.add(create_chat(
+        id=concurrent_chat_id,
+        title="Concurrent chat",
+        messages=[],
+        pending_messages=[],
+      ))
+      concurrent.commit()
+    except Exception as exc:  # recorded so the assertion names the lock
+      write_errors.append(repr(exc))
+    finally:
+      concurrent.close()
+    return prepare_env(*args, **kwargs)
+
+  monkeypatch.setattr(
+    app_apply.app_python_env, "prepare_env", prepare_env_while_chat_is_created,
+  )
+
+  response = _apply(client, auth, source)
+
+  assert response.status_code == 200, response.text
+  assert response.json()["mode"] == mode
+  assert write_errors == []
 
 
 def test_apply_updates_multifile_revision_once(client, auth, db):
@@ -188,6 +239,37 @@ def test_apply_updates_multifile_revision_once(client, auth, db):
       "chatId": "editing-chat",
     }),
   ]
+
+
+def test_shell_shortcuts_are_on_unless_the_manifest_opts_out(client, auth, db):
+  source = _source()
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  assert created.json()["app"]["shell_shortcuts"] is True
+  app_id = created.json()["app"]["id"]
+
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["shell_shortcuts"] = False
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  opted_out = _apply(client, auth, source)
+  assert opted_out.status_code == 200, opted_out.text
+  assert opted_out.json()["app"]["shell_shortcuts"] is False
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.shell_shortcuts is False
+
+  # Removing the declaration restores the default rather than keeping the
+  # previous value.
+  del manifest["shell_shortcuts"]
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  restored = _apply(client, auth, source)
+  assert restored.status_code == 200, restored.text
+  assert restored.json()["app"]["shell_shortcuts"] is True
+
+  manifest["shell_shortcuts"] = "no"
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  rejected = _apply(client, auth, source)
+  assert rejected.status_code >= 400
+  assert "shell_shortcuts" in rejected.text
 
 
 def test_apply_probes_the_implicit_service_identity_it_will_keep(
@@ -257,15 +339,16 @@ def test_local_apply_materializes_versioned_static_assets(client, auth):
   assert not served.exists()
 
 
-def test_local_apply_enforces_static_asset_count_before_materialization(
-  client, auth,
-):
+def test_local_apply_has_no_static_asset_count_cap(client, auth):
+  """Local apply once capped static assets at 256 files. The manifest's byte
+  cap already bounds how many can be listed, and the package byte bound limits
+  their size."""
   source = _source()
   asset_sources = source / "listing-assets"
   asset_sources.mkdir()
   manifest = json.loads((source / "mobius.json").read_text())
   manifest["static_assets"] = {}
-  for index in range(STATIC_ASSETS_COUNT_MAX):
+  for index in range(300):
     name = f"item-{index}.txt"
     (asset_sources / name).write_text(str(index))
     manifest["static_assets"][f"listing/{name}"] = f"listing-assets/{name}"
@@ -274,30 +357,41 @@ def test_local_apply_enforces_static_asset_count_before_materialization(
   accepted = _apply(client, auth, source)
 
   assert accepted.status_code == 200, accepted.text
-  served = source / "static" / "listing"
-  assert len(list(served.iterdir())) == STATIC_ASSETS_COUNT_MAX
-  accepted_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  assert len(list((source / "static" / "listing").iterdir())) == 300
 
-  extra_name = "item-over-limit.txt"
-  (asset_sources / extra_name).write_text("must not publish")
-  manifest["static_assets"][f"listing/{extra_name}"] = (
-    f"listing-assets/{extra_name}"
-  )
+
+def test_local_apply_refuses_an_oversized_package_before_reading_it(
+  client, auth, monkeypatch,
+):
+  """Local apply bounds the same declared files install downloads, from their
+  sizes on disk, before it materializes anything."""
+  from app import app_apply
+  from app.manifest_contract import package_bytes_on_disk
+
+  source = _source()
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  accepted_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  (source / "data.bin").write_bytes(b"x" * 64)
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["static_assets"] = {"data.bin": "data.bin"}
   (source / "mobius.json").write_text(json.dumps(manifest))
+  monkeypatch.setattr(
+    app_apply, "PACKAGE_MAX_BYTES", package_bytes_on_disk(source, manifest) - 1,
+  )
+
+  def read_assets(*_args):
+    raise AssertionError("static assets were read before the size check")
+
+  monkeypatch.setattr(app_apply, "_snapshot_static_assets", read_assets)
 
   rejected = _apply(client, auth, source)
 
   assert rejected.status_code == 422, rejected.text
-  assert rejected.json()["detail"] == {
-    "code": "manifest_invalid",
-    "message": (
-      "Manifest has too many static_assets "
-      f"(max {STATIC_ASSETS_COUNT_MAX})."
-    ),
-  }
+  assert rejected.json()["detail"]["code"] == "package_too_large"
+  assert "MiB app package limit" in rejected.json()["detail"]["message"]
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == accepted_head
-  assert len(list(served.iterdir())) == STATIC_ASSETS_COUNT_MAX
-  assert not (served / extra_name).exists()
+  assert not (source / "static" / "data.bin").exists()
 
 
 @pytest.mark.parametrize("symlink_component", ["source", "parent"])
@@ -694,6 +788,23 @@ def test_local_manifest_icon_is_materialized_with_its_accepted_revision(
   assert client.get(f"/api/apps/{app_id}/icon").status_code == 404
 
 
+def test_local_apply_scales_down_a_large_icon_like_install(client, auth, db):
+  """Apply used to refuse anything over 4096 px that install merely skipped."""
+  from PIL import Image
+  source = _source()
+  output = io.BytesIO()
+  Image.new("RGB", (5000, 4800), (40, 90, 180)).save(output, format="PNG")
+  _declare_icon(source, output.getvalue())
+
+  applied = _apply(client, auth, source)
+
+  assert applied.status_code == 200, applied.text
+  row = db.query(models.App).populate_existing().filter_by(
+    id=applied.json()["app"]["id"],
+  ).one()
+  assert Image.open(io.BytesIO(row.icon_png)).size == (1024, 1024)
+
+
 def test_invalid_local_manifest_icon_keeps_previous_revision(
   client, auth, db,
 ):
@@ -738,6 +849,60 @@ def test_compile_failure_keeps_previous_live_revision(client, auth, db):
   assert row.compiled_path == previous_bundle
   assert "first" in row.jsx_source
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
+
+
+def test_stalled_build_is_reported_as_environment_not_source(
+  client, auth, db, monkeypatch,
+):
+  """A build stopped by its wall limit must not read as a compile failure."""
+  from app import compiler
+
+  source = _source()
+  created = _apply(client, auth, source)
+  app_id = created.json()["app"]["id"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  previous_bundle = row.compiled_path
+  previous_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  (source / "index.jsx").write_text(
+    "export default function App(){ return 'second' }\n"
+  )
+  monkeypatch.setattr(compiler, "ROLLDOWN_WALL_LIMIT_SECS", 1)
+  monkeypatch.setattr(
+    compiler, "rolldown_command",
+    lambda *_args, **_kwargs: ["sleep", "300"],
+  )
+
+  failed = _apply(client, auth, source)
+
+  assert failed.status_code == 503
+  detail = failed.json()["detail"]
+  assert detail["code"] == "build_stalled"
+  assert "source was not judged" in detail["message"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.compiled_path == previous_bundle
+  assert "first" in row.jsx_source
+  assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
+
+
+def test_compile_failure_reports_the_error_and_location_without_colour(client, auth):
+  source = _source()
+  _apply(client, auth, source)
+  # The compiler colours every character of a quoted source line, so one long
+  # line used to push the error header past the response's tail cap.
+  style = ", ".join(f"key{i}: 'value {i}'" for i in range(20))
+  (source / "index.jsx").write_text(
+    "export default function App() {\n"
+    f"  return <div style={{{{{style}}}}}>Hello {{ </div>\n"
+    "}\n"
+  )
+
+  failed = _apply(client, auth, source)
+
+  assert failed.status_code == 422
+  stderr = failed.json()["detail"]["stderr"]
+  assert "\x1b" not in stderr
+  assert "PARSE_ERROR" in stderr
+  assert "─[ index.jsx:" in stderr
 
 
 def test_invalid_manifest_keeps_previous_live_revision(client, auth, db):
@@ -1029,6 +1194,55 @@ def test_reapply_unchanged_source_has_no_commit_or_timestamp_change(
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == head
 
 
+@pytest.mark.parametrize("module, step, served_while_blocked", [
+  (app_git, "materialize_tree", b"screen-v1"),
+  (applied_app_runtime, "prepare_runtime", b"screen-v2"),
+])
+def test_cancelled_apply_finishes_under_its_locks(
+  client, auth, db, monkeypatch, module, step, served_while_blocked,
+):
+  """A cancelled Apply keeps its locks until its writes end, and is not cut short.
+
+  Unsettled, the cancel released the source lock while the thread still wrote,
+  and skipped Apply's rollback, leaving new static assets on an old revision.
+  """
+  from app import fs_locks, schemas
+  from app.routes import apps as routes
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  source = _source()
+  asset = source / "listing-assets" / "screen.png"
+  asset.parent.mkdir()
+  asset.write_bytes(b"screen-v1")
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["static_assets"] = {"listing/screen.png": "listing-assets/screen.png"}
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  assert _apply(client, auth, source).status_code == 200
+  served = source / "static" / "listing" / "screen.png"
+  asset.write_bytes(b"screen-v2")
+  (source / "index.jsx").write_text(
+    "export default function App() { return <div>second</div> }\n"
+  )
+  worker = BlockedWorker(wraps=getattr(module, step))
+  monkeypatch.setattr(module, step, worker)
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(source)),
+    lambda: routes.apply_app_source(
+      schemas.AppApply(source_dir=str(source)), db, None,
+    ),
+    worker,
+    while_blocked=lambda: served.read_bytes() == served_while_blocked,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.expire_all()
+  row = db.query(models.App).filter_by(slug="demo").one()
+  assert "second" in row.jsx_source
+  assert row.source_commit == app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  assert served.read_bytes() == b"screen-v2"
+
+
 def test_local_source_revision_clears_previously_verified_distribution_manifest(
   client, auth, db,
 ):
@@ -1069,6 +1283,21 @@ def test_local_manifest_identity_is_immutable(client, auth, db):
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert row.slug == "demo"
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
+
+
+def test_local_manifest_identity_uses_stored_address_parser():
+  from types import SimpleNamespace
+
+  source = Path("/apps/local-name")
+  app = SimpleNamespace(manifest_url="https://example.test/app#manifest-id=stored-id")
+  app_apply._validate_local_identity(
+    source, {"id": "stored-id", "name": "Stored"}, app,
+  )
+  app.manifest_url += "&other=fragment"
+  with pytest.raises(app_apply.AppApplyError, match="source-directory name"):
+    app_apply._validate_local_identity(
+      source, {"id": "stored-id", "name": "Stored"}, app,
+    )
 
 
 def test_local_apply_updates_runtime_capabilities_with_source(
@@ -1229,7 +1458,7 @@ def test_store_ordinary_apply_warns_when_local_package_declarations_diverge(
   diverged = _apply(client, auth, source)
   assert diverged.status_code == 200, diverged.text
   assert diverged.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert not (row.capability_contract.get("agent") or {}).get("tools")
@@ -1255,7 +1484,7 @@ def test_store_ordinary_apply_warns_on_any_dropped_manifest_edit(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
 
 

@@ -14,6 +14,7 @@ import {
   flushPersistedQueryCache,
 } from '../../queryClient.js'
 import * as paneModel from './paneModel.js'
+import { sharedBrowserRoutePath } from '../../lib/sharedBrowserWorkspace.js'
 
 export function deriveShellReloadState({ workspace, activeView, drawerOpen }) {
   const content = paneModel.activeContentRoute(workspace)
@@ -43,7 +44,10 @@ export default function useShellUpdateController(inputs) {
     setUpdateAvailable(true)
   }, [])
 
-  const applyShellUpdate = useCallback(async () => {
+  // `inspectUpdate` asks the service worker for a newer shell before leaving.
+  // That check can wait up to SW_DISCOVERY_SETTLE_TIMEOUT_MS, so a reload that
+  // only re-reads the current document (the theme status-bar refresh) skips it.
+  const reloadShellDocument = useCallback(async ({ inspectUpdate }) => {
     if (applyingRef.current) return false
     applyingRef.current = true
 
@@ -56,33 +60,41 @@ export default function useShellUpdateController(inputs) {
       workspaceStateRef,
       activeViewRef,
       drawerOpenRef,
+      sharedBrowserAccess,
     } = inputsRef.current
 
     let registration = null
-    try {
-      ;({ registration } = await inspectShellUpdate({
-        serviceWorker: nav.serviceWorker,
-      }))
-    } catch { /* online document navigation remains authoritative */ }
+    if (inspectUpdate) {
+      try {
+        ;({ registration } = await inspectShellUpdate({
+          serviceWorker: nav.serviceWorker,
+        }))
+      } catch { /* online document navigation remains authoritative */ }
+    }
 
     win.dispatchEvent(new win.Event(BEFORE_SHELL_RELOAD_EVENT))
-    await awaitCacheFlushBeforeReload(flushPersistedQueryCache(queryClient))
+    if (!sharedBrowserAccess) {
+      await awaitCacheFlushBeforeReload(flushPersistedQueryCache(queryClient))
+    }
     persistWorkspaceSnapshot()
-    writeShellReload(storage, deriveShellReloadState({
-      workspace: workspaceStateRef.current.ws,
-      activeView: activeViewRef.current,
-      drawerOpen: drawerOpenRef.current,
-    }))
+    if (!sharedBrowserAccess) {
+      writeShellReload(storage, deriveShellReloadState({
+        workspace: workspaceStateRef.current.ws,
+        activeView: activeViewRef.current,
+        drawerOpen: drawerOpenRef.current,
+      }))
+    }
 
     // The new document restores the current workspace from the one-shot state
     // above. Online shell navigation owns freshness; releasing the worker only
     // advances the coherent offline generation.
-    replaceNavEntry('base', '/shell/')
+    const routePath = sharedBrowserAccess ? sharedBrowserRoutePath() : '/shell/'
+    replaceNavEntry('base', routePath)
     releaseWaitingShellUpdate(registration)
     const transitionPrepared = (
       win.__mobiusPrepareShellReloadTransition?.() === true
     )
-    const navigate = () => win.location.replace('/shell/')
+    const navigate = () => win.location.replace(routePath)
     if (transitionPrepared && typeof win.requestAnimationFrame === 'function') {
       // Give Chromium one rendering boundary to activate the cross-document
       // transition before the owner-approved replacement starts.
@@ -92,6 +104,15 @@ export default function useShellUpdateController(inputs) {
     }
     return true
   }, [])
+
+  const applyShellUpdate = useCallback(
+    () => reloadShellDocument({ inspectUpdate: true }),
+    [reloadShellDocument],
+  )
+  const reloadShell = useCallback(
+    () => reloadShellDocument({ inspectUpdate: false }),
+    [reloadShellDocument],
+  )
 
   useEffect(() => watchForShellUpdateOnResume({
     doc: inputsRef.current.doc,
@@ -104,5 +125,6 @@ export default function useShellUpdateController(inputs) {
     updateAvailable,
     markShellUpdateAvailable,
     applyShellUpdate,
+    reloadShell,
   }
 }

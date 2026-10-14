@@ -58,7 +58,7 @@ def test_core_submit_attaches_without_app_and_nested_child_inherits_none(
   db.commit()
   policy = policy_for_chat(db, child)
   assert policy is not None and policy.app_id is None
-  child_auth = {"Authorization": f"Bearer {delegation_execution_token(db, policy)}"}
+  child_auth = {"Authorization": f"Bearer {delegation_execution_token(db, policy, run_id='core-child-run')}"}
   capabilities = client.get("/api/delegations/capabilities", headers=child_auth)
   assert capabilities.status_code == 200, capabilities.text
   nested = _submit(client, child_auth, child, name="nested")
@@ -91,7 +91,7 @@ def test_app_owned_nested_submission_inherits_app_but_core_remains_core(
                        chat_id=child, status="running", provider="codex"))
   db.commit()
   policy = policy_for_chat(db, child)
-  child_auth = {"Authorization": f"Bearer {delegation_execution_token(db, policy)}"}
+  child_auth = {"Authorization": f"Bearer {delegation_execution_token(db, policy, run_id='app-child-run')}"}
   nested = _submit(client, child_auth, child, name="owned-nested")
   assert nested.status_code == 201, nested.text
   assert nested.json()["app_id"] == app_id
@@ -138,7 +138,7 @@ def test_cancelled_core_parent_cannot_create_more_nested_work(client, owner_toke
   db.add(make_goal_run(db, id="core-child-run", root_run_id="core-child-run",
                        chat_id=child, status="running", provider="codex"))
   db.commit()
-  token = delegation_execution_token(db, policy_for_chat(db, child))
+  token = delegation_execution_token(db, policy_for_chat(db, child), run_id="core-child-run")
   row = db.get(models.Delegation, first.json()["id"])
   mark_cancelled(db, row)
   response = _submit(client, {"Authorization": f"Bearer {token}"}, child, name="too-late")

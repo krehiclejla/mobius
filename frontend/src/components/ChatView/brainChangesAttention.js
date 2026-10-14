@@ -1,10 +1,7 @@
 /* View acknowledgement for actionable work represented by the Brain's Changes row. */
+import { localStore } from '../../lib/workspaceStorage.js'
 
 const STORAGE_PREFIX = 'mobius:brain-changes-seen:v1:'
-
-function browserStorage() {
-  try { return globalThis.localStorage ?? null } catch { return null }
-}
 
 function storageKey(chatId) {
   if (chatId == null || chatId === '') return ''
@@ -26,7 +23,7 @@ export function changesAttentionCursor(overview) {
   return `${overview.workflowRevision || ''}||${workCursor}`
 }
 
-export function readSeenChangesAttention(chatId, storage = browserStorage()) {
+export function readSeenChangesAttention(chatId, storage = localStore()) {
   const key = storageKey(chatId)
   if (!key || !storage) return ''
   try { return storage.getItem(key) || '' } catch { return '' }
@@ -35,7 +32,7 @@ export function readSeenChangesAttention(chatId, storage = browserStorage()) {
 export function writeSeenChangesAttention(
   chatId,
   cursor,
-  storage = browserStorage(),
+  storage = localStore(),
 ) {
   const key = storageKey(chatId)
   if (!key || !cursor || !storage) return false

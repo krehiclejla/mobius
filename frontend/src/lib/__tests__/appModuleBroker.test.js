@@ -58,6 +58,22 @@ test('module request keys keep the app version but discard the frame revision', 
   assert.equal(url.searchParams.get('_'), '1')
 })
 
+test('shared module reads cannot reuse an owner or prior guest SW cache key', async () => {
+  const previous = globalThis.location
+  globalThis.location = { pathname: '/shell/shared', origin: 'https://mobius.test' }
+  try {
+    const { appCodeCacheKey } = await import('../../sw-cache-policy.js')
+    const baseUrl = 'https://mobius.test/api/apps/66/module'
+    const first = appModuleRequestUrl(baseUrl, { token: 'guest-token', frameVersion: 'v1' })
+    const second = appModuleRequestUrl(baseUrl, { token: 'guest-token', frameVersion: 'v1' })
+    const owner = `${baseUrl}?token=owner-token&v=v1`
+    assert.notEqual(appCodeCacheKey(first), appCodeCacheKey(second))
+    assert.notEqual(appCodeCacheKey(first), appCodeCacheKey(owner))
+  } finally {
+    globalThis.location = previous
+  }
+})
+
 test('module broker returns bounded bytes from the controlled parent fetch', async () => {
   let seen
   const bytes = await fetchAppModuleBytes({

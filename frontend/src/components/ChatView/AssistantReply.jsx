@@ -4,8 +4,8 @@ import MsgContent from './MsgContent.jsx'
 import MessageSources from './MessageSources.jsx'
 import { carryDurableBlockState, streamItemsToAssistantPayload } from './streamPromotion.js'
 import { projectSteerContinuationMessage } from './steerContinuity.js'
-import { mergeProjectedPeerActivity } from './peerTimeline.js'
-import { presentAssistantReply, replyQuestionSuppression } from './assistantReplies.js'
+import { mergeProjectedActivity } from './peerTimeline.js'
+import { presentAssistantReply, presentAssistantActivity, replyQuestionSuppression } from './assistantReplies.js'
 import { PeerTimelineRows } from './PeerTimeline.jsx'
 import { PeerTimelineContext } from './peerTimelineContext.js'
 
@@ -27,40 +27,52 @@ function AssistantReply({
   resumeCardRef,
   ...messageProps
 }) {
-  const positions = useContext(PeerTimelineContext)?.positions
+  const timeline = useContext(PeerTimelineContext)
+  const positions = timeline?.positions
+  const presentationRows = replyGroup.presentationRows
   const msg = useMemo(() => {
     let source = null
     if (useDbActivePayload) {
       source = activeMirrorMsg
     } else if (hasLivePayload) {
       const livePayload = streamItemsToAssistantPayload(streamItems, { finalize: false })
-      const blocks = mergeProjectedPeerActivity(
+      const blocks = mergeProjectedActivity(
         livePayload.blocks, activeMirrorMsg?.blocks || [], activitySourceBlocks || [],
       )
       source = {
-        ...(activeMirrorMsg || replyGroup.rows[activeRowIndex]?.message || {}),
+        ...(activeMirrorMsg || presentationRows[activeRowIndex]?.message || {}),
         ...livePayload,
         role: 'assistant',
         blocks: carryDurableBlockState(blocks, activeMirrorMsg?.blocks || []),
       }
     }
-    return replyGroup.rows.length > 1 ? source : projectSteerContinuationMessage(
+    return presentationRows.length > 1 ? source : projectSteerContinuationMessage(
       sealedSteerAssistant, source, { active: isStreaming },
     )
   }, [activeMirrorMsg, activitySourceBlocks, hasLivePayload, isStreaming,
-    sealedSteerAssistant, streamItems, useDbActivePayload, replyGroup, activeRowIndex])
+    sealedSteerAssistant, streamItems, useDbActivePayload, presentationRows, activeRowIndex])
 
-  const sourceRows = useMemo(() => replyGroup.rows.map((row, index) => (
-    index === (activeRowIndex >= 0 ? activeRowIndex : replyGroup.rows.length - 1)
+  const sourceRows = useMemo(() => presentationRows.map((row, index) => (
+    index === (activeRowIndex >= 0 ? activeRowIndex : presentationRows.length - 1)
       ? { ...row, message: msg || row.message } : row
-  )), [replyGroup, activeRowIndex, msg])
-  const rows = useMemo(() => presentAssistantReply(sourceRows, {
+  )), [presentationRows, activeRowIndex, msg])
+  const proseRows = useMemo(() => presentAssistantReply(sourceRows, {
     activeIndex: isStreaming ? activeRowIndex : -1, positions,
   }), [sourceRows, activeRowIndex, isStreaming, positions])
+  const activity = useMemo(() => presentAssistantActivity(proseRows, {
+    activeIndex: isStreaming ? activeRowIndex : -1, positions,
+  }), [proseRows, activeRowIndex, isStreaming, positions])
+  const rows = activity.rows
+  const displayTimeline = useMemo(() => ({ tools: timeline?.tools, positions: activity.positions }), [timeline?.tools, activity.positions])
   if (!msg) return null
 
   const lastVisibleRow = rows.findLastIndex(row => !row.message.hidden)
-  return <li className="chat__reply">
+  return <PeerTimelineContext.Provider value={displayTimeline}><li
+    className="chat__reply"
+    // The whole active reply is the current response: activity presentation may
+    // move its live tools into an earlier row than the streaming one.
+    data-current-response={activeRowIndex >= 0 ? 'true' : undefined}
+  >
     <ul className="chat__reply-rows" role="presentation">
       {rows.map((row, index) => {
         const active = index === activeRowIndex
@@ -82,7 +94,7 @@ function AssistantReply({
               chatId={chatId}
               messageKey={row.key}
               activityMessageId={row.message.id}
-              activitySourceBlocks={active ? activitySourceBlocks : replyGroup.rows[index].message.blocks}
+              activitySourceBlocks={active ? activitySourceBlocks : presentationRows[index].message.blocks}
               isStreaming={active && isStreaming}
               isActiveAnswer={active}
               isLastMsg={tail && isLastMsg}
@@ -94,6 +106,7 @@ function AssistantReply({
               onAutoResumeChange={tail ? messageProps.onAutoResumeChange : undefined}
               limitResetElapsed={tail && messageProps.limitResetElapsed}
               continuationWait={tail ? messageProps.continuationWait : null}
+              handoff={tail ? messageProps.handoff : null}
               recoveryCredit={tail ? messageProps.recoveryCredit : null}
               pendingQuestionRef={pendingQuestionRef}
               resumeCardRef={resumeCardRef}
@@ -111,7 +124,7 @@ function AssistantReply({
       refs={sourceRows.flatMap(row => row.message.source_ref ? [row.message.source_ref] : [])}
       disclosureKey={`${rows[lastVisibleRow].key}:references`}
     />}
-  </li>
+  </li></PeerTimelineContext.Provider>
 }
 
 export default memo(AssistantReply)

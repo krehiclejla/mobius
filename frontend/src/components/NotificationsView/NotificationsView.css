@@ -48,7 +48,7 @@
   border: 0;
   border-radius: 999px;
   background: transparent;
-  color: var(--accent);
+  color: var(--text);
   font: inherit;
   font-size: 13px;
   font-weight: 650;
@@ -395,6 +395,10 @@
   overflow-wrap: anywhere;
   font-size: 14px;
   font-weight: 600;
+}
+
+.notifications__row--error .notifications__row-icon {
+  color: var(--danger);
 }
 
 .notifications__row-body {

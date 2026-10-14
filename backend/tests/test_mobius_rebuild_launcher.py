@@ -7,8 +7,11 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -46,6 +49,8 @@ def state(tmp_path, monkeypatch):
   monkeypatch.setattr(launcher, "INDEX", index)
   monkeypatch.setattr(launcher, "STATUS", status)
   monkeypatch.setattr(launcher, "LOCK", tmp_path / "replace.lock")
+  monkeypatch.setattr(launcher, "TRIAL_LOCK", tmp_path / "candidate.lock")
+  monkeypatch.setattr(launcher, "TRANSACTION", tmp_path / "transaction.json")
   monkeypatch.setattr(host, "WORKER_INDEX", index)
   monkeypatch.setenv("MOBIUS_REBUILD_LAUNCHER", "1")
 
@@ -87,8 +92,8 @@ def test_seed_installs_the_checkout_worker_and_never_downgrades(state):
   assert host.seed_worker(worker(1)) == "installed: revision 1"
   assert host.seed_worker(worker(1)) == "current: revision 1"
   assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered: revision 3")
-  # Reinstalling from an older checkout keeps the newer offered worker.
-  assert host.seed_worker(worker(2)).startswith("kept")
+  # A superseded checkout cannot claim the still-old active worker was upgraded.
+  assert host.seed_worker(worker(2)).startswith("rejected")
   assert _index(state)["candidate"]["revision"] == 3
   assert host.seed_worker(worker(4, "def broken(:")).startswith("rejected")
 
@@ -139,13 +144,16 @@ def _run_launcher(monkeypatch, behaviour: dict, command: str = "run") -> tuple[i
   None, callback run inside the worker)."""
   calls = []
 
-  def execute(entry, cmd):
+  def execute(entry, cmd, *, trial_fd=None):
     calls.append((entry["revision"], cmd))
     code, status, inside = behaviour[entry["revision"]]
     if inside:
       inside()
     if status is not None:
-      launcher.STATUS.write_text(json.dumps({"by": entry["revision"], **status}))
+      launcher.STATUS.write_text(json.dumps({
+        "by": entry["revision"], "worker_revision": entry["revision"],
+        "operation_id": f"{entry['revision']:032x}", **status,
+      }))
     return code
 
   monkeypatch.setattr(launcher, "execute", execute)
@@ -193,6 +201,395 @@ def test_a_trial_the_host_interrupts_is_never_repeated(state, monkeypatch):
     _run_launcher(monkeypatch, {2: (1, None, killed)})
   index = _index(state)
   assert index["active"]["revision"] == 1 and index["candidate"] is None
+  assert index["recovery"]["revision"] == 2
+
+
+def test_power_loss_before_journal_clears_pin_and_uses_active(state, monkeypatch):
+  _with_candidate(state)
+
+  def killed():
+    raise KeyboardInterrupt
+
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (1, None, killed)})
+  result, calls = _run_launcher(monkeypatch, {1: (0, None, None)})
+  assert (result, calls) == (0, [(1, "run")])
+  assert _index(state)["recovery"] is None
+  assert _index(state)["candidate"] is None
+
+
+def test_crash_after_success_before_settle_promotes_exact_candidate(state, monkeypatch):
+  _with_candidate(state)
+  update = launcher._update
+  calls = []
+
+  def crash_at_settle(change):
+    calls.append(True)
+    if len(calls) == 2:
+      raise KeyboardInterrupt
+    update(change)
+
+  monkeypatch.setattr(launcher, "_update", crash_at_settle)
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, None)})
+  assert _index(state)["recovery"]["revision"] == 2
+  monkeypatch.setattr(launcher, "_update", update)
+  result, worker_calls = _run_launcher(monkeypatch, {})
+  assert (result, worker_calls) == (0, [])  # do not replay the successful run
+  index = _index(state)
+  assert index["active"]["revision"] == 2 and index["recovery"] is None
+
+
+def test_stale_prior_success_never_promotes_candidate(state, monkeypatch):
+  _with_candidate(state)
+  launcher.STATUS.write_text(json.dumps({
+    "state": "succeeded", "worker_revision": 2, "operation_id": "a" * 32,
+  }))
+
+  def killed():
+    raise KeyboardInterrupt
+
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (1, None, killed)})
+  assert _run_launcher(monkeypatch, {1: (0, None, None)})[1] == [(1, "run")]
+  assert _index(state)["active"]["revision"] == 1
+
+
+@pytest.mark.parametrize("outcome", [
+  {"state": "failed"},
+  {"state": "succeeded", "worker_revision": 1},
+  {"state": "succeeded", "operation_id": "a" * 32},
+])
+def test_no_journal_requires_fresh_attributable_success(
+    state, monkeypatch, outcome):
+  _with_candidate(state)
+  launcher.STATUS.write_text(json.dumps({
+    "state": "queued", "operation_id": "a" * 32,
+  }))
+  update = launcher._update
+  calls = []
+
+  def crash_at_settle(change):
+    calls.append(True)
+    if len(calls) == 2:
+      raise KeyboardInterrupt
+    update(change)
+
+  monkeypatch.setattr(launcher, "_update", crash_at_settle)
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (0, outcome, None)})
+  monkeypatch.setattr(launcher, "_update", update)
+  assert _run_launcher(monkeypatch, {1: (0, None, None)})[1] == [(1, "run")]
+  assert _index(state)["active"]["revision"] == 1
+
+
+def test_no_journal_success_does_not_supersede_new_installer(state, monkeypatch):
+  _with_candidate(state)
+
+  def installed():
+    assert host.seed_worker(worker(4)).startswith("installed")
+
+  update = launcher._update
+  calls = []
+
+  def crash_at_settle(change):
+    calls.append(True)
+    if len(calls) == 2:
+      raise KeyboardInterrupt
+    update(change)
+
+  monkeypatch.setattr(launcher, "_update", crash_at_settle)
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, installed)})
+  monkeypatch.setattr(launcher, "_update", update)
+  assert _run_launcher(monkeypatch, {4: (0, None, None)})[1] == [(4, "run")]
+  assert _index(state)["active"]["revision"] == 4
+
+
+@pytest.mark.parametrize("next_command", ["run", "reconcile"])
+def test_power_loss_with_journal_reconciles_exact_candidate_once(
+    state, monkeypatch, next_command):
+  _with_candidate(state)
+
+  def killed():
+    launcher.TRANSACTION.write_text('{"version":1}')
+    launcher.TRANSACTION.chmod(0o600)
+    raise KeyboardInterrupt
+
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (1, None, killed)})
+
+  def settle():
+    launcher.TRANSACTION.unlink()
+
+  result, calls = _run_launcher(
+    monkeypatch, {1: (0, None, None), 2: (0, None, settle)}, next_command,
+  )
+  assert (result, calls) == (0, [(2, "reconcile")])
+  assert _index(state)["recovery"] is None
+  assert _index(state)["active"]["revision"] == 1
+
+
+@pytest.mark.parametrize("outcome, promoted", [
+  ("succeeded", True),
+  ("no_change", True),
+  ("rolled_back", False),
+  ("failed", False),
+])
+def test_reconcile_settlement_promotes_only_fresh_candidate_success(
+    state, monkeypatch, outcome, promoted):
+  _with_candidate(state)
+
+  def interrupted():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  assert _run_launcher(monkeypatch, {2: (1, None, interrupted)})[0] == 1
+
+  def settle():
+    launcher.TRANSACTION.unlink()
+
+  result, calls = _run_launcher(
+    monkeypatch, {2: (0, {"state": outcome}, settle), 1: (0, None, None)},
+  )
+  assert (result, calls) == (0, [(2, "reconcile")])
+  index = _index(state)
+  assert index["recovery"] is None
+  assert index["active"]["revision"] == (2 if promoted else 1)
+
+
+def test_unsettled_journal_keeps_pin_even_after_reconcile(state, monkeypatch):
+  _with_candidate(state)
+
+  def interrupted():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  assert _run_launcher(monkeypatch, {2: (1, None, interrupted)})[0] == 1
+  assert _index(state)["recovery"]["revision"] == 2
+  for _ in range(2):
+    assert _run_launcher(monkeypatch, {2: (0, None, None), 1: (0, None, None)})[1] == [
+      (2, "reconcile"),
+    ]
+  assert _index(state)["recovery"]["revision"] == 2
+
+
+def test_live_trial_without_journal_cannot_lose_recovery_pin(state, monkeypatch):
+  _with_candidate(state)
+  nested = []
+
+  def before_journal():
+    # A second launcher reaches reconciliation after the pin is durable but
+    # before the candidate has written transaction.json.
+    nested.append(_run_launcher(monkeypatch, {1: (0, None, None)}, "reconcile"))
+
+  result, calls = _run_launcher(monkeypatch, {2: (1, None, before_journal)})
+  assert (result, calls) == (1, [(2, "run")])
+  assert nested == [(0, [])]
+  assert _index(state)["recovery"] is None  # trial itself settled without a journal
+
+
+def test_active_reconcile_cannot_run_after_a_new_candidate_pin(state, monkeypatch):
+  _with_candidate(state)
+  nested = []
+
+  def while_active_selected():
+    nested.append(_run_launcher(monkeypatch, {2: (0, None, None)}, "run"))
+    assert _index(state).get("recovery") is None
+
+  result, calls = _run_launcher(monkeypatch, {1: (0, None, while_active_selected)},
+                                "reconcile")
+  assert (result, calls) == (0, [(1, "reconcile")])
+  assert nested == [(1, [])]
+  assert _index(state)["candidate"]["revision"] == 2
+
+
+def test_active_run_blocks_a_new_trial_until_it_finishes(state, monkeypatch):
+  host.seed_worker(worker(1))
+  nested = []
+
+  def while_active_running():
+    assert host.offer_worker(worker(2), IMAGE_ID).startswith("offered")
+    nested.append(_run_launcher(monkeypatch, {2: (0, None, None)}, "run"))
+    assert _index(state).get("recovery") is None
+
+  result, calls = _run_launcher(monkeypatch, {1: (0, None, while_active_running)})
+  assert (result, calls) == (0, [(1, "run")])
+  assert nested == [(1, [])]
+  assert _index(state)["candidate"]["revision"] == 2
+  assert _run_launcher(monkeypatch, {2: (0, None, None)})[1] == [(2, "run")]
+
+
+@pytest.mark.parametrize("trial", [False, True])
+def test_killed_launcher_child_keeps_trial_lock_until_journal(state, monkeypatch, trial):
+  """The worker can outlive its launcher between Popen and journaling."""
+  body = f"""import os, sys, time
+from pathlib import Path
+base = Path({str(state)!r})
+if sys.argv[1] == 'run':
+    (base / 'child-ready').write_text(str(os.getpid()))
+    while not (base / 'release-child').exists():
+        time.sleep(0.01)
+    (base / 'transaction.json').write_text('{{}}')
+    (base / 'child-done').write_text('done')
+elif sys.argv[1] == 'reconcile':
+    (base / 'transaction.json').unlink(missing_ok=True)
+"""
+  if trial:
+    host.seed_worker(worker(1))
+    assert host.offer_worker(worker(2, body), IMAGE_ID).startswith("offered")
+  else:
+    # An active worker must inherit the same fence at the prejournal boundary.
+    host.seed_worker(worker(1, body))
+  monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+  monkeypatch.setattr(launcher, "PYTHON", sys.executable)
+  # Start a fresh interpreter: forking the threaded pytest process can itself
+  # deadlock before the ownership boundary this regression is meant to test.
+  bootstrap = f"""import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('launcher', {str(ROOT / 'scripts/mobius-rebuild-launcher.py')!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+base = Path({str(state)!r})
+module.STATE_DIR = base
+for name, relative in {{'WORKERS':'workers', 'INDEX':'workers.json', 'STATUS':'status.json',
+                       'LOCK':'replace.lock', 'TRIAL_LOCK':'candidate.lock',
+                       'TRANSACTION':'transaction.json'}}.items():
+    setattr(module, name, base / relative)
+uid = os.getuid()
+def private(path, *, directory):
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    kind = 0o040000 if directory else 0o100000
+    return info.st_mode & 0o170000 == kind and info.st_uid == uid and not info.st_mode & 0o077
+module._root_private = private
+module.os.geteuid = lambda: 0
+module.PYTHON = sys.executable
+raise SystemExit(module.main(['launcher', 'run']))
+"""
+  process = subprocess.Popen([sys.executable, "-c", bootstrap])
+  child_pid = None
+  try:
+    deadline = time.monotonic() + 5
+    while not (state / "child-ready").exists() and time.monotonic() < deadline:
+      time.sleep(0.01)
+    assert (state / "child-ready").exists()
+    child_pid = int((state / "child-ready").read_text())
+    process.kill()  # after Popen, before the child writes transaction.json
+    process.wait(timeout=5)
+    assert process.poll() is not None
+    assert not launcher.TRANSACTION.exists()
+    assert launcher.main(["launcher", "reconcile"]) == 0
+    if trial:
+      assert _index(state)["recovery"]["revision"] == 2
+    else:
+      assert _index(state).get("recovery") is None
+    (state / "release-child").touch()
+    while not (state / "child-done").exists() and time.monotonic() < deadline:
+      time.sleep(0.01)
+    assert (state / "child-done").exists()
+    assert launcher.TRANSACTION.exists()
+    while (launcher.TRANSACTION.exists() or _index(state).get("recovery") is not None) and time.monotonic() < deadline:
+      launcher.main(["launcher", "reconcile"])
+      time.sleep(0.01)
+    assert _index(state).get("recovery") is None
+    assert _index(state)["active"]["revision"] == 1
+    assert not launcher.TRANSACTION.exists()
+  finally:
+    if process.poll() is None:
+      process.kill()
+      process.wait(timeout=5)
+    if child_pid is not None and not (state / "child-done").exists():
+      try:
+        os.kill(child_pid, signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+
+
+def test_candidate_return_with_pending_journal_does_not_promote(state, monkeypatch):
+  _with_candidate(state)
+
+  def pending():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, pending)})
+  index = _index(state)
+  assert index["active"]["revision"] == 1
+  assert index["recovery"]["revision"] == 2
+  assert index["candidate"] is None
+
+
+def test_recovery_survives_new_installer_active(state, monkeypatch):
+  _with_candidate(state)
+
+  def interrupted():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  _run_launcher(monkeypatch, {2: (1, None, interrupted)})
+  assert host.seed_worker(worker(4)).startswith("installed")
+  assert _index(state)["recovery"]["revision"] == 2
+  assert _run_launcher(monkeypatch, {2: (0, None, None), 4: (0, None, None)})[1] == [
+    (2, "reconcile"),
+  ]
+  assert _index(state)["active"]["revision"] == 4
+
+
+def test_reconcile_success_does_not_supersede_new_installer(state, monkeypatch):
+  _with_candidate(state)
+
+  def interrupted():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  _run_launcher(monkeypatch, {2: (1, None, interrupted)})
+  assert host.seed_worker(worker(4)).startswith("installed")
+
+  def settle():
+    launcher.TRANSACTION.unlink()
+
+  assert _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, settle)})[1] == [
+    (2, "reconcile"),
+  ]
+  assert _index(state)["active"]["revision"] == 4
+  assert _index(state)["recovery"] is None
+
+
+def test_tampered_recovery_pin_fails_closed(state, monkeypatch):
+  _with_candidate(state)
+
+  def interrupted():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  _run_launcher(monkeypatch, {2: (1, None, interrupted)})
+  index = _index(state)
+  index["recovery"]["sha256"] = "0" * 64
+  launcher.INDEX.write_text(json.dumps(index))
+  assert launcher.load_index() is None
+  assert _run_launcher(monkeypatch, {1: (0, None, None)}) == (1, [])
+
+
+def test_clear_does_not_erase_another_recovery_owner(state, monkeypatch):
+  _with_candidate(state)
+
+  def interrupted():
+    launcher.TRANSACTION.write_text("{}")
+    launcher.TRANSACTION.chmod(0o600)
+
+  _run_launcher(monkeypatch, {2: (1, None, interrupted)})
+  old = launcher.load_index()["recovery"]
+  assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered")
+  index = _index(state)
+  index["recovery"] = index["candidate"]
+  index["candidate"] = None
+  launcher.INDEX.write_text(json.dumps(index))
+  launcher.TRANSACTION.unlink()
+  launcher._clear_recovery(old)
+  assert _index(state)["recovery"]["revision"] == 3
 
 
 def test_a_candidate_is_kept_when_nothing_was_queued(state, monkeypatch):
@@ -245,7 +642,23 @@ def test_launcher_runs_workers_isolated(state, monkeypatch):
   assert launcher.execute(launcher.load_index()["active"], "run") == 0
   assert seen["args"][:3] == ["/usr/bin/python3", "-I", "-S"]
   assert seen["cwd"] == "/"
+  assert seen["pass_fds"] == ()
   assert set(seen["env"]) == {"PATH", "HOME", "LANG", "MOBIUS_REBUILD_LAUNCHER"}
+
+
+def test_execute_inherits_only_explicit_trial_lock(state, monkeypatch):
+  host.seed_worker(worker(1))
+  seen = {}
+
+  def fake_run(args, **kwargs):
+    seen.update(kwargs)
+    return subprocess.CompletedProcess(args, 0)
+
+  monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+  with launcher.TRIAL_LOCK.open("a+") as trial:
+    assert launcher.execute(launcher.load_index()["active"], "reconcile",
+                            trial_fd=trial.fileno()) == 0
+    assert seen["pass_fds"] == (trial.fileno(),)
 
 
 # --- Extraction from the exact verified image -------------------------------
@@ -273,8 +686,8 @@ def _fake_docker(monkeypatch, archive: bytes) -> list:
     calls.append(args)
     return subprocess.CompletedProcess(args, 0, "c" * 64 if args[1] == "create" else "", "")
 
-  monkeypatch.setattr(host.subprocess, "run", run)
-  monkeypatch.setattr(host, "_bounded_output", lambda args, limit: (
+  monkeypatch.setattr(host, "docker_command", run)
+  monkeypatch.setattr(host, "_bounded_output", lambda args, limit, **kwargs: (
     calls.append(args) or (archive if len(archive) <= limit else
                            (_ for _ in ()).throw(RuntimeError("too large")))
   ))
@@ -353,6 +766,7 @@ TXN = {
 
 @pytest.fixture
 def journal(tmp_path, monkeypatch):
+  monkeypatch.setattr(host, "cutover_boot_consumed", lambda *_a, **_k: True)
   monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
   host.write_transaction(TXN)
   writes, rollbacks = [], []
@@ -365,18 +779,21 @@ def journal(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("healthy,running", [
-  (True, TXN["previous_image"]),  # stopped before the new container started
-  (True, IMAGE_ID),  # the new container was running when the worker stopped
-  (False, IMAGE_ID),  # the new container never became healthy
+  (True, TXN["previous_image"]),
+  (True, IMAGE_ID),
+  (False, IMAGE_ID),
 ])
-def test_recovery_restores_the_previous_container(journal, monkeypatch, healthy, running):
-  _writes, rollbacks = journal
-  monkeypatch.setattr(host.subprocess, "run", lambda args, **_k: None)  # docker tag
-  monkeypatch.setattr(host, "wait_healthy", lambda *a: healthy)
-  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", running))
+def test_recovery_settles_healthy_target_instead_of_undoing_it(journal, monkeypatch, healthy, running):
+  writes, rollbacks = journal
+  monkeypatch.setattr(host, "container_health", lambda _c: ("cid", running, "healthy" if healthy else "dead"))
   host.recover({}, host.read_transaction())
-  assert rollbacks and rollbacks[0][3] == "worker_interrupted"
-  assert rollbacks[0][5] == TXN["previous_image"]
+  if healthy and running == IMAGE_ID:
+    assert not rollbacks
+    assert writes[-1]["state"] == "succeeded"
+    assert host.read_transaction() is None
+  else:
+    assert rollbacks and rollbacks[0][3] == "worker_interrupted"
+    assert rollbacks[0][5] == TXN["previous_image"]
 
 
 def test_a_new_request_waits_for_an_interrupted_replacement(tmp_path, monkeypatch):
@@ -415,22 +832,20 @@ def test_extraction_is_bounded_while_reading():
   assert time.monotonic() - started < 10
 
 
-def test_recovery_restores_the_journaled_previous_image(journal, monkeypatch):
-  tagged = []
-  monkeypatch.setattr(host.subprocess, "run", lambda args, **_k: tagged.append(args))
-  monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
+def test_recovery_passes_the_journaled_previous_image(journal, monkeypatch):
+  _writes, rollbacks = journal
+  monkeypatch.setattr(host, "container_health", lambda _c: ("", "", "missing"))
   host.recover({}, host.read_transaction())
-  assert ["docker", "tag", TXN["previous_image"], host.ROLLBACK_TAG] in tagged
+  assert rollbacks[0][5] == TXN["previous_image"]
 
 
-def test_recovery_never_restores_an_unconfirmed_previous_image(journal, monkeypatch):
+def test_recovery_never_restores_when_docker_state_is_unknown(journal, monkeypatch):
   writes, rollbacks = journal
 
-  def failing_tag(args, **_kwargs):
-    raise subprocess.CalledProcessError(1, args)
+  def failing_probe(_config):
+    raise subprocess.TimeoutExpired("docker", 10)
 
-  monkeypatch.setattr(host.subprocess, "run", failing_tag)
-  monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
+  monkeypatch.setattr(host, "container_health", failing_probe)
   host.recover({}, host.read_transaction())
   assert not rollbacks
   assert writes[-1]["state"] == "needs_recovery"
@@ -440,18 +855,18 @@ def test_recovery_never_restores_an_unconfirmed_previous_image(journal, monkeypa
 def test_a_healthy_rollback_to_the_wrong_image_is_not_settled(tmp_path, monkeypatch):
   monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
   host.write_transaction(TXN)
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
+  monkeypatch.setattr(host, "cutover_boot_consumed", lambda *_a, **_k: True)
   writes = []
   monkeypatch.setattr(host, "write_status", lambda _c, **fields: writes.append(fields))
   monkeypatch.setattr(host, "restart_ledger", lambda *a, **k: True)
-  monkeypatch.setattr(host, "compose", lambda *a, **k: None)
-  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
-  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", "sha256:" + "e" * 64))
+  monkeypatch.setattr(host, "container_health", lambda _c: ("cid", "sha256:" + "e" * 64, "healthy"))
   assert host.rollback({}, TXN["operation_id"], TXN["expected_sha"], "x", "y",
                        TXN["previous_image"]) == 1
   assert writes[-1]["state"] == "needs_recovery"
   assert writes[-1]["code"] == "rollback_wrong_image"
   assert host.read_transaction() is not None
-  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", TXN["previous_image"]))
+  monkeypatch.setattr(host, "container_health", lambda _c: ("cid", TXN["previous_image"], "healthy"))
   host.rollback({}, TXN["operation_id"], TXN["expected_sha"], "x", "y",
                 TXN["previous_image"])
   assert writes[-1]["state"] == "rolled_back" and host.read_transaction() is None
@@ -471,7 +886,9 @@ def test_a_candidate_taken_by_someone_else_is_not_run(state, monkeypatch):
   host.offer_worker(worker(3), IMAGE_ID)  # the record changes before the trial
   calls = []
   monkeypatch.setattr(launcher, "execute", lambda entry, cmd: calls.append(entry) or 0)
-  assert launcher.try_candidate(loaded["candidate"], loaded["active"]["sha256"]) == 1
+  with launcher.TRIAL_LOCK.open("a+") as dispatch:
+    assert launcher.try_candidate(loaded["candidate"], loaded["active"]["sha256"],
+                                  dispatch.fileno()) == 1
   assert not calls and _index(state)["candidate"]["revision"] == 3
 
 
@@ -495,3 +912,83 @@ def test_a_revision_one_worker_can_still_recover_this_journal(tmp_path, monkeypa
   ))
   assert revision1.read_transaction() is not None
   assert host.read_transaction() is not None
+
+
+def test_trusted_install_activates_exact_pending_candidate_before_reconcile(state, monkeypatch):
+  host.seed_worker(worker(2))
+  host.offer_worker(worker(3), IMAGE_ID)
+  assert host.seed_worker(worker(3)) == "installed: revision 3"
+  index = _index(state)
+  assert index["high_water"] == 3
+  assert index["active"]["revision"] == 3
+  assert index["candidate"] is None
+  assert _run_launcher(monkeypatch, {3: (0, None, None)}, "reconcile")[1] == [(3, "reconcile")]
+
+
+def test_same_revision_other_bytes_cannot_replace_pending_candidate(state):
+  host.seed_worker(worker(2))
+  host.offer_worker(worker(3), IMAGE_ID)
+  before = _index(state)
+  assert host.seed_worker(worker(3, "print('different')")).startswith("rejected:")
+  assert _index(state) == before
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_trusted_install_cannot_retry_a_removed_trial_candidate(state, monkeypatch, interrupted):
+  _with_candidate(state)
+
+  def inside_trial():
+    # The trial removes the candidate before any candidate code runs.
+    assert _index(state)["candidate"] is None
+    assert host.seed_worker(worker(2)).startswith("rejected:")
+    if interrupted:
+      raise KeyboardInterrupt
+
+  if interrupted:
+    with pytest.raises(KeyboardInterrupt):
+      _run_launcher(monkeypatch, {2: (1, None, inside_trial)})
+  else:
+    _run_launcher(monkeypatch, {2: (1, {"state": "failed"}, inside_trial)})
+  before = _index(state)
+  assert host.seed_worker(worker(2)).startswith("rejected:")
+  assert _index(state) == before
+  assert before["active"]["revision"] == 1
+  assert before["high_water"] == 2
+
+
+def test_current_or_genuinely_newer_active_worker_keeps_newer_offer(state):
+  host.seed_worker(worker(3))
+  host.offer_worker(worker(5), IMAGE_ID)
+  before = _index(state)
+  assert host.seed_worker(worker(3)) == "current: revision 3"
+  assert host.seed_worker(worker(2)) == "kept: a newer worker (revision 3) is installed"
+  assert host.seed_worker(worker(4)).startswith("rejected:")
+  assert _index(state) == before
+
+
+def test_same_revision_different_active_bytes_are_not_a_newer_installed_worker(state):
+  host.seed_worker(worker(3))
+  before = _index(state)
+  assert host.seed_worker(worker(3, "print('different')")).startswith("rejected:")
+  assert _index(state) == before
+
+
+@pytest.mark.parametrize("revision,expected", [(2, 1), (3, 0), (None, 1)])
+def test_adopt_self_exit_status_cannot_claim_rejected_upgrade_succeeded(
+  state, monkeypatch, capsys, revision, expected,
+):
+  host.seed_worker(worker(1))
+  host.offer_worker(worker(3), IMAGE_ID)
+  source = state / "checkout-worker.py"
+  source.write_bytes(worker(revision))
+  monkeypatch.setattr(host, "__file__", str(source))
+  monkeypatch.setattr(host, "LOCK", state / "replace.lock")
+  assert host.adopt_self() == expected
+  output = capsys.readouterr().out
+  if expected:
+    assert not output.startswith(("installed:", "kept:", "current:"))
+    assert _index(state)["active"]["revision"] == 1
+    assert _index(state)["candidate"]["revision"] == 3
+  else:
+    assert output.startswith("installed: revision 3")
+    assert _index(state)["active"]["revision"] == 3

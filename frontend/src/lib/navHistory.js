@@ -1,14 +1,17 @@
 // History-state tags for the shell's OWN session-history entries.
 //
-// A sandboxed mini-app or Web Studio preview iframe can push entries onto
-// the SHARED top-level session history. Those entries are intentionally left
-// untagged so the shell can ignore them. Shell entries carry three additional
-// pieces of state:
+// Child-frame pushState grows joint session history but does not change the
+// top-level history.state or navigation.entries(). These tags track only the
+// shell's own entries; they cannot identify iframe-owned history. Shell entries
+// carry the following state:
 //
 //   index — the shell-relative session-history position. It lets the popstate
 //           fallback distinguish Back from Forward without guessing.
 //   route — the restorable shell view at this entry. Forward traversal cannot
 //           be reconstructed from the destructive navStack alone.
+//   hasShellForward — a shell push marked this source entry as having a
+//           continuation, surviving reload where classic History has no
+//           enumeration API. A fresh push truncates the old branch.
 //   kind  — base | drawer | dismissible | app | nav. Drawer, transient
 //           dismissibles, and reversible app entries carry the semantics needed
 //           to consume Back without accidentally popping a shell route.
@@ -85,6 +88,30 @@ export function navTraversalDirection(
 // unambiguous separator (a raw `${a}:${b}` collides on ids containing ':').
 export function ownerKeyOf(paneId, appId) {
   return JSON.stringify([String(paneId), String(appId)])
+}
+
+// Document-local ownership is never recovered from history payloads. Unknown
+// entries after a host reload, like explicitly retired entries, have no owner.
+export function isRetiredAppEntry(record) {
+  return !record || record.status === 'retired'
+}
+
+// Reuse requires agreement with the host's own current-entry tracking. This
+// cannot detect child-frame pushState, which leaves top-level state unchanged.
+export function isCurrentRetiredAppEntry(record, entryId, currentEntryId) {
+  return typeof entryId === 'string' && entryId.length > 0
+    && entryId === currentEntryId && isRetiredAppEntry(record)
+}
+
+export function retireAppEntries(registry, appId, reason = 'reset') {
+  const retired = []
+  for (const [entryId, record] of registry) {
+    if (record.appId !== String(appId) || record.status === 'retired') continue
+    record.status = 'retired'
+    record.retiredReason = reason
+    retired.push(entryId)
+  }
+  return retired
 }
 
 // Pure "my tagged entry is topmost" predicate for the single-FIFO local-pop
@@ -175,6 +202,21 @@ export function pushNavEntry(kind, route = null, {
   entryId = null,
 } = {}) {
   const current = navEntryIndex(currentState)
+  // The History API cannot enumerate Forward entries after a document reload.
+  // Leave a shell-owned continuation on the source entry before pushing so a
+  // reloaded popstate-only browser can still offer Forward without guessing
+  // from navigation.canGoForward (which also includes non-shell entries).
+  // The marker is best-effort: a failed write (e.g. Safari's history rate
+  // limit) must not abort the real push below.
+  if (isMobiusNavState(history.state)) {
+    const source = { ...history.state, hasShellForward: true }
+    try {
+      history.replaceState(source, '')
+      mirrorCurrentEntry(source)
+    } catch (error) {
+      recordClientError({ where: 'navHistory.markShellForward', error })
+    }
+  }
   const state = navState(kind, {
     index: current == null ? 0 : current + 1,
     route,

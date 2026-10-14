@@ -18,7 +18,7 @@
  *     cached, the strategy is cache-first in every connectivity state: the
  *     cached app opens immediately and a background fetch refreshes the cache.
  *     Freshness comes from the versioned frame/module URLs
- *     (`?v=<app.updated_at>` is part of the cache key), so an app update
+ *     (`?v=<app.frame_version>` is part of the cache key), so an app update
  *     naturally becomes a cache miss and loads from the network on its first
  *     open.
  *   - cache:'reload' on the network attempt avoids the 304-no-body trap that
@@ -61,6 +61,7 @@ import {
   isCacheableAppAssetResponse,
   SHELL_DATA_CACHE,
   isShellListUrl,
+  isSharedBrowserRequest,
   requiresLiveShellList,
   SHELL_DOCUMENT_POLICY_REVISION,
   packagedAssetCacheLane,
@@ -417,7 +418,7 @@ registerRoute(
 // Frame/module strategy: CACHE-FIRST once cached. A cached app is served
 // instantly and revalidated in the background in every connectivity
 // state. This is safe and fresh enough because AppCanvas includes
-// `?v=<app.updated_at>` in the frame URL and the frame forwards that same
+// `?v=<app.frame_version>` in the frame URL and the frame forwards that same
 // version into the module URL; an app edit changes the cache key and forces a
 // network load for the new version. Stale cached versions are NOT left behind
 // until the bucket is cleared — they are pruned eagerly on the next successful
@@ -590,16 +591,16 @@ function appCodeHandler(cacheName, { gated }) {
 // launch renders chrome + drawer instead of throwing. SWR: serve
 // cache, revalidate when online. Owner-scoped; wiped on logout.
 registerRoute(
-  ({ url }) =>
+  ({ url, request }) =>
     url.origin === self.location.origin &&
-    url.pathname === '/api/theme',
+    url.pathname === '/api/theme' && !isSharedBrowserRequest(request),
   new StaleWhileRevalidate({ cacheName: SHELL_DATA_CACHE }),
 )
 
 // Catch-up requires the network, but successful responses still replenish the
 // ordinary offline list. Keep this before the fallback-capable viewing route.
 registerRoute(
-  ({ url, request }) => url.origin === self.location.origin && requiresLiveShellList(request),
+  ({ url, request }) => url.origin === self.location.origin && !isSharedBrowserRequest(request) && requiresLiveShellList(request),
   new LiveShellList({ cacheName: SHELL_DATA_CACHE }),
 )
 
@@ -631,7 +632,7 @@ registerRoute(
 // next refetch. NetworkFirst returns the live list when online and still
 // falls back to the cached list offline (cold-drawer render preserved).
 registerRoute(
-  ({ url }) => url.origin === self.location.origin && isShellListUrl(url),
+  ({ url, request }) => url.origin === self.location.origin && !isSharedBrowserRequest(request) && isShellListUrl(url),
   new NetworkFirst({
     cacheName: SHELL_DATA_CACHE,
     // KEPT at 5s deliberately. Workbox returns a cache fallback as a
@@ -652,7 +653,7 @@ registerRoute(
 // NetworkFirst+304 trap that once left the module uncached and blanked the
 // in-shell iframe offline.
 registerRoute(
-  ({ url }) => isAppCodeRoute(url.pathname),
+  ({ url, request }) => isAppCodeRoute(url.pathname) && !isSharedBrowserRequest(request),
   appCodeHandler(OFFLINE_APPS_CACHE, { gated: false }),
 )
 

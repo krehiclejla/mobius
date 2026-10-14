@@ -3,9 +3,9 @@ import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import React from 'react'
 import { renderWithModels } from './modelRegistryRender.js'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 globalThis.window = { location: { origin: 'http://localhost', href: 'http://localhost/shell/' }, innerWidth: 420 }
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/AssistantReply.jsx')
 const { assistantReplyGroups } = await vite.ssrLoadModule('/src/components/ChatView/assistantReplies.js')
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
@@ -36,7 +36,7 @@ test('hidden final segment leaves a visible recovery control and stable source o
 const note = { id: 'incoming', sender_chat_id: 'peer', sender_name: 'Colleague', body: 'New information', created_at: 2000, display_position: { assistant_message_id: 'answer', block_index: 0, text_offset: 9 } }
 const context = { tools: new Map([['peer-incoming', [note]]]), positions: new Map([['answer', [note]]]) }
 const message = { id: 'answer', role: 'assistant', blocks: [{ type: 'text', content: 'Earlier\n\nLater response' }] }
-const replyGroup = { rows: [{ message, key: 'answer', anchorKey: 'answer', notes: [] }] }
+const replyGroup = assistantReplyGroups([message]).get(0)
 function render(Component, props, value = context) {
   return renderWithModels(React.createElement(PeerTimelineContext.Provider, { value }, React.createElement(Component, props)))
 }
@@ -384,4 +384,47 @@ test('one reply owns its final References, including a folded source row', () =>
   assert.match(html, /data-key="reference-reply"/)
   assert.match(html, /data-key="reference-reply:assistant:1"/)
   assert.doesNotMatch(html, /data-key="reference-reply:assistant:2"/)
+})
+
+
+test('grouped replies carry authoritative manual recovery to their existing action', () => {
+  for (const kind of ['memory', 'storage', 'model_capacity']) {
+    const msg = { id: 'recover-run', role: 'assistant', blocks: [
+      { type: 'error', resumable: true, pause: { kind } },
+    ] }
+    const props = {
+      replyGroup: assistantReplyGroups([msg]).get(0),
+      activeMirrorMsg: msg, useDbActivePayload: true, onResume() {}, isLastMsg: true,
+    }
+    const manual = render(Active, { ...props, handoff: { kind: 'recovery' } })
+    assert.match(manual, /class="chat__resume chat__recovery-action"/)
+    const automatic = render(Active, { ...props, handoff: { kind: 'automatic' } })
+    assert.doesNotMatch(automatic, /class="chat__resume chat__recovery-action"/)
+    assert.doesNotMatch(manual, /will continue automatically|Trying again shortly/)
+  }
+})
+
+test('live tools joined into an earlier row stay inside the marked current response', () => {
+  const tool = (id, status = 'done') => ({ type: 'tool', tool: 'Bash', input: `echo ${id}`, tool_use_id: id, status })
+  const first = { role: 'assistant', id: 'rt-join:assistant:1', blocks: [tool('inspect')], ts: 2 }
+  const next = { role: 'assistant', id: 'rt-join:assistant:2', blocks: [], ts: 4 }
+  const group = assistantReplyGroups([
+    first,
+    { role: 'user', hidden: true, steered: true, kind: 'delegation_result', source_work_id: 'goal-root', ts: 3 },
+    next,
+  ]).get(0)
+  assert.equal(group.rows.length, 2)
+  const props = { replyGroup: group, activeMirrorMsg: next, activitySourceBlocks: [], useDbActivePayload: false,
+    hasLivePayload: true, streamItems: [tool('continue', 'running')], chatId: 'chat', isStreaming: true }
+  const html = render(Active, { ...props, activeRowIndex: 1 }, { tools: new Map(), positions: new Map() })
+  const reply = html.indexOf('data-current-response="true"')
+  const earlierRow = html.indexOf('data-key="rt-join:assistant:1"')
+  assert.ok(reply >= 0 && reply < earlierRow, 'the active reply as a whole is the current response')
+  assert.doesNotMatch(html.slice(earlierRow, html.indexOf('>', earlierRow)), /data-active-assistant/)
+  const live = html.indexOf('in progress"')
+  assert.ok(live > earlierRow && live < html.indexOf('data-active-assistant="true"'),
+    'the live activity header is presented in the earlier, unmarked row')
+  const settled = render(Active, { ...props, activeRowIndex: -1, useDbActivePayload: true, hasLivePayload: false, isStreaming: false },
+    { tools: new Map(), positions: new Map() })
+  assert.doesNotMatch(settled, /data-current-response/)
 })

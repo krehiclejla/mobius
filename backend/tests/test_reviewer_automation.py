@@ -30,24 +30,22 @@ def _app_owned_reviewer_policy(monkeypatch):
   monkeypatch.setattr("app.routes.reviewer._reviewer_prepare_grant", grant)
 
 
-def test_public_authority_changes_require_owner_scope():
+def test_public_authority_changes_require_installation_owner():
+  from app.deps import Principal
+  from app.browser_access import BrowserLineage
   from app.routes import reviewer as reviewer_routes
 
-  reviewer_routes._require_reviewer_owner_action(SimpleNamespace(
-    scope="owner", app_id=None, delegation_id=None,
-  ))
+  owner = models.Owner(username="reviewer-fixture", hashed_password="unused")
+  reviewer_routes._require_reviewer_owner_action(Principal(owner=owner, app_id=None))
 
-  with pytest.raises(HTTPException) as app_denied:
-    reviewer_routes._require_reviewer_owner_action(SimpleNamespace(
-      scope="app", app_id=12, delegation_id=None,
-    ))
-  assert app_denied.value.status_code == 403
-
-  with pytest.raises(HTTPException) as child_denied:
-    reviewer_routes._require_reviewer_owner_action(SimpleNamespace(
-      scope="owner", app_id=None, delegation_id="child-1",
-    ))
-  assert child_denied.value.status_code == 403
+  for principal in (
+    Principal(owner=owner, scope="app", app_id=12),
+    Principal(owner=owner, app_id=None, delegation_id="child-1"),
+    Principal(owner=owner, app_id=None, browser=BrowserLineage("guest")),
+  ):
+    with pytest.raises(HTTPException) as denied:
+      reviewer_routes._require_reviewer_owner_action(principal)
+    assert denied.value.status_code == 403
 
 
 def test_app_policy_cannot_broaden_an_owner_approved_grant():

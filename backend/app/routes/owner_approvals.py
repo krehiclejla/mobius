@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
+from app import transcript_rows
 from app import chat_queue, models, questions, secure_inputs
 from app.chat_event_sink import get_active_sink
 from app.database import get_db
@@ -65,7 +66,7 @@ class QuestionSpec(BaseModel):
 
 class QuestionRequest(BaseModel):
   model_config = ConfigDict(extra="forbid")
-  questions: list[QuestionSpec] = Field(min_length=1, max_length=3)
+  questions: list[QuestionSpec] = Field(min_length=1, max_length=10)
 
   @model_validator(mode="after")
   def distinct_questions(self):
@@ -94,6 +95,44 @@ class RestartRequest(BaseModel):
   """The server, not the caller, derives the exact restart action."""
 
   model_config = ConfigDict(extra="forbid")
+
+
+class TurnEndRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+  receipt_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/{chat_id}/turn-end", dependencies=[Depends(reject_cross_site)])
+async def end_codex_turn(
+  chat_id: str,
+  body: TurnEndRequest,
+  principal: Principal = Depends(get_agent_run_principal),
+  db: Session = Depends(get_db),
+):
+  """Post-tool rendezvous: interrupt before the completed tool resumes Codex.
+
+  Only a saved card or recorded question this exact run produced ends it.
+  """
+  from app.runner_registry import RunnerKind, registry
+
+  if principal.chat_id != chat_id:
+    raise HTTPException(403, "Agent run belongs to another chat.")
+  get_active_chat_for_principal(db, chat_id, principal, load_fields=())
+  sink = get_active_sink(chat_id)
+  handle = registry.get_handle(chat_id, RunnerKind.CODEX_SDK)
+  if (sink is None or sink.run_token != principal.run_id
+      or not sink.ends_turn(body.receipt_id) or handle is None):
+    raise HTTPException(409, "This turn did not produce that turn-ending result.")
+  db.close()  # No database connection is needed while waiting on the provider.
+  interrupt = handle.begin_finish_after_owner_card()
+  try:
+    if interrupt is not None:
+      await interrupt
+    else:
+      await handle.wait_for_owner_card_end()
+  except Exception as exc:
+    raise HTTPException(503, "Could not end the turn.") from exc
+  return {"ended": handle.owner_card_requested}
 
 
 @router.post("/{chat_id}/question", dependencies=[Depends(reject_cross_site)])
@@ -253,7 +292,7 @@ async def save_owner_question(
         activation_wait["created_by_run_id"] = run.id
         activation_wait["root_run_id"] = run.root_run_id or run.id
         activation_wait["goal_id"] = run.goal_id
-      for message in reversed(chat.messages or []):
+      for message in reversed(transcript_rows.history(chat)):
         for block in message.get("blocks") or []:
           if block.get("type") == "question" and block.get("question_id") == question_id:
             if block.get("answers"):

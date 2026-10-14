@@ -17,14 +17,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import parse_qs, urlsplit
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app import (
   app_git, app_python_env, chat_app_artifacts, icon_assets, managed_paths, models,
-  service_preload, timeutil,
+  pending_update, service_preload, timeutil, tracing,
 )
 from app.app_capabilities import (
   contract_from_app_state,
@@ -39,12 +38,13 @@ from app.compiler import (
   unlink_app_bundle,
 )
 from app.config import get_settings
+from app.manifest_identity import requested_manifest_source
 from app.manifest_contract import (
-  ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES,
-  STATIC_ASSET_MAX_BYTES,
-  STATIC_ASSETS_TOTAL_MAX,
+  PACKAGE_MAX_BYTES,
   ManifestContractError,
+  package_bytes_on_disk,
+  package_limit_message,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
@@ -72,7 +72,7 @@ _LOCAL_PACKAGE_WARNING = (
   "and skills; a future reviewed Store update may replace them."
 )
 
-_STORE_LOCAL_PACKAGE_DIVERGED = (
+STORE_LOCAL_PACKAGE_DIVERGED = (
   "This app is Store-managed, so its live package comes from the accepted "
   "manifest. Your local mobius.json changes were NOT applied by this "
   "ordinary apply. Re-apply with --accept-local-package to make the local "
@@ -185,7 +185,6 @@ def _snapshot_static_assets(
 ) -> dict[str, bytes]:
   """Read local package assets from the same immutable tree being accepted."""
   assets: dict[str, bytes] = {}
-  total = 0
   for destination, source in static_asset_entries(
     manifest.get("static_assets") or {},
   ).items():
@@ -211,17 +210,6 @@ def _snapshot_static_assets(
         "static_asset_unreadable",
         f"Could not read manifest static asset {source!r}: {exc}",
       ) from exc
-    if len(raw) > STATIC_ASSET_MAX_BYTES:
-      raise AppApplyError(
-        "static_asset_too_large",
-        f"Manifest static asset {source!r} exceeds {STATIC_ASSET_MAX_BYTES} bytes.",
-      )
-    total += len(raw)
-    if total > STATIC_ASSETS_TOTAL_MAX:
-      raise AppApplyError(
-        "static_assets_too_large",
-        f"Manifest static assets exceed {STATIC_ASSETS_TOTAL_MAX} bytes total.",
-      )
     assets[destination] = raw
   return assets
 
@@ -385,6 +373,9 @@ def _read_manifest(snapshot_dir: Path) -> dict:
     validate_manifest_contract(manifest)
   except ManifestContractError as exc:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
+  size = package_bytes_on_disk(snapshot_dir, manifest)
+  if size > PACKAGE_MAX_BYTES:
+    raise AppApplyError("package_too_large", package_limit_message(size))
   return dict(manifest)
 
 
@@ -405,7 +396,7 @@ def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str 
     )
   except (OSError, ValueError, applied_app_runtime.AppliedRuntimeUnavailable):
     return None
-  return _STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
+  return STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:
@@ -432,18 +423,6 @@ def _entry_source(snapshot_dir: Path, relative: str) -> str:
   return source
 
 
-def _normalize_manifest_icon(relative: str, raw: bytes) -> bytes:
-  if len(raw) > ICON_MAX_BYTES:
-    raise AppApplyError(
-      "icon_too_large",
-      f"Manifest icon {relative!r} exceeds the {ICON_MAX_BYTES}-byte limit.",
-    )
-  try:
-    return icon_assets.normalize_icon(raw)
-  except icon_assets.InvalidIcon as exc:
-    raise AppApplyError("icon_invalid", str(exc)) from exc
-
-
 def _manifest_icon(snapshot_dir: Path, manifest: dict) -> bytes | None:
   """Normalize the icon declared by this exact accepted source snapshot."""
   relative = manifest.get("icon")
@@ -460,7 +439,10 @@ def _manifest_icon(snapshot_dir: Path, manifest: dict) -> bytes | None:
     raise AppApplyError(
       "icon_unreadable", f"Could not read manifest icon {relative!r}: {exc}",
     ) from exc
-  return _normalize_manifest_icon(relative, raw)
+  try:
+    return icon_assets.normalize_icon(raw)
+  except icon_assets.InvalidIcon as exc:
+    raise AppApplyError("icon_invalid", str(exc)) from exc
 
 
 def retire_integrated_app_provenance(db: Session) -> tuple[int, list[str]]:
@@ -496,11 +478,9 @@ def _validate_local_identity(
 ) -> None:
   accepted_ids = {source_dir.name}
   if app is not None and app.manifest_url:
-    accepted_ids.update(
-      value for value in parse_qs(urlsplit(app.manifest_url).fragment).get(
-        "manifest-id", []
-      ) if value
-    )
+    _, bound_id = requested_manifest_source(app.manifest_url)
+    if bound_id is not None:
+      accepted_ids.add(bound_id)
   if manifest["id"] not in accepted_ids:
     raise AppApplyError(
       "manifest_id_mismatch",
@@ -558,6 +538,7 @@ def _apply_explicit_package_runtime(
     app.offline_capable = runtime_fields["offline_capable"]
   if "embeds_agent" in manifest:
     app.embeds_agent = bool(manifest["embeds_agent"])
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.project_templates_json = manifest.get("project_templates") or None
@@ -602,6 +583,7 @@ def _apply_local_manifest_runtime(
   if "offline_capable" in runtime_fields:
     app.offline_capable = runtime_fields["offline_capable"]
   app.embeds_agent = bool(manifest.get("embeds_agent", False))
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.project_templates_json = manifest.get("project_templates") or None
@@ -643,6 +625,7 @@ def _live_runtime_state(app: models.App) -> tuple:
     app.connect_manage,
     app.offline_capable,
     app.embeds_agent,
+    app.shell_shortcuts,
     app.offline_contract,
     app.system_prompt_file,
     app.project_templates_json,
@@ -668,6 +651,35 @@ async def apply_source_revision(
   app: models.App | None,
   chat_id: str | None,
   accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
+) -> ApplyResult:
+  """Compile, accept, and publish one source revision (traced as app.apply).
+
+  ``expected_tree`` pins the exact candidate a caller already checked; any
+  other snapshot is refused as ``source_changed``.
+  """
+  with tracing.span("app.apply", {
+    "mobius.app_id": app.id if app is not None else None,
+    "mobius.chat_id": chat_id,
+  }):
+    return await _apply_source_revision(
+      db,
+      source_dir=source_dir,
+      app=app,
+      chat_id=chat_id,
+      accept_local_package=accept_local_package,
+      expected_tree=expected_tree,
+    )
+
+
+async def _apply_source_revision(
+  db: Session,
+  *,
+  source_dir: str,
+  app: models.App | None,
+  chat_id: str | None,
+  accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
 ) -> ApplyResult:
   """Compile, accept, and publish one source revision.
 
@@ -693,9 +705,7 @@ async def apply_source_revision(
       status_code=409,
     )
   if accept_local_package and app is not None:
-    from app import install
-
-    if install.pending_update_receipt_file(source_path).is_file():
+    if pending_update.pending_update_receipt_file(source_path).is_file():
       # Finishing the pending update installs its reviewed package metadata;
       # accepting local metadata now would be silently overwritten by it.
       raise AppApplyError(
@@ -716,6 +726,13 @@ async def apply_source_revision(
   candidate = await _git_operation(
     "snapshot", app_git.snapshot_worktree, source_path,
   )
+  if expected_tree is not None and candidate != expected_tree:
+    raise AppApplyError(
+      "source_changed",
+      "App source changed after it was checked; retry once the current edit "
+      "is complete.",
+      status_code=409,
+    )
   previous_bundle = None
   published = None
   staged = None
@@ -851,16 +868,6 @@ async def apply_source_revision(
         install._assert_service_transition_safe(
           app, service_id=service_id, aliases=service_aliases,
         )
-        if store_managed and accept_local_package:
-          _apply_explicit_package_runtime(
-            db, app, manifest, package_icon=package_icon,
-          )
-        else:
-          _apply_local_manifest_runtime(
-            db, app, manifest, package_icon=package_icon,
-          )
-      if chat_id is not None:
-        app.chat_id = chat_id
 
       committed = await _git_operation(
         "commit",
@@ -935,15 +942,27 @@ async def apply_source_revision(
           f"Could not build the app's Python environment. {exc}",
           status_code=422,
         ) from exc
+      # Begin the SQLite write transaction only now, after the last await.
+      # Holding it across the build, Git commit or environment preparation
+      # let a writer that waits on SQLite inside the event loop (any async
+      # route committing) stall this apply until its busy timeout expired,
+      # failing that unrelated request. Everything slow or failure-prone above
+      # is independent of the durable row, and nothing below awaits before
+      # the commit or rollback that ends the transaction.
       if created:
-        # A new App has no numeric id until SQLite inserts it. Compiling after
-        # that insert used to hold the database write lock for the entire
-        # build, so an unrelated chat creation could exhaust SQLite's busy
-        # timeout. Everything slow or failure-prone above this point is
-        # independent of the durable identity; begin the write transaction
-        # only when the accepted Git tree and compiled bytes are ready.
         db.add(app)
         db.flush()
+      if manifest is not None:
+        if store_managed and accept_local_package:
+          _apply_explicit_package_runtime(
+            db, app, manifest, package_icon=package_icon,
+          )
+        else:
+          _apply_local_manifest_runtime(
+            db, app, manifest, package_icon=package_icon,
+          )
+      if chat_id is not None:
+        app.chat_id = chat_id
       if python_env is not None:
         published_env = app_python_env.publish_env(
           get_settings().data_dir, app.id, python_env,

@@ -15,6 +15,8 @@ These tests pin four behaviours of that boundary:
   4. Stopped path — once Stop has completed, a later deliberate Submit
      restarts from the durable question while a Stop racing Submit still wins.
 """
+from sqlalchemy.orm import object_session
+from app import transcript_rows
 
 from tests.goal_fixtures import goal_run as make_goal_run, persist_goal_fixture
 
@@ -50,6 +52,7 @@ def _seed_question_block(
   question_id: str,
   *,
   user_content: str = "go",
+  assistant_run_id: str | None = None,
 ) -> None:
   """Persist an assistant message carrying the open question block.
 
@@ -63,10 +66,11 @@ def _seed_question_block(
   db = SessionLocal()
   try:
     chat = db.query(models.Chat).filter(models.Chat.id == chat_id).first()
-    chat.messages = [
+    transcript_rows.replace_all(object_session(chat), chat, [
       {"role": "user", "content": user_content, "ts": 1},
       {
         "role": "assistant",
+        **({"id": assistant_run_id} if assistant_run_id else {}),
         "content": "",
         "ts": 2,
         "blocks": [
@@ -79,7 +83,7 @@ def _seed_question_block(
           }
         ],
       },
-    ]
+    ])
     db.commit()
   finally:
     db.close()
@@ -89,7 +93,7 @@ def _seed_question_blocks(chat_id: str, question_ids: list[str]) -> None:
   db = SessionLocal()
   try:
     chat = db.query(models.Chat).filter(models.Chat.id == chat_id).first()
-    chat.messages = [
+    transcript_rows.replace_all(object_session(chat), chat, [
       {"role": "user", "content": "go", "ts": 1},
       {
         "role": "assistant",
@@ -106,7 +110,7 @@ def _seed_question_blocks(chat_id: str, question_ids: list[str]) -> None:
           for qid in question_ids
         ],
       },
-    ]
+    ])
     db.commit()
   finally:
     db.close()
@@ -118,7 +122,7 @@ def _question_blocks(chat_id: str) -> list[dict]:
     chat = db.query(models.Chat).filter(models.Chat.id == chat_id).first()
     return [
       block
-      for block in (chat.messages[-1].get("blocks") or [])
+      for block in (list(transcript_rows.history(chat))[-1].get("blocks") or [])
       if block.get("type") == "question"
     ]
   finally:
@@ -224,8 +228,9 @@ def test_answer_delivers_immediately_when_pending_registered(
   asyncio.run(go())
 
 
+@pytest.mark.parametrize("assistant_run_id", ["rt-interrupted-goal", None])
 def test_answer_recovers_durable_question_without_live_pending(
-  client, auth, chat, monkeypatch,
+  client, auth, chat, monkeypatch, assistant_run_id,
 ):
   """A restart kills the in-memory future but keeps the question block.
 
@@ -249,6 +254,7 @@ def test_answer_recovers_durable_question_without_live_pending(
     qid = "q-recovered"
     _seed_question_block(
       chat.id, qid, user_content="/goal finish the migration",
+      assistant_run_id=assistant_run_id,
     )
     db = SessionLocal()
     try:
@@ -299,19 +305,22 @@ def test_answer_recovers_durable_question_without_live_pending(
     try:
       row = db.query(models.Chat).filter(models.Chat.id == chat.id).first()
       question = [
-        b for b in row.messages[1]["blocks"]
+        b for b in list(transcript_rows.history(row))[1]["blocks"]
         if b.get("type") == "question"
       ][0]
       assert question["answers"] == {"Pick one": "b"}
-      assert row.messages[-1]["hidden"] is True
-      assert row.messages[-1]["content"] == "- Pick one: b"
+      assert list(transcript_rows.history(row))[-1]["hidden"] is True
+      assert list(transcript_rows.history(row))[-1]["content"] == "- Pick one: b"
       assert [m["content"] for m in row.pending_messages] == [
         "queued-visible"
       ]
       running = db.query(models.ChatRun).filter_by(
         chat_id=chat.id, status="running",
       ).one()
-      assert running.goal_objective == "finish the migration"
+      # An identified card recovers its exact Goal. Legacy cards with no
+      # run identity remain answerable, but cannot borrow the latest Goal.
+      assert running.goal_id == assistant_run_id
+      assert running.goal_objective == ("finish the migration" if assistant_run_id else None)
     finally:
       db.close()
 
@@ -378,7 +387,7 @@ def test_recovered_answer_clears_pending_question_marker(
     try:
       row = db.query(models.Chat).filter(models.Chat.id == chat.id).first()
       question = [
-        b for b in row.messages[1]["blocks"]
+        b for b in list(transcript_rows.history(row))[1]["blocks"]
         if b.get("type") == "question"
       ][0]
       assert question["answers"] == {"Pick one": "b"}
@@ -450,7 +459,7 @@ def test_answer_after_completed_stop_recovers_durable_question(
       row = db.query(models.Chat).filter(models.Chat.id == chat.id).first()
       question = next(
         block
-        for msg in row.messages
+        for msg in list(transcript_rows.history(row))
         for block in (msg.get("blocks") or [])
         if block.get("question_id") == qid
       )
@@ -548,7 +557,7 @@ def test_open_question_survives_trailing_output_and_blocks_plain_send(
   db = SessionLocal()
   try:
     row = db.query(models.Chat).filter(models.Chat.id == chat.id).first()
-    row.messages = [
+    transcript_rows.replace_all(object_session(row), row, [
       {"role": "user", "content": "clean up the new-chat debt", "ts": 1},
       {
         "role": "assistant",
@@ -566,7 +575,7 @@ def test_open_question_survives_trailing_output_and_blocks_plain_send(
           {"type": "error", "message": "You've hit your session limit"},
         ],
       },
-    ]
+    ])
     row.pending_question_id = qid
     db.commit()
   finally:

@@ -41,6 +41,8 @@ from __future__ import annotations
 import re
 
 from app.continuations import (
+  SIDE_QUESTION_LABEL,
+  SIDE_QUESTION_MESSAGE_KIND,
   continuation_actor_label,
   is_continuation_message,
 )
@@ -160,7 +162,11 @@ def redact_message(msg: dict) -> dict | None:
       "text": f"{continuation_actor_label(msg)}.",
     }
   role = msg.get("role")
-  if role == "assistant":
+  if msg.get("kind") == SIDE_QUESTION_MESSAGE_KIND:
+    # Kept /btw answers ride the user slot but are not the owner's words.
+    role = "system"
+    text = f"{SIDE_QUESTION_LABEL}: {msg.get('content', '') or ''}"
+  elif role == "assistant":
     text = _assistant_text(msg.get("blocks") or [], msg.get("content", ""))
   else:
     # User (or any non-assistant) message: strip the fs-path
@@ -173,7 +179,7 @@ def redact_message(msg: dict) -> dict | None:
   return {"role": role or "user", "text": text}
 
 
-def redact_messages(messages: list, *, newest: int = MAX_MESSAGES_PER_CHAT,
+def redact_messages(messages, *, newest: int = MAX_MESSAGES_PER_CHAT,
                      char_cap: int = MESSAGE_CHARS) -> list[dict]:
   """Whitelisted, capped, newest-`newest` redacted view of a transcript.
 
@@ -181,18 +187,20 @@ def redact_messages(messages: list, *, newest: int = MAX_MESSAGES_PER_CHAT,
   drops, truncates each surviving text to `char_cap`, and returns at
   most `newest` messages (the tail — most-recent — slice). The cap is a
   structural bound so one chat can't return an unbounded body even at
-  `summary` tier.
+  `summary` tier. ``messages`` is any reversible sequence; it is read from
+  the newest end and only until the cap is reached.
   """
   out: list[dict] = []
-  for msg in messages or []:
+  for msg in reversed(messages):
     red = redact_message(msg)
     if red is None:
       continue
     if len(red["text"]) > char_cap:
       red["text"] = red["text"][:char_cap] + "…"
     out.append(red)
-  if newest and len(out) > newest:
-    out = out[-newest:]
+    if newest and len(out) >= newest:
+      break
+  out.reverse()
   return out
 
 

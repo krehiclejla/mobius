@@ -32,6 +32,12 @@ test('cold restore reads one coherent app destination', () => {
 
 test('deep links preserve slug, numeric identity, and intent', () => {
   assert.deepEqual(parseShellDeepLink({
+    pathname: '/shell/shared', search: '?chat=guest-chat&focus=question',
+  }), { view: 'chat', chatId: 'guest-chat', intent: null, focusQuestion: true })
+  assert.deepEqual(parseShellDeepLink({
+    pathname: '/shell/shared/', search: '?app=42&intent=open%3Areport',
+  }), { view: 'canvas', app: '42', appId: 42, intent: 'open:report' })
+  assert.deepEqual(parseShellDeepLink({
     pathname: '/shell/', search: '?app=42&intent=open%3Areport',
   }), { view: 'canvas', app: '42', appId: 42, intent: 'open:report' })
   assert.deepEqual(parseShellDeepLink({
@@ -40,6 +46,17 @@ test('deep links preserve slug, numeric identity, and intent', () => {
   assert.deepEqual(parseShellDeepLink({
     pathname: '/shell/', search: '?chat=chat-1&focus=question',
   }), { view: 'chat', chatId: 'chat-1', intent: null, focusQuestion: true })
+})
+
+test('a /shell/?settings deep link opens Settings at a known section only', () => {
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?settings=github' }),
+    { view: 'settings', section: 'github' })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?settings' }),
+    { view: 'settings' })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?settings=evil' }),
+    { view: 'settings' })
+  assert.equal(parseShellDeepLink({ pathname: '/shell/', search: '?chat=c&settings=github' }).view,
+    'chat')
 })
 
 test('legacy path deep links translate /app, /chat, and /settings', () => {

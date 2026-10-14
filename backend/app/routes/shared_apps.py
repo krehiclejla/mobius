@@ -78,6 +78,13 @@ class SharedAppMemberUpdate(BaseModel):
     return value
 
 
+def _require_membership_administration(principal: SharedAppPrincipal) -> None:
+  # Existing shared-app owners keep their resource-confined member powers.
+  # Browser guests cannot create independent access that escapes their grant.
+  if principal.browser is not None:
+    raise HTTPException(403, "Only the installation owner can change shared access.")
+
+
 def _invite_hash(secret: str) -> str:
   return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
@@ -497,6 +504,7 @@ def _create_shared_app_invite(
   principal: SharedAppPrincipal,
   db: Session,
 ):
+  _require_membership_administration(principal)
   row = _instance_for(db, instance_id, principal, "owner")
   secret = secrets.token_urlsafe(32)
   now = now_naive_utc()
@@ -526,6 +534,7 @@ def revoke_shared_app_invite(
   principal: SharedAppPrincipal = Depends(get_shared_app_principal),
   db: Session = Depends(get_db),
 ):
+  _require_membership_administration(principal)
   row = _instance_for(db, instance_id, principal, "owner")
   invite = db.query(models.SharedAppInvite).filter(
     models.SharedAppInvite.id == invite_id,
@@ -549,6 +558,7 @@ def update_shared_app_member(
   principal: SharedAppPrincipal = Depends(get_shared_app_principal),
   db: Session = Depends(get_db),
 ):
+  _require_membership_administration(principal)
   row = _instance_for(db, instance_id, principal, "owner")
   member = db.query(models.SharedAppMember).filter(
     models.SharedAppMember.id == member_id,
@@ -572,6 +582,7 @@ def revoke_shared_app_member(
   principal: SharedAppPrincipal = Depends(get_shared_app_principal),
   db: Session = Depends(get_db),
 ):
+  _require_membership_administration(principal)
   row = _instance_for(db, instance_id, principal, "owner")
   member = db.query(models.SharedAppMember).filter(
     models.SharedAppMember.id == member_id,

@@ -2,11 +2,13 @@
 
 Two layers:
   - Module (app/contribution_autopilot.py): the claim/lease/round state machine,
-    dedupe/cursor, run_id binding, escalation, round limit, pause/resume.
+    dedupe/cursor, run_id binding, escalation, no round budget, pause/resume.
   - Routes (app/routes/github.py autopilot endpoints): the trust boundary — the
     DB row is the only authorization, a forged ledger block does nothing, agent
     tokens can't forge a claim, status advertises capability.
 """
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 import json
 import os
@@ -402,18 +404,20 @@ def test_sweep_reclamation_survives_its_own_session():
     reader.close()
 
 
-def test_round_limit_escalates(db):
+def test_follow_up_has_no_round_budget(db):
+  """Completed rounds never exhaust a budget; only failed rounds escalate."""
   autopilot.stamp_grant(db, 1, "rec", head_sha="abc")
   row = autopilot.get_row(db, 1, "rec")
-  row.rounds_used = row.max_rounds
+  row.rounds_used = 50
   db.commit()
   v = autopilot.claim_for_round(
     db, 1, "rec", attention_key="k", event_at="2026-08-01T00:00:00Z",
   )
-  assert v["status"] == "escalate" and v["reason"] == "round_limit"
+  assert v["status"] == "granted"
+  assert "max_rounds" not in autopilot.mirror_block(autopilot.get_row(db, 1, "rec"))
 
 
-def test_resume_resets_round_limit_and_close_out(db):
+def test_resume_resets_counters_and_close_out(db):
   autopilot.stamp_grant(db, 1, "rec", head_sha="abc")
   row = autopilot.get_row(db, 1, "rec")
   row.rounds_used = 5
@@ -430,7 +434,7 @@ def test_visible_in_owner_drawer_honors_explicit_flag():
   from app.routes.chats import _visible_in_owner_drawer
 
   # An ordinary owner chat (no creating app) is visible by default...
-  owner_chat = models.Chat(
+  owner_chat = create_chat(
     id="c-owner", title="t", messages=[], pending_messages=[],
   )
   assert _visible_in_owner_drawer(owner_chat) is True
@@ -528,7 +532,7 @@ def test_followup_chat_rotates_on_provider_or_model_identity_change(
   assert old.agent_settings_json["drawer_hidden"] is True
   assert new.provider == provider
   assert new.session_id is None
-  assert new.messages == []
+  assert list(transcript_rows.history(new)) == []
   assert new.agent_settings_json["model"] == model
   assert new.agent_settings_json["effort"] == "high"
   assert new.agent_settings_json["drawer_hidden"] is True
@@ -572,7 +576,7 @@ async def test_round_turn_does_not_bypass_pending_owner_question(
       }],
     }],
   }
-  chat = models.Chat(
+  chat = create_chat(
     id="autopilot-question-blocked",
     title="Autopilot follow-up",
     messages=[question],
@@ -603,7 +607,7 @@ async def test_round_turn_does_not_bypass_pending_owner_question(
   assert [start["chat_id"] for start in starts] == [chat.id]
   db.expire_all()
   parked = db.get(models.Chat, chat.id)
-  assert parked.messages == [question]
+  assert list(transcript_rows.history(parked)) == [question]
   assert parked.pending_question_id == "owner-decision"
   assert db.query(models.ChatRun).filter_by(chat_id=chat.id).count() == 0
 

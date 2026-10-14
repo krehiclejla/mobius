@@ -194,15 +194,14 @@ def _goal(chat, approval_run, status='pending'):
     run = db.get(models.ChatRun, approval_run[0].run_token)
     run.goal_id = run.id
     run.goal_objective = 'Finish the repair'
-    run.goal_plan_json = {'version': 1, 'tasks': [
+    plan = {'version': 1, 'tasks': [
       {'id': 'repair', 'title': 'Repair', 'status': status, 'depends_on': []}]}
-    persist_goal_fixture(db, run, status='completed' if status == 'completed' else 'open')
+    persist_goal_fixture(db, run, status='completed' if status == 'completed' else 'open', plan=plan)
     db.commit()
 
 
 def test_quiet_answer_closes_a_card_of_an_unfinished_goal(client, chat, auth, approval_run):
-  """A card is not a Goal's required next owner: closing it quietly leaves the
-  unfinished Goal open and idle, which is simply the owner's turn."""
+  """Explicit quiet closure pauses its exact Goal, without a model turn or false success."""
   _goal(chat, approval_run)
   qid = _ask_quiet(client, chat, approval_run).json()['question_id']
   response = _quiet(client, chat, auth, qid)
@@ -210,7 +209,10 @@ def test_quiet_answer_closes_a_card_of_an_unfinished_goal(client, chat, auth, ap
   assert _row(chat.id)[0] is None and _row(chat.id)[2] == []
   with SessionLocal() as db:
     goal = db.get(models.ChatGoal, approval_run[0].run_token)
-    assert goal.status == 'open'
+    assert goal.status == 'stopped'
+    assert goal.hold_json['cause'] == 'quiet_answer'
+    assert goal.hold_json['actor'] == 'owner'
+    assert goal.hold_json['source_id'] == qid
     assert goal.plan_json['tasks'][0]['status'] == 'pending'
 
 

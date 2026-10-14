@@ -3,11 +3,11 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement as h } from 'react'
 import { renderToStaticMarkup as render } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 const previousWindow = globalThis.window
 globalThis.window = { location: { href: 'http://localhost/' } }
 after(() => { globalThis.window = previousWindow })
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 after(() => vite.close())
 const load = async name => (await vite.ssrLoadModule('/src/components/ChatView/' + name + '.jsx')).default
 const Goal = await load('GoalHistoryCard')
@@ -44,11 +44,11 @@ test('automatic resume markers explain what caused the continuation', () => {
 
  assert.match(restarted, /Server restarted — continuing automatically/)
  assert.match(goalHandoff, /Continuing Goal/)
- assert.match(goalHandoff, /The agent turn ended, but the Goal is still unfinished/)
+ assert.match(goalHandoff, /Continuing toward the Goal/)
  assert.match(recovered, /Interrupted work recovered — continuing automatically/)
 })
 
-test('composer Waiting follows the compact Goal identity instead of a tile or badge', async () => {
+test('in-conversation Waiting follows the compact handoff identity instead of a tile or badge', async () => {
  const { WaitCard } = await vite.ssrLoadModule('/src/components/ChatView/WaitingChip.jsx')
  const html = render(h(WaitCard, { wait: { id: 'sample', kind: 'condition', description: 'Review approved' }, expanded: false, onToggle: () => {}, onCancel: () => {} }))
  assert.match(html, /chat__progress-identity/)

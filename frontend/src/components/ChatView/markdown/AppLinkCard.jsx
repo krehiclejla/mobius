@@ -4,15 +4,17 @@ import { ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { appIconUrl } from '../../appIcon.js'
 import { appQueries } from '../../../hooks/queries.js'
 import AppLinkPreview from './AppLinkPreview.jsx'
+import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
 
 export default function AppLinkCard({ card, onInternalNav }) {
   const appsQuery = appQueries.list.useQuery()
   const app = (appsQuery.data || []).find((candidate) => candidate.slug === card.app)
   const iconSrc = appIconUrl(app, 64) || card.iconSrc
+  const href = sharedBrowserShellHref(card.href)
   return (
     <a
       className="md-app-card"
-      href={card.href}
+      href={href}
       target="_blank"
       rel="noopener noreferrer"
       onClick={(event) => {
@@ -25,7 +27,7 @@ export default function AppLinkCard({ card, onInternalNav }) {
           || event.button !== 0
         ) return
         event.preventDefault()
-        onInternalNav(new URL(card.href, window.location.href))
+        onInternalNav(new URL(href, window.location.href))
       }}
     >
       <AppLinkPreview appId={app?.id} card={card} fallbackIcon={iconSrc} />

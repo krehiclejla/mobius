@@ -1,4 +1,5 @@
 """Exact selected heads, private reviews and guarded public merge receipts."""
+from app.chat_writer import create_chat
 import asyncio
 import json
 from types import SimpleNamespace
@@ -34,7 +35,7 @@ def setup(fresh_db, monkeypatch):
   owner = models.Owner(username="review-owner", hashed_password="unused")
   db.add(owner)
   db.flush()
-  chat = models.Chat(id="review-chat", title="Review")
+  chat = create_chat(id="review-chat", title="Review")
   db.add(chat)
   db.add(models.App(id=1, name="Contribute", slug="contribute", source_dir="test-contribute", github_access=True, token_nonce="nonce"))
   db.add(models.ChatRun(id="physical-run", chat_id=chat.id, status="running"))
@@ -75,6 +76,38 @@ def test_exact_clear_head_merges_once_and_replay_is_read_only(setup, monkeypatch
   assert report(setup)["run"]["items"][0]["state"] == "merged"
   report(setup)
   assert calls == [TARGET]
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_a_cancelled_report_holds_the_transition_lock_through_the_merge(
+  setup, monkeypatch, queued,
+):
+  """The merge or enqueue thread ends under the lock before the cancel lands."""
+  from app import chat_queue
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  db, row, principal = setup
+  monkeypatch.setattr(
+    domain, "pull_checks", lambda *args: {**CHECKS, "isMergeQueueEnabled": queued},
+  )
+  worker = BlockedWorker(
+    (lambda: {"id": "queue-1"}) if queued else (lambda: {"merged": True, "sha": "landed"}),
+  )
+  monkeypatch.setattr(domain, "enqueue" if queued else "perform_merge", worker)
+  data = {**ITEM, "state": "all_clear", "summary": "Full diff reviewed",
+          "scope": sorted(routes.SCOPE), "tests": "Focused tests passed"}
+
+  transition = chat_queue.get_transition_lock(f"review-outcome:{row.id}")
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    SimpleNamespace(locked=transition._lock.locked),
+    lambda: routes.report_outcome(1, row.id, routes.ReviewOutcome(**data), db, principal),
+    worker,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.refresh(row)
+  # The armed attempt stays durable, so the next report reconciles, never replays.
+  assert row.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
 
 
 def test_foreign_chat_cannot_report_or_consume_grant(setup):
@@ -447,7 +480,7 @@ def test_http_admission_accepts_explicit_chat_consent_but_not_an_unapproved_agen
 
 def test_chat_cannot_rebind_an_existing_other_conversations_selection(setup):
   db, row, principal = setup
-  db.add(models.Chat(id="other-chat", title="Other"))
+  db.add(create_chat(id="other-chat", title="Other"))
   db.add(models.ChatRun(id="other-run", chat_id="other-chat", status="running"))
   db.commit()
   principal.chat_id, principal.run_id = "other-chat", "other-run"
@@ -484,7 +517,7 @@ def test_chat_admission_rechecks_revocation_after_remote_inspection(setup, monke
 def test_peer_owns_exact_merge_so_review_links_to_it_without_public_action(setup, monkeypatch):
   from app import agent_work_claims
   db, _, principal = setup
-  db.add(models.Chat(id="peer-chat", title="Existing owner"))
+  db.add(create_chat(id="peer-chat", title="Existing owner"))
   db.add(models.ChatRun(id="peer-run", chat_id="peer-chat", status="running"))
   db.commit()
   agent_work_claims.claim_work(db, owner_id=principal.owner.id,

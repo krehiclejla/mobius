@@ -1,4 +1,5 @@
 """Long provider turns must not pin a pooled database connection."""
+from app.chat_writer import create_chat
 
 import asyncio
 
@@ -104,10 +105,15 @@ async def test_agent_turn_closes_preflight_session_before_provider_wait(
   release_runner = asyncio.Event()
   connector_plan = object()
 
-  def fake_connector_plan(turn_db, *, include_owner_connectors):
+  def fake_connector_plan(
+    turn_db, *, include_owner_connectors, owner_id, owner_epoch,
+    browser_grant_id,
+  ):
     assert turn_db is turn_sessions[0]
     assert turn_db.close_calls == 0
     assert include_owner_connectors is True
+    assert type(owner_id) is int and type(owner_epoch) is int
+    assert browser_grant_id is None
     # Prove the registry snapshot can still read at the preflight boundary.
     turn_db.query(models.Chat).filter(models.Chat.id == chat.id).one()
     return connector_plan
@@ -175,7 +181,7 @@ async def test_agent_turn_returns_connection_while_provider_is_running(
       hashed_password="unused",
       provider=provider_id,
     ))
-    setup.add(models.Chat(
+    setup.add(create_chat(
       id=chat_id,
       title="pool release",
       messages=[],
@@ -343,7 +349,7 @@ async def test_provider_exception_requests_owned_browser_cleanup(
       hashed_password="unused",
       provider=provider_id,
     ))
-    setup.add(models.Chat(
+    setup.add(create_chat(
       id=chat_id,
       title="browser cleanup",
       messages=[],

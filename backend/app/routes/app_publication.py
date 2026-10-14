@@ -1,6 +1,5 @@
 """Artifact persistence and public-site ownership for installed apps."""
 
-import asyncio
 import html
 import logging
 import mimetypes
@@ -15,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import fs_locks, storage_io
+from app import fs_locks, settled, storage_io
 from app.artifact_data import (
   ArtifactDataError,
   MAX_ARTIFACT_KEYS,
@@ -53,7 +52,7 @@ from app.publication import (
   replace_publication_record,
 )
 from app.resource_access import live_app_or_404
-from app.routes.storage import _recheck_app_identity
+from app.resource_access import recheck_app_identity
 from app.storage_io import (
   app_dir_usage, atomic_write, read_capped_body,
   rmtree_strict as _rmtree_strict,
@@ -201,7 +200,7 @@ async def _revoke_publish_token(
     if not target.exists():
       continue
     try:
-      await asyncio.to_thread(shutil.rmtree, target)
+      await settled.run_settled(shutil.rmtree, target)
     except OSError as exc:
       log.warning("revoked token %s cleanup failed for %s: %s",
                   token, target, exc)
@@ -270,7 +269,7 @@ async def artifact_data_keys(
   expected_nonce = app.token_nonce
   settings = get_settings()
   async with fs_locks.app_storage_lock(app_id):
-    _recheck_app_identity(db, app_id, expected_nonce)
+    recheck_app_identity(db, app_id, expected_nonce)
     try:
       keys = list_artifact_keys(
         artifact_dir_path(settings, app_id, artifact_id),
@@ -312,7 +311,7 @@ async def artifact_data_value(
 
   settings = get_settings()
   async with fs_locks.app_storage_lock(app_id):
-    _recheck_app_identity(db, app_id, expected_nonce)
+    recheck_app_identity(db, app_id, expected_nonce)
     try:
       artifact_root, file_path = artifact_file_path(
         settings, app_id, artifact_id, key,
@@ -559,7 +558,7 @@ async def publish_app_site(
   expected_nonce = app.token_nonce
   settings = get_settings()
   async with fs_locks.app_storage_lock(app_id):
-    _recheck_app_identity(db, app_id, expected_nonce)
+    recheck_app_identity(db, app_id, expected_nonce)
     _validate_publish_paths(settings, app, project_id)
     site_dir, token_file = _publish_paths(settings, app, project_id)
     try:
@@ -619,7 +618,7 @@ async def publish_app_site(
     promoted = False
     preserve_stage = False
     try:
-      await asyncio.to_thread(_snapshot)
+      await settled.run_settled(_snapshot)
       # Keep the exchange itself on this task so cancellation cannot leave the
       # thread committing a swap after ``promoted`` incorrectly stayed false.
       atomic_promote_directory(stage, destination)
@@ -638,7 +637,7 @@ async def publish_app_site(
           pass
       if promoted and record.state == "staged":
         try:
-          await asyncio.to_thread(shutil.rmtree, destination)
+          await settled.run_settled(shutil.rmtree, destination)
         except OSError:
           pass
       elif promoted and republishing:
@@ -665,7 +664,7 @@ async def publish_app_site(
     finally:
       if not preserve_stage and stage.exists() and not stage.is_symlink():
         try:
-          await asyncio.to_thread(shutil.rmtree, stage)
+          await settled.run_settled(shutil.rmtree, stage)
         except OSError:
           pass
   return {
@@ -693,7 +692,7 @@ async def unpublish_app_site(
   project_id = project_id or None
   settings = get_settings()
   async with fs_locks.app_storage_lock(app_id):
-    _recheck_app_identity(db, app_id, expected_nonce)
+    recheck_app_identity(db, app_id, expected_nonce)
     # The registry lives OUTSIDE app-writable storage and is the authority for
     # what is public, so enumerate + revoke registry-owned tokens first and let
     # nothing app-controlled gate it. The legacy publish-token.txt hint lives in

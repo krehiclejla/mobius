@@ -186,6 +186,7 @@ export function chatDetailCacheValue(data = {}) {
     activeAssistantMessageId: data.active_assistant_message_id || null,
     recoveryRunId: data.recovery_run_id || null,
     continuationWait: data.continuation_wait || null,
+    handoff: data.handoff || null,
     runId: data.run_id || null,
     runStatus: data.run_status || null,
     runtimeRevision: Number.isSafeInteger(data.runtime_revision)
@@ -195,9 +196,6 @@ export function chatDetailCacheValue(data = {}) {
     total,
     offset,
     running: !!data.running,
-    activeGoalObjective: typeof data.active_goal_objective === 'string'
-      ? data.active_goal_objective
-      : '',
     goal: data.goal && typeof data.goal === 'object' ? { ...data.goal } : null,
     pending_messages: Array.isArray(data.pending_messages)
       ? data.pending_messages

@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -80,6 +81,10 @@ _KNOWN_STATES = {
   "no_change", "failed", "rolled_back", "needs_recovery",
 }
 _ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
+# Recovery is not running (the browser must stop polling), but the controller
+# still owns its unresolved transaction. It is neither a retryable outcome nor
+# proof that the exact bound replacement ended.
+_UNRESOLVED_STATES = {"needs_recovery"}
 # The host path unit (mobius-rebuild.path) claims request.json within seconds.
 # Well past that with the host still idle, the helper is not picking up requests
 # (for example the path unit is not installed or not running).
@@ -97,6 +102,18 @@ _UPGRADE_MESSAGE = (
   "safe external chat-handoff contract. Re-run "
   "scripts/install-rebuild-helper.sh from the current trusted checkout."
 )
+_HELPER_PROTOCOL_MESSAGE = (
+  "The Host replacement helper is older than this release requires. Update "
+  "the Möbius checkout on the host, then re-run sudo "
+  "scripts/install-rebuild-helper.sh there before replacing the container."
+)
+# A release that needs new host pieces advances its helper protocol. A host
+# replacement is queued only when the protocol the host installer certified
+# meets both the served source's and the target release's requirement, so a
+# helper fix that was merged but never installed on this host blocks
+# replacement instead of running the old cutover path.
+_HELPER_REQUIREMENT_PATH = "deployment/self-hosted-helper.required"
+_REQUIRED_HELPER_PROTOCOL = Path(__file__).resolve().parents[2] / _HELPER_REQUIREMENT_PATH
 
 
 def _empty_status(
@@ -428,7 +445,7 @@ def _read_host_status() -> dict[str, Any]:
       "The host controller returned unreadable replacement status.",
     )
   request = _inbox_dir() / "request.json"
-  if str(value.get("state") or "idle") not in _ACTIVE_STATES and request.is_file():
+  if str(value.get("state") or "idle") not in (_ACTIVE_STATES | _UNRESOLVED_STATES) and request.is_file():
     try:
       pending = json.loads(request.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -479,6 +496,29 @@ def _read_host_status() -> dict[str, Any]:
   return value
 
 
+def _required_helper_protocol(target_sha: str | None = None) -> int | None:
+  """The larger of the served and target requirements; None if unreadable."""
+  try:
+    required = int(_REQUIRED_HELPER_PROTOCOL.read_text(encoding="ascii").strip())
+  except (OSError, UnicodeError, ValueError):
+    return None
+  if target_sha is None:
+    return required
+  repo = platform_update.PLATFORM_REPO
+  try:
+    if platform_update._rev(repo, target_sha) != target_sha:
+      return None
+  except (OSError, subprocess.SubprocessError):
+    return None
+  shown = platform_update._git_blob(repo, target_sha, _HELPER_REQUIREMENT_PATH)
+  if shown is None:
+    return required  # a release from before the requirement existed
+  try:
+    return max(required, int(shown.decode("ascii").strip()))
+  except (UnicodeError, ValueError):
+    return None
+
+
 def _current_host_controller(raw: dict[str, Any]) -> bool:
   # Request version 2 carries the app's nonce, which the helper echoes so only
   # that exact replacement can confirm an update (``reconcile_bound_operation``).
@@ -488,6 +528,24 @@ def _current_host_controller(raw: dict[str, Any]) -> bool:
     and not raw.get("runtime_overlay")
     and isinstance(versions, list) and _HOST_REQUEST_VERSION in versions
   )
+
+
+def _ensure_host_helper_meets_release(target_sha: str) -> None:
+  """Dispatch-only: status of an older helper stays readable for recovery."""
+  required = _required_helper_protocol(target_sha)
+  if required is None:
+    raise DeploymentControlError(
+      "helper_requirement_unavailable",
+      "Möbius could not read this release's host helper requirement. Refresh "
+      "the update review and try again.",
+      status_code=409,
+    )
+  installed = _read_host_status().get("helper_protocol")
+  if not (isinstance(installed, int) and not isinstance(installed, bool)
+          and installed >= required):
+    raise DeploymentControlError(
+      "controller_upgrade_required", _HELPER_PROTOCOL_MESSAGE, status_code=409,
+    )
 
 
 def _write_request(expected_sha: str, nonce: str) -> None:
@@ -568,6 +626,13 @@ async def withdraw_unclaimed_host_request() -> RebuildStatus:
     raise DeploymentControlError(
       "not_configured",
       "The host replacement helper is not configured on this deployment.",
+      status_code=409,
+    )
+  # An unresolved journal is host-owned even if a stray inbox file exists.
+  if (await asyncio.to_thread(_read_host_status)).get("state") in _UNRESOLVED_STATES:
+    raise DeploymentControlError(
+      "recovery_required",
+      "The previous container replacement needs host recovery before this request can be withdrawn.",
       status_code=409,
     )
   withdrawn = await asyncio.to_thread(_claim_unclaimed_request)
@@ -703,7 +768,7 @@ def _host_request_ended(nonce: str) -> bool:
   if not isinstance(status, dict):
     return False
   if status.get("request_nonce") == nonce:
-    return str(status.get("state") or "idle") not in _ACTIVE_STATES
+    return str(status.get("state") or "idle") not in (_ACTIVE_STATES | _UNRESOLVED_STATES)
   return True
 
 
@@ -718,7 +783,7 @@ async def _binding_ended(operation: dict) -> bool:
     status = await read_rebuild_status()
   except DeploymentControlError:
     return False
-  if not status.get("supported") or status.get("state") in _ACTIVE_STATES:
+  if not status.get("supported") or status.get("state") in (_ACTIVE_STATES | _UNRESOLVED_STATES):
     return False
   return True
 
@@ -727,6 +792,18 @@ async def release_ended_binding() -> None:
   """Before cancelling a prepared update, release a binding whose
   replacement provably ended. Anything short of that proof keeps it, and
   cancelling then refuses."""
+  # Cancellation must not silently discard an unresolved host transaction
+  # even if an older prepared record lacks the operation binding.
+  try:
+    status = await read_rebuild_status()
+  except DeploymentControlError:
+    status = None
+  if status is not None and status.get("state") in _UNRESOLVED_STATES:
+    raise DeploymentControlError(
+      "recovery_required",
+      "The unresolved container replacement must be recovered before cancelling this update.",
+      status_code=409,
+    )
   operation = await asyncio.to_thread(_bound_operation)
   if operation is not None and await _binding_ended(operation):
     await _release_binding(operation)
@@ -754,9 +831,11 @@ async def keep_settling_update() -> None:
     record is not None and status is not None
     and platform_update.status_reports_bound_operation(status, record)
   ):
-    if status.get("state") in _ACTIVE_STATES:
+    if status.get("state") in (_ACTIVE_STATES | _UNRESOLVED_STATES):
       raise DeploymentControlError(
-        "already_running",
+        "recovery_required" if status.get("state") in _UNRESOLVED_STATES else "already_running",
+        "The unresolved container replacement must be recovered first."
+        if status.get("state") in _UNRESOLVED_STATES else
         "The container replacement is still running. Wait for it to finish.",
         status_code=409,
       )
@@ -826,9 +905,12 @@ def _ensure_can_rebuild(status: RebuildStatus) -> None:
       status.get("message") or "Container updates are not available here yet.",
       status_code=409,
     )
-  if status.get("state") in _ACTIVE_STATES:
+  if status.get("state") in (_ACTIVE_STATES | _UNRESOLVED_STATES):
     raise DeploymentControlError(
-      "already_running", "A container rebuild is already running.", status_code=409,
+      "recovery_required" if status.get("state") in _UNRESOLVED_STATES else "already_running",
+      "The previous container replacement needs recovery before another request."
+      if status.get("state") in _UNRESOLVED_STATES else "A container rebuild is already running.",
+      status_code=409,
     )
 
 
@@ -847,6 +929,7 @@ async def _request_self_hosted_rebuild(
       status_code=409,
     )
   _ensure_can_rebuild(await read_rebuild_status())
+  await asyncio.to_thread(_ensure_host_helper_meets_release, expected_sha)
   # A binding left by an attempt that provably ended may be replaced.
   stale = await asyncio.to_thread(_bound_operation)
   replacing = stale if stale and await _binding_ended(stale) else None
@@ -1011,6 +1094,10 @@ async def _request_reviewed_rebuild_transaction(
   else:
     await asyncio.to_thread(validate_reviewed_release)
     _ensure_can_rebuild(await read_rebuild_status())
+    if deployment != "railway":
+      # Refuse before preparing: an outdated helper must not leave a
+      # prepared update parked with nothing able to finish it.
+      await asyncio.to_thread(_ensure_host_helper_meets_release, target_sha)
     started.set()
     # Prepare from a snapshot of the live source; the live checkout keeps
     # serving it until the cutover swaps the checked update in.

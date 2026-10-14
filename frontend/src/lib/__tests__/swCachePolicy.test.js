@@ -377,6 +377,16 @@ test('authoritative shell reads bypass offline fallback while ordinary reads kee
   assert.equal(requiresLiveShellList(new Request('https://mobius.test/api/theme', { cache: 'no-store' })), false)
 })
 
+test('shared-browser reads are marked for a network-only service-worker lane', async () => {
+  const { isSharedBrowserRequest, isShellListUrl } = await import('../../sw-cache-policy.js')
+  const guest = new Request('https://mobius.test/api/chats?shared_browser=1', {
+    headers: { 'X-Mobius-Shared-Browser': '1' },
+  })
+  assert.equal(isSharedBrowserRequest(guest), true)
+  assert.equal(isShellListUrl(new URL(guest.url)), false)
+  assert.equal(isSharedBrowserRequest(new Request('https://mobius.test/api/chats')), false)
+})
+
 test('scoped chat row reads never enter the offline shell-list cache', async () => {
   const { isShellListUrl, requiresLiveShellList } = await import('../../sw-cache-policy.js')
   assert.equal(isShellListUrl(new URL('https://mobius.test/api/chats')), true)

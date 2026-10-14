@@ -1,3 +1,6 @@
+// A guest's theme comes from the server each time; only the owner caches it.
+import { ownerStore } from './workspaceStorage.js'
+
 /**
  * Theme application library — the SINGLE source of truth for how a
  * Möbius surface paints the active theme onto its own DOM.
@@ -42,10 +45,6 @@ const SLOT_ID = '__mobius-theme__'
 const STORE_KEY = 'mobius-theme'
 const DEFAULT_BG = '#0d0d0d'
 const DEFAULT_MODE = 'dark'
-
-function defaultStore() {
-  try { return globalThis.localStorage } catch { return null }
-}
 
 export function colorSchemeMetaContent(mode) {
   return mode === 'light' ? 'light dark' : 'dark light'
@@ -96,7 +95,7 @@ export function inferMode(bg) {
  * behind, so they don't need css here). `mode` always resolves —
  * d.mode || inferMode(d.bg) || 'dark'.
  */
-export function resolveTheme({ doc = globalThis.document, store = defaultStore() } = {}) {
+export function resolveTheme({ doc = globalThis.document, store = ownerStore() } = {}) {
   // 1. Server-serialized slot.
   try {
     const el = doc && doc.getElementById(SLOT_ID)
@@ -135,7 +134,7 @@ export function resolveTheme({ doc = globalThis.document, store = defaultStore()
  *
  * `doc`/`store` are injectable for tests; default to globals.
  */
-export function applyTheme(theme, { doc = globalThis.document, store = defaultStore() } = {}) {
+export function applyTheme(theme, { doc = globalThis.document, store = ownerStore() } = {}) {
   const css = theme && typeof theme.css === 'string' ? theme.css : ''
   const bg = theme && theme.bg
   let themeStyleEl = null
@@ -271,7 +270,7 @@ export const PREPAINT_SRC = `(function () {
         mode = d.mode || infer(bg);
       }
     } catch (e) {}
-    if (!bg) {
+    if (!bg && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
       try {
         var raw = localStorage.getItem('mobius-theme');
         if (raw) {
@@ -328,7 +327,7 @@ export const PREPAINT_SRC = `(function () {
     // Opaque app frames use a memory-only storage shim with an EMPTY slot, so it must NOT write — else it clobbers the owner's
     // real theme with the dark default and the shell re-reads it (drawer bleed).
     try {
-      if (window.parent === window) {
+      if (window.parent === window && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
         localStorage.setItem('mobius-theme', JSON.stringify({ bg: bg, mode: mode }));
       }
     } catch (e) {}

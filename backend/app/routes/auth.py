@@ -42,7 +42,7 @@ from app.deps import (
   get_owner_app_or_chat_embed_for_models,
   get_owner_or_delegated_owner_for_app_token, reject_cross_site,
   require_chat_embed_operation,
-  require_nondelegated_owner_control,
+  require_installation_owner_control,
 )
 from app.timeutil import now_naive_utc
 from app.routes.shell_install_pass import router as shell_install_pass_router
@@ -559,6 +559,7 @@ def create_app_token_endpoint(
     app_nonce=app.token_nonce,
     delegation_id=delegation_id,
     delegation_chat=delegation_chat,
+    browser=principal.browser,
   )
   return {"token": token}
 
@@ -642,7 +643,7 @@ def set_model_connection_enabled(
   principal: Principal = Depends(get_principal),
 ):
   from app.providers import update_agent_settings
-  require_nondelegated_owner_control(principal)
+  require_installation_owner_control(principal)
   _app_model_connection(provider_id, principal)
   data_dir = get_settings().data_dir
   if not update_agent_settings(data_dir, lambda current: {
@@ -977,6 +978,7 @@ from pathlib import Path
 
 from app.codex_login_parse import banner_has_code, parse_login_banner
 from app.runtime_identity import broker_request as _mobius_broker_request
+from app.providers import mobius_account_changed
 
 _codex_login_procs: dict[str, asyncio.subprocess.Process] = {}
 _codex_login_status: dict[str, str] = {}  # "complete" | "failed"
@@ -1277,9 +1279,13 @@ async def _complete_mobius_enrollment(
   ):
     return _mobius_enroll_error_redirect()
 
-  await _mobius_broker_request(
-    "POST", "/identity/enroll", {"receipt": receipt}
-  )
+  try:
+    await _mobius_broker_request(
+      "POST", "/identity/enroll", {"receipt": receipt}
+    )
+  finally:
+    # Even an uncertain enroll outcome may have linked the runtime.
+    mobius_account_changed()
   # The conditional update preserves the same no-rebind invariant if the
   # owner row changes while the external enrollment request is in flight.
   updated = db.query(models.Owner).filter(
@@ -1405,9 +1411,12 @@ async def _complete_mobius_web_login(
     ):
       return _mobius_login_error_redirect()
   else:
-    enrolled = await _mobius_broker_request(
-      "POST", "/identity/enroll", {"receipt": receipt}
-    )
+    try:
+      enrolled = await _mobius_broker_request(
+        "POST", "/identity/enroll", {"receipt": receipt}
+      )
+    finally:
+      mobius_account_changed()
     if (
       enrolled.get("linked") is not True
       or not secrets.compare_digest(

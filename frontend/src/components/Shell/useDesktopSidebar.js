@@ -89,14 +89,10 @@ function desktopQueryMatches() {
  * Desktop navigation is ordinary layout state, deliberately separate from the
  * mobile drawer's history-backed virtual route in useNavigation.
  */
-export default function useDesktopSidebar() {
+export default function useDesktopSidebar(storage = globalThis.localStorage) {
   const [desktop, setDesktop] = useState(desktopQueryMatches)
-  const [open, setOpenState] = useState(() => readDesktopSidebarOpen(
-    typeof localStorage === 'undefined' ? null : localStorage,
-  ))
-  const [width, setWidthState] = useState(() => readDesktopSidebarWidth(
-    typeof localStorage === 'undefined' ? null : localStorage,
-  ))
+  const [open, setOpenState] = useState(() => readDesktopSidebarOpen(storage))
+  const [width, setWidthState] = useState(() => readDesktopSidebarWidth(storage))
 
   useEffect(() => {
     const query = window.matchMedia?.(DESKTOP_SIDEBAR_QUERY)
@@ -110,20 +106,14 @@ export default function useDesktopSidebar() {
   const setOpen = useCallback((nextOpen) => {
     const value = Boolean(nextOpen)
     setOpenState(value)
-    writeDesktopSidebarOpen(
-      typeof localStorage === 'undefined' ? null : localStorage,
-      value,
-    )
-  }, [])
+    writeDesktopSidebarOpen(storage, value)
+  }, [storage])
 
   const setWidth = useCallback((nextWidth) => {
     const value = clampDesktopSidebarWidth(nextWidth)
     setWidthState(value)
-    writeDesktopSidebarWidth(
-      typeof localStorage === 'undefined' ? null : localStorage,
-      value,
-    )
-  }, [])
+    writeDesktopSidebarWidth(storage, value)
+  }, [storage])
 
   return { desktop, open, setOpen, width, setWidth }
 }

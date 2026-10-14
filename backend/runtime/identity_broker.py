@@ -94,8 +94,8 @@ MANAGED_USER_AGENT = "mobius-managed-deployment/1"
 # favour of the baked copy instead of returning 404 for the new routes.
 # 1 = pre-/managed broker; 2 = /managed upstream-proxy routes present;
 # 3 = standalone web search endpoint; 4 = flat gateway wire for Codex web.run;
-# 5 = account review read/write routes.
-BROKER_ROUTE_EPOCH = 5
+# 5 = account review routes; 6 = shared access; 7 = recipient invitation response.
+BROKER_ROUTE_EPOCH = 7
 
 # Declarative public forwarding policy. Callers never supply a target URL,
 # audience, or arbitrary upstream path. Contribution and community routes are
@@ -313,7 +313,12 @@ def _flatten_web_tool(body: bytes) -> tuple[bytes, bool, bool]:
   # A bare `run` can denote web.run only when no other advertised tool
   # could have meant it. Never guess across namespace collisions.
   bare_run_is_web = run_candidates == ["web"]
-  return json.dumps(request, separators=(",", ":")).encode(), True, bare_run_is_web
+  # Rewriting the tool must not expand the whole Unicode conversation into
+  # ASCII escapes. Keep escaped lone surrogates lossless as valid JSON bytes.
+  encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode(
+    "utf-8", errors="backslashreplace",
+  )
+  return encoded, True, bare_run_is_web
 
 
 def _restore_web_tool_event(line: bytes, *, bare_run_is_web: bool = False) -> bytes:
@@ -425,6 +430,14 @@ def _managed_upstream_path(method: str, path: str) -> str | None:
   ):
     return None
   if (method, upstream) in MANAGED_EXACT_ROUTES:
+    return upstream
+  if (method, upstream) in {
+    ("POST", "/api/instance/v1/browser-access/grants"),
+    ("GET", "/api/instance/v1/browser-access/shared"),
+    ("POST", "/api/instance/v1/browser-access/shared/respond"),
+  } or (method == "DELETE" and re.fullmatch(
+    r"/api/instance/v1/browser-access/grants/[A-Za-z0-9_-]{20,64}", upstream
+  )):
     return upstream
   if any(
     method in methods
@@ -1244,10 +1257,11 @@ class Broker:
 
 
 class RequestBodyTooLarge(ValueError):
-  def __init__(self, length: int, maximum: int):
+  def __init__(self, length: int, maximum: int, *, received_bytes: int | None = None):
     super().__init__("request body is too large")
     self.length = length
     self.maximum = maximum
+    self.received_bytes = received_bytes
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1328,6 +1342,9 @@ class _Handler(BaseHTTPRequestHandler):
       bare_run_is_web = False
       if method == "POST" and path == "/v1/responses":
         body, web_tool_flattened, bare_run_is_web = _flatten_web_tool(body)
+        # The ingress bound also applies after the broker rewrites the wire body.
+        if len(body) > body_limit:
+          raise RequestBodyTooLarge(len(body), body_limit, received_bytes=received_bytes)
       incoming = {key.lower(): value for key, value in self.headers.items()}
       upstream = broker.proxy(
         method=method,
@@ -1370,15 +1387,19 @@ class _Handler(BaseHTTPRequestHandler):
     except RequestBodyTooLarge as exc:
       log.warning(
         "Request rejected: origin=local_broker status=413 "
-        "declared_bytes=%d limit_bytes=%d", exc.length, exc.maximum,
+        "request_bytes=%d limit_bytes=%d received_bytes=%s",
+        exc.length, exc.maximum, exc.received_bytes,
       )
-      self._json(413, {
+      error = {
         "error": "request body is too large",
         "code": "request_body_too_large",
         "origin": "local_broker",
         "request_bytes": exc.length,
         "limit_bytes": exc.maximum,
-      })
+      }
+      if exc.received_bytes is not None:
+        error.update(stage="rewritten", received_bytes=exc.received_bytes)
+      self._json(413, error)
     except ValueError as exc:
       self._json(400, {"error": str(exc)})
     except httpx.HTTPStatusError as exc:

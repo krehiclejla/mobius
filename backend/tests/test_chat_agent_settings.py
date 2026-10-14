@@ -9,6 +9,8 @@ Locks in three contracts:
      into the runner — verified by mocking the SDK runner and
      asserting the `agent_settings` kwarg.
 """
+from app import transcript_rows
+from sqlalchemy.orm import object_session
 
 import asyncio
 import json
@@ -471,10 +473,10 @@ def test_get_chat_has_assistant_turns_reflects_history(
   client, auth, chat, db,
 ):
   """The flag flips to True once an assistant message exists."""
-  chat.messages = [
+  transcript_rows.replace_all(object_session(chat), chat, [
     {"role": "user", "content": "hi"},
     {"role": "assistant", "content": "hello"},
-  ]
+  ])
   db.commit()
   r = client.get(f"/api/chats/{chat.id}", headers=auth)
   assert r.json()["has_assistant_turns"] is True
@@ -536,7 +538,7 @@ def test_first_live_turn_cannot_switch_provider_via_patch(
   """The provider is immutable once the first run has claimed the chat."""
   from app import models
 
-  chat.messages = [{"role": "user", "content": "first request"}]
+  transcript_rows.replace_all(object_session(chat), chat, [{"role": "user", "content": "first request"}])
   db.add(models.ChatRun(
     id="first-live-turn",
     chat_id=chat.id,
@@ -728,8 +730,10 @@ def test_claude_receives_an_owner_goal_command_as_a_plain_request(
     asyncio.run(_scenario())
 
   prompt = captured["user_message"]
-  assert prompt.startswith("[Context — current time:")
-  assert "Goal: ship the fix" in prompt
+  # Per-run delivery instructions may precede the time header; neither may
+  # turn the owner's request back into Claude's native slash command.
+  assert any(line.startswith("[Context — current time:") for line in prompt.splitlines())
+  assert prompt.endswith("\n\nGoal: ship the fix")
   assert not any(line.startswith("/goal") for line in prompt.splitlines())
 
 
@@ -799,10 +803,10 @@ def test_patch_cannot_bypass_handoff_after_assistant_turn(
   )
   chat.session_id = "claude-session"
   chat.agent_settings_json = {"model": "claude-sonnet-4-6"}
-  chat.messages = [
+  transcript_rows.replace_all(object_session(chat), chat, [
     {"role": "user", "content": "hello"},
     {"role": "assistant", "content": "hi"},
-  ]
+  ])
   db.commit()
 
   response = client.patch(
@@ -957,3 +961,59 @@ def test_run_chat_passes_deployed_skill_and_picker_settings(
   )
   assert snapshot is not None
   assert snapshot.content == "DEPLOYED-SKILL"
+
+
+def test_new_chat_composes_app_prompt_fragments_off_the_event_loop(
+  client, auth, chat, db, monkeypatch,
+):
+  """Fragment reads run Git per app, so they must not block the server's loop."""
+  from app import chat as chat_mod, schemas, system_prompts
+
+  monkeypatch.setattr(chat_mod, "_read_skill_text", lambda: "DEPLOYED-SKILL")
+  db.add(models.App(
+    slug="memory", name="Memory", source_dir="/nonexistent/memory",
+    source_commit="0" * 40, system_prompt_file="memory-core.md",
+  ))
+  db.commit()
+  on_loop = []
+
+  def read_fragment(source_dir, source_commit, basename):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    return "APP FRAGMENT"
+
+  monkeypatch.setattr(system_prompts, "_read_safe_fragment", read_fragment)
+  captured = {}
+
+  async def fake_runner(**kwargs):
+    captured.update(kwargs)
+    return {"session_id": "s", "cost_usd": 0.0, "error": None}
+
+  async def _scenario():
+    from app.broadcast import create_broadcast
+    create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat)
+    await chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content="hi")],
+      chat_id=chat.id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=chat_mod.current_run_generation(chat.id),
+      run_token=run_token,
+    )
+
+  with patch(
+         "app.claude_sdk_runner.run_claude_sdk_turn",
+         side_effect=fake_runner,
+       ), \
+       patch(
+         "app.providers.ClaudeProvider.check_auth",
+         return_value=None,
+       ):
+    asyncio.run(_scenario())
+
+  assert on_loop == [False]
+  assert "APP FRAGMENT" in captured["skill_text"]

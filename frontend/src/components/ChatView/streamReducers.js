@@ -262,8 +262,17 @@ export function replaceTextItem(prev, content, {
       }
       break
     }
-    updated[trailingIdx] = { ...trailing, content }
-    return updated
+    // A final-only envelope may have no preceding delta or boundary. Distinct
+    // known identities are separate items; retain the legacy trailing repair
+    // only when one side lacks identity, adopting the final's id if available.
+    if (!(textItemId && trailing.text_item_id && trailing.text_item_id !== textItemId)) {
+      updated[trailingIdx] = {
+        ...trailing,
+        content,
+        ...(textItemId ? { text_item_id: textItemId } : {}),
+      }
+      return updated
+    }
   }
   // Provider item ids are best-effort. Codex request_user_input has been
   // observed to interrupt after a prefix and then complete that SAME message
@@ -568,6 +577,11 @@ export function attachToolOutput(prev, content, event = null) {
   }
   if (typeof event?.owner_card_question_id === 'string') {
     block.owner_card_question_id = event.owner_card_question_id
+  }
+  // A screenshot step names the chat-media picture it saved, so opening it
+  // live never downloads the full stored result.
+  if (typeof event?.saved_image === 'string') {
+    block.saved_image = event.saved_image
   }
   if (event?.output_exit_code != null) {
     block.output_exit_code = event.output_exit_code

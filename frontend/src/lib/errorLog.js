@@ -11,6 +11,7 @@
 // itself throw.
 
 import { redactDiagnosticText } from './diagnosticRedaction.js'
+import { ownerStore } from './workspaceStorage.js'
 
 const RING_KEY = 'mobius:error-log' // ring buffer of the last MAX errors
 const MAX = 10
@@ -45,8 +46,10 @@ function shouldReport(key, now) {
  * why this is standalone + keepalive + swallow-all.)
  */
 function postClientError(record) {
+  // This leaf logger uses only owner credentials. A shared-browser page must
+  // never inspect the owner's localStorage token to report a guest error.
   let token
-  try { token = localStorage.getItem('token') } catch { token = null }
+  try { token = ownerStore()?.getItem('token') } catch { token = null }
   if (!token || !record.message) return
   const key = String(record.message).slice(0, 200)
   const now = Date.now()

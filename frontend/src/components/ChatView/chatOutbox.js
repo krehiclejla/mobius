@@ -49,8 +49,8 @@ let retirementSequence = 0
  *
  * This is only a browser-storage ownership boundary; the server still verifies
  * the signed token on every replay. Owner sessions remain stable across token
- * renewal through sub+epoch. Embedded chats are additionally bound to their
- * capability scope, app, and chat so the owner shell cannot inherit their
+ * renewal through sub+epoch. Embedded chats and shared-browser grants are
+ * additionally bound to their capability lineage so the owner shell cannot inherit their
  * queued text. Invalid/opaque tokens opt out of persistence rather than putting
  * owner-authored content into an unscoped database.
  */
@@ -64,15 +64,18 @@ export function outboxPrincipalKey(token) {
     const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
     const claims = JSON.parse(new TextDecoder().decode(bytes))
     if (typeof claims?.sub !== 'string' || !claims.sub) return null
-    const scope = claims.scope || 'owner'
-    if (scope !== 'owner' && scope !== 'chat_embed') return null
-    return JSON.stringify([
-      claims.sub,
-      claims.epoch ?? 0,
-      scope,
-      scope === 'chat_embed' ? String(claims.app_id ?? '') : '',
-      scope === 'chat_embed' ? String(claims.chat_id ?? '') : '',
-    ])
+    const sharedGrant = claims.browser_grant
+    const scope = sharedGrant ? 'browser_shared' : (claims.scope || 'owner')
+    if (!['owner', 'chat_embed', 'browser_shared'].includes(scope)) return null
+    if (scope === 'browser_shared' && (
+      typeof sharedGrant !== 'string' || !sharedGrant
+      || typeof claims.browser_session !== 'string'
+      || !claims.browser_session
+    )) return null
+    const partition = scope === 'chat_embed'
+      ? [String(claims.app_id ?? ''), String(claims.chat_id ?? '')]
+      : scope === 'browser_shared' ? [sharedGrant, claims.browser_session] : ['', '']
+    return JSON.stringify([claims.sub, claims.epoch ?? 0, scope, ...partition])
   } catch {
     return null
   }
@@ -80,9 +83,13 @@ export function outboxPrincipalKey(token) {
 
 function sameOwnerPartition(first, second) {
   try {
-    const [firstSubject, firstEpoch] = JSON.parse(first)
-    const [secondSubject, secondEpoch] = JSON.parse(second)
+    const [firstSubject, firstEpoch, firstScope] = JSON.parse(first)
+    const [secondSubject, secondEpoch, secondScope] = JSON.parse(second)
+    // Preserve another capability's queued intent without ever adopting it.
+    // Exact ownership is checked above, against the full grant/session key.
     return firstSubject === secondSubject && firstEpoch === secondEpoch
+      && ['owner', 'chat_embed', 'browser_shared'].includes(firstScope)
+      && ['owner', 'chat_embed', 'browser_shared'].includes(secondScope)
   } catch {
     return false
   }

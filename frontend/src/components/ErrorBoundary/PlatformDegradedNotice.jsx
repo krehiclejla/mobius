@@ -1,6 +1,7 @@
 import useAgentRepair from '../../hooks/useAgentRepair.js'
 import { BASE } from '../../api/client.js'
 import { repairChatPath } from '../../lib/errorRecovery.js'
+import { sharedBrowserShellHref } from '../../lib/sharedBrowserWorkspace.js'
 import './ErrorBoundary.css'
 
 // `/api/version` reports which tree is ACTUALLY serving. Two fallbacks exist,
@@ -35,9 +36,12 @@ const VARIANTS = {
         'changes did not finish loading. The latest source is preserved but ' +
         'is not being served.',
       '',
-      'Reproduce the import failure from the served backend, read the relevant ' +
-        'boot/container logs, find the root cause in /data/platform, and ' +
-        'implement a targeted fix so the normal platform serves again.',
+      'Reproduce the import failure from the served backend. ' +
+        '/data/logs/platform-boot.jsonl records the boot transaction (its ' +
+        'activate, guard and revert steps, with the exact error of a failed ' +
+        'one), not the import check itself. Find the root cause in ' +
+        '/data/platform and implement a targeted fix so the normal platform ' +
+        'serves again.',
       '',
       'Preserve the edits and all data. Do not reset or restore the platform ' +
         'unless ordinary diagnosis and a targeted fix cannot make progress. The ' +
@@ -80,7 +84,7 @@ export default function PlatformDegradedNotice({ onContinue, variant = 'backend'
   const repairFailed = attempt?.phase === 'agent-failed'
   const handleRepair = () => {
     if (repairDirected) {
-      window.location.assign(repairChatPath(repairChatId, BASE))
+      window.location.assign(sharedBrowserShellHref(repairChatPath(repairChatId, BASE)))
       return
     }
     void repair()

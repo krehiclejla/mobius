@@ -36,6 +36,7 @@ from sqlalchemy import inspect as inspect_database
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from app.chat_logging import get_logger as get_chat_logger
 from app.config import get_settings
 from app.database import (
   Base,
@@ -45,13 +46,16 @@ from app.database import (
   reset_database_request_label,
   set_database_request_label,
 )
-from app.schema_migrations import mapped_schema_gaps, run_migrations
+from app.schema_migrations import (
+  ensure_transcript_triggers, mapped_schema_gaps, run_migrations,
+)
 from app.http_caching import strip_range
 from app.frontend_assets import (
   baked_frontend_dir,
   live_frontend_dir,
   resolve_frontend_dir,
 )
+from app.managed_paths import SERVED_STATIC_DIR
 from app.memory_observability import record_memory_checkpoint
 from app.runtime_provenance import (
   protected_runtime_status,
@@ -68,7 +72,8 @@ from app.response_policy import (
   static_embed_csp,
 )
 from app.storage_io import ParentIsFile, atomic_write
-from app import activity, models
+from app.account_browser_access import SharedAccessError
+from app import activity, models, tracing
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
 # uvicorn boot. See the
@@ -76,7 +81,7 @@ from app import activity, models
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
   app_tools_router,
-  auth_router,
+  auth_router, browser_access_router,
   app_chat_router,
   chat_continuity_router, chat_embed_router, chat_logs_router, chat_router,
   chats_router, chats_stream_router,
@@ -231,6 +236,8 @@ def _init_db():
     try:
       Base.metadata.create_all(bind=engine)
       run_migrations(engine)
+      # The previous release's change detection depends on these triggers.
+      ensure_transcript_triggers(engine)
       gaps = mapped_schema_gaps(engine)
       if gaps:
         # A mapped column with no migration fails at first query, not at
@@ -292,6 +299,10 @@ async def lifespan(app):
   )
   database_boot = await run_startup_plan(startup_context)
   _set_database_boot_state(database_boot)
+  if database_boot.serviceable:
+    # A database that failed its boot check is left untouched for Recovery.
+    from app.database import open_wal_anchor
+    open_wal_anchor()
   from app.runtime_supervisors import RuntimeSupervisors
   supervisors = RuntimeSupervisors(
     settings=settings,
@@ -304,6 +315,13 @@ async def lifespan(app):
   record_memory_checkpoint("startup_frontend_watcher_started")
   if database_boot.serviceable:
     await supervisors.start_database_services()
+    # Like cron mutation and restoration, the retry never runs in the test
+    # runtime, where it would reach other tests' HTTP doubles.
+    if (
+      startup_context.bootstrap_retry is not None
+      and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+    ):
+      supervisors.retry_bootstrap_apps(startup_context.bootstrap_retry)
     from app.saved_secure_inputs import recover_interrupted
     await recover_interrupted()
     from app.startup import _capture_platform_activation_snapshot
@@ -332,11 +350,13 @@ async def lifespan(app):
       setup_task.cancel()
       await asyncio.gather(setup_task, return_exceptions=True)
     record_memory_checkpoint("shutdown_begin")
-    try:
-      from app.public_app_transport import close_public_fetch_clients
-      await close_public_fetch_clients()
-    except Exception as exc:
-      _log.error("public fetch client shutdown failed: %s", exc, exc_info=True)
+    from app.public_app_transport import close_public_fetch_clients
+    from app.routes.proxy import close_proxy_clients
+    for close_clients in (close_public_fetch_clients, close_proxy_clients):
+      try:
+        await close_clients()
+      except Exception as exc:
+        _log.error("outbound fetch client shutdown failed: %s", exc, exc_info=True)
     # Preserve the final partial request-error windows across graceful restarts.
     # This is one bounded batch append, not one write per response.
     activity.flush_request_errors()
@@ -360,6 +380,10 @@ async def lifespan(app):
       stop_writer()
     except Exception as exc:
       _log.error("chat writer stop failed: %s", exc, exc_info=True)
+    # Last database user out: closing the anchor lets SQLite checkpoint the
+    # log on the way down.
+    from app.database import close_wal_anchor
+    close_wal_anchor()
 
 settings = get_settings()
 
@@ -385,6 +409,9 @@ app = FastAPI(
   lifespan=lifespan,
 )
 
+# Opt-in, off unless <data_dir>/tracing.json enables it; see app.tracing.
+tracing.configure(app, engine)
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -392,6 +419,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.exception_handler(IntegerOutOfRange)
 async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
   return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(SharedAccessError)
+async def _shared_access_error_handler(_request: Request, exc: SharedAccessError):
+  # Shared-access failures the Connect app branches on carry a stable code.
+  return JSONResponse(
+    status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code},
+  )
 
 
 @app.exception_handler(ParentIsFile)
@@ -745,6 +780,10 @@ class _DatabaseRequestContextMiddleware:
       reset_database_request_label(token)
 
 
+def _matched_route(scope) -> str:
+  return getattr(scope.get("route"), "path", None) or "<unmatched>"
+
+
 class _RequestErrorTelemetryMiddleware:
   """Aggregate failed responses by matched route without retaining raw URLs.
 
@@ -753,10 +792,31 @@ class _RequestErrorTelemetryMiddleware:
   so a retry loop remains observable without amplifying its CPU or disk cost.
   FastAPI leaves the matched route template and path params in the ASGI scope;
   those templates contain no user paths or query values.
+
+  Unhandled exceptions also leave their traceback in the chat log (uvicorn's
+  own report reaches only the container's stdout), once per route and
+  exception type per window so a crash loop cannot flood the log.
   """
+
+  _TRACEBACK_WINDOW_SEC = 60
+  _TRACEBACK_KEY_CAP = 512
 
   def __init__(self, app):
     self.app = app
+    self._traceback_logged_at: dict[tuple[str, str], float] = {}
+
+  def _log_traceback(self, route: str, exc: Exception) -> None:
+    key = (route, type(exc).__qualname__)
+    now = time.monotonic()
+    last = self._traceback_logged_at.get(key)
+    if last is not None and now - last < self._TRACEBACK_WINDOW_SEC:
+      return
+    if len(self._traceback_logged_at) >= self._TRACEBACK_KEY_CAP:
+      self._traceback_logged_at.clear()
+    self._traceback_logged_at[key] = now
+    get_chat_logger().error(
+      "unhandled exception in route %s", route, exc_info=exc,
+    )
 
   async def __call__(self, scope, receive, send):
     if scope["type"] != "http":
@@ -771,13 +831,15 @@ class _RequestErrorTelemetryMiddleware:
 
     try:
       return await self.app(scope, receive, _send)
-    except Exception:
+    except Exception as exc:
       status = status or 500
+      self._log_traceback(
+        f"{scope.get('method', '?')} {_matched_route(scope)}", exc,
+      )
       raise
     finally:
       if status is not None and status >= 400:
-        matched = scope.get("route")
-        route = getattr(matched, "path", None) or "<unmatched>"
+        route = _matched_route(scope)
         raw_app_id = (scope.get("path_params") or {}).get("app_id")
         try:
           app_id = int(raw_app_id) if raw_app_id is not None else None
@@ -996,6 +1058,7 @@ app.include_router(public_storage_router)
 app.include_router(public_apps_router)
 app.include_router(local_services_router)
 app.include_router(connect_router)
+app.include_router(browser_access_router)
 app.include_router(client_error_router)
 app.include_router(client_signal_router)
 app.include_router(community_router)
@@ -1682,7 +1745,7 @@ def _serve_app_static_asset(
   if not source_dir:
     raise HTTPException(status_code=404, detail="Not found.")
 
-  root = (Path(source_dir) / "static").resolve()
+  root = (Path(source_dir) / SERVED_STATIC_DIR).resolve()
   try:
     target = (root / (asset_path or "index.html")).resolve()
   except OSError:

@@ -11,11 +11,10 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from app import transcript_rows
 from app import models, schemas
-from app.continuations import (
-  continuation_actor_label,
-  is_continuation_message,
-)
+from app.continuations import not_owner_speech_label
+from app.prompt_blocks import as_block_data
 from app.goal_commands import (
   goal_argument as _goal_argument,
   goal_clear_requested as _goal_clear_requested,
@@ -23,8 +22,8 @@ from app.goal_commands import (
   is_goal_continue,
   is_goal_command as _is_goal_command,
 )
-def recent_chat_digest_order(db: Session) -> list[str]:
-  """Chat ids whose digests new sessions may see, most recent activity first.
+def recent_chat_summary_order(db: Session) -> list[str]:
+  """Chat ids whose summaries new sessions may see, most recent activity first.
 
   Deleted chats are gone and archived chats are filed away; neither belongs in
   another session's picture of current work. An archived chat's note stays
@@ -86,17 +85,21 @@ def _last_user_message_elapsed(db, chat_id: str) -> str | None:
     chat = (
       db.query(models.Chat).filter(models.Chat.id == chat_id).first()
     )
-    msgs = (chat.messages if chat else None) or []
+    if chat is None:
+      return None
+    size = transcript_rows.count(db, chat)
     now_ms = _time.time() * 1000.0
-    for m in reversed(msgs[:-1]):  # skip the current (just-committed) message
-      # Only owner-authored USER messages count. Product-owned automatic
-      # continuation rows retain role=user for provider history but must not
-      # reset the owner's recency clock.
+    for index, m in transcript_rows.reverse_iter(db, chat):
+      if index == size - 1:  # skip the current (just-committed) message
+        continue
+      # Only owner-authored USER messages count. Product-written rows
+      # (continuations, kept side questions) retain role=user for provider
+      # history but must not reset the owner's recency clock.
       if (
         not isinstance(m, dict)
         or m.get("role") != "user"
         or m.get("hidden")
-        or is_continuation_message(m)
+        or not_owner_speech_label(m) is not None
       ):
         continue
       ts = m.get("ts")
@@ -489,16 +492,37 @@ def _latest_compaction_brief(chat_row) -> str | None:
   """Most recent portable compaction block, if the chat has one."""
   if chat_row is None:
     return None
-  for msg in reversed(list(chat_row.messages or [])):
+  for msg in reversed(transcript_rows.history(chat_row)):
     if not isinstance(msg, dict) or msg.get("kind") != "compaction":
       continue
     content = msg.get("content")
     if isinstance(content, str) and content.strip():
+      evidence = msg.get("source_evidence")
+      if (isinstance(evidence, dict) and evidence.get("chat_id") == chat_row.id
+          and type(evidence.get("message_count")) is int
+          and evidence["message_count"] >= 0):
+        from app.manual_compaction import evidence_reference
+        return content.strip() + "\n\n" + evidence_reference(chat_row.id, evidence["message_count"])
       return content.strip()
   return None
 
 
 _RESUME_CONTEXT_CHAR_BUDGET = 12000
+
+
+# Retired quiet-write frames that leaked into saved replies. A reseeded session
+# must not see itself writing them, or it keeps copying the withdrawn protocol.
+_WRITE_FRAME = re.compile(
+  r"<MOBIUS_WRITE\b[^>]*/>"  # A self-closing tag.
+  r"|<MOBIUS_WRITE\b[^>]*>.*?</MOBIUS_WRITE>"  # A complete frame.
+  r"|<MOBIUS_WRITE\b[^>]*>\s*\{(?:(?!\n[ \t]*\n).)*"  # An unclosed one, to its paragraph end.
+  r"|</?MOBIUS_WRITE\b[^>]*>",  # Any stray tag.
+  re.DOTALL,
+)
+
+
+def _without_write_frames(text: str) -> str:
+  return _WRITE_FRAME.sub("", text) if "MOBIUS_WRITE" in text else text
 
 
 def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
@@ -527,7 +551,7 @@ def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
   if chat_row is None:
     return None
   entries: list[tuple[dict, str]] = []
-  for msg in chat_row.messages or []:
+  for msg in transcript_rows.history(chat_row):
     if not isinstance(msg, dict):
       continue
     role = msg.get("role")
@@ -536,15 +560,20 @@ def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
     content = msg.get("content")
     if not isinstance(content, str) or not content.strip():
       continue
-    if is_continuation_message(msg):
-      speaker = continuation_actor_label(msg)
-    else:
-      speaker = "User" if role == "user" else "Assistant"
-    entries.append((msg, f"{speaker}: {content.strip()}"))
+    if role == "assistant":
+      content = _without_write_frames(content)
+      if not content.strip():
+        continue
+    speaker = not_owner_speech_label(msg) or (
+      "User" if role == "user" else "Assistant"
+    )
+    # Every entry is recalled text inside one tagged block; none may end it.
+    content = as_block_data(content.strip(), "resumed_context")
+    entries.append((msg, f"{speaker}: {content}"))
   task = None
   if (
     keep_task and entries and entries[0][0].get("role") == "user"
-    and not is_continuation_message(entries[0][0])
+    and not_owner_speech_label(entries[0][0]) is None
   ):
     task = entries.pop(0)[1]
   budget = _RESUME_CONTEXT_CHAR_BUDGET - len(task or "")
@@ -578,13 +607,19 @@ def _build_resumed_context(chat_row, *, keep_task: bool = False) -> str | None:
 # The slash commands Möbius owns; none is forwarded to a provider CLI. `/goal`
 # creates the Möbius Goal, and the agent receives its objective as a plain
 # request (goal_commands.goal_request_for_agent), so Claude's own `/goal` never
-# runs. `/compact` rewrites the chat's live context and resets the provider
-# session (routes/chats.py ``/compact``); it never reaches a model as prose.
+# runs. The rest are chat actions the composer runs instead of sending, so none
+# reaches a model as prose: `/compact` rewrites the chat's live context and
+# resets the provider session (routes/chats.py ``/compact``); `/new` and its
+# alias `/clear` open a new chat in the same project with the same model;
+# `/context` reads ``/context-sizes``; `/btw` asks ``/btw`` for an answer from a
+# temporary copy of the chat.
 # This is half of a cross-language contract: the composer's "/" menu
 # (frontend/src/components/ChatView/slashCommands.js) offers exactly this set,
-# and `test_slash_command_registry_parity` pins the two together so a menu entry
-# can never silently degrade into prose.
-MOBIUS_SLASH_COMMANDS = frozenset({"/goal", "/compact"})
+# aliases included, and `test_slash_command_registry_parity` pins the two
+# together so a menu entry can never silently degrade into prose.
+MOBIUS_SLASH_COMMANDS = frozenset({
+  "/goal", "/compact", "/new", "/clear", "/context", "/btw",
+})
 
 
 def _chat_has_goal_intent(messages: list[schemas.ChatMessage]) -> bool:

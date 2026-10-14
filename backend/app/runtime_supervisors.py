@@ -40,6 +40,11 @@ PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS = 5 * 60
 OOM_WATCHDOG_FAST_INTERVAL_SECS = 2.0
 OOM_WATCHDOG_SLOW_INTERVAL_SECS = 20.0
 OOM_WATCHDOG_FAST_WINDOW_SECS = 180.0
+# A heavy WebGL page can grow by gigabytes within a minute.
+BROWSER_REAPER_INTERVAL_SECS = 30.0
+# Chat browsers may hold this share of the container memory limit; the server
+# and agent processes need the rest.
+BROWSER_MEMORY_SHARE = 0.4
 REQUIRED_DATABASE_SUPERVISORS = frozenset({
   "wedged-marker-sweep",
   "reset-park-sweep",
@@ -86,6 +91,8 @@ class RuntimeSupervisors:
     self._frontend_handler = None
     self._database_services_started = False
     self._database_services_error: str | None = None
+    from app.app_update_batches import AppUpdateBatches
+    self.app_updates = AppUpdateBatches(settings.data_dir)
 
   def _spawn(self, name: str, coroutine) -> None:
     self._tasks[name] = asyncio.create_task(
@@ -97,7 +104,9 @@ class RuntimeSupervisors:
 
     Boot reconciles the platform checkout, may finish an update swap, and
     bootstraps apps before any turn exists, so no settled-turn cleanup follows
-    that git and tool I/O. One pass at readiness, off the event loop.
+    that git and tool I/O. Startup maintenance also reads much of the main
+    database file, so that one file is advised too. One pass at readiness,
+    off the event loop.
     """
     async def reclaim():
       from app.file_cache import reclaim_background_work_cache
@@ -107,8 +116,28 @@ class RuntimeSupervisors:
         )
       except Exception:
         self.log.debug("boot file cache advice failed", exc_info=True)
+      from app.database import reclaim_startup_database_file_cache
+      try:
+        result = await asyncio.to_thread(reclaim_startup_database_file_cache)
+      except Exception:
+        self.log.debug("startup database file cache advice failed", exc_info=True)
+        return
+      if result and result["files"]:
+        # Advised, not reclaimed: concurrent activity moves the cgroup figures.
+        self.log.info(
+          "startup database file cache advice: advised_bytes=%s "
+          "cgroup_file_before=%s cgroup_file_after=%s",
+          result["advised_file_bytes"],
+          result["file_cache_before_bytes"],
+          result["file_cache_after_bytes"],
+        )
 
     self._spawn("boot-file-cache-reclaim", reclaim())
+
+  def retry_bootstrap_apps(self, outcome) -> None:
+    """Keep retrying default apps that failed only transiently at boot."""
+    from app.bootstrap import retry_bootstrap_apps
+    self._spawn("bootstrap-apps-retry", retry_bootstrap_apps(outcome))
 
   async def start_process_services(self) -> None:
     """Start services that are safe without a serviceable database."""
@@ -116,6 +145,29 @@ class RuntimeSupervisors:
     from app.connect_outbound import supervise_outbound_connects
     self._spawn("connect-outbound", supervise_outbound_connects())
     self._spawn("oom-watchdog", self._oom_watchdog_loop())
+    self._spawn("browser-reaper", self._browser_reaper_loop())
+
+  async def _browser_reaper_loop(self) -> None:
+    """Close agent browsers left by turns that died with an earlier process.
+
+    Its first pass starts at boot alongside other supervisors. A browser
+    outliving a killed server may hold memory across restarts; this sweep
+    runs concurrently with chat resumption, not as a startup barrier.
+    """
+    from app import chat, memory_observability
+
+    while True:
+      try:
+        # No container limit means no OOM cliff to guard.
+        limit = memory_observability.cgroup_memory_snapshot().get("limit_bytes")
+        await chat.reap_unowned_browsers(
+          memory_budget_bytes=int(limit * BROWSER_MEMORY_SHARE) if limit else None,
+        )
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        self.log.error("agent-browser reaper failed: %s", exc, exc_info=True)
+      await asyncio.sleep(BROWSER_REAPER_INTERVAL_SECS)
 
   async def _oom_watchdog_loop(self) -> None:
     """Record a durable diagnostic whenever the cgroup loses a process to OOM.
@@ -194,6 +246,8 @@ class RuntimeSupervisors:
           "required runtime supervisors were not started: "
           + ", ".join(sorted(missing))
         )
+      # Settles any batch a stopped server left running, then admits new ones.
+      await self.app_updates.start()
       self._database_services_started = True
       self._database_services_error = None
     except Exception as exc:
@@ -498,6 +552,13 @@ class RuntimeSupervisors:
                 "capacity alert tier=%s free=%s", result["tier"],
                 (result["snapshot"] or {}).get("data_free_bytes"),
               )
+          # This tick observes the disk; a transcript conversion that paused
+          # for disk resumes when this observation says pressure recovered.
+          from app.chat_writer import rearm_transcript_conversion
+          from app.resource_pressure import resource_status
+          disk_state = resource_status(data_dir)["pressure"]["disk"].get("state")
+          if rearm_transcript_conversion(str(disk_state)):
+            self.log.info("transcript conversion resumed after disk pressure recovered")
         except asyncio.CancelledError:
           raise
         except Exception as exc:
@@ -569,6 +630,8 @@ class RuntimeSupervisors:
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""
+    # First, so each running update settles while the owners it uses still run.
+    await self.app_updates.stop()
     tasks = list(self._tasks.values())
     for task in tasks:
       task.cancel()

@@ -1,4 +1,7 @@
 """Contracts for durable delegated tasks and restrictive child policy."""
+from sqlalchemy.orm import object_session
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 from tests.goal_fixtures import goal_run as make_goal_run, persist_goal_fixture
 
@@ -18,6 +21,12 @@ from app.chat_writer import (
 from app.codex_sdk_runner import _codex_config_overrides
 from app.delegations import (
   RunPolicy,
+  DelegationIntent,
+  create_or_attach_delegation,
+  delegation_source_work_id,
+  delegation_source_work_filter,
+  activity_continuation_delivery_source_work_id,
+  own_helper_statuses,
   background_helper_chat_ids,
   delegation_execution_token,
   derived_status,
@@ -63,7 +72,7 @@ def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
   )
   for index, (status, park_reason) in enumerate(states):
     child_id = f"legacy-child-{index}"
-    db.add(models.Chat(
+    db.add(create_chat(
       id=child_id, title="Legacy task", provider="codex",
       created_by_app_id=app_id, auto_resume_on_restart=True,
       messages=[{"role": "user", "content": f"inspect {index}"}],
@@ -105,9 +114,9 @@ def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
     row = db.get(models.Delegation, f"legacy-{index}")
     child = db.get(models.Chat, f"legacy-child-{index}")
     assert row.scope == "read" and row.startup_prompt == f"inspect {index}"
-    assert child.messages[0] == {"role": "user", "content": f"inspect {index}"}
+    assert list(transcript_rows.history(child))[0] == {"role": "user", "content": f"inspect {index}"}
     if status != "running":
-      assert len(child.messages) == 1
+      assert len(list(transcript_rows.history(child))) == 1
     if status == "completed":
       assert row.interrupted_at is None
       assert derived_status(db, row)[0] == "completed"
@@ -123,7 +132,7 @@ def test_legacy_read_cutover_is_durable_and_preserves_transcripts(
         assert db.get(models.ChatRun, f"legacy-run-{index}").status == expected
       if status == "running":
         assert db.get(models.ChatRun, f"legacy-run-{index}").status == "interrupted"
-        blocks = child.messages[-1].get("blocks") or []
+        blocks = list(transcript_rows.history(child))[-1].get("blocks") or []
         assert any("single-mode cutover" in block.get("message", "") for block in blocks)
         assert not any(block.get("resumable") for block in blocks)
       with pytest.raises(RuntimeError, match="cannot resume"):
@@ -155,8 +164,8 @@ def test_delegation_inherits_owner_tools_with_run_bound_delegation_identity(
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
   app_id = create_local_app(client, owner_auth, name="Read policy")['id']
   db.add_all([
-    models.Chat(id="parent", title="Parent", messages=[]),
-    models.Chat(id="read-child", title="Child", messages=[], created_by_app_id=app_id),
+    create_chat(id="parent", title="Parent", messages=[]),
+    create_chat(id="read-child", title="Child", messages=[], created_by_app_id=app_id),
   ])
   db.add(models.Delegation(
     id="read-policy", app_id=app_id, parent_chat_id="parent",
@@ -202,8 +211,8 @@ def test_limit_resume_identity_requires_the_exact_active_delegation_run(
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
   app_id = create_local_app(client, owner_auth, name="Resume policy")['id']
   db.add_all([
-    models.Chat(id="resume-parent", title="Parent", messages=[]),
-    models.Chat(
+    create_chat(id="resume-parent", title="Parent", messages=[]),
+    create_chat(
       id="resume-child", title="Child", messages=[],
       created_by_app_id=app_id,
     ),
@@ -273,8 +282,8 @@ def test_explicit_retry_uses_the_exact_owned_limit_park(
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
   app_id = create_local_app(client, owner_auth, name="Retry paused helper")['id']
   db.add_all([
-    models.Chat(id="retry-parent", title="Parent", messages=[]),
-    models.Chat(
+    create_chat(id="retry-parent", title="Parent", messages=[]),
+    create_chat(
       id="retry-child", title="Child", messages=[],
       created_by_app_id=app_id,
     ),
@@ -532,14 +541,51 @@ def test_single_mode_submit_accepts_old_write_but_never_upgrades_old_read(
   assert len(starts) == 2
 
 
-def test_goal_identity_is_the_delegation_idempotency_parent(db, chat):
+def test_physical_root_is_the_delegation_parent(db, chat):
   db.add(make_goal_run(db,
     id="goal-physical", root_run_id="logical-before-restart",
     chat_id=chat.id, status="running", provider="codex",
     goal_objective="Ship", goal_id="stable-goal",
   ))
   db.commit()
-  assert parent_root_run_id(db, chat.id, require_active=True) == "stable-goal"
+  assert parent_root_run_id(db, chat.id, require_active=True) == "logical-before-restart"
+
+
+def test_goal_submit_reattaches_across_attempts_with_omitted_cwd(
+  client, owner_token, db, monkeypatch,
+):
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  parent_id = _parent_with_run(client, owner_token, db)
+  first_run = db.get(models.ChatRun, "parent-physical")
+  first_run.goal_id = "goal-cwd"
+  db.commit()
+
+  async def fake_start(**kwargs):
+    return True
+
+  monkeypatch.setattr(
+    "app.routes.delegations.start_programmatic_chat_turn", fake_start,
+  )
+  body = {
+    "parent_chat_id": parent_id, "task_key": "same-goal-task",
+    "prompt": "Do the work.", "provider": "codex", "cwd": "/data/platform",
+  }
+  first = client.post("/api/delegations", json=body, headers=auth)
+  assert first.status_code == 201, first.text
+  first_run.status = "completed"
+  db.add(make_goal_run(db, id="goal-attempt-2", root_run_id="goal-attempt-2",
+    chat_id=parent_id, status="running", provider="codex", goal_id="goal-cwd",
+    started_at=datetime(2026, 1, 2)))
+  db.commit()
+
+  retry = client.post("/api/delegations", json={
+    key: value for key, value in body.items() if key != "cwd"
+  }, headers=auth)
+  assert retry.status_code == 201, retry.text
+  assert retry.json()["attached"] is True
+  assert retry.json()["id"] == first.json()["id"]
+  assert retry.json()["cwd"] == "/data/platform"
+  assert db.query(models.Delegation).count() == 1
 
 
 def test_submit_records_the_plan_task_and_refuses_an_unknown_one(
@@ -619,7 +665,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   child_policy = policy_for_chat(db, child_id)
   assert child_policy is not None and child_policy.depth == 1
   child_auth = {
-    "Authorization": f"Bearer {delegation_execution_token(db, child_policy)}"
+    "Authorization": f"Bearer {delegation_execution_token(db, child_policy, run_id='child-parent-run')}"
   }
   async def fake_models(_data_dir):
     return {
@@ -669,7 +715,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
     assert nested_parent_policy is not None
     nested_auth = {
       "Authorization": (
-        f"Bearer {delegation_execution_token(db, nested_parent_policy)}"
+        f"Bearer {delegation_execution_token(db, nested_parent_policy, run_id=f'depth-{depth}-parent-run')}"
       )
     }
     deeper = client.post("/api/delegations", json={
@@ -693,7 +739,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   assert fifth_parent_policy is not None and fifth_parent_policy.depth == 4
   fifth_parent_auth = {
     "Authorization": (
-      f"Bearer {delegation_execution_token(db, fifth_parent_policy)}"
+      f"Bearer {delegation_execution_token(db, fifth_parent_policy, run_id='depth-5-parent-run')}"
     )
   }
   fifth = client.post("/api/delegations", json={
@@ -756,6 +802,83 @@ def test_delegation_listing_exposes_run_usage_without_loading_result(
   }
 
 
+def test_delegation_listing_reads_a_fixed_number_of_queries_for_any_page_size(
+  client, owner_token, db, monkeypatch,
+):
+  """The polled helper list batches runs, parent titles, and lifecycle repair
+  instead of three queries per row, and still matches the single-row view."""
+  from sqlalchemy import event
+
+  from app.database import engine
+  from app.delegations import serialize_delegation
+
+  owner_auth = {"Authorization": f"Bearer {owner_token}"}
+  parent_chat_id = _parent_with_run(client, owner_token, db)
+
+  async def fake_start(**_kwargs):
+    return True
+
+  monkeypatch.setattr(
+    "app.routes.delegations.start_programmatic_chat_turn", fake_start,
+  )
+  created = []
+  for index, status in enumerate(("completed", "running", None)):
+    response = client.post("/api/delegations", json={
+      "parent_chat_id": parent_chat_id,
+      "task_key": f"batched-{index}",
+      "prompt": "Review only.",
+      "provider": "codex",
+      "scope": "write",
+    }, headers=owner_auth)
+    assert response.status_code == 201, response.text
+    created.append(response.json())
+    if status is not None:
+      db.add(make_goal_run(db,
+        id=f"batched-run-{index}", root_run_id=f"batched-run-{index}",
+        chat_id=response.json()["child_chat_id"], status=status,
+        provider="codex", total_tokens=10 * (index + 1),
+      ))
+  db.commit()
+
+  def selects_for(limit):
+    statements = []
+
+    def capture(_conn, _cursor, statement, *_args):
+      if statement.lstrip().upper().startswith("SELECT"):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+      response = client.get(
+        f"/api/delegations?parent_chat_id={parent_chat_id}&limit={limit}",
+        headers=owner_auth,
+      )
+    finally:
+      event.remove(engine, "before_cursor_execute", capture)
+    assert response.status_code == 200, response.text
+    return response.json()["items"], len(statements)
+
+  selects_for(3)  # first read records the lifecycle facts it repairs
+  one, one_selects = selects_for(1)
+  items, three_selects = selects_for(3)
+  assert len(one) == 1 and len(items) == 3
+  assert three_selects == one_selects
+
+  db.expire_all()
+  rows = {
+    row.id: row for row in db.query(models.Delegation).filter(
+      models.Delegation.parent_chat_id == parent_chat_id,
+    )
+  }
+  assert {item["id"] for item in items} == {row["id"] for row in created}
+  for item in items:
+    assert item == serialize_delegation(
+      db, rows[item["id"]], include_result=False,
+    )
+  assert {item["status"] for item in items} == {"completed", "running", "starting"}
+  assert all(item["parent_chat_title"] == "Parent" for item in items)
+
+
 def test_helper_without_resumable_session_needs_parent_review(
   client, owner_token, db, monkeypatch,
 ):
@@ -774,8 +897,8 @@ def test_helper_without_resumable_session_needs_parent_review(
   )
   db.add(app)
   db.flush()
-  parent = models.Chat(id="parent", title="Parent", messages=[])
-  child = models.Chat(
+  parent = create_chat(id="parent", title="Parent", messages=[])
+  child = create_chat(
     id="child", title="Child", provider="claude",
     created_by_app_id=app.id, session_id=None,
     messages=[
@@ -824,7 +947,7 @@ def test_helper_without_resumable_session_needs_parent_review(
 
   db.expire_all()
   assert prompts == []
-  final = db.get(models.Chat, child.id).messages[-1]
+  final = list(transcript_rows.history(db.get(models.Chat, child.id)))[-1]
   assert "DELEGATION_WRITE_REVIEW_REQUIRED" in str(final)
 
 
@@ -836,8 +959,8 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   )
   db.add(app)
   db.flush()
-  parent = models.Chat(id="parent", title="Parent", messages=[])
-  child = models.Chat(
+  parent = create_chat(id="parent", title="Parent", messages=[])
+  child = create_chat(
     id="child", title="Child",
     messages=[{"role": "user", "content": "Make the bounded edit."}],
     provider="claude",
@@ -879,9 +1002,10 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   )
   assert "Never read or write /data/cli-auth" not in policy.system_prompt
 
-  child.messages = [
+  transcript_rows.replace_all(object_session(child), child, [
     {"role": "user", "content": "Make the bounded edit."},
     {
+      "id": "child-run",
       "role": "assistant",
       "blocks": [{
         "type": "error",
@@ -890,7 +1014,7 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
         ),
       }],
     },
-  ]
+  ])
   db.add(make_goal_run(db,
     id="child-run", root_run_id="child-run", chat_id=child.id,
     status="failed", provider="claude",
@@ -917,7 +1041,7 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
 
 
 def test_continuation_physical_runs_inherit_one_logical_root(db):
-  chat = models.Chat(id="rooted-chat", title="Rooted", messages=[])
+  chat = create_chat(id="rooted-chat", title="Rooted", messages=[])
   db.add(chat)
   db.commit()
 
@@ -1008,7 +1132,7 @@ def _seed_delegation(
   db.flush()
   if parent_id is None:
     parent_id = f"parent-{suffix}"
-    db.add(models.Chat(
+    db.add(create_chat(
       id=parent_id, title="Parent",
       messages=parent_messages or [], provider="claude",
       pending_question_id=parent_pending_question_id,
@@ -1016,8 +1140,8 @@ def _seed_delegation(
   child_id = f"child-{suffix}"
   messages = [{"role": "user", "content": "Do the bounded task."}]
   if result_blocks is not None:
-    messages.append({"role": "assistant", "blocks": result_blocks})
-  db.add(models.Chat(
+    messages.append({"id": f"child-run-{suffix}", "role": "assistant", "blocks": result_blocks})
+  db.add(create_chat(
     id=child_id, title="Child", messages=messages,
     provider="claude", created_by_app_id=app.id,
   ))
@@ -1049,6 +1173,39 @@ def _seed_delegation(
   return parent_id, child_id, delegation_id
 
 
+def test_completed_helper_delivery_is_bounded_and_drains_in_batches(db):
+  from app import delegations as delegations_mod
+  limit = delegations_mod.WAKE_NOTICE_DELEGATION_LIMIT
+  parent_id = None
+  ids = []
+  for index in range(limit + 1):
+    parent_id, _child, delegation_id = _seed_delegation(
+      db, suffix=f"bounded-wake-{index}", parent_id=parent_id,
+      parent_root_id="bounded-root",
+      result_blocks=[{"type": "text", "content": "R" * 5000}],
+    )
+    ids.append(delegation_id)
+
+  first = delegations_mod.available_delegation_results(db, parent_id)
+  assert len(first) == limit
+  assert len(delegations_mod._wake_eligible_rows_for_parent(
+    db, parent_id, "bounded-root",
+  )) == limit
+  delivery = delegations_mod.build_delegation_result_context(
+    db, parent_id,
+  )
+  assert len(delivery.results) == limit
+  assert delivery.text.count('"result_truncated":true') == limit
+  assert "R" * 3001 not in delivery.text
+
+  for row in first:
+    row.delivered_run_id = f"child-run-{row.id.removeprefix('delegation-')}"
+  db.commit()
+  assert [row.id for row in delegations_mod.available_delegation_results(
+    db, parent_id,
+  )] == [ids[-1]]
+
+
 def test_background_helper_projection_owns_waiting_until_parent_wake(
   client, owner_token, db,
 ):
@@ -1070,6 +1227,7 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
     "items": [{
       "id": delegation_id,
       "task_key": "task-waiting-owner",
+      "title": "task-waiting-owner",
       "provider": "claude",
       "status": "running",
     }],
@@ -1098,6 +1256,38 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   db.commit()
   assert background_helper_chat_ids(db, [parent_id]) == set()
   assert serialize_background_helpers(db, parent_id) == {"count": 0, "items": []}
+
+
+def test_failed_followup_after_closed_goal_never_asks_the_owner(
+  client, owner_token, db,
+):
+  """Helper failures belong to agents, never owner cards. Current work cannot
+  reach this state (follow-ups after a closed Goal are refused, and completion
+  waits for undelivered results); a pre-existing row stays readable history
+  through the helper's own record."""
+  from datetime import timedelta
+
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="closed-goal-followup", child_status="failed",
+  )
+  goal = models.ChatGoal(
+    id="closed-goal-followup-goal", chat_id=parent_id,
+    objective="Original work", status="completed",
+    completed_at=now_naive_utc() - timedelta(minutes=1),
+  )
+  db.add(goal)
+  db.get(models.Delegation, delegation_id).goal_id = goal.id
+  db.commit()
+
+  assert background_helper_chat_ids(db, [parent_id]) == set()
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  summary = next(row for row in client.get("/api/chats", headers=auth).json()
+                 if row["id"] == parent_id)
+  detail = client.get(f"/api/chats/{parent_id}", headers=auth).json()
+  runtime = client.get(f"/api/chats/{parent_id}/runtime", headers=auth).json()
+  for row in (summary, detail, runtime):
+    assert row["handoff"] == {"kind": "none", "reason": None}
+    assert "stranded_helper_followup" not in row
 
 
 def test_background_helper_wait_event_is_parent_scoped_and_best_effort(
@@ -1219,7 +1409,7 @@ def test_child_completion_starts_one_non_message_checkpoint_for_waiting_parent(
   )
   root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
   starts = _capture_activity_starts(monkeypatch)
-  before = list(db.get(models.Chat, parent_id).messages or [])
+  before = list(transcript_rows.history(db.get(models.Chat, parent_id)))
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
@@ -1234,7 +1424,7 @@ def test_child_completion_starts_one_non_message_checkpoint_for_waiting_parent(
     "_transition_lock_held": True,
   }]
   db.expire_all()
-  assert db.get(models.Chat, parent_id).messages == before
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == before
   assert db.get(models.Chat, parent_id).pending_messages == []
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
@@ -1266,7 +1456,7 @@ def test_running_parent_retains_result_for_next_context_without_queueing(
 
   assert starts == []
   parent = db.get(models.Chat, parent_id)
-  assert parent.messages == []
+  assert list(transcript_rows.history(parent)) == []
   assert parent.pending_messages == []
   delivery = delegations_mod.build_delegation_result_context(db, parent_id)
   assert delivery.delegation_ids == (delegation_id,)
@@ -1286,7 +1476,7 @@ def test_owner_question_remains_authoritative_over_delayed_helper_result(
 
   parent = db.get(models.Chat, parent_id)
   assert parent.pending_question_id == "owner-decision"
-  assert parent.messages == []
+  assert list(transcript_rows.history(parent)) == []
   assert parent.pending_messages == []
   assert delegations_mod.build_delegation_result_context(
     db, parent_id,
@@ -1328,7 +1518,7 @@ def test_activity_continuation_writer_changes_run_state_not_messages(db):
   )
   root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
   parent = db.get(models.Chat, parent_id)
-  before_messages = list(parent.messages or [])
+  before_messages = list(transcript_rows.history(parent))
   before_pending = list(parent.pending_messages or [])
   run_token = delegations_mod._activity_continuation_run_id(
     db, db.get(models.Delegation, delegation_id),
@@ -1345,11 +1535,56 @@ def test_activity_continuation_writer_changes_run_state_not_messages(db):
   ]
   db.expire_all()
   parent = db.get(models.Chat, parent_id)
-  assert parent.messages == before_messages
+  assert list(transcript_rows.history(parent)) == before_messages
   assert parent.pending_messages == before_pending
   physical = db.get(models.ChatRun, run_token)
   assert physical.status == "running"
   assert physical.root_run_id == root_run_id
+
+
+def test_nested_helper_result_wake_keeps_inherited_goal_out_of_helper_run(db):
+  """A helper's result wakes its parent helper without adopting the owner's Goal."""
+  from app.chat_writer import StartActivityContinuation
+  from app import delegations as delegations_mod
+
+  owner_id, helper_id, outer_id = _seed_delegation(
+    db, suffix="nested-goal-outer", parent_root_id="owner-goal",
+  )
+  _owner, nested_id, inner_id = _seed_delegation(
+    db, suffix="nested-goal-inner", parent_id=helper_id,
+    parent_root_id="child-run-nested-goal-outer",
+    result_blocks=[{"type": "text", "content": "Nested work done."}],
+  )
+  db.add(models.ChatGoal(
+    id="owner-goal", chat_id=owner_id, objective="Owner's Goal", status="open",
+  ))
+  db.get(models.Delegation, outer_id).goal_id = "owner-goal"
+  inner = db.get(models.Delegation, inner_id)
+  inner.goal_id = "owner-goal"
+  db.commit()
+
+  root = delegations_mod._parent_wake_continuation_root(db, helper_id, "owner-goal")
+  assert root == "child-run-nested-goal-outer"
+  token = delegations_mod._activity_continuation_run_id(db, inner)
+  result = get_writer().submit(StartActivityContinuation(
+    chat_id=helper_id, run_token=token, root_run_id=root,
+    source_work_id="owner-goal", activity_id=inner_id,
+  )).result(timeout=5)
+
+  assert isinstance(result, dict)
+  db.expire_all()
+  run = db.get(models.ChatRun, token)
+  assert (run.status, run.goal_id, run.goal_objective) == ("running", None, None)
+  assert run.activity_delivery_json == {
+    "delegation_ids": [inner_id], "source_work_id": "owner-goal",
+  }
+  assert delegations_mod.activity_continuation_delivery_source_work_id(
+    db, helper_id, token,
+  ) == "owner-goal"
+  assert delegations_mod.build_delegation_result_context(
+    db, helper_id, source_work_id="owner-goal",
+  ).delegation_ids == (inner_id,)
+  assert db.get(models.Delegation, inner_id).delivered_run_id is None
 
 
 def _seed_later_parent_turn(db, parent_id, run_id, *, provider="claude",
@@ -1537,6 +1772,165 @@ def test_activity_scope_keeps_goal_source_distinct_from_physical_root(db):
   assert delegations_mod.activity_continuation_delivery_source_work_id(
     db, parent_id, run_token,
   ) == "stable-goal-source"
+
+
+def _seed_nested_goal_wake(db, suffix, *, awaiting_answer=False):
+  """A coordinator Goal, its assigned helper, and that helper's sub-helper."""
+  goal_id = f"shared-goal-{suffix}"
+  coordinator = f"coordinator-{suffix}"
+  db.add(create_chat(id=coordinator, title="Coordinator", provider="claude"))
+  db.add(make_goal_run(
+    db, id=f"coordinator-run-{suffix}", root_run_id=f"coordinator-run-{suffix}",
+    chat_id=coordinator, status="completed", provider="claude",
+    goal_id=goal_id, goal_objective="Complete shared work",
+    goal_plan_json={"tasks": [
+      {"id": "assigned", "title": "Assigned branch", "status": "running",
+       "depends_on": []},
+      {"id": "subtask", "title": "Nested result", "status": "running",
+       "parent_id": "assigned", "depends_on": []},
+    ]},
+    started_at=now_naive_utc() - timedelta(minutes=2),
+  ))
+  parent_id, child_id, delegation_id = _seed_delegation(
+    db, suffix=suffix, result_blocks=[{"type": "text", "content": "violet"}],
+    parent_messages=[{"role": "user", "content": "Work on the assigned branch."}],
+  )
+  outer_parent, _outer_child, outer_id = _seed_delegation(
+    db, suffix=f"{suffix}-outer", parent_id=coordinator,
+    parent_root_id=f"coordinator-run-{suffix}", child_status=None,
+  )
+  assert outer_parent == coordinator
+  outer = db.get(models.Delegation, outer_id)
+  outer.child_chat_id = parent_id
+  outer.goal_id = goal_id
+  outer.goal_task_id = "assigned"
+  outer.app_id = None
+  inner = db.get(models.Delegation, delegation_id)
+  inner.goal_id = goal_id
+  inner.goal_task_id = "subtask"
+  inner.app_id = None
+  root = _seed_idle_parent_wake_root(db, delegation_id)
+  if awaiting_answer:
+    db.add(models.DelegationQuestion(
+      id=f"question-{suffix}", delegation_id=delegation_id,
+      child_chat_id=child_id, root_run_id=f"child-run-{suffix}",
+      asking_run_id=f"child-run-{suffix}",
+      answer_run_id=f"answer-run-{suffix}",
+      question="Which marker?", options_json=["violet", "amber"],
+    ))
+  db.commit()
+  return parent_id, child_id, delegation_id, outer_id, goal_id, root
+
+
+@pytest.mark.parametrize("awaiting_answer", [True, False], ids=["needs-input", "completed"])
+def test_nested_goal_parent_wake_keeps_foreign_goal_scoped_not_admitted(
+  db, awaiting_answer,
+):
+  from app.chat_writer import (
+    AdmitProviderExecution, Finalize, StartActivityContinuation,
+    StartContinuationAttached,
+  )
+  from app.goals import turn_goal_brief
+
+  suffix = f"nested-shared-{awaiting_answer}"
+  parent_id, _child_id, delegation_id, _outer_id, goal_id, root = (
+    _seed_nested_goal_wake(db, suffix, awaiting_answer=awaiting_answer)
+  )
+  row = db.get(models.Delegation, delegation_id)
+  assert derived_status(db, row, load_result=False)[0] == (
+    "needs_input" if awaiting_answer else "completed"
+  )
+  token = delegations_mod._activity_continuation_run_id(db, row)
+  cmd = StartActivityContinuation(
+    chat_id=parent_id, run_token=token, root_run_id=root,
+    source_work_id=goal_id, activity_id=delegation_id,
+  )
+  started = get_writer().submit(cmd).result(timeout=5)
+  assert "promoted" not in started
+  assert get_writer().submit(StartActivityContinuation(
+    chat_id=parent_id, run_token=token, root_run_id=root,
+    source_work_id=goal_id, activity_id=delegation_id,
+  )).result(timeout=5) == StartContinuationAttached()
+  db.expire_all()
+  run = db.get(models.ChatRun, token)
+  assert run.goal_id is None and run.goal_objective is None
+  assert run.root_run_id == root
+  assert run.activity_delivery_json == {
+    "delegation_ids": [delegation_id], "source_work_id": goal_id,
+  }
+  assert delegations_mod.activity_continuation_delivery_source_work_id(
+    db, parent_id, token,
+  ) == goal_id
+  brief = turn_goal_brief(db, parent_id, token, delegated=True)
+  assert '"focus":"assigned"' in brief
+  assert '"plan_task":"assigned"' in brief
+  assert '"depth":1' in brief
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  assert db.query(models.ChatRun).filter_by(id=token).count() == 1
+
+  get_writer().submit(AdmitProviderExecution(
+    chat_id=parent_id, run_token=token,
+    activity_results=_current_result(db, delegation_id),
+  )).result(timeout=5)
+  terminal = Finalize(
+    chat_id=parent_id, run_token=token,
+    snapshot={"id": token, "role": "assistant", "blocks": [
+      {"type": "text", "content": "Result received."},
+    ]},
+    incorporate_activity_delivery=True,
+  )
+  assert get_writer().submit(terminal).result(timeout=5) is True
+  db.expire_all()
+  delivered = db.get(models.Delegation, delegation_id).delivered_run_id
+  assert delivered == f"child-run-{suffix}"
+  assert get_writer().submit(Finalize(
+    chat_id=terminal.chat_id, run_token=terminal.run_token,
+    snapshot=terminal.snapshot, incorporate_activity_delivery=True,
+  )).result(timeout=5) is True
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id == delivered
+
+
+@pytest.mark.parametrize("boundary", [
+  "stopped", "closed", "missing-goal", "foreign-assignment",
+])
+def test_nested_goal_parent_wake_refuses_closed_work_and_never_binds_unowned_goals(db, boundary):
+  from app.chat_writer import StartActivityContinuation, StartContinuationBlocked
+
+  suffix = f"nested-boundary-{boundary}"
+  parent_id, _child_id, delegation_id, outer_id, goal_id, root = (
+    _seed_nested_goal_wake(db, suffix)
+  )
+  if boundary == "stopped":
+    db.get(models.ChatRun, root).status = "stopped"
+  elif boundary == "closed":
+    db.get(models.ChatGoal, goal_id).status = "completed"
+  elif boundary == "missing-goal":
+    db.delete(db.get(models.ChatGoal, goal_id))
+  else:
+    db.get(models.Delegation, outer_id).goal_id = f"unrelated-{suffix}"
+  db.commit()
+  token = delegations_mod._activity_continuation_run_id(
+    db, db.get(models.Delegation, delegation_id),
+  )
+  result = get_writer().submit(StartActivityContinuation(
+    chat_id=parent_id, run_token=token, root_run_id=root,
+    source_work_id=goal_id, activity_id=delegation_id,
+  )).result(timeout=5)
+  if boundary in ("stopped", "closed"):
+    # The shared wake gate refuses these, so the owner's waiting view agrees.
+    assert result == StartContinuationBlocked({
+      "stopped": "parent_not_waiting", "closed": "goal_closed",
+    }[boundary])
+    db.expire_all()
+    assert db.get(models.ChatRun, token) is None
+    return
+  # A Goal that is gone or not this chain's never binds, but the result still
+  # reaches its parent: refusing here would strand a chat shown as waiting.
+  assert isinstance(result, dict)
+  db.expire_all()
+  run = db.get(models.ChatRun, token)
+  assert (run.status, run.goal_id, run.goal_objective) == ("running", None, None)
 
 
 def test_successful_finalize_consumes_exact_activity_once(db):
@@ -1830,7 +2224,10 @@ def _drive_parent_turn(
     if provider_error is not None:
       bc.publish({"type": "error", "message": provider_error})
       return {"session_id": None, "cost_usd": None, "error": provider_error}
-    bc.publish({"type": "text", "content": response})
+    # Match the normalized provider stream: an identified delta followed by
+    # its authoritative snapshot. Anonymous provisional text is not publishable.
+    bc.publish({"type": "text", "text_item_id": "reply", "content": response})
+    bc.publish({"type": "text_final", "text_item_id": "reply", "content": response})
     if before_provider_return is not None:
       before_provider_return()
     return {
@@ -1886,7 +2283,7 @@ def test_delegated_prompt_keeps_a_leading_goal_command_verbatim(db, monkeypatch)
     db, suffix="literal-goal", child_status="running",
   )
   child = db.get(models.Chat, child_id)
-  child.messages = [{"role": "user", "content": task}]
+  transcript_rows.replace_all(object_session(child), child, [{"role": "user", "content": task}])
   db.get(models.Delegation, delegation_id).prompt_sha256 = hashlib.sha256(
     task.encode("utf-8"),
   ).hexdigest()
@@ -2215,7 +2612,7 @@ def test_failed_finalize_keeps_injected_activity_result_redeliverable(
 
   db.expire_all()
   parent = db.get(models.Chat, parent_id)
-  durable_messages = list(parent.messages or [])
+  durable_messages = list(transcript_rows.history(parent))
   delivery_after_failure = delegations_mod.build_delegation_result_context(
     db, parent_id,
   )
@@ -2303,7 +2700,7 @@ def test_stop_and_supersession_gates_keep_activity_result_redeliverable(
   )
   durable_reply = any(
     "Provider reply at the ownership race." in str(message)
-    for message in (db.get(models.Chat, parent_id).messages or [])
+    for message in (list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
   )
   assert durable_reply is (race == "stop")
   assert delegations_mod.build_delegation_result_context(
@@ -2360,7 +2757,7 @@ def test_stop_after_provider_return_before_finalize_keeps_activity_redeliverable
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
   assert any(
     "Partial response persisted after Stop." in str(message)
-    for message in (db.get(models.Chat, parent_id).messages or [])
+    for message in (list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
   )
   assert delegations_mod.build_delegation_result_context(
     db, parent_id,
@@ -2409,7 +2806,7 @@ def test_unadmitted_activity_restart_reschedules_same_physical_turn(
   assert db.query(models.ChatRun).filter(
     models.ChatRun.id == run_token,
   ).count() == 1
-  assert db.get(models.Chat, parent_id).messages == []
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == []
 
 
 def test_wake_recovery_reschedules_an_unadmitted_activity_orphan(
@@ -2606,7 +3003,7 @@ def test_stopped_or_superseded_activity_never_consumes_accepted_result(
   ).incorporated_run_id is None
   assert any(
     "Persisted partial output." in str(message)
-    for message in (db.get(models.Chat, parent_id).messages or [])
+    for message in (list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
   )
   from app.chat_activity import chat_activity_page
   assert chat_activity_page(db, parent_id)["events"][0][
@@ -2631,9 +3028,9 @@ def test_legacy_completion_carrier_is_recognized_without_rewriting_history(db):
     "kind": "delegation_result", "source_work_id": row.parent_root_run_id,
   }
   parent = db.get(models.Chat, parent_id)
-  parent.messages = [carrier]
+  transcript_rows.replace_all(object_session(parent), parent, [carrier])
   db.commit()
-  before = list(parent.messages)
+  before = list(transcript_rows.history(parent))
 
   # The turn that carries it records the result in its envelope (latched at
   # its Finalize) without rendering it a second time.
@@ -2643,7 +3040,7 @@ def test_legacy_completion_carrier_is_recognized_without_rewriting_history(db):
   assert delivery.delegation_ids == (delegation_id,)
   assert delivery.text == ""
   db.expire_all()
-  assert db.get(models.Chat, parent_id).messages == before
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == before
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
   assert run_token.startswith("delegation-wake-")
 
@@ -2713,7 +3110,7 @@ def test_legacy_committed_carrier_keeps_its_exact_restart_recovery(
     "kind": "delegation_result", "source_work_id": row.parent_root_run_id,
   }
   parent = db.get(models.Chat, parent_id)
-  parent.messages = [carrier]
+  transcript_rows.replace_all(object_session(parent), parent, [carrier])
   parent.live_assistant = {
     "id": run_token, "role": "assistant", "blocks": [], "ts": 2,
   }
@@ -2741,11 +3138,11 @@ def test_legacy_committed_carrier_keeps_its_exact_restart_recovery(
   )) is True
   assert attempts[0]["run_token"] == run_token
   db.expire_all()
-  assert db.get(models.Chat, parent_id).messages == [carrier]
+  assert list(transcript_rows.history(db.get(models.Chat, parent_id))) == [carrier]
 
   # The same exact orphan must not survive cutover if this parent is itself
   # a retired read helper; no parent wake can ever drive that chat again.
-  db.add(models.Chat(id="grandparent-legacy-recovery", title="Grandparent", messages=[]))
+  db.add(create_chat(id="grandparent-legacy-recovery", title="Grandparent", messages=[]))
   db.add(models.Delegation(
     id="retired-parent-legacy-recovery", app_id=row.app_id,
     parent_chat_id="grandparent-legacy-recovery", parent_root_run_id="grand-root",
@@ -3416,3 +3813,245 @@ def test_a_wake_run_started_under_an_earlier_id_still_attaches(db):
     source_work_id="root-old-basis-orphan", activity_id=delegation_id,
   )).result(timeout=5)
   assert isinstance(attached, StartContinuationAttached)
+
+
+def test_delegation_capabilities_checks_provider_auth_off_the_event_loop(
+  client, auth, monkeypatch,
+):
+  """Möbius check_auth is a synchronous broker call (3 s timeout); a stalled
+  broker must not freeze every other request on the loop."""
+  import threading
+  from app import providers
+
+  loop_threads = []
+  auth_threads = []
+
+  async def fake_models(_data_dir):
+    loop_threads.append(threading.get_ident())
+    return {}
+
+  def check_auth(_self, _data_dir):
+    auth_threads.append(threading.get_ident())
+    return None
+
+  monkeypatch.setattr("app.routes.delegations.providers.list_models", fake_models)
+  # Patch the classes: undoing an instance patch leaves the bound original in
+  # the instance dict, which would shadow later class-level patches.
+  for provider in providers.PROVIDERS.values():
+    monkeypatch.setattr(type(provider), "check_auth", check_auth)
+  response = client.get("/api/delegations/capabilities", headers=auth)
+  assert response.status_code == 200, response.text
+  assert auth_threads and loop_threads
+  assert loop_threads[0] not in auth_threads
+
+
+def test_long_question_and_result_are_durable_but_automatic_notice_is_bounded(db):
+  from app.routes.delegations import DelegationQuestionAsk, DelegationSubmit
+  from app import delegations as delegations_mod
+  question = "Question detail " * 800
+  report = "Full report " * 800
+  assert DelegationQuestionAsk(question=question).question == question.strip()
+  assert DelegationSubmit(parent_chat_id="parent", task_key="report",
+                          prompt=report, provider="codex").prompt == report.strip()
+  _parent, _child, delegation_id = _seed_delegation(
+    db, suffix="full-result", result_blocks=[{"type": "text", "content": report}],
+  )
+  row = db.get(models.Delegation, delegation_id)
+  notice = delegations_mod._compose_wake_notice(
+    db, [row], delegations_mod.settled_result_run_ids(db, [row.id]),
+  )
+  assert report.strip() not in notice
+  assert '"result_truncated":true' in notice
+  assert report[:delegations_mod._WAKE_RESULT_MAX] in notice
+  assert "GET /api/delegations/<id>?include_history=true" in notice
+  payload = delegations_mod.serialize_delegation(db, row)
+  assert payload["result"] == report.strip()
+  assert "result_truncated" not in payload
+
+
+def test_same_task_key_can_be_reused_by_a_new_goal_on_one_physical_run(db, chat):
+  run = make_goal_run(db, id="one-run", root_run_id="one-run",
+                      chat_id=chat.id, status="running", provider="codex",
+                      goal_id="goal-A")
+  db.add(run)
+  db.commit()
+  base = dict(app_id=None, parent_chat_id=chat.id,
+              parent_root_run_id="one-run", task_key="research",
+              prompt="Full task", provider="codex", model=None,
+              effort=None, cwd="/data")
+  a, attached = create_or_attach_delegation(db, DelegationIntent(**base, goal_id="goal-A"))
+  assert not attached and a.goal_id == "goal-A"
+  run.goal_id = "goal-B"
+  db.commit()
+  b, attached = create_or_attach_delegation(db, DelegationIntent(**base, goal_id="goal-B"))
+  assert not attached and b.id != a.id
+  assert b.parent_root_run_id == a.parent_root_run_id == "one-run"
+  assert delegation_source_work_id(a) == "goal-A"
+  assert delegation_source_work_id(b) == "goal-B"
+  assert [r.id for r in db.query(models.Delegation).filter(
+    delegation_source_work_filter("goal-A")
+  ).all()] == [a.id]
+  assert [item["id"] for item in own_helper_statuses(db, chat.id, "one-run")] == [b.id]
+  assert activity_continuation_delivery_source_work_id(
+    db, chat.id, "one-run",
+  ) == "goal-B"
+  for row in (a, b):
+    db.add(make_goal_run(db, id=f"child-{row.id}",
+      root_run_id=f"child-{row.id}", chat_id=row.child_chat_id,
+      status="completed", provider="codex"))
+  old_goal = db.get(models.ChatGoal, "goal-A")
+  old_goal.status = "completed"
+  old_goal.completion_run_id = "one-run"
+  db.commit()
+  from app import delegations as delegations_mod
+  assert [row.id for row in delegations_mod._wake_eligible_rows_for_parent(
+    db, chat.id, "goal-B",
+  )] == [b.id]
+  assert delegations_mod.parent_wake_blocker(
+    db, chat.id, "goal-A", "one-run",
+  )[0] == "goal_closed"
+
+
+def test_goal_helper_result_uses_current_attempt_and_attaches_earlier_helpers(db, chat):
+  from app import delegations as delegations_mod
+  from app.run_state import queued_continuation_root
+
+  db.add(make_goal_run(db, id="attempt-r1", root_run_id="attempt-r1",
+    chat_id=chat.id, status="completed", provider="codex", goal_id="goal-shared",
+    started_at=datetime(2026, 1, 1)))
+  db.commit()
+  base = dict(app_id=None, parent_chat_id=chat.id, goal_id="goal-shared",
+    prompt="Do the task", provider="codex", model=None, effort=None, cwd="/data")
+  d1, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r1", task_key="d1"))
+  assert not attached
+  db.add(make_goal_run(db, id="attempt-r2", root_run_id="attempt-r2",
+    chat_id=chat.id, status="running", provider="codex", goal_id="goal-shared",
+    started_at=datetime(2026, 1, 2)))
+  db.commit()
+  d2, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r2", task_key="d2"))
+  assert not attached
+  db.commit()
+
+  assert delegations_mod._parent_wake_continuation_root(
+    db, chat.id, "goal-shared") == "attempt-r2"
+  assert queued_continuation_root(db, chat.id, {
+    "kind": "delegation_result", "source_work_id": "goal-shared",
+  }) == "attempt-r2"
+  assert {item["id"] for item in own_helper_statuses(
+    db, chat.id, "attempt-r2")} == {d1.id, d2.id}
+  again, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r2", task_key="d2"))
+  assert attached and again.id == d2.id
+  earlier, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r2", task_key="d1"))
+  assert attached and earlier.id == d1.id
+
+
+def test_legacy_goal_root_resolves_its_completion_run_after_rebind(db):
+  from app import delegations as delegations_mod
+  parent_id, _child, delegation_id = _seed_delegation(
+    db, suffix="legacy-rebound", parent_root_id="goal-A",
+  )
+  db.add(make_goal_run(db, id="physical-A-then-B",
+    root_run_id="physical-A-then-B", chat_id=parent_id,
+    status="completed", provider="codex", goal_id="goal-B"))
+  db.add(models.ChatGoal(
+    id="goal-A", chat_id=parent_id, objective="Earlier task",
+    status="completed", completion_run_id="physical-A-then-B",
+  ))
+  db.commit()
+  assert delegations_mod._parent_wake_continuation_root(
+    db, parent_id, "goal-A",
+  ) == "physical-A-then-B"
+  assert delegations_mod.parent_wake_blocker(
+    db, parent_id, "goal-A", "physical-A-then-B",
+  )[0] == "goal_closed"
+
+
+# Helper results resume their source even when several helpers share it.
+# Regression: the shared resolver once demanded exactly one delegation per
+# source and crashed as soon as a parent had two helpers.
+
+def _shared_root_chat(db, chat_id):
+  db.add(models.Chat(id=chat_id, title=chat_id, legacy_messages=[]))
+
+
+def _shared_root_helper(db, helper_id, parent, root, goal=None):
+  from datetime import datetime
+  child = f"child-{helper_id}"
+  _shared_root_chat(db, child)
+  db.add(models.Delegation(id=helper_id, parent_chat_id=parent, parent_root_run_id=root,
+    goal_id=goal, task_key=helper_id, child_chat_id=child, provider="claude", scope="write",
+    cwd="/data", prompt_sha256="x" * 64, notify_parent_on_complete=True,
+    created_at=datetime(2026, 1, 1)))
+
+
+def test_helper_results_resume_a_plain_root_shared_by_several_helpers(db):
+  from datetime import datetime
+  from app.run_state import helper_result_continuation_root
+  _shared_root_chat(db, "p")
+  db.add(models.ChatRun(id="r1", chat_id="p", status="completed", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  _shared_root_helper(db, "d1", "p", "r1")
+  _shared_root_helper(db, "d2", "p", "r1")
+  db.commit()
+  assert helper_result_continuation_root(db, "p", "r1") == "r1"
+
+
+def test_helper_results_resume_an_inherited_goal_root_shared_by_several_helpers(db):
+  from datetime import datetime
+  from app.run_state import helper_result_continuation_root
+  _shared_root_chat(db, "h")
+  db.add(models.ChatRun(id="hr1", chat_id="h", status="completed", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  _shared_root_helper(db, "n1", "h", "hr1", goal="G")
+  _shared_root_helper(db, "n2", "h", "hr1", goal="G")
+  db.commit()
+  assert helper_result_continuation_root(db, "h", "G") == "hr1"
+
+
+def test_inherited_goal_helper_result_uses_latest_attempt_with_multiple_helpers(db):
+  from app.run_state import helper_result_continuation_root
+  _shared_root_chat(db, "nested")
+  db.add(models.ChatRun(id="nested-old", chat_id="nested", status="completed",
+    provider="claude", started_at=datetime(2026, 1, 1)))
+  db.add(models.ChatRun(id="nested-new", chat_id="nested", status="completed",
+    provider="claude", started_at=datetime(2026, 1, 2)))
+  _shared_root_helper(db, "old-1", "nested", "nested-old", goal="G")
+  _shared_root_helper(db, "old-2", "nested", "nested-old", goal="G")
+  _shared_root_helper(db, "new-1", "nested", "nested-new", goal="G")
+  _shared_root_helper(db, "new-2", "nested", "nested-new", goal="G")
+  db.commit()
+  assert helper_result_continuation_root(db, "nested", "G") == "nested-new"
+
+
+def test_parent_wake_plans_for_several_settled_goalless_helpers(db):
+  from datetime import datetime
+  from app.delegations import _plan_parent_wake
+  _shared_root_chat(db, "p2")
+  db.add(models.ChatRun(id="pr1", chat_id="p2", status="completed", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  for helper_id in ("e1", "e2"):
+    _shared_root_helper(db, helper_id, "p2", "pr1")
+    db.add(models.ChatRun(id=f"run-{helper_id}", chat_id=f"child-{helper_id}",
+      status="completed", provider="claude", started_at=datetime(2026, 1, 2)))
+  db.commit()
+  plan = _plan_parent_wake("p2", "pr1")
+  assert plan is not None and plan.root_run_id == "pr1"
+
+
+def test_queued_helper_result_resolves_a_root_shared_by_several_helpers(db):
+  from datetime import datetime
+  from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
+  from app.run_state import queued_continuation_root
+  _shared_root_chat(db, "p3")
+  db.add(models.ChatRun(id="q1", chat_id="p3", status="running", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  _shared_root_helper(db, "f1", "p3", "q1")
+  _shared_root_helper(db, "f2", "p3", "q1")
+  db.commit()
+  queued = {"role": "user", "hidden": True, "kind": DELEGATION_RESULT_MESSAGE_KIND,
+            "source_work_id": "q1", "cid": "delegation-result:x", "content": "r"}
+  assert queued_continuation_root(db, "p3", queued) == "q1"

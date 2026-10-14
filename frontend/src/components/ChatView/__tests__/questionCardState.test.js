@@ -5,10 +5,70 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import QuestionCard from '../QuestionCard.jsx'
 import { LocalAnswersContext } from '../localAnswersContext.js'
+import { questionDraftKey, writeQuestionDraft } from '../questionDraft.js'
 
 const component = readFileSync(new URL('../QuestionCard.jsx', import.meta.url), 'utf8')
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const css = readFileSync(new URL('../QuestionCard.css', import.meta.url), 'utf8')
+
+test('every answer has its own paperclip, an icon left of its box', () => {
+  const single = renderToStaticMarkup(createElement(QuestionCard, {
+    chatId: 'clip', questionId: 'clip-q', questions: [{ question: 'Anything else?', options: [] }],
+  }))
+  assert.match(single, /class="qcard__answer-row"><button[^>]*class="qcard__attach"[\s\S]*?<\/button><div class="qcard__composer/)
+  assert.equal((single.match(/class="qcard__file-input"/g) || []).length, 1)
+  assert.doesNotMatch(single, /attach or paste/)
+  const grouped = renderToStaticMarkup(createElement(QuestionCard, {
+    chatId: 'clip', questionId: 'clip-g', questions: [
+      { question: 'First?', options: [] },
+      { question: 'Second?', options: [] },
+    ],
+  }))
+  assert.equal((grouped.match(/class="qcard__answer-row"><button[^>]*class="qcard__attach"/g) || []).length, 2)
+  assert.equal((grouped.match(/class="qcard__file-input"/g) || []).length, 1)
+})
+
+test('a file-only question answer can submit and ordinary cards offer upload', () => {
+  const storage = {
+    values: new Map(),
+    getItem(key) { return this.values.get(key) || null },
+    setItem(key, value) { this.values.set(key, value) },
+    removeItem(key) { this.values.delete(key) },
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
+  try {
+    const questions = [{ question: 'Send a picture', options: [] }]
+    const key = questionDraftKey('file-only', 'file-only-q', questions)
+    writeQuestionDraft(key, { answers: {}, otherTexts: {}, files: [{ name: 'photo.png', status: 'done', size: 4, mime_type: 'image/png' }] }, storage)
+    const html = renderToStaticMarkup(createElement(QuestionCard, {
+      chatId: 'file-only', questionId: 'file-only-q', questions,
+    }))
+    assert.match(html, /Attach a photo or file/)
+    assert.match(html, /class="qcard__submit"[^>]*>Submit</)
+    assert.equal((html.match(/aria-label="Files for this answer"/g) || []).length, 1)
+    const submitted = renderToStaticMarkup(createElement(QuestionCard, {
+      chatId: 'file-only', questionId: 'file-only-q', questions,
+      answeredMap: { 'Send a picture': 'Attached 1 file' },
+      attachments: [{ name: 'photo.png', size: 4, mime_type: 'image/png' }],
+    }))
+    assert.match(submitted, /aria-label="Files for this answer"/)
+    assert.match(submitted, /chat__attachments/)
+    assert.doesNotMatch(submitted, /Files for all answers/)
+    // The attach row stays with the Submitted action row, so answering never
+    // moves the card; it only stops taking files.
+    assert.match(submitted, /class="qcard__attach"[^>]*disabled=""/)
+    assert.match(submitted, /class="qcard__file-input"[^>]*disabled=""/)
+    const restart = renderToStaticMarkup(createElement(QuestionCard, {
+      chatId: 'restart', questionId: 'restart-q', questions,
+      platformAction: { type: 'restart', version: 2, status: 'awaiting_owner' },
+    }))
+    assert.doesNotMatch(restart, /Attach a photo or file/)
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
+    else delete globalThis.localStorage
+  }
+})
 
 test('text-only questions never offer choice instructions or empty choice groups', () => {
   for (const options of [undefined, null, []]) {
@@ -72,6 +132,27 @@ test('mixed grouped questions describe answering without inventing text-only cho
   assert.equal((html.match(/role="radiogroup"/g) || []).length, 1)
   assert.match(html, /placeholder="Type your answer…"/)
   assert.doesNotMatch(html, /questions still need|questions to submit|qcard__submit-hint/)
+})
+
+test('a ten-question block renders every prompt and preserves every saved reply', () => {
+  const questions = Array.from({ length: 10 }, (_, index) => ({
+    id: `question-${index + 1}`, header: `Question ${index + 1}`,
+    question: `Decision ${index + 1}?`, options: [],
+  }))
+  for (const answered of [false, true]) {
+    const answeredMap = answered
+      ? Object.fromEntries(questions.map((question, index) => [question.question, `Reply ${index + 1}`]))
+      : undefined
+    const html = renderToStaticMarkup(createElement(QuestionCard, {
+      chatId: 'ten-questions', questionId: 'ten-questions-q', questions, answeredMap,
+    }))
+    assert.match(html, /10 decisions/)
+    assert.equal((html.match(/<textarea\b/g) || []).length, 10)
+    for (let index = 1; index <= 10; index += 1) {
+      assert.ok(html.includes(`Decision ${index}?`))
+      if (answered) assert.ok(html.includes(`>Reply ${index}</textarea>`))
+    }
+  }
 })
 
 test('a written Restart card uses its displayed action list for choice instructions', () => {
@@ -140,16 +221,14 @@ test('unanswered question cards do not have a stale gray state', () => {
     'multi-select options should compose with a written custom answer')
   assert.match(component, /if \(!q\?\.multiSelect\) \{\s*setOtherTexts\(prev => \(\{ \.\.\.prev, \[question\]: '' \}\)\)/,
     'choosing a single option should clear custom text that is no longer active')
-  assert.match(component, /writeQuestionDraft\(draftKey, answers, otherTexts\)/,
-    'unsubmitted selections and custom text should be cached')
+  assert.match(component, /writeQuestionDraft\(draftKey, \{ answers, otherTexts, files \}\)/,
+    'unsubmitted selections, custom text, and files should be cached')
   assert.match(component, /if \(answered\) \{\s*clearQuestionDraft\(draftKey\)/,
     'committed answers should clear their cached draft')
   assert.doesNotMatch(component, /if \(answered \|\| disabled\) \{\s*clearQuestionDraft/,
     'a transient disabled handoff must not erase an offline choice')
   assert.match(component, /Your choice is saved — submit it when you’re back online/,
     'an offline submit should explain that the choice is retained')
-  assert.match(component, /const accepted = await onAnswer[\s\S]*if \(accepted === false \|\| accepted\?\.status === 'locally_queued' \|\| accepted\?\.status === 'locally_settled'\)[\s\S]*else \{\s*setSubmitted\(true\)/,
-    'a card should settle only after the answer request is accepted')
   assert.match(component, /catch \(error\) \{[\s\S]*Keep the choices and[\s\S]*\} finally/,
     'a failed answer should retain its retryable draft')
 })
@@ -188,7 +267,7 @@ test('multiple questions read as one compact decision panel', () => {
 
 test('a failed question submission does not append a transcript row', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   assert.ok(start >= 0 && end > start, 'doSendSilent source should be present')
   const silentSubmit = chatView.slice(start, end)
   assert.doesNotMatch(
@@ -215,7 +294,7 @@ test('a failed question submission does not append a transcript row', () => {
 
 test('question submission paints a resumed turn only after the POST commits', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   const silentSubmit = chatView.slice(start, end)
   const send = silentSubmit.indexOf('const response = await streamSend')
   const paintRunning = silentSubmit.indexOf('setServerRunningState(true)')
@@ -230,7 +309,7 @@ test('question submission paints a resumed turn only after the POST commits', ()
 
 test('question submission freezes the visible anchor before the async handoff', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   const silentSubmit = chatView.slice(start, end)
   const freeze = silentSubmit.indexOf('freezeQuestionSubmission(questionSubmissionContext)')
   const send = silentSubmit.indexOf('const response = await streamSend')

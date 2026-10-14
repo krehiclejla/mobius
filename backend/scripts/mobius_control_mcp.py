@@ -9,17 +9,21 @@ substantially more memory than this small control surface needs.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import importlib.util
+import io
 import subprocess
 import json
 import os
 import sys
+import threading
 import uuid
 from pathlib import Path
 from types import ModuleType
 from typing import Any, TextIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -34,6 +38,8 @@ SUPPORTED_PROTOCOL_VERSIONS = {
 }
 PROMOTE_GOAL_TOOL = "promote_goal"
 UPDATE_GOAL_TOOL = "update_goal"
+READ_GOAL_TOOL = "read_goal"
+UPDATE_GOAL_TASKS_TOOL = "update_goal_tasks"
 DECLARE_WAIT_TOOL = "declare_wait"
 CANCEL_WAIT_TOOL = "cancel_wait"
 REQUEST_APPROVAL_TOOL = "request_approval"
@@ -70,6 +76,7 @@ SPAWN_AGENT_TOOL = "spawn_agent"
 MESSAGE_AGENT_TOOL = "message_agent"
 STOP_AGENT_TOOL = "stop_agent"
 LIST_AGENTS_TOOL = "list_agents"
+ASK_PARENT_TOOL = "ask_parent"
 # Möbius-owned helpers: every provider delegates through these, and a helper
 # can use them too (nesting).
 HELPER_TOOLS = (
@@ -82,6 +89,7 @@ OWNER_TOOLS = (
   *HELPER_TOOLS,
   PROMOTE_GOAL_TOOL,
   UPDATE_GOAL_TOOL,
+  READ_GOAL_TOOL,
   DECLARE_WAIT_TOOL,
   CANCEL_WAIT_TOOL,
   REQUEST_APPROVAL_TOOL,
@@ -95,8 +103,8 @@ OWNER_TOOLS = (
   *APP_TOOLS,
 )
 DELEGATED_TOOLS = (
-  *HELPER_TOOLS, *PEER_TOOLS, *WORK_OWNERSHIP_TOOLS, CHECKPOINT_CHAT_TOOL,
-  *APP_TOOLS,
+  *HELPER_TOOLS, ASK_PARENT_TOOL, *PEER_TOOLS, *WORK_OWNERSHIP_TOOLS,
+  CHECKPOINT_CHAT_TOOL, READ_GOAL_TOOL, UPDATE_GOAL_TASKS_TOOL, *APP_TOOLS,
 )
 # A helper turn's identity when it runs inside a shared helper host: the
 # process environment belongs to the whole host, so the turn's own values
@@ -115,10 +123,31 @@ UPDATE_GOAL_DESCRIPTION = (
   "Advance this chat's Goal in one call. tasks edits the plan as one "
   "revision: a known id changes only the fields given (for example status "
   "completed with a result, and the next task running), a new id adds a task. "
-  "next_action records the exact next step. complete "
-  "records the verified outcome and closes the Goal; it is refused while "
-  "tasks or helpers are unfinished. With no arguments it returns the current "
-  "plan. goal_id attaches to a named retained Goal instead of the presented one."
+  "next_action records the exact next step. complete records only the verified "
+  "original outcome. If unreachable, first ask the owner an actionable question; "
+  "a temporary owner action or approval keeps the Goal open with its saved card. "
+  "If the owner defers a step, continue other authorized work. When none can "
+  "proceed, use defer with the reason and end normally: no repeat question, "
+  "automatic retry, or failed outcome. This holds the original Goal and releases "
+  "its claims; resolve existing helpers, cards and Waits first. "
+  "Only a genuinely unreachable outcome uses cannot_complete with reason, "
+  "efforts/partial results, and unmet_outcome; cancel means the owner called it "
+  "off. Settle every task honestly and wait for helpers before any outcome. "
+  "Tasks and outcome commit atomically; refusal saves neither. No proof-of-prose "
+  "approval validator substitutes for the agent's judgment. With no arguments it returns the current "
+  "plan. goal_id explicitly resumes a named retained Goal instead of the presented "
+  "one, including a held Goal only when the owner asked to continue that work. "
+  "Do not create a replacement Goal or reattach an unrelated follow-up."
+)
+READ_GOAL_DESCRIPTION = (
+  "Expand one task of your own Goal in full. Briefs summarize other tasks as "
+  "id, title and status with has_result/has_note flags; read_goal(task=<id>) "
+  "returns that task's full record with its ancestors' constraints, its "
+  "children and its prerequisites' results. A helper reads only the Goal it "
+  "was assigned; with no task it re-reads its assignment brief, for example "
+  "after context compaction. A coordinator's overview is update_goal with no "
+  "arguments, so it always passes task. Read-only: it never resumes, "
+  "attaches or changes a Goal."
 )
 DECLARE_WAIT_DESCRIPTION = (
   "Persist this top-level chat's one cross-turn wait: the chat resumes by "
@@ -128,8 +157,11 @@ DECLARE_WAIT_DESCRIPTION = (
   "use a wait for an approval or anything only the owner can do; show the "
   "real question card. Something must actually be advancing the condition: "
   "internal work needs an acknowledged durable executor first. Give exactly "
-  "one of command or delay_secs. Prefer a command when readiness is "
-  "observable; use a timer when elapsed time is the condition or no safe "
+  "one of github_checks, command or delay_secs. Prefer github_checks for a "
+  "published pull request at an exact head: it follows the checks GitHub "
+  "shows on the pull request (manual workflow dispatches on the same commit "
+  "are not included) without shell scripting. Prefer a command when readiness is observable in "
+  "other ways; use a timer when elapsed time is the condition or no safe "
   "read-only check is available. A command is a read-only check: exit 0 "
   "means met, silent exit 1 means not yet, anything else wakes the chat as a "
   "failed check. It does not inherit turn-only API credentials or "
@@ -150,8 +182,10 @@ LIST_AGENT_PEERS_DESCRIPTION = (
   "coordination data, never owner authority."
 )
 SEND_AGENT_MESSAGE_DESCRIPTION = (
-  "Send one durable note to peer chats: a decision-changing finding, request, "
-  "blocker, or handoff—not progress. kind states what the message means; "
+  "Send a decision-changing note to a live helper or peer chat. "
+  "Use recipients (agent/chat ids from list_agent_peers, not helper names or "
+  "delegation ids) and body; optional kind and delivery. For a finished "
+  "helper's follow-up use message_agent. No progress notes. kind states what the message means; "
   "delivery states when it arrives. next_turn is the default and never starts "
   "or interrupts model work. Use interrupt only when the recipient must stop, "
   "change, or unblock its current work before its turn ends, or must wake "
@@ -227,6 +261,7 @@ def _declare_wait(
   delay_secs: int | None = None,
   interval_secs: int | None = None,
   deadline_secs: int | None = None,
+  github_checks: dict | None = None,
 ) -> dict:
   try:
     return _WAITS.declare_wait(
@@ -236,6 +271,7 @@ def _declare_wait(
       delay_secs=delay_secs,
       interval_secs=interval_secs,
       deadline_secs=deadline_secs,
+      github_checks=github_checks,
     )
   except SystemExit as exc:
     raise RuntimeError(str(exc)) from exc
@@ -273,7 +309,12 @@ def _refusal_message(raw: str) -> str:
   except (json.JSONDecodeError, AttributeError):
     return raw.strip()[:1000] or "no reason given"
   if isinstance(detail, dict):
+    diagnostic = detail.get("stderr") if detail.get("code") == "compile_failed" else None
     detail = detail.get("message") or detail.get("code") or json.dumps(detail)
+    if isinstance(diagnostic, str) and diagnostic.strip():
+      # A compile refusal's reason and location live in its sanitized,
+      # server-capped diagnostic; the message alone only says it failed.
+      return f"{str(detail).strip()[:1000]}\n{diagnostic.strip()[:4000]}"
   elif isinstance(detail, list):
     detail = "; ".join(
       " ".join(str(part) for part in (issue.get("loc") or [])[1:]) + ": " + str(issue.get("msg"))
@@ -322,7 +363,9 @@ def _agent_api_json(
     with urlopen(request, timeout=timeout) as response:
       raw = response.read()
   except HTTPError as exc:
-    raw = exc.read().decode("utf-8", errors="replace")[:4000]
+    # Large enough for a whole structured refusal (a compile diagnostic is
+    # ~4 KB plus its envelope); _refusal_message caps what is rendered.
+    raw = exc.read(65536).decode("utf-8", errors="replace")
     raise RuntimeError(
       f"Refused ({exc.code}): {_refusal_message(raw)}"
     ) from exc
@@ -508,8 +551,23 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
     line += f": {summary.get('completed', 0)}/{summary.get('total', 0)} tasks complete"
   lines = [line + "."]
   for label, key in (("Running", "running"), ("Ready", "ready")):
-    if summary.get(key):
+    if goal.get("status") == "open" and summary.get(key):
       lines.append(f"{label}: {', '.join(summary[key])}.")
+  if goal.get("status") == "open":
+    if summary.get("can_complete"):
+      lines.append("Ready to complete after verification; omit next_action.")
+    elif full and summary.get("completion_blockers"):
+      lines.append("Completion blocked by: " + ", ".join(summary["completion_blockers"]) + ".")
+    if (full or summary.get("can_complete")) and goal.get("held_work_keys"):
+      lines.append(
+        "Held work_keys (finished_claims accepts only these; name only work performed): "
+        + ", ".join(goal["held_work_keys"]) + "."
+      )
+  elif isinstance(goal.get("hold"), dict) and goal["hold"].get("cause") == "deferred":
+    lines.append("On hold: " + goal["hold"]["reason"])
+    lines.append("End normally. Resume only when the owner asks to continue; no automatic retry.")
+  elif goal.get("result") and (full or goal.get("status") != "completed"):
+    lines.append("Outcome: " + goal["result"] + ".")
   if full:
     lines.insert(0, f"Objective: {goal.get('objective')}")
     for task in (plan or {}).get("tasks") or []:
@@ -527,11 +585,42 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
 
 
 def _call_update_goal(arguments: dict[str, Any]) -> str:
-  allowed = {"tasks", "next_action", "complete", "finished_claims", "goal_id"}
+  allowed = {"tasks", "next_action", "complete", "cannot_complete", "cancel", "defer", "finished_claims", "goal_id"}
   unknown = set(arguments) - allowed
   if unknown:
     raise ValueError(f"update_goal does not take: {', '.join(sorted(unknown))}")
   return _update_goal(arguments)
+
+
+def _call_update_goal_tasks(arguments: dict[str, Any]) -> dict:
+  if set(arguments) != {"tasks"}:
+    raise ValueError("update_goal_tasks needs only tasks")
+  chat_id = os.environ.get("CHAT_ID") or ""
+  if not chat_id:
+    raise RuntimeError("missing environment: CHAT_ID")
+  return _agent_api_call(
+    "POST", f"/api/chats/{quote(chat_id, safe='')}/goal/tasks", arguments,
+  )
+
+
+def _call_read_goal(arguments: dict[str, Any]) -> dict:
+  unknown = set(arguments) - {"task"}
+  if unknown:
+    raise ValueError(f"read_goal does not take: {', '.join(sorted(unknown))}")
+  chat_id = os.environ.get("CHAT_ID") or ""
+  if not chat_id:
+    raise RuntimeError("missing environment: CHAT_ID")
+  query = {"task": arguments["task"]} if arguments.get("task") is not None else {}
+  path = f"/api/chats/{quote(chat_id, safe='')}/goal-brief"
+  if query:
+    path += "?" + urlencode(query)
+  payload = _agent_api_call("GET", path)
+  if payload.get("goal") is None:
+    payload["goal"] = (
+      "This helper has no assigned Goal; complete the bounded task you were given."
+      if payload.get("role") == "helper" else "This chat has no Goal."
+    )
+  return payload
 
 
 def _call_request_approval(arguments: dict[str, Any]) -> dict:
@@ -575,7 +664,7 @@ def _optional_int(arguments: dict[str, Any], name: str) -> int | None:
 def _call_declare_wait(arguments: dict[str, Any]) -> dict:
   allowed = {
     "description", "condition_owner", "command", "delay_secs", "interval_secs",
-    "deadline_secs",
+    "deadline_secs", "github_checks",
   }
   if not set(arguments).issubset(allowed):
     raise ValueError("declare_wait received unknown arguments")
@@ -592,6 +681,8 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     raise ValueError("command waits need a condition_owner")
   if command and arguments.get("deadline_secs") is None:
     raise ValueError("command waits need an explicit deadline_secs")
+  if arguments.get("github_checks") is not None and not isinstance(arguments["github_checks"], dict):
+    raise ValueError("github_checks must be an object")
   return _declare_wait(
     description.strip(),
     command=command,
@@ -601,6 +692,7 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     delay_secs=_optional_int(arguments, "delay_secs"),
     interval_secs=_optional_int(arguments, "interval_secs"),
     deadline_secs=_optional_int(arguments, "deadline_secs"),
+    github_checks=arguments.get("github_checks"),
   )
 
 
@@ -626,15 +718,24 @@ def _call_send_agent_message(arguments: dict[str, Any]) -> dict:
   allowed = {
     "recipients", "broadcast", "kind", "delivery", "body", "send_id",
   }
-  if not set(arguments).issubset(allowed):
-    raise ValueError("send_agent_message received unknown arguments")
+  unknown = set(arguments) - allowed
+  if unknown:
+    raise ValueError(
+      "send_agent_message invalid keys: " + ", ".join(sorted(unknown))
+      + "; expected recipients (agent/chat ids), body, and optional "
+      "broadcast, kind, delivery, send_id. For a finished helper follow-up "
+      "use message_agent(helper, message)."
+    )
   recipients = arguments.get("recipients", [])
   if (
     not isinstance(recipients, list)
     or len(recipients) > 24
     or any(not isinstance(value, str) or not value for value in recipients)
   ):
-    raise ValueError("recipients must contain at most 24 agent ids")
+    raise ValueError(
+      "recipients must be a list of at most 24 agent/chat ids from "
+      "list_agent_peers; for a finished helper use message_agent(helper, message)"
+    )
   broadcast = arguments.get("broadcast", False)
   if not isinstance(broadcast, bool):
     raise ValueError("broadcast must be true or false")
@@ -835,12 +936,19 @@ def _helper_rows() -> list[dict[str, Any]]:
 
 def _find_helper(reference: Any) -> dict[str, Any]:
   if not isinstance(reference, str) or not reference.strip():
-    raise ValueError("helper must be a helper name or id from spawn_agent")
+    raise ValueError(
+      "helper must be a name or helper_id from spawn_agent/list_agents, "
+      "not a peer chat id; use send_agent_message(recipients, body) for peers"
+    )
   reference = reference.strip()
   for row in _helper_rows():  # newest first
     if reference in (row.get("id"), row.get("task_key")):
       return row
-  raise ValueError(f"No helper named {reference!r} in this chat.")
+  raise ValueError(
+    "No helper with that name or helper_id in this chat. Use list_agents "
+    "for helper names/ids; a peer chat id belongs in "
+    "send_agent_message(recipients, body)."
+  )
 
 
 def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]:
@@ -851,6 +959,8 @@ def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]
     "model": row.get("model"),
     "status": row.get("status"),
   }
+  if isinstance(row.get("question"), dict):
+    view["question"] = row["question"]
   if result and row.get("result"):
     view["result"] = row["result"]
   return view
@@ -903,18 +1013,66 @@ def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
 
 
 def _call_message_agent(arguments: dict[str, Any]) -> dict:
-  if set(arguments) != {"helper", "message"}:
-    raise ValueError("message_agent needs exactly helper and message")
+  required, optional = {"helper", "message"}, {"question_id"}
+  if not required <= set(arguments) <= required | optional:
+    unknown = set(arguments) - required - optional
+    missing = required - set(arguments)
+    details = []
+    if unknown:
+      details.append("invalid keys: " + ", ".join(sorted(unknown)))
+    if missing:
+      details.append("missing: " + ", ".join(sorted(missing)))
+    raise ValueError(
+      "message_agent needs exactly helper (spawn_agent name/helper_id) and "
+      "message, plus question_id when answering; " + "; ".join(details)
+      + ". For live helpers or other peer chats use "
+      "send_agent_message(recipients, body, kind, delivery)."
+    )
   message = arguments.get("message")
   if not isinstance(message, str) or not message.strip():
     raise ValueError("message must not be empty")
+  body = {"message": message}
+  if "question_id" in arguments:
+    question_id = arguments["question_id"]
+    if not isinstance(question_id, str) or not question_id.strip():
+      raise ValueError("question_id must be the helper's question id")
+    body["question_id"] = question_id.strip()
   row = _find_helper(arguments.get("helper"))
   updated = _agent_api_call(
-    "POST", f"/api/delegations/{row['id']}/messages", {"message": message},
+    "POST", f"/api/delegations/{row['id']}/messages", body,
   )
   view = _helper_view(updated)
-  view["note"] = "Follow-up started; its result arrives in this chat by itself."
+  if "question_id" in body:
+    view["note"] = (
+      "That answer was already delivered; nothing new started."
+      if updated.get("already_answered")
+      else "Answer delivered; the helper resumes and its result arrives in this chat by itself."
+    )
+  else:
+    view["note"] = "Follow-up accepted; its result or failure returns to this chat automatically unless the work is stopped or held."
   return view
+
+
+def _call_ask_parent(arguments: dict[str, Any]) -> dict:
+  if "question" not in arguments or not set(arguments) <= {"question", "options"}:
+    raise ValueError("ask_parent takes a question and optional options")
+  question = arguments.get("question")
+  if not isinstance(question, str) or not question.strip():
+    raise ValueError("question must be a non-empty string")
+  options = arguments.get("options", [])
+  if not isinstance(options, list) or not all(isinstance(item, str) for item in options):
+    raise ValueError("options must be a list of strings")
+  delegation_id = (os.environ.get("MOBIUS_DELEGATION_ID") or "").strip()
+  if not delegation_id:
+    raise RuntimeError("This run is not a delegated helper.")
+  result = _agent_api_call(
+    "POST", f"/api/delegations/{delegation_id}/questions",
+    {"question": question.strip(), "options": options},
+  )
+  if isinstance(result.get("turn_end_id"), str):
+    # The run's end hook recognizes this receipt and ends the turn here.
+    return json.dumps({**result, "state": "turn_end"})
+  return result
 
 
 def _call_stop_agent(arguments: dict[str, Any]) -> dict:
@@ -941,8 +1099,10 @@ def _call_list_agents(arguments: dict[str, Any]) -> dict:
 
 
 def _call_checkpoint_chat(arguments: dict[str, Any]) -> str:
-  if not arguments or not set(arguments).issubset({"title", "digest", "summary"}):
-    raise ValueError("checkpoint_chat takes one or more of title, digest, summary")
+  if not arguments or not set(arguments).issubset({"title", "chat_summary", "digest_entry"}):
+    raise ValueError(
+      "checkpoint_chat takes one or more of title, chat_summary, digest_entry"
+    )
   if not all(isinstance(value, str) for value in arguments.values()):
     raise ValueError("checkpoint_chat fields must be strings")
   _agent_api_call("POST", "/api/chat/continuity/checkpoints", arguments)
@@ -980,6 +1140,8 @@ def _call_notify_owner(arguments: dict[str, Any]) -> str:
 
 
 def _call_open_item(arguments: dict[str, Any]) -> str:
+  if arguments.get("kind") == "settings":
+    return _open_settings(arguments)
   _require_args(OPEN_ITEM_TOOL, arguments, {"kind", "id", "activation"}, ("kind", "id"))
   activation = arguments.get("activation", "background")
   _agent_api_call("POST", "/api/notify", {
@@ -994,6 +1156,27 @@ def _call_open_item(arguments: dict[str, Any]) -> str:
   return (
     f"Opened {arguments['kind']} {arguments['id']} in the owner's workspace "
     f"({activation}). It is live-only; add notify_owner if they may be away."
+  )
+
+
+def _open_settings(arguments: dict[str, Any]) -> str:
+  """Navigate the owner's shell to Settings, optionally one section.
+
+  Opening is navigation only: Settings is never placed beside this chat, and
+  nothing inside it (sign-in, credentials, deletion) happens until the owner
+  taps it, so a background open has no meaning here.
+  """
+  _require_args(OPEN_ITEM_TOOL, arguments, {"kind", "id", "activation"}, ("kind",))
+  if arguments.get("activation", "foreground") != "foreground":
+    raise ValueError("Settings opens in the foreground only; open it when the owner asked to see it")
+  event = {"type": "open_item", "itemKind": "settings"}
+  if arguments.get("id"):
+    event["itemId"] = str(arguments["id"])
+  _agent_api_call("POST", "/api/notify", event)
+  where = f"Settings ({event['itemId']})" if "itemId" in event else "Settings"
+  return (
+    f"Opened {where} on the owner's screen. Only navigation happened: they "
+    "still make any change there themselves."
   )
 
 
@@ -1076,7 +1259,14 @@ def _call_apply_app(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 SCREENSHOT_SCRIPT = Path(__file__).with_name("agent-screenshot.sh")
-SCREENSHOT_TIMEOUT_SECONDS = 150
+# A capture makes up to 29 browser commands, and a loaded 1 GB server takes
+# ~5 s per command, so a healthy capture there needs ~150 s before pauses or
+# its one reset. The control server allows a tool far longer than this.
+SCREENSHOT_TIMEOUT_SECONDS = 240
+# The helper bounds its whole capture by the time this tool can wait, less a
+# margin for its final kill, cleanup, and report, so a too-busy machine yields
+# the helper's own explanation instead of this tool's bare timeout.
+SCREENSHOT_CAPTURE_BUDGET_SECONDS = SCREENSHOT_TIMEOUT_SECONDS - 10
 
 
 def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
@@ -1085,10 +1275,18 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
   The helper keeps its auth, freshness, and atomic-output checks; the image
   lands in this chat's served media so the embed line works for the owner.
   """
-  _require_args(SCREENSHOT_TOOL, arguments, {"route", "content_only"}, ("route",))
-  route = arguments["route"]
+  _require_args(SCREENSHOT_TOOL, arguments, {"route", "app_id", "content_only"})
+  if ("route" in arguments) == ("app_id" in arguments):
+    raise ValueError("Provide either app_id from list_apps or route, not both.")
+  if "app_id" in arguments:
+    app_id = arguments["app_id"]
+    if type(app_id) is not int or app_id < 1:
+      raise ValueError("app_id must be a positive numeric id from list_apps, not an app name or slug.")
+    route = f"/shell/?app={app_id}"
+  else:
+    route = arguments["route"]
   if not isinstance(route, str) or not route.startswith("/"):
-    raise ValueError("route must be a path such as /app/42 or /settings")
+    raise ValueError("route must be a path such as /shell/?app=42 or /settings")
   command = ["bash", str(SCREENSHOT_SCRIPT)]
   if arguments.get("content_only"):
     command.append("--content-only")
@@ -1096,6 +1294,10 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
   try:
     done = subprocess.run(
       command, capture_output=True, text=True, timeout=SCREENSHOT_TIMEOUT_SECONDS,
+      env={
+        **os.environ,
+        "MOBIUS_SCREENSHOT_BUDGET_SECONDS": str(SCREENSHOT_CAPTURE_BUDGET_SECONDS),
+      },
     )
   except subprocess.TimeoutExpired as exc:
     raise RuntimeError("screenshot timed out; nothing was captured") from exc
@@ -1112,6 +1314,8 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
     raise RuntimeError("screenshot failed: " + " / ".join(output.splitlines()[-3:]))
   image = Path(lines[0])
   embed = next((line.split(": ", 1)[1] for line in lines if "![screenshot](" in line), None)
+  # The step records the saved file from this "Saved <path>." note
+  # (app/screenshot_steps.py), so the chat shows it straight from chat media.
   note = (
     f"Saved {image}. To show the owner, paste {embed} before describing it."
     if embed else f"Saved {image}; it is outside chat media, so it cannot be embedded."
@@ -1128,12 +1332,12 @@ _TOOL_DEFINITIONS = {
     "name": CHECKPOINT_CHAT_TOOL,
     "description": (
       "Save this chat's continuity note. Every field is optional: title "
-      "renames the chat (a name the owner chose always wins), digest replaces "
-      "its short current paragraph, and summary appends one entry to its "
-      "cumulative Summary. Default to one concise changes-only save per substantive "
+      "renames the chat (a name the owner chose always wins), chat_summary "
+      "replaces its short Summary, and digest_entry appends one entry to its "
+      "cumulative Digest. Default to one concise changes-only save per substantive "
       "turn; save earlier before handoffs, owner-input cards, restarts, or "
       "risky/long work that needs a recovery checkpoint. Omit unchanged title "
-      "and digest; do not repeat saved facts or raw tool output. Omitted fields "
+      "and chat_summary; do not repeat saved facts or raw tool output. Omitted fields "
       "stay unchanged. If a save fails, read the note before retrying so an entry "
       "is not added twice."
     ),
@@ -1141,8 +1345,10 @@ _TOOL_DEFINITIONS = {
       "type": "object", "additionalProperties": False,
       "properties": {
         "title": {"type": "string", "maxLength": 200},
-        "digest": {"type": "string", "maxLength": 1000},
-        "summary": {"type": "string", "maxLength": 8000},
+        "chat_summary": {"type": "string",
+                         "description": "Short overview of the whole chat; replaces the previous one."},
+        "digest_entry": {"type": "string",
+                         "description": "New facts since the last save; appended to the cumulative Digest."},
       },
     },
   },
@@ -1166,7 +1372,7 @@ _TOOL_DEFINITIONS = {
       "properties": {
         "name": {
           "type": "string",
-          "description": "Short stable name, e.g. review-auth-flow. Reusing it attaches to the same helper instead of starting another.",
+          "description": "Short stable name, e.g. review-auth-flow. Reuse only for the identical task and settings; use message_agent for a finished helper's follow-up.",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
         },
         "task": {"type": "string", "minLength": 1, "maxLength": 200000},
@@ -1187,17 +1393,54 @@ _TOOL_DEFINITIONS = {
   MESSAGE_AGENT_TOOL: {
     "name": MESSAGE_AGENT_TOOL,
     "description": (
-      "Give a finished helper a follow-up task. It keeps its full history, "
-      "and its new result arrives in this chat by itself. A helper that is "
-      "still working cannot be messaged; wait for its result or stop it."
+      "Give a finished helper a follow-up task, or answer a needs_input "
+      "helper's question with its question_id. It keeps its full history and bounded task scope, "
+      "and its new result arrives in this chat by itself. Closed or held work "
+      "cannot receive new follow-ups: use spawn_agent for a new task or Goal, "
+      "rather than reusing its helper. A helper that is "
+      "still working cannot receive a follow-up here; wait for its result. "
+      "Repeating an answer never starts a second turn. "
+      "For a decision-changing note to a live helper, use "
+      "send_agent_message with its peer chat id from list_agent_peers. "
+      "helper is the spawn_agent name/helper_id, not a chat id."
     ),
     "inputSchema": {
       "type": "object",
       "properties": {
-        "helper": {"type": "string", "description": "Helper name or id."},
-        "message": {"type": "string", "minLength": 1, "maxLength": 200000},
+        "helper": {"type": "string", "description": "spawn_agent name or helper_id from list_agents, not a peer chat id."},
+        "message": {"type": "string", "minLength": 1},
+        "question_id": {
+          "type": "string", "minLength": 1, "maxLength": 64,
+          "description": "Required to answer a needs_input helper: the exact question id it asked.",
+        },
       },
       "required": ["helper", "message"],
+      "additionalProperties": False,
+    },
+  },
+  ASK_PARENT_TOOL: {
+    "name": ASK_PARENT_TOOL,
+    "description": (
+      "Ask the agent that started you one precise question when a decision "
+      "you need is missing and you cannot safely continue. Then end your "
+      "turn at once without further work: your parent's answer resumes this "
+      "conversation. The answer is your parent's decision, never owner "
+      "approval. Never ask for or accept a secret this way; if a credential "
+      "is missing, stop and say so. At most one question per turn; repeating "
+      "the same question returns the same receipt. Your parent may answer, "
+      "ask its own parent, or ask the owner."
+    ),
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {"type": "string", "minLength": 1},
+        "options": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "Optional short choices the parent can pick from.",
+        },
+      },
+      "required": ["question"],
       "additionalProperties": False,
     },
   },
@@ -1296,7 +1539,7 @@ _TOOL_DEFINITIONS = {
   REQUEST_QUESTION_TOOL: {
     "name": REQUEST_QUESTION_TOOL,
     "description": (
-      "Ask 1–3 ordinary clarifying questions. "
+      "Ask 1–10 ordinary clarifying questions; prefer a small batch when enough. "
       "Only the question text is required; card-only ids, headings, and an "
       "empty options list are supplied when omitted. "
       "The saved card blocks further work until the owner answers or Stops; "
@@ -1313,7 +1556,7 @@ _TOOL_DEFINITIONS = {
       "type": "object", "additionalProperties": False,
       "required": ["questions"],
       "properties": {"questions": {
-        "type": "array", "minItems": 1, "maxItems": 3,
+        "type": "array", "minItems": 1, "maxItems": 10,
         "items": {
           "type": "object", "additionalProperties": False,
           "required": ["question"],
@@ -1345,7 +1588,8 @@ _TOOL_DEFINITIONS = {
     "name": SCREENSHOT_TOOL,
     "description": (
       "Capture an authenticated Möbius route at the owner's viewport and "
-      "return the image to you: /shell/?app=42 (an app in the shell), "
+      "return the image to you. For a shell app prefer app_id from list_apps "
+      "rather than constructing a route. Alternatively use route: /shell/?app=42, "
       "/shell/?chat=<id>, / (the shell), or /apps/<slug>/ (an app's own "
       "page). It writes the image, so read-only runs cannot use it. "
       "content_only hides product "
@@ -1354,9 +1598,10 @@ _TOOL_DEFINITIONS = {
       "several seconds; keep captures purposeful."
     ),
     "inputSchema": {
-      "type": "object", "additionalProperties": False, "required": ["route"],
+      "type": "object", "additionalProperties": False,
       "properties": {
-        "route": {"type": "string", "pattern": "^/"},
+        "route": {"type": "string", "pattern": "^/", "description": "Use either route or app_id. Shell app routes take numeric ids, never slugs; standalone /apps/<slug>/ takes a slug."},
+        "app_id": {"type": "integer", "minimum": 1, "description": "Numeric id from list_apps. Captures that exact app in the shell; do not also pass route."},
         "content_only": {"type": "boolean"},
       },
     },
@@ -1365,9 +1610,12 @@ _TOOL_DEFINITIONS = {
     "name": NOTIFY_OWNER_TOOL,
     "description": (
       "Send the owner a push notification for a meaningful event: a finished "
-      "long task, an error or question that needs them, or when they asked to "
-      "be told. Not for routine confirmations. target defaults to this chat's "
-      "in-app link; use /shell/?app=ID for an app. tag groups pushes about one "
+      "long task, an error that needs them outside a card, or when they asked "
+      "to be told. Not for routine confirmations, and not for a saved "
+      "question, approval, restart or secure-input card: the card sends its "
+      "own notification. target defaults to this chat's "
+      "in-app link; use /shell/?app=ID for an app or /shell/?settings=SECTION "
+      "for a Settings section. tag groups pushes about one "
       "thing so a newer one replaces the older. The push is skipped while the "
       "owner is viewing this chat. Never fire one from a script under test."
     ),
@@ -1398,16 +1646,25 @@ _TOOL_DEFINITIONS = {
     "description": (
       "Open an app (numeric id) or a chat in the owner's live workspace beside "
       "this chat. activation defaults to background; use foreground only when "
-      "the owner just asked to open that exact item. It is live-only and never "
-      "stored, so pair it with notify_owner when they may be away. Say it is "
-      "open in their workspace; never describe the layout."
+      "the owner just asked to open that exact item. kind settings is always "
+      "foreground and instead takes the owner to Settings, focused on section "
+      "id ai-providers, "
+      "background-agents, github or models (omit id for Settings itself); use "
+      "it when they asked to see it or accepted your offer to open it. It only "
+      "navigates: signing in, entering credentials and every other change "
+      "there stay their own taps. It is live-only and never stored, so pair "
+      "it with notify_owner when they may be away. Say it is open in their "
+      "workspace; never describe the layout."
     ),
     "inputSchema": {
       "type": "object", "additionalProperties": False,
-      "required": ["kind", "id"],
+      "required": ["kind"],
       "properties": {
-        "kind": {"type": "string", "enum": ["app", "chat"]},
-        "id": {"type": ["string", "integer"]},
+        "kind": {"type": "string", "enum": ["app", "chat", "settings"]},
+        "id": {
+          "type": ["string", "integer"],
+          "description": "App id, chat id, or Settings section id; required for app and chat.",
+        },
         "activation": {"type": "string", "enum": ["background", "foreground"]},
       },
     },
@@ -1495,7 +1752,7 @@ _TOOL_DEFINITIONS = {
       "properties": {
         "objective": {
           "type": "string",
-          "description": "Concise outcome and observable completion condition.",
+          "description": "Short, plain-language outcome shown to the owner. Put the route and verification criteria in tasks, not this heading.",
         },
         "tasks": {
           **_GOAL_TASKS_SCHEMA,
@@ -1513,16 +1770,57 @@ _TOOL_DEFINITIONS = {
       "type": "object",
       "properties": {
         "tasks": _GOAL_TASKS_SCHEMA,
-        "next_action": {"type": "string", "maxLength": 2000},
+        "next_action": {"type": "string", "maxLength": 2000, "description": "Next step for unfinished work. Do not combine with complete."},
         "complete": {
-          "type": "string", "maxLength": 4000,
-          "description": "Verified evidence that the whole outcome holds.",
+          "type": "boolean", "enum": [True],
+          "description": "Set true after verifying the whole outcome. No separate success summary. Keep useful verification evidence in task results or the chat checkpoint; communicate the outcome and any consequential caveats in your normal final reply. Do not combine with next_action; final task edits may share this call.",
         },
+        "cannot_complete": {
+          "type": "object", "additionalProperties": False,
+          "required": ["reason", "efforts", "unmet_outcome"],
+          "properties": {
+            "reason": {"type": "string", "minLength": 1, "maxLength": 1500},
+            "efforts": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "unmet_outcome": {"type": "string", "minLength": 1, "maxLength": 1000},
+          },
+        },
+        "cancel": {"type": "string", "minLength": 1, "maxLength": 4000,
+                   "description": "Owner-called-off reason, not an unreachable-work shortcut."},
+        "defer": {"type": "string", "minLength": 1, "maxLength": 2000,
+                  "description": "Why remaining work is deferred, after other authorized work is done. Quietly holds this Goal, not an outcome or a new question; tasks may share this atomic call. Do not combine with next_action or outcomes."},
         "finished_claims": {
           "type": "array", "items": {"type": "string"}, "maxItems": 50,
-          "description": "With complete: work_keys this Goal performed; other claims are released.",
+          "description": "With complete only: exact held work_keys this Goal performed, not claim ids or invented names. Other held claims are released.",
         },
         "goal_id": {"type": "string"},
+      },
+      "additionalProperties": False,
+    },
+  },
+  UPDATE_GOAL_TASKS_TOOL: {
+    "name": UPDATE_GOAL_TASKS_TOOL,
+    "description": (
+      "Update your assigned Goal checklist branch in one batch. Add meaningful "
+      "substeps with parent_id; update their progress, evidence and status. "
+      "No plan approval or progress message is needed. Your assigning parent "
+      "accepts your boundary task: leave it unfinished and return your final "
+      "result normally. You cannot change its objective/constraints, other "
+      "branches or the Goal outcome. Reuse stable task ids; prefer a branch "
+      "prefix for new ids. read_goal expands details when needed."
+    ),
+    "inputSchema": {
+      "type": "object", "properties": {"tasks": _GOAL_TASKS_SCHEMA},
+      "required": ["tasks"], "additionalProperties": False,
+    },
+  },
+  READ_GOAL_TOOL: {
+    "name": READ_GOAL_TOOL,
+    "description": READ_GOAL_DESCRIPTION,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task": {"type": "string", "minLength": 1, "maxLength": 64,
+                 "description": "A task id of this Goal to show in full. Required for a coordinator."},
       },
       "additionalProperties": False,
     },
@@ -1534,34 +1832,45 @@ _TOOL_DEFINITIONS = {
       "type": "object",
       "properties": {
         "description": {
-          "type": "string",
+          "type": "string", "minLength": 1, "maxLength": 500,
           "description": "Plain-language condition this chat will resume for.",
         },
         "condition_owner": {
-          "type": "string",
+          "type": "string", "maxLength": 160,
           "description": (
             "Who or what can make the condition true. For internal work, "
             "name only an executor that has acknowledged ownership. If only "
             "the partner can act, use a question card instead of this tool."
           ),
         },
+        "github_checks": {
+          "type": "object",
+          "description": "Wait for the checks GitHub shows on one published pull-request head to finish (finished does not mean passed; manual workflow dispatches on the same commit are not included).",
+          "properties": {
+            "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "maxLength": 200},
+            "pull_request": {"type": "integer", "minimum": 1},
+            "head_sha": {"type": "string", "pattern": "^[a-fA-F0-9]{7,40}$"},
+          },
+          "required": ["repository", "pull_request", "head_sha"],
+          "additionalProperties": False,
+        },
         "command": {
-          "type": "string",
+          "type": "string", "maxLength": 4000,
           "description": "Read-only shell check with 0/1/error exit semantics.",
         },
         "delay_secs": {
-          "type": "integer",
+          "type": "integer", "minimum": 60, "maximum": 604800,
           "description": "Timer delay in seconds, minimum 60.",
         },
         "interval_secs": {
-          "type": "integer",
+          "type": "integer", "minimum": 60, "maximum": 86400,
           "description": "Command polling interval in seconds, minimum 60.",
         },
         "deadline_secs": {
-          "type": "integer",
+          "type": "integer", "minimum": 1, "maximum": 604800,
           "description": (
             "Wake-up deadline in seconds, maximum 604800. Required for "
-            "command waits; normally 2–3× the expected duration."
+            "command or GitHub waits; normally 2–3× the expected duration."
           ),
         },
       },
@@ -1604,7 +1913,7 @@ _TOOL_DEFINITIONS = {
           "type": "array",
           "items": {"type": "string"},
           "maxItems": 24,
-          "description": "Agent ids from list_agent_peers for a direct note.",
+          "description": "Agent/chat ids from list_agent_peers for a direct note, including a live helper's peer chat id; not spawn_agent helper names or delegation ids.",
         },
         "broadcast": {
           "type": "boolean",
@@ -1691,6 +2000,7 @@ _TOOL_DEFINITIONS = {
 _TOOL_HANDLERS = {
   SPAWN_AGENT_TOOL: _call_spawn_agent,
   MESSAGE_AGENT_TOOL: _call_message_agent,
+  ASK_PARENT_TOOL: _call_ask_parent,
   STOP_AGENT_TOOL: _call_stop_agent,
   LIST_AGENTS_TOOL: _call_list_agents,
   REQUEST_APPROVAL_TOOL: _call_request_approval,
@@ -1698,6 +2008,8 @@ _TOOL_HANDLERS = {
   REQUEST_RESTART_TOOL: _call_request_restart,
   PROMOTE_GOAL_TOOL: _call_promote_goal,
   UPDATE_GOAL_TOOL: _call_update_goal,
+  READ_GOAL_TOOL: _call_read_goal,
+  UPDATE_GOAL_TASKS_TOOL: _call_update_goal_tasks,
   DECLARE_WAIT_TOOL: _call_declare_wait,
   CANCEL_WAIT_TOOL: _call_cancel_wait,
   LIST_AGENT_PEERS_TOOL: _call_list_agent_peers,
@@ -1772,23 +2084,109 @@ def _write_message(stream: TextIO, message: dict[str, Any]) -> None:
   stream.flush()
 
 
+MAX_IN_FLIGHT_REQUESTS = 8
+WORKER_TIMEOUT_SECONDS = 620
+
+
+def _dispatch_in_child(message: Any) -> dict[str, Any] | None:
+  """Run a request with its own process environment, including _CallerEnv."""
+  message_id = message.get("id") if isinstance(message, dict) else None
+  try:
+    completed = subprocess.run(
+      [sys.executable, str(Path(__file__).resolve()), "--dispatch-message"],
+      input=json.dumps(message, ensure_ascii=False), text=True,
+      capture_output=True, check=False, timeout=WORKER_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+      raise RuntimeError("request worker exited unsuccessfully")
+    response = json.loads(completed.stdout)
+    if (
+      not isinstance(response, dict)
+      or response.get("jsonrpc") != "2.0"
+      or response.get("id") != message_id
+      or ("result" in response) == ("error" in response)
+    ):
+      raise ValueError("request worker returned an invalid response")
+    return response
+  except subprocess.TimeoutExpired:
+    return _error(
+      message_id, -32603,
+      "Request worker timed out; outcome is unknown. Check state before retrying.",
+    )
+  except (OSError, ValueError, RuntimeError):
+    return _error(
+      message_id, -32603,
+      "Request worker failed; outcome is unknown. Check state before retrying.",
+    )
+
+
+def _dispatch_message_cli() -> int:
+  """Private one-request worker; keep handler stdout off the protocol pipe."""
+  message: Any = None
+  try:
+    message = json.loads(sys.stdin.read())
+    with contextlib.redirect_stdout(io.StringIO()):
+      response = _dispatch_message(message)
+  except Exception:
+    message_id = message.get("id") if isinstance(message, dict) else None
+    response = _error(message_id, -32603, "Internal error")
+  print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+  return 0
+
+
 def serve(input_stream: TextIO, output_stream: TextIO) -> None:
   """Serve newline-delimited JSON-RPC until the provider closes stdin."""
-  for raw_line in input_stream:
-    if not raw_line.strip():
-      continue
-    try:
-      message = json.loads(raw_line)
-    except json.JSONDecodeError:
-      _write_message(output_stream, _error(None, -32700, "Parse error"))
-      continue
-    try:
-      response = _dispatch_message(message)
-    except Exception:  # Keep a malformed request from terminating the server.
-      message_id = message.get("id") if isinstance(message, dict) else None
-      response = _error(message_id, -32603, "Internal error")
+  write_lock = threading.Lock()
+  slots = threading.BoundedSemaphore(MAX_IN_FLIGHT_REQUESTS)
+
+  def send(response: dict[str, Any] | None) -> None:
     if response is not None:
-      _write_message(output_stream, response)
+      with write_lock:
+        _write_message(output_stream, response)
+
+  def finish(future: Any, message_id: Any) -> None:
+    try:
+      try:
+        response = future.result()
+      except Exception:
+        response = _error(message_id, -32603, "Internal error")
+      send(response)
+    finally:
+      slots.release()
+
+  # The reader stays responsive while workers wait on slow tools; EOF drains
+  # accepted requests before returning. Each worker gets a separate process,
+  # because _CallerEnv changes os.environ and cannot be shared across threads.
+  with ThreadPoolExecutor(max_workers=MAX_IN_FLIGHT_REQUESTS) as workers:
+    for raw_line in input_stream:
+      if not raw_line.strip():
+        continue
+      try:
+        message = json.loads(raw_line)
+      except json.JSONDecodeError:
+        send(_error(None, -32700, "Parse error"))
+        continue
+      # Notifications have no response and no local state to update.
+      if isinstance(message, dict) and "id" not in message and message.get("jsonrpc") == "2.0" and isinstance(message.get("method"), str):
+        continue
+      if isinstance(message, dict) and message.get("jsonrpc") == "2.0" and message.get("method") in ("initialize", "ping"):
+        try:
+          response = _dispatch_message(message)
+        except Exception:
+          response = _error(message.get("id"), -32603, "Internal error")
+        send(response)
+        continue
+      message_id = message.get("id") if isinstance(message, dict) else None
+      if not slots.acquire(blocking=False):
+        send(_error(message_id, -32000, "Server busy; request was not executed."))
+        continue
+      try:
+        workers.submit(_dispatch_in_child, message).add_done_callback(
+          lambda future, message_id=message_id: finish(future, message_id)
+        )
+      except Exception:
+        slots.release()
+        send(_error(message_id, -32603, "Internal error"))
 
 
 def _cli_call(argv: list[str]) -> int:
@@ -1837,6 +2235,8 @@ if __name__ == "__main__":
   # Stdio server mode is intentionally argument-free. Any argument means a
   # human/provider invoked the CLI seam and must receive bounded validation;
   # a typo must not silently become a server waiting forever on stdin.
+  if sys.argv[1:] == ["--dispatch-message"]:
+    raise SystemExit(_dispatch_message_cli())
   if len(sys.argv) > 1:
     raise SystemExit(_cli_call(sys.argv[1:]))
   serve(sys.stdin, sys.stdout)

@@ -20,7 +20,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { createTaggedChat, attachCleanup } from './_chatTracker.mjs'
-import { mockAcceptedMessages } from './_mockAcceptedMessages.mjs'
+import { mockAcceptedMessages, releaseMockRoutesAfterEach } from './_mockAcceptedMessages.mjs'
 import * as paneModel from '../frontend/src/components/Shell/paneModel.js'
 import { DRAG_HOLD_HAPTIC_MS, PRESS_MENU_HOLD_MS } from '../frontend/src/components/Shell/dragController.js'
 import { settledBox } from './_geometry.mjs'
@@ -34,6 +34,7 @@ const PHONE = { width: 412, height: 760 }
 
 test.use({ serviceWorkers: 'block' })
 attachCleanup()
+releaseMockRoutesAfterEach()
 
 function builderSeed(tabs) {
   return paneModel.setViewMode(paneModel.seedFromFlatTabs(tabs), 'panes')
@@ -225,6 +226,12 @@ function twoChatPanes(chatA, chatB) {
 async function waitTiled(page) {
   await expect(page.locator('.workspace__chrome')).toHaveCount(1, { timeout: 8000 })
   await expect(page.locator('.workspace__divider').first()).toBeVisible({ timeout: 8000 })
+  // A chat tab reads "Chat" until the chat list names it, then widens to its
+  // title and pushes every later tab sideways. The strip can sit still for many
+  // frames before the list arrives, so a frame settle alone can hand out
+  // placeholder geometry; wait for every fixture chat to carry its title.
+  await expect(page.locator('[data-pane-strip] .shell__tab-open[title="Chat"]'))
+    .toHaveCount(0, { timeout: 8000 })
   await page.evaluate(() => new Promise(r =>
     requestAnimationFrame(() => requestAnimationFrame(r))))
   await waitStripSettled(page)
@@ -1655,21 +1662,37 @@ test.describe('Workspace view-mode toggle', () => {
     const builderScroll = builderSurface.locator('.chat__scroll')
     await expect(builderScroll).toBeVisible({ timeout: 15000 })
 
-    const previousWriteAt = await page.evaluate(
-      id => JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]?.at || 0,
-      String(a.id),
-    )
-    await builderScroll.evaluate((scroll) => {
+    // One reader scroll: pointer contact around a scrollTop write. It returns
+    // the last saved-position time read in the same task, before the gesture,
+    // so an earlier write that lands late cannot pass for this gesture's.
+    const readerScroll = target => builderScroll.evaluate((scroll, { id, target }) => {
+      const previousAt =
+        JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]?.at || 0
       scroll.dispatchEvent(new PointerEvent('pointerdown', {
         bubbles: true,
         pointerType: 'mouse',
       }))
-      scroll.scrollTop = Math.floor(scroll.scrollHeight / 3)
+      scroll.scrollTop = target === 'top' ? 0 : Math.floor(scroll.scrollHeight / 3)
       scroll.dispatchEvent(new PointerEvent('pointerup', {
         bubbles: true,
         pointerType: 'mouse',
       }))
-    })
+      return previousAt
+    }, { id: String(a.id), target })
+
+    // Builder can restore through the anchor-addressed read, whose window
+    // starts one row above the saved tail row. There every scrollTop is the
+    // physical tail, so a "one third" gesture correctly becomes FOLLOW_BOTTOM.
+    // Page in the whole seeded history so one third is a real reading position.
+    await expect.poll(async () => {
+      if (await builderSurface.locator('.chat__msg[data-key="workspace-reading-0"]').count()) {
+        return true
+      }
+      await readerScroll('top')
+      return false
+    }, { timeout: 15000 }).toBe(true)
+
+    const previousWriteAt = await readerScroll('third')
     await page.waitForFunction(({ id, after }) => (
       (JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]?.at || 0) > after
     ), { id: String(a.id), after: previousWriteAt })
@@ -1681,13 +1704,24 @@ test.describe('Workspace view-mode toggle', () => {
       const { at: _at, ...saved } =
         JSON.parse(localStorage.getItem('chat-reading-position') || '{}')[id]
       const wrapper = scroll.closest('[data-chat-world="builder"]')
+      // The reading position is the saved row's place in the viewport. Raw
+      // scrollTop is not: re-entry may legitimately mount a different loaded
+      // window (here the shared cache's anchored window without the older
+      // rows paged in above), which shifts scrollTop by those rows' height.
+      const row = saved.kind === 'ANCHOR_AT'
+        ? scroll.querySelector(`.chat__msg[data-key="${CSS.escape(saved.key)}"]`)
+        : null
       return {
-        top: scroll.scrollTop,
+        anchorTop: row
+          ? row.getBoundingClientRect().top - scroll.getBoundingClientRect().top
+          : null,
         saved,
         width: wrapper.getBoundingClientRect().width,
       }
     }, String(a.id))
     const before = await readBuilderState()
+    // The round trip must preserve a reader-chosen hold, not live follow.
+    expect(before.saved.kind).toBe('ANCHOR_AT')
 
     await brand.focus()
     await page.keyboard.press('Shift+Enter')
@@ -1705,8 +1739,10 @@ test.describe('Workspace view-mode toggle', () => {
     await expect(builderScroll).toHaveAttribute('data-scroll-mode', 'ANCHOR_AT', {
       timeout: 15000,
     })
-    expect(Math.abs((await builderScroll.evaluate(scroll => scroll.scrollTop)) - before.top))
-      .toBeLessThanOrEqual(8)
+    const afterReturn = await readBuilderState()
+    expect(afterReturn.saved).toEqual(before.saved)
+    expect(before.anchorTop).not.toBeNull()
+    expect(Math.abs(afterReturn.anchorTop - before.anchorTop)).toBeLessThanOrEqual(8)
   })
 
   // Regression (item 0): a genuine MULTI-PANE exit via the real POINTER-HOLD

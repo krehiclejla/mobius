@@ -2,14 +2,9 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: MsgContent } = await vite.ssrLoadModule(
   '/src/components/ChatView/MsgContent.jsx',
 )
@@ -30,11 +25,15 @@ const { default: DocumentAttachment, markdownCardExcerpt } = await vite.ssrLoadM
 const { default: AssistantReply } = await vite.ssrLoadModule(
   '/src/components/ChatView/AssistantReply.jsx',
 )
+const { assistantReplyGroups } = await vite.ssrLoadModule(
+  '/src/components/ChatView/assistantReplies.js',
+)
 
 after(() => vite.close())
 
 const generatedMessage = {
   role: 'assistant',
+  id: 'assistant-file',
   content: '',
   blocks: [{
     type: 'generated_files',
@@ -269,7 +268,7 @@ for (const isStreaming of [true, false]) {
       status: 'done', input: '', output: '',
     }
     const html = renderToStaticMarkup(createElement(AssistantReply, {
-      replyGroup: { rows: [{ message: generatedMessage, key: 'assistant-file', anchorKey: 'assistant-file', notes: [] }] },
+      replyGroup: assistantReplyGroups([generatedMessage]).get(0),
       activeMirrorMsg: { ...generatedMessage, blocks: [peer, ...rawBlocks] },
       activitySourceBlocks: rawBlocks,
       useDbActivePayload: false,

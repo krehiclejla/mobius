@@ -20,3 +20,10 @@ export const SOURCE_TYPE_ICONS = Object.freeze({
 export function iconKindForSource(sourceType) {
   return SOURCE_TYPE_ICONS[sourceType] ?? 'default'
 }
+
+export function mergeNotificationRows(history, sessionNotices) {
+  return [...sessionNotices, ...history].sort((a, b) => (
+    Date.parse(b.sent_at) - Date.parse(a.sent_at)
+    || String(b.id).localeCompare(String(a.id))
+  ))
+}

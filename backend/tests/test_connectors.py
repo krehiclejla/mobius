@@ -17,6 +17,11 @@ from app import models
 from app.database import SessionLocal, checked_out_connections
 from app.routes import connectors as connector_routes
 
+_UNBOUND_TEST_PLAN = dict(
+  owner_id=None, owner_epoch=None,
+  browser_grant_id=None,
+)
+
 
 def test_slug_auth_and_token_helpers_are_provider_consistent():
   assert core.slugify("Context7 Docs!") == "context7_docs"
@@ -530,6 +535,7 @@ def test_turn_plan_serves_both_providers_without_config_secrets():
   plan = core.build_turn_plan(
     _FakeDb(plan_source_rows),
     include_owner_connectors=True,
+    **_UNBOUND_TEST_PLAN,
   )
   assert plan is not None
 
@@ -568,6 +574,7 @@ def test_turn_plan_requires_explicit_owner_connector_access():
   assert core.build_turn_plan(
     _NoQueryDb(),
     include_owner_connectors=False,
+    **_UNBOUND_TEST_PLAN,
   ) is None
 
 
@@ -807,6 +814,7 @@ def test_unhealthy_connection_cannot_be_enabled_planned_or_brokered(
   assert core.build_turn_plan(
     db,
     include_owner_connectors=True,
+    **_UNBOUND_TEST_PLAN,
   ) is None
   capability = core.mint_broker_capability(row.id, row.capability_id)
   with TestClient(client.app, client=("127.0.0.1", 43100)) as loopback:
@@ -930,7 +938,9 @@ def test_refresh_transient_failure_keeps_last_known_health(
   assert "Could not reach" in body["status_detail"]
   assert body["est_tokens"] == 1200
   db.expire_all()
-  assert core.build_turn_plan(db, include_owner_connectors=True) is not None
+  assert core.build_turn_plan(
+    db, include_owner_connectors=True, **_UNBOUND_TEST_PLAN,
+  ) is not None
 
   async def definitive_probe(*_args, **_kwargs):
     raise core.ConnectorError(
@@ -945,7 +955,9 @@ def test_refresh_transient_failure_keeps_last_known_health(
   assert rejected.status_code == 200
   assert rejected.json()["status"] == "error"
   db.expire_all()
-  assert core.build_turn_plan(db, include_owner_connectors=True) is None
+  assert core.build_turn_plan(
+    db, include_owner_connectors=True, **_UNBOUND_TEST_PLAN,
+  ) is None
 
   # A blip while already latched keeps the definitive diagnosis so the owner
   # still sees the real reason, not a generic transport message.

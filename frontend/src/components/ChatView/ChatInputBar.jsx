@@ -70,31 +70,36 @@
  * ║      turn when possible, otherwise it sends normally.            ║
  * ║      Shift+Enter always inserts a newline.                        ║
  * ║                                                                  ║
- * ║   8. SENT-MESSAGE HISTORY                                        ║
- * ║      Up recalls sent messages only after native textarea movement ║
- * ║      has reached the visual top; once browsing, Up/Down walk       ║
- * ║      history and Down past the newest restores the unfinished     ║
- * ║      draft. Manual edits and sends exit history. Modifier chords   ║
- * ║      and IME composition stay native.                              ║
+ * ║   8. MESSAGE HISTORY AND QUEUED EDITS                            ║
+ * ║      Up walks queued messages (newest first), then sent ones;    ║
+ * ║      Down comes back to the draft. They switch only from the     ║
+ * ║      top or bottom line; elsewhere the caret moves natively.     ║
+ * ║      The draft, with its attached files, is kept until it is     ║
+ * ║      sent: edits to browsed messages survive moves and Esc       ║
+ * ║      drops them. Enter saves a queued message in place or sends  ║
+ * ║      an earlier one again without the draft's files, then the    ║
+ * ║      draft returns. The queue's pencil opens its message here    ║
+ * ║      too. Modifier chords and IME composition stay native.       ║
  * ║                                                                  ║
  * ╚══════════════════════════════════════════════════════════════════╝
  */
 
 import { useRef, useState, useEffect, useLayoutEffect } from 'react'
-import ImageLightbox from './markdown/ImageLightbox.jsx'
-import ChatPanePortal from './ChatPanePortal.jsx'
-import { useHistoryDismiss } from '../../hooks/useHistoryDismiss.jsx'
+import FileChips from './FileChips.jsx'
 import { ArrowUp, DoubleChevronRight, Stop } from '@openai/apps-sdk-ui/components/Icon'
-import { BASE } from '../../api/client.js'
-import { mediaTokenParam } from '../../api/mediaToken.js'
 import {
-  composerHistoryNativeProbe,
+  composerHistoryDirection,
+  composerHistoryKeyPlan,
   composerHistoryProbeReachedBoundary,
-  resolveComposerHistoryMove,
 } from './composerHistory.js'
+import useComposerHistory from './hooks/useComposerHistory.js'
+import ComposerHistoryStrip, { composerHistoryKeyHint } from './ComposerHistoryStrip.jsx'
 import {
+  composerFormattingMarker,
   isPlainTextPasteShortcut,
+  linkPasteText,
   resolveComposerEnterAction,
+  wrapComposerSelection,
 } from './composerShortcuts.js'
 import { isTouchPrimary } from '../../lib/pointerPrimary.js'
 import ComposerMicIcon from './ComposerMicIcon.jsx'
@@ -126,6 +131,7 @@ import {
 } from './markdownClipboard.js'
 import {
   textareaUsesNativeSizing,
+  textareaHasWrappedLines,
   syncComposerTallState,
 } from './composerTextareaSizing.js'
 import {
@@ -152,7 +158,7 @@ import {
  *  target. Its glyph stack stays mounted so CSS can finish the directional
  *  glyph before Stop appears, without timing state in React. Send → Steer
  *  remains immediate. Mic stays distinct as the idle input affordance. */
-function PrimaryActionGlyphs({ action }) {
+export function PrimaryActionGlyphs({ action }) {
   return (
     <span className={`chat__action-glyphs chat__action-glyphs--${action}`} aria-hidden="true">
       <ArrowUp className="chat__action-glyph chat__action-glyph--send" width={24} height={24} />
@@ -162,12 +168,19 @@ function PrimaryActionGlyphs({ action }) {
   )
 }
 
-function PrimaryAction({
+export function PrimaryAction({
   sending, listening, hasInput, hasUploading, showSteer, steerReady,
-  submissionBlocked, questionBlocked,
+  submissionBlocked, questionBlocked, savesQueued = false, resendsHistory = false,
   onSubmit, onStop, onSteer, onToggleVoice,
 }) {
-  if (!questionBlocked && sending && !hasInput && showSteer) {
+  // A queued message open in the chat box is saved in place. That edits the
+  // queue rather than sending, so a running turn, a waiting question card, and
+  // the draft's own uploads leave the button to it; the save reports anything
+  // that blocks it (an empty edit included) in the history strip.
+  // A recalled sent message resends without the draft's files (`fromHistory`),
+  // so those uploads don't block it either.
+  const holdsQueuedEdit = savesQueued && !listening
+  if (!holdsQueuedEdit && !questionBlocked && sending && !hasInput && showSteer) {
     return (
       <button
         key="primary"
@@ -189,7 +202,7 @@ function PrimaryAction({
   }
   // A pending question is a protocol barrier, not queueable work. Keep the
   // draft editable, but let Stop outrank Send until the card is answered.
-  if (questionBlocked || (sending && !hasInput)) {
+  if (!holdsQueuedEdit && (questionBlocked || (sending && !hasInput))) {
     return (
       <button
         key="primary"
@@ -208,7 +221,7 @@ function PrimaryAction({
       </button>
     )
   }
-  if (hasInput && !listening) {
+  if (holdsQueuedEdit || (hasInput && !listening)) {
     return (
       <button
         key="primary"
@@ -223,13 +236,13 @@ function PrimaryAction({
         onPointerDown={(e) => e.preventDefault()}
         onTouchEnd={(e) => { e.preventDefault(); onSubmit(e) }}
         onClick={onSubmit}
-        aria-label="Send"
+        aria-label={holdsQueuedEdit ? 'Save queued message' : 'Send'}
         // Offline is deliberately NOT a disable here. A send composed offline is
         // recorded in the durable outbox (chatOutbox) and auto-replays on
         // reconnect, so the button must reach doSend just like the Enter path
         // (canSubmit ignores offline). Gating it on `offline` was a leftover
         // from the old online-only composer and silently swallowed offline taps.
-        disabled={hasUploading || submissionBlocked}
+        disabled={!holdsQueuedEdit && ((hasUploading && !resendsHistory) || submissionBlocked)}
       >
         <PrimaryActionGlyphs action="send" />
       </button>
@@ -251,190 +264,6 @@ function PrimaryAction({
 }
 
 
-/** File-upload chips (rendered above the input row when files exist). */
-/** Classifies a file by extension into a colored badge variant.
- *  Returns {kind, label} where kind = 'pdf' | 'doc' | 'code' and
- *  label is the short tag shown inside the badge. */
-function classifyFile(name) {
-  const ext = (name.split('.').pop() || '').toLowerCase()
-  if (ext === 'pdf') return { kind: 'pdf', label: 'PDF' }
-  if (['doc', 'docx', 'rtf', 'odt'].includes(ext)) return { kind: 'doc', label: 'DOC' }
-  if (['xls', 'xlsx', 'csv', 'tsv'].includes(ext)) return { kind: 'doc', label: 'XLS' }
-  if (['ppt', 'pptx'].includes(ext)) return { kind: 'doc', label: 'PPT' }
-  if (['md', 'markdown', 'txt'].includes(ext)) return { kind: 'doc', label: 'TXT' }
-  if (['zip', 'tar', 'gz', 'rar', '7z'].includes(ext)) return { kind: 'doc', label: 'ZIP' }
-  return { kind: 'code', label: (ext || 'FILE').toUpperCase().slice(0, 4) }
-}
-
-/** Strip the trailing `.ext` so the visible name reads like a label
- *  rather than a file. The badge already communicates the type
- *  (PDF / DOC / TXT / etc.), so the extension is redundant and just
- *  eats horizontal room on a fixed-width card. Leaves names
- *  without a dot untouched and
- *  preserves any earlier dots in the name (e.g. `report.v2.pdf`
- *  → `report.v2`). */
-function stripExt(name) {
-  if (!name) return name
-  const idx = name.lastIndexOf('.')
-  if (idx <= 0) return name
-  return name.slice(0, idx)
-}
-
-/** Fixed-box attach cards rendered inside the pill above the input
- *  row when files are attached. Two variants:
- *   - image (PNG/JPEG/etc.): 72×72 square thumbnail; the image IS
- *     the identifier so no filename label.
- *   - file (PDF/DOC/code): 168px-wide rectangle with a colored
- *     type badge and the filename below.
- *  The remove `×` is a 20×20 button floating at the card's top-
- *  right corner (half-overlapping outside). */
-function FileChips({ files, onRemove, chatId }) {
-  const trayRef = useRef(null)
-  const [tokenState, setTokenState] = useState({
-    chatId: null,
-    param: '',
-    failed: false,
-  })
-  // Index into the attached-image gallery currently shown full-screen.
-  const [lightboxIndex, setLightboxIndex] = useState(null)
-  const historyDismiss = useHistoryDismiss(() => setLightboxIndex(null))
-  const hasRestoredImage = files?.some(file => (
-    file.mime_type?.startsWith('image/') && !file.objectUrl
-  ))
-
-  useEffect(() => {
-    if (!hasRestoredImage || !chatId) {
-      setTokenState({ chatId: null, param: '', failed: false })
-      return undefined
-    }
-    let cancelled = false
-    setTokenState({ chatId, param: '', failed: false })
-    mediaTokenParam(chatId).then(param => {
-      if (!cancelled) setTokenState({ chatId, param, failed: !param })
-    }).catch(() => {
-      if (!cancelled) setTokenState({ chatId, param: '', failed: true })
-    })
-    return () => { cancelled = true }
-  }, [chatId, hasRestoredImage])
-
-  // Never reuse a previous chat's token during the effect boundary.
-  const currentTokenState = tokenState.chatId === chatId
-    ? tokenState
-    : { param: '', failed: false }
-
-  if (!files?.length) return null
-
-  const cards = files.map(chip => {
-    const isImage = !!chip.objectUrl || chip.mime_type?.startsWith('image/')
-    const previewSrc = chip.objectUrl || (
-      isImage && currentTokenState.param
-        ? `${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(chip.name)}${currentTokenState.param}`
-        : ''
-    )
-    return {
-      chip,
-      isImage,
-      previewSrc,
-      previewFailed: !!(isImage && !chip.objectUrl && currentTokenState.failed),
-    }
-  })
-  // Every viewable attached image, in tray order, so the full-screen
-  // viewer can page/swipe between them like a sent-message gallery. Each
-  // card records its own gallery position: two attachments can share a
-  // preview URL (same restored filename), so looking the index up by src
-  // would open the wrong one.
-  const gallery = []
-  for (const card of cards) {
-    if (!card.isImage || !card.previewSrc) continue
-    card.galleryIndex = gallery.length
-    gallery.push({ src: card.previewSrc, alt: card.chip.name })
-  }
-  // Removing an attachment while open can invalidate the index; treat
-  // an out-of-range index as closed rather than showing the wrong image.
-  const openIndex = lightboxIndex !== null && lightboxIndex < gallery.length
-    ? lightboxIndex
-    : null
-
-  return (
-    <div ref={trayRef} className="chat__attach-tray">
-      {cards.map(({ chip, isImage, previewSrc, previewFailed, galleryIndex }) => {
-        const cls = classifyFile(chip.name || '')
-        const errorMark = chip.status === 'error' ? ' chat__attach-card--error' : ''
-        return (
-          <div
-            key={chip.id}
-            className={
-              'chat__attach-card'
-              + (isImage ? ' chat__attach-card--image' : ' chat__attach-card--file')
-              + errorMark
-            }
-            title={previewFailed
-              ? `${chip.name} — preview unavailable; attachment is still ready to send`
-              : (chip.status === 'error' ? chip.error : chip.name)}
-          >
-            {isImage && previewSrc ? (
-              <button
-                type="button"
-                className="chat__attach-card-thumb-button"
-                // Preserve the textarea until the dialog mounts. The shared
-                // lightbox then moves focus into itself deliberately and
-                // restores this button/text-entry context when it closes.
-                onPointerDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  historyDismiss.open()
-                  setLightboxIndex(galleryIndex)
-                }}
-                aria-label={`Preview ${chip.name}`}
-              >
-                <img className="chat__attach-card-thumb" src={previewSrc} alt="" />
-              </button>
-            ) : previewFailed ? (
-              <span className="chat__attach-card-preview-error" role="status">
-                Preview unavailable
-              </span>
-            ) : isImage ? (
-              <span className="chat__attach-card-spin" aria-hidden="true" />
-            ) : (
-              <>
-                <span className={`chat__attach-card-icon chat__attach-card-icon--${cls.kind}`}>
-                  {cls.label}
-                </span>
-                <span className="chat__attach-card-name">{stripExt(chip.name)}</span>
-              </>
-            )}
-            {chip.status === 'uploading' && (
-              <span className="chat__attach-card-spin" aria-hidden="true" />
-            )}
-            <button
-              type="button"
-              className="chat__attach-card-remove"
-              // Keep the soft keyboard up — without preventDefault on
-              // pointerdown the tap shifts focus off the textarea and
-              // iOS collapses the keyboard. Matches the same trick
-              // used on the `+` trigger, the popover rows, and every
-              // other interactive element inside the composer.
-              onPointerDown={(e) => e.preventDefault()}
-              onClick={() => onRemove(chip.id)}
-              aria-label={`Remove ${chip.name}`}
-            >×</button>
-          </div>
-        )
-      })}
-      {openIndex !== null && <ChatPanePortal anchorRef={trayRef}>
-        <ImageLightbox
-          src={gallery[openIndex].src}
-          alt={gallery[openIndex].alt}
-          items={gallery}
-          index={openIndex}
-          onNavigate={setLightboxIndex}
-          onClose={historyDismiss.close}
-        />
-      </ChatPanePortal>}
-    </div>
-  )
-}
-
-
 /**
  * The input bar. Composes:
  *   • File-upload chips (above the input row)
@@ -447,9 +276,13 @@ function FileChips({ files, onRemove, chatId }) {
  *   input              — current textarea value
  *   onInputChange      — receives new string
  *   onInputIntent      — runs after the controlled draft accepts an edit
- *   onSubmit           — called with FormEvent | MouseEvent | TouchEvent
+ *   onSubmit           — called with FormEvent | MouseEvent | TouchEvent and
+ *                        `{ fromHistory }`: true when the box holds an
+ *                        earlier message, whose send leaves the draft's
+ *                        attached files in the composer (contract 8)
  *   onSubmitSteer      — submits composed text and immediately steers
- *                        it when a live turn can accept steering
+ *                        it when a live turn can accept steering; same
+ *                        second argument as onSubmit
  *   inputRef           — for caller to focus/blur (e.g. dismiss keyboard)
  *   sending            — agent is currently streaming
  *   listening          — voice input active
@@ -493,7 +326,17 @@ function FileChips({ files, onRemove, chatId }) {
  *   questionBlocked    — true while an unanswered owner question holds the
  *                        turn; the draft stays editable and Stop owns the
  *                        primary action until the card is answered.
- *   messageHistory     — visible owner-authored message text, oldest first.
+ *   messageHistory     — sent owner messages as composerHistory entries,
+ *                        oldest first (composerHistoryFromMessages).
+ *   queuedMessages     — visible queued rows; ↑ and the pencil open them here.
+ *   onSaveQueued       — the queue's save, (cid, text) → outcome string.
+ *   draftAside         — { set, take }: keeps the draft stored while history
+ *                        shows another message, and hands it back.
+ *   queuedComposerRef  — caller-owned ref. The bar installs
+ *                        `{ open(cid), setAside(cid) }` so the queue tray's
+ *                        pencil and × reach the chat box.
+ *   onQueuedInComposerChange — receives the cid of the queued message the
+ *                        box is editing, or null, for the tray's tag.
  *   provider           — the chat's provider id ('claude' | 'codex'). Filters
  *                        the "/" menu to commands that actually dispatch on it;
  *                        provider-specific commands stay hidden while unknown.
@@ -533,12 +376,15 @@ export default function ChatInputBar({
   attachTriggerRef,
   attachmentsDisabled = false,
   messageHistory = [],
+  queuedMessages = [],
+  onSaveQueued,
+  draftAside,
+  queuedComposerRef,
+  onQueuedInComposerChange,
   provider,
   projectRef = null,
 }) {
   const fileInputRef = useRef(null)
-  const historyIndexRef = useRef(null)
-  const historyDraftRef = useRef('')
   const pendingComposerCaretRef = useRef(null)
   const historyProbeVersionRef = useRef(0)
   const pasteAsPlainTextRef = useRef(false)
@@ -610,7 +456,7 @@ export default function ChatInputBar({
   function acceptFileMention(file) {
     if (!file || !mention) return
     const next = applyFileMention(input, mention, mentionAgentPath(projectRef?.root_path, file.path))
-    resetMessageHistory()
+    noteComposerEdit()
     if (listeningRef?.current) onManualVoiceEdit?.(next)
     onInputChange(next)
     focusComposerElement(inputRef?.current)
@@ -641,20 +487,69 @@ export default function ChatInputBar({
     }
   }, [attachTriggerRef, attachmentsDisabled, inputRef])
 
-  function resetMessageHistory() {
+  // Typing, dictation, paste, and the menus edit whatever the box holds — the
+  // draft or a browsed message — without leaving history (contract 8).
+  function noteComposerEdit() {
     historyProbeVersionRef.current += 1
-    historyIndexRef.current = null
-    historyDraftRef.current = ''
     pendingComposerCaretRef.current = null
+    composerHistory.noteEdit()
   }
 
-  // Never carry a traversal or its saved draft into another chat. History
-  // list refreshes deliberately do not reset this: a queued message can move
-  // into the transcript while the owner is browsing, and that must not erase
-  // the draft that Down will restore.
+  // History moves, queued saves, and the returning draft all put text in the
+  // box through this one path, with the same voice rebase and controlled
+  // caret handoff as other programmatic edits.
+  function showComposerValue(value) {
+    historyProbeVersionRef.current += 1
+    pendingComposerCaretRef.current = { value, caret: value.length }
+    if (listeningRef?.current) {
+      onManualVoiceEdit?.(value)
+    }
+    onInputChange(value)
+    // Moving between entries can resolve to the value already shown, so React
+    // may not commit a render for the caret layout effect below.
+    const textarea = inputRef?.current
+    if (textarea && textarea.value === value) {
+      try { textarea.setSelectionRange(value.length, value.length) } catch {}
+      pendingComposerCaretRef.current = null
+    }
+  }
+
+  // The hook resets itself when the chat changes, so a traversal or its saved
+  // draft never carries into another chat. History list refreshes do not
+  // reset it: a queued message can start while the owner is browsing, and that
+  // must not erase the draft that Down will restore.
+  const composerHistory = useComposerHistory({
+    chatId,
+    value: input,
+    sentHistory: messageHistory,
+    queuedMessages,
+    showValue: showComposerValue,
+    saveQueued: onSaveQueued,
+    draftAside,
+  })
+  const { open: openInComposer, setAside: setAsideFromComposer } = composerHistory
+
+  // The queue tray is ChatView's sibling of this bar; its pencil and × reach
+  // the box through this caller-owned ref, like attachTriggerRef above.
+  useLayoutEffect(() => {
+    if (!queuedComposerRef) return undefined
+    queuedComposerRef.current = {
+      open: (cid) => {
+        openInComposer(cid)
+        // Focus inside the tap so iOS keeps (or raises) the soft keyboard.
+        focusComposerElement(inputRef?.current)
+      },
+      setAside: setAsideFromComposer,
+    }
+    return () => { queuedComposerRef.current = null }
+  }, [queuedComposerRef, openInComposer, setAsideFromComposer, inputRef])
+
+  // The tray tags the row open here; a chat box that goes away takes its
+  // tag with it.
   useEffect(() => {
-    resetMessageHistory()
-  }, [chatId])
+    onQueuedInComposerChange?.(composerHistory.queuedKey)
+    return () => onQueuedInComposerChange?.(null)
+  }, [composerHistory.queuedKey, onQueuedInComposerChange])
 
   // Programmatic composer edits arrive through the controlled value boundary.
   // Restore their caret after React commits without changing focus or scroll.
@@ -662,7 +557,7 @@ export default function ChatInputBar({
     const pending = pendingComposerCaretRef.current
     const textarea = inputRef?.current
     if (!pending || pending.value !== input || !textarea) return
-    try { textarea.setSelectionRange(pending.caret, pending.caret) } catch {}
+    try { textarea.setSelectionRange(pending.anchor ?? pending.caret, pending.caret) } catch {}
     pendingComposerCaretRef.current = null
   }, [input, inputRef])
 
@@ -714,7 +609,7 @@ export default function ChatInputBar({
 
   function handleTextareaChange(e) {
     const value = e.target.value
-    resetMessageHistory()
+    noteComposerEdit()
     if (listeningRef?.current) onManualVoiceEdit?.(value)
     onInputChange(value)
     onInputIntent?.(e.nativeEvent)
@@ -732,16 +627,22 @@ export default function ChatInputBar({
       return
     }
 
-    const pastedText = assistantClipboardText(
+    const textarea = e.currentTarget
+    const selectionStart = textarea.selectionStart
+    const selectionEnd = textarea.selectionEnd
+    // A web address pasted over selected text links that text; the plain-text
+    // chord (Cmd/Ctrl+Shift+V) always pastes exactly what was copied.
+    const linkText = preferPlainText ? null : linkPasteText(
+      textarea.value.slice(selectionStart, selectionEnd),
+      e.clipboardData?.getData?.('text/plain'),
+    )
+    const pastedText = linkText ?? assistantClipboardText(
       e.clipboardData,
       preferPlainText,
     )
     if (pastedText === null) return
 
     e.preventDefault()
-    const textarea = e.currentTarget
-    const selectionStart = textarea.selectionStart
-    const selectionEnd = textarea.selectionEnd
     const pasteEvent = e.nativeEvent
     const applyControlledFallback = () => {
       // Some embedded browsers reject the native editing command. Keep the
@@ -752,7 +653,7 @@ export default function ChatInputBar({
         selectionEnd,
         pastedText,
       )
-      resetMessageHistory()
+      noteComposerEdit()
       pendingComposerCaretRef.current = next
       if (listeningRef?.current) onManualVoiceEdit?.(next.value)
       onInputChange(next.value)
@@ -763,10 +664,38 @@ export default function ChatInputBar({
     applyControlledFallback()
   }
 
+  // Cmd/Ctrl+B, I and E wrap the selection through the same undo-safe edit as
+  // paste, then select the wrapped text (or its placeholder) to type over.
+  function applyComposerFormatting(textarea, marker) {
+    const edit = wrapComposerSelection(
+      textarea.value,
+      textarea.selectionStart,
+      textarea.selectionEnd,
+      marker,
+    )
+    const selectWrappedText = () => {
+      try { textarea.setSelectionRange(edit.selectionStart, edit.selectionEnd) } catch {}
+    }
+    const applyControlledFallback = () => {
+      noteComposerEdit()
+      pendingComposerCaretRef.current = {
+        value: edit.value,
+        anchor: edit.selectionStart,
+        caret: edit.selectionEnd,
+      }
+      if (listeningRef?.current) onManualVoiceEdit?.(edit.value)
+      onInputChange(edit.value)
+    }
+    if (queueClipboardTextUndoably(
+      textarea, edit.text, applyControlledFallback, selectWrappedText,
+    )) return
+    applyControlledFallback()
+  }
+
   function acceptSlashCommand(command) {
     if (!command || !slashCommandIsAvailable(command, provider)) return
     const value = applySlashCommand(command)
-    resetMessageHistory()
+    noteComposerEdit()
     if (listeningRef?.current) onManualVoiceEdit?.(value)
     onInputChange(value)
     // The textarea never lost focus (rows suppress pointerdown), but a click
@@ -812,66 +741,52 @@ export default function ChatInputBar({
       return
     }
 
-    function applyHistoryMove(historyMove) {
-      historyIndexRef.current = historyMove.index
-      historyDraftRef.current = historyMove.draft
-      pendingComposerCaretRef.current = {
-        value: historyMove.value,
-        caret: historyMove.value.length,
-      }
-      if (listeningRef?.current) {
-        onManualVoiceEdit?.(historyMove.value)
-      }
-      onInputChange(historyMove.value)
-      // At the oldest entry another Up resolves to the same controlled value,
-      // so React may not commit a render for the layout effect above.
-      if (historyMove.value === input) {
-        try {
-          inputRef?.current?.setSelectionRange(
-            historyMove.value.length,
-            historyMove.value.length,
-          )
-        } catch {}
-        pendingComposerCaretRef.current = null
-      }
-    }
-
-    const historyMove = resolveComposerHistoryMove(e, {
-      history: messageHistory,
-      index: historyIndexRef.current,
-      draft: historyDraftRef.current,
-      value: input,
-    })
-    if (historyMove) {
+    const formattingMarker = composerFormattingMarker(e)
+    if (formattingMarker) {
       e.preventDefault()
-      applyHistoryMove(historyMove)
+      applyComposerFormatting(e.currentTarget, formattingMarker)
       return
     }
 
-    const historyProbe = composerHistoryNativeProbe(e, {
-      history: messageHistory,
-      index: historyIndexRef.current,
+    // Esc gives the box back to the draft and drops kept edits. Outside
+    // history it stays native; the menus above already claimed theirs.
+    if (
+      e.key === 'Escape'
+      && composerHistory.browsing
+      && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
+      && !e.isComposing && !e.nativeEvent?.isComposing
+    ) {
+      e.preventDefault()
+      composerHistory.escape()
+      return
+    }
+
+    const historyDirection = composerHistoryDirection(e)
+    const historyPlan = historyDirection && composerHistoryKeyPlan(e, {
+      direction: historyDirection,
       value: input,
+      // Only ↑ uses it, and only a non-empty box needs the layout read.
+      linesWrap: historyDirection !== 'older' || !input
+        || textareaHasWrappedLines(e.target),
     })
-    if (historyProbe) {
+    if (historyPlan?.when === 'now') {
+      if (composerHistory.move(historyDirection)) e.preventDefault()
+      return
+    }
+    const canMoveHistory = historyDirection === 'older'
+      ? composerHistory.hasEntries
+      : composerHistory.browsing
+    if (historyPlan?.when === 'after-native' && canMoveHistory) {
+      // Let the browser move the caret first; switch only if it was already
+      // on the edge line. A later edit or move invalidates this probe.
+      const probe = historyPlan.probe
       const probeVersion = ++historyProbeVersionRef.current
       requestAnimationFrame(() => {
-        const textarea = inputRef?.current
         if (
           historyProbeVersionRef.current !== probeVersion
-          || !composerHistoryProbeReachedBoundary(historyProbe, textarea)
+          || !composerHistoryProbeReachedBoundary(probe, inputRef?.current)
         ) return
-        const deferredMove = resolveComposerHistoryMove({
-          key: 'ArrowUp',
-          target: textarea,
-        }, {
-          history: messageHistory,
-          index: historyIndexRef.current,
-          draft: historyDraftRef.current,
-          value: input,
-          nativeBoundary: true,
-        })
-        if (deferredMove) applyHistoryMove(deferredMove)
+        composerHistory.move(historyDirection)
       })
       return
     }
@@ -885,36 +800,52 @@ export default function ChatInputBar({
     })
     if (!action) return
     e.preventDefault()
-    if (action === 'steer') {
-      resetMessageHistory()
-      onSteer()
+    if (action === 'submit' || action === 'submit-steer') {
+      submitComposer(e, { steer: action === 'submit-steer' })
       return
     }
-    if (action === 'submit-steer') {
-      if (canSubmit) {
-        resetMessageHistory()
-        onSubmitSteer(e)
-      }
+    // An empty box asks to steer queued work — unless a message is open here:
+    // then Enter belongs to that message (an empty queued edit explains why
+    // it can't be saved).
+    if (composerHistory.browsing) {
+      if (composerHistory.position?.kind === 'queued') composerHistory.submit()
       return
     }
-    if (action === 'submit') {
-      if (canSubmit) {
-        resetMessageHistory()
-        onSubmit(e)
-      }
-    }
+    if (action === 'steer') onSteer()
   }
 
-  function handleSubmit(e) {
-    if (!canSubmit) {
+  // Enter and the send button. A queued message open here is saved in place
+  // of the original; anything else is sent as a new message, and a draft set
+  // aside by history comes back once that send clears the box. The draft's
+  // attached files belong to the draft, so an earlier message sent again from
+  // history goes without them (`fromHistory`).
+  function submitComposer(e, { steer = false } = {}) {
+    const savesQueued = composerHistory.position?.kind === 'queued'
+    if (!savesQueued && !canSubmit) {
       e?.preventDefault?.()
       return
     }
-    resetMessageHistory()
-    onSubmit(e)
+    const fromHistory = composerHistory.browsing
+    if (composerHistory.submit() === 'handled') {
+      e?.preventDefault?.()
+      return
+    }
+    if (steer) onSubmitSteer(e, { fromHistory })
+    else onSubmit(e, { fromHistory })
+  }
+
+  function handleSubmit(e) {
+    submitComposer(e)
   }
 
   const hasFiles = !!pendingFiles?.length
+  const touchPrimary = isTouchPrimary()
+  const historyKeyHint = composerHistoryKeyHint({
+    browsing: composerHistory.browsing,
+    hasEntries: composerHistory.hasEntries,
+    touch: touchPrimary,
+  })
+  const historyKeyHintId = `composer-history-keys-${chatId}`
 
   return (
     <form className="chat__form" onSubmit={handleSubmit}>
@@ -964,9 +895,17 @@ export default function ChatInputBar({
         listId={mentionListId}
         optionId={mentionOptionId}
       />
+      <ComposerHistoryStrip
+        position={composerHistory.position}
+        note={composerHistory.note}
+        saving={composerHistory.saving}
+        draftFileCount={pendingFiles?.length || 0}
+        touch={touchPrimary}
+        onBack={composerHistory.escape}
+      />
       <div className="chat__input-row">
         {leftButtons}
-        <div className={`chat__pill${hasFiles ? ' chat__pill--with-attach' : ''}`}>
+        <div className={`chat__pill${hasFiles ? ' chat__pill--with-attach' : ''}${hasFiles && composerHistory.browsing ? ' chat__pill--draft-aside' : ''}`}>
           {hasFiles && (
             <FileChips
               files={pendingFiles}
@@ -990,6 +929,7 @@ export default function ChatInputBar({
               onBlur={() => setSlashInputFocused(false)}
               placeholder="Message Möbius…"
               aria-label="Message Möbius…"
+              aria-describedby={historyKeyHint ? historyKeyHintId : undefined}
               name="message"
               autoComplete="off"
               rows={1}
@@ -1004,6 +944,9 @@ export default function ChatInputBar({
                 'aria-autocomplete': 'list',
               } : {})}
             />
+            {historyKeyHint && (
+              <span id={historyKeyHintId} className="chat__sr-only">{historyKeyHint}</span>
+            )}
             {rightButtons}
             <PrimaryAction
               sending={sending}
@@ -1014,6 +957,8 @@ export default function ChatInputBar({
               steerReady={steerReady}
               submissionBlocked={submissionBlocked}
               questionBlocked={questionBlocked}
+              savesQueued={composerHistory.position?.kind === 'queued'}
+              resendsHistory={composerHistory.browsing}
               onSubmit={handleSubmit}
               onStop={onStop}
               onSteer={onSteer}

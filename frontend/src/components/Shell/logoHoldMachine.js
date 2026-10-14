@@ -80,7 +80,7 @@ export const HOLD_HAPTIC_EXIT_MS = 8
 //   - the logo SPRING/SNAP is motion, SKIPPED under reduced motion (the haptic is
 //     not). The persistent state (180° twisted logo + tinted wordmark + faint
 //     static shared halo) plus the card-deal/pane-out are the durable confirmation,
-//     so there is deliberately NO toast or text label.
+//     so there is deliberately no notice or text label.
 export function runHoldCompletion({ vibrate, reducedMotion, entering, startFlourish }) {
   if (typeof vibrate === 'function') vibrate(entering ? HOLD_HAPTIC_ENTER_MS : HOLD_HAPTIC_EXIT_MS)
   if (!reducedMotion && typeof startFlourish === 'function') startFlourish(entering)

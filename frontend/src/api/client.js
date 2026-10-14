@@ -6,10 +6,12 @@
 import { del as idbDel } from 'idb-keyval'
 import * as setupSession from '../lib/setupSession.js'
 import { clearLatchedTokens } from '../lib/appToken.js'
+import { clearAppNavLocations } from '../lib/appNavLocationStore.js'
 import { clearOwnerDraftStorage } from '../lib/ownerDraftStorage.js'
 import { clearReadingPositions } from '../components/ChatView/scroll/readingPositions.js'
 import { clearDurableComposerDrafts } from '../components/ChatView/composerDraft.js'
 import { clearChatOutbox } from '../components/ChatView/chatOutbox.js'
+import { setActiveSharedBrowserGrantId, sharedBrowserCacheBuster } from '../lib/sharedBrowserWorkspace.js'
 import {
   reportNetworkReachable,
   verifyConnectivity,
@@ -36,6 +38,135 @@ let ephemeralAuthEnabled = false
 let ephemeralToken = null
 let ephemeralInstanceId = null
 let ephemeralSessionGeneration = 0
+// A shared-browser session is not an owner or an opaque chat embed. Its bearer
+// lives only in this document. The HttpOnly cookie behind renewal changes only
+// when this browser redeems an invitation or finalizes an account sign-in, and
+// renewal never rewrites it. Tabs therefore need no shared coordination: the
+// last sign-in wins and every other tab sees SHARED_ACCESS_GRANT_CHANGED on its
+// next renewal.
+let sharedBrowserEnabled = false
+let sharedBrowserToken = null
+let sharedBrowserGrantId = null
+let sharedBrowserExpiresAt = 0
+// Changes whenever this tab starts a sign-in or ends its session. Work begun
+// under one authority never installs a session or sends a request under another.
+let sharedBrowserAuthority = 0
+let sharedBrowserRenewal = null
+let sharedBrowserAccountFinalization = null
+let pendingSharedBrowserLogoutGrantId = null
+let sharedBrowserClosed = false
+
+export function beginSharedBrowserAuth() {
+  sharedBrowserEnabled = true
+  sharedBrowserClosed = false
+}
+
+export function isSharedBrowserAuth() { return sharedBrowserEnabled }
+
+function acceptSharedBrowserSession(data, { renewal = false } = {}) {
+  if (!data?.access_token || data.token_type?.toLowerCase() !== 'bearer'
+      || !data.grant?.id || !Number.isFinite(Number(data.expires_in))) {
+    throw new Error('SHARED_ACCESS_INVALID_SESSION')
+  }
+  if (renewal && sharedBrowserGrantId !== null
+      && String(data.grant.id) !== sharedBrowserGrantId) {
+    throw new Error('SHARED_ACCESS_GRANT_CHANGED')
+  }
+  sharedBrowserClosed = false
+  sharedBrowserToken = data.access_token
+  sharedBrowserGrantId = String(data.grant.id)
+  setActiveSharedBrowserGrantId(sharedBrowserGrantId)
+  sharedBrowserExpiresAt = Date.now() + Math.min(900, Number(data.expires_in)) * 1000
+  return data
+}
+
+function endSharedBrowserAuthority() {
+  sharedBrowserAuthority += 1
+  sharedBrowserClosed = true
+  sharedBrowserToken = null
+  sharedBrowserGrantId = null
+  setActiveSharedBrowserGrantId(null)
+  sharedBrowserExpiresAt = 0
+  sharedBrowserRenewal = null
+  sharedBrowserAccountFinalization = null
+}
+
+export function clearSharedBrowserSession() {
+  endSharedBrowserAuthority()
+  try { window.dispatchEvent(new CustomEvent('mobius:shared-browser-auth-ended')) } catch {}
+}
+
+async function sharedBrowserSessionRequest(path, body) {
+  const authority = sharedBrowserAuthority
+  const response = await fetch(`${BASE}/api/connect/browser-access/${path}`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  })
+  if (!response.ok) throw new Error('SHARED_ACCESS_ENDED')
+  const data = await response.json()
+  if (authority !== sharedBrowserAuthority) throw new Error('SHARED_ACCESS_SUPERSEDED')
+  return acceptSharedBrowserSession(data, { renewal: path === 'session' })
+}
+
+// A sign-in replaces this tab's current session before it starts, so nothing
+// can be sent with the previous grant while the new one is being established.
+function signInSharedBrowser(path, body) {
+  endSharedBrowserAuthority()
+  return sharedBrowserSessionRequest(path, body)
+}
+
+export function redeemSharedBrowserInvite(invite) {
+  if (!sharedBrowserEnabled || !invite) throw new Error('SHARED_ACCESS_INVALID_INVITE')
+  return signInSharedBrowser('session/redeem', { invite })
+}
+
+export function finalizeSharedBrowserAccount(pendingId) {
+  if (!sharedBrowserEnabled || !pendingId) throw new Error('SHARED_ACCESS_INVALID_ACCOUNT_FLOW')
+  // The pending sign-in is one-use. React's repeated effect setup must observe
+  // the same operation instead of spending it twice.
+  if (sharedBrowserAccountFinalization?.id === pendingId) {
+    return sharedBrowserAccountFinalization.promise
+  }
+  const operation = { id: pendingId }
+  operation.promise = signInSharedBrowser('session/account/finalize', { pending_id: pendingId })
+    .finally(() => {
+      if (sharedBrowserAccountFinalization === operation) sharedBrowserAccountFinalization = null
+    })
+  sharedBrowserAccountFinalization = operation
+  return operation.promise
+}
+
+export function renewSharedBrowserSession() {
+  if (!sharedBrowserEnabled) throw new Error('SHARED_ACCESS_NOT_ENABLED')
+  if (sharedBrowserClosed) throw new Error('SHARED_ACCESS_ENDED')
+  if (!sharedBrowserRenewal) {
+    const authority = sharedBrowserAuthority
+    const renewal = sharedBrowserSessionRequest('session').catch(error => {
+      if (sharedBrowserAuthority === authority) clearSharedBrowserSession()
+      throw error
+    }).finally(() => {
+      if (sharedBrowserRenewal === renewal) sharedBrowserRenewal = null
+    })
+    sharedBrowserRenewal = renewal
+  }
+  return sharedBrowserRenewal
+}
+
+export async function leaveSharedBrowserSession() {
+  const grantId = sharedBrowserGrantId || pendingSharedBrowserLogoutGrantId
+  if (!grantId) throw new Error('SHARED_ACCESS_LOGOUT_UNAVAILABLE')
+  pendingSharedBrowserLogoutGrantId = grantId
+  clearSharedBrowserSession()
+  const response = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_id: grantId }),
+  })
+  if (!response.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
+  if (pendingSharedBrowserLogoutGrantId === grantId) pendingSharedBrowserLogoutGrantId = null
+  return true
+}
 
 export function beginEphemeralAuth() {
   ephemeralAuthEnabled = true
@@ -65,7 +196,8 @@ export function clearEphemeralAuthSession() {
 // its per-chat cache entry atomically when that session changes, without
 // exposing or decoding the bearer itself.
 export function getAuthSessionCacheKey() {
-  return ephemeralAuthEnabled ? `embed:${ephemeralSessionGeneration}` : 'owner'
+  return sharedBrowserEnabled ? `shared:${sharedBrowserAuthority}`
+    : ephemeralAuthEnabled ? `embed:${ephemeralSessionGeneration}` : 'owner'
 }
 
 export function isEphemeralAuth() {
@@ -77,12 +209,19 @@ export function isEphemeralAuth() {
 // to decide between Shell / Login / SetupWizard — an uncaught throw
 // here would crash the splash. Wrap all three helpers defensively.
 export function getToken() {
+  if (sharedBrowserEnabled) return sharedBrowserToken
   if (ephemeralAuthEnabled) return ephemeralToken
   try { return localStorage.getItem('token') } catch { return null }
 }
 
 export function getAuthHeaders(extra = {}) {
   const token = getToken()
+  if (sharedBrowserEnabled) {
+    const safeExtra = Object.fromEntries(Object.entries(extra).filter(
+      ([name]) => name.toLowerCase() !== 'authorization',
+    ))
+    return { ...safeExtra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+  }
   return {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(ephemeralAuthEnabled && ephemeralInstanceId
@@ -93,11 +232,16 @@ export function getAuthHeaders(extra = {}) {
 }
 
 export function setToken(token) {
+  if (sharedBrowserEnabled) throw new Error('Owner token cannot be set in shared access')
   try { localStorage.setItem('token', token) } catch {}
   try { window.dispatchEvent(new Event(OWNER_TOKEN_CHANGED_EVENT)) } catch {}
 }
 
 export function clearToken() {
+  if (sharedBrowserEnabled) {
+    clearSharedBrowserSession()
+    return
+  }
   if (ephemeralAuthEnabled) {
     clearEphemeralAuthSession()
     return
@@ -149,6 +293,8 @@ function clearOwnerClientState({ preserveChatOutbox }) {
   // harmless shell preferences, they must not survive logout/token expiry and
   // appear in a later owner's session on the same browser.
   clearOwnerDraftStorage()
+  // Where each app was (a search query, an open item) is owner app data too.
+  clearAppNavLocations()
   // Media token cache is per-owner (tokens carry the owner's epoch). Clear
   // on logout so a new session doesn't inherit stale media tokens.
   try {
@@ -169,6 +315,7 @@ function clearOwnerClientState({ preserveChatOutbox }) {
 
 /** Remove every browser-local trace owned by the current signed-in owner. */
 export function clearQueryCache() {
+  if (sharedBrowserEnabled) return Promise.resolve()
   return clearOwnerClientState({ preserveChatOutbox: false })
 }
 
@@ -179,6 +326,10 @@ export function clearQueryCache() {
  * it with the rest of the owner-scoped browser state.
  */
 export async function clearExpiredOwnerSession() {
+  if (sharedBrowserEnabled) {
+    clearSharedBrowserSession()
+    return
+  }
   clearToken()
   try { sessionStorage.setItem('auth_expired', '1') } catch {}
   await clearOwnerClientState({ preserveChatOutbox: true })
@@ -289,6 +440,48 @@ async function ownerSessionConfirmedInvalid(ownerToken) {
 }
 
 export async function apiFetch(path, options = {}) {
+  if (sharedBrowserEnabled) {
+    // An API operation belongs to the authority that initiated it, even if
+    // renewal rotates its bearer. Never send its body with a later grant.
+    const authority = sharedBrowserAuthority
+    const assertAuthority = () => {
+      if (authority !== sharedBrowserAuthority || !sharedBrowserToken) {
+        throw new Error('SHARED_ACCESS_SUPERSEDED')
+      }
+    }
+    if (!sharedBrowserToken || Date.now() >= sharedBrowserExpiresAt - 30_000) {
+      await renewSharedBrowserSession()
+    }
+    assertAuthority()
+    const guestPath = (options.method || 'GET').toUpperCase() !== 'GET'
+      ? path
+      : path === '/theme'
+        ? `${path}?shared_browser=${encodeURIComponent(sharedBrowserCacheBuster())}`
+        : ['/chats', '/apps/'].includes(path)
+        ? `${path}?shared_browser=1`
+        : path
+    const send = () => {
+      assertAuthority()
+      return fetch(`${BASE}/api${guestPath}`, {
+        ...options, credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders(options.headers), 'X-Mobius-Shared-Browser': '1' },
+      })
+    }
+    const tokenAtSend = sharedBrowserToken
+    let response = await send()
+    assertAuthority()
+    if (response.status === 401) {
+      if (sharedBrowserToken === tokenAtSend) await renewSharedBrowserSession()
+      assertAuthority()
+      response = await send()
+      assertAuthority()
+      if (response.status === 401) {
+        clearSharedBrowserSession()
+        throw new Error('SHARED_ACCESS_ENDED')
+      }
+    }
+    return response
+  }
   const headers = {
     'Content-Type': 'application/json',
     ...getAuthHeaders(options.headers),
@@ -452,6 +645,26 @@ async function listAffectingMutation(kind, path, options) {
   return response
 }
 
+/**
+ * A list-affecting write whose repeat is harmless (the server leaves an
+ * already-applied state unchanged), resent once if the connection fails.
+ *
+ * A phone returning from the background often sends its first request on a
+ * connection the network has already dropped; fetch then rejects with a
+ * TypeError before any response. One immediate resend opens a fresh
+ * connection. Only transport failures repeat: an HTTP status is the server's
+ * answer, and aborts or expired sessions are deliberate. Use only for
+ * operations that are safe to apply twice.
+ */
+async function repeatableListMutation(kind, path, options) {
+  try {
+    return await listAffectingMutation(kind, path, options)
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error
+    return await listAffectingMutation(kind, path, options)
+  }
+}
+
 async function pinnedMutation(path, {
   method,
   body,
@@ -593,9 +806,15 @@ export async function jsonOrThrow(response, label = 'Request failed') {
   }
   if (!response.ok) {
     const detail = body?.detail
-    const message = typeof detail === 'string'
+    const reason = typeof detail === 'string'
       ? detail
       : (detail?.message || `${label} (${response.status})`)
+    // A compile refusal's reason and location live in its sanitized
+    // diagnostic; the message alone only says that compilation failed.
+    const diagnostic = detail?.code === 'compile_failed' && typeof detail.stderr === 'string'
+      ? detail.stderr.trim()
+      : ''
+    const message = diagnostic ? `${reason}\n${diagnostic}` : reason
     const error = new Error(message)
     error.status = response.status
     error.detail = detail
@@ -734,13 +953,21 @@ export const api = {
     }),
     // In-place compaction: optional owner guidance shapes the fresh briefing;
     // omitting it preserves the bodyless route used by older clients.
-    compact: (chatId, { instructions = '', ...options } = {}) => apiFetch(
+    compact: (chatId, { instructions = '', batch_id, recovery_id, ...options } = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/compact`,
       {
         ...options,
         method: 'POST',
-        ...(instructions ? { body: JSON.stringify({ instructions }) } : {}),
+        ...(instructions || batch_id || recovery_id
+          ? { body: JSON.stringify({ ...(instructions ? { instructions } : {}), batch_id, recovery_id }) }
+          : {}),
       },
+    ),
+    compactProgress: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/compact-progress`, options,
+    ),
+    compactStop: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/compact-stop`, { ...options, method: 'POST' },
     ),
     runtime: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/runtime`,
@@ -753,6 +980,27 @@ export const api = {
     usage: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/usage`,
       options,
+    ),
+    // Estimated tokens of each part Möbius adds to the context (/context).
+    contextSizes: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/context-sizes`,
+      options,
+    ),
+    // `/btw`: an answer from a temporary copy of the chat. The copy rereads the
+    // whole chat first, so it can take far longer than an ordinary read.
+    askSideQuestion: (chatId, question, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/btw`,
+      {
+        timeoutMs: 200_000,
+        ...options,
+        method: 'POST',
+        body: JSON.stringify({ question }),
+      },
+    ),
+    // "Add to chat" for a side question; `cid` makes a retried add idempotent.
+    keepSideQuestion: (chatId, payload, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/side-questions`,
+      { ...options, method: 'POST', body: JSON.stringify(payload) },
     ),
     goalPlan: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/goal-plan`,
@@ -804,10 +1052,10 @@ export const api = {
     // Archiving files a chat under Archived without touching its history or
     // work; restoring returns it to Recents. Both answer the persisted
     // `{ archived_at, pinned_at }` so the drawer can settle its rows.
-    archive: (chatId) => listAffectingMutation(
+    archive: (chatId) => repeatableListMutation(
       'chats', `/chats/${encodeURIComponent(chatId)}/archive`, { method: 'POST' },
     ),
-    unarchive: (chatId) => listAffectingMutation(
+    unarchive: (chatId) => repeatableListMutation(
       'chats', `/chats/${encodeURIComponent(chatId)}/unarchive`, { method: 'POST' },
     ),
     remove: (chatId) => listAffectingMutation(
@@ -918,9 +1166,9 @@ export const api = {
     markOpened: (appId) => apiFetch(`/apps/${appId}/opened`, {
       method: 'POST',
     }),
-    markActivitySeen: (appId, activityVersion) => apiFetch(`/apps/${appId}/activity/seen`, {
+    markActivitySeen: (appId, activityVersion, appCreatedAt) => apiFetch(`/apps/${appId}/activity/seen`, {
       method: 'POST',
-      body: JSON.stringify({ activity_version: activityVersion }),
+      body: JSON.stringify({ activity_version: activityVersion, app_created_at: appCreatedAt }),
     }),
     update: (appId, payload) => listAffectingMutation('apps', `/apps/${appId}`, {
       method: 'PATCH',
@@ -947,7 +1195,7 @@ export const api = {
     // Wipes the app's runtime storage back to empty while KEEPING it
     // installed — distinct from `remove` (which tombstones the whole app).
     deleteData: (appId) => apiFetch(`/apps/${appId}/data`, { method: 'DELETE' }),
-    // Stable base URL. AppCanvas appends `?v=<app.updated_at>` so the
+    // Stable base URL. AppCanvas appends `?v=<app.frame_version>` so the
     // service worker can serve cached offline-capable apps cache-first while
     // app edits naturally become cache misses. The backend still sends ETags
     // for browser-cache revalidation on non-SW/cold paths.

@@ -95,6 +95,49 @@ def test_text_final_empty_is_noop():
   assert blocks == [{"type": "text", "content": "kept"}]
 
 
+def test_distinct_final_only_items_survive_replay_without_deltas_or_boundaries():
+  blocks = []
+  for identity, content in (("one", "First."), ("two", "Second."), ("one", "First.")):
+    process_event({"type": "text_final", "content": content,
+                   "text_item_id": identity}, blocks)
+  assert blocks == [
+    {"type": "text", "content": "First.", "text_item_id": "one"},
+    {"type": "text", "content": "Second.", "text_item_id": "two"},
+  ]
+
+
+def test_distinct_final_items_are_not_deduplicated_by_equal_text():
+  blocks = []
+  for identity in ("one", "two"):
+    assert process_event({"type": "text_final", "content": "Same.",
+                          "text_item_id": identity}, blocks)
+  assert len(blocks) == 2
+
+
+def test_final_adopts_identity_when_repairing_anonymous_trailing_text():
+  for prefix in ("Fin", "Final."):
+    blocks = [{"type": "text", "content": prefix}]
+    final = {"type": "text_final", "content": "Final.", "text_item_id": "one"}
+    assert process_event(final, blocks)
+    assert blocks == [{"type": "text", "content": "Final.", "text_item_id": "one"}]
+    assert process_event(final, blocks) is False
+
+
+def test_final_boundary_preserves_identity_for_later_replay():
+  blocks = [{"type": "text_boundary"}]
+  final = {"type": "text_final", "content": "First.", "text_item_id": "one"}
+  assert process_event(final, blocks)
+  process_event({"type": "text_final", "content": "Second.", "text_item_id": "two"}, blocks)
+  assert process_event(final, blocks) is False
+  assert [block["content"] for block in blocks] == ["First.", "Second."]
+
+
+def test_anonymous_final_keeps_legacy_trailing_repair_and_known_identity():
+  blocks = [{"type": "text", "content": "Fin", "text_item_id": "one"}]
+  assert process_event({"type": "text_final", "content": "Final."}, blocks)
+  assert blocks == [{"type": "text", "content": "Final.", "text_item_id": "one"}]
+
+
 def test_text_item_continues_before_interleaved_live_question():
   blocks = []
   process_event({

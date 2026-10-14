@@ -2,6 +2,7 @@
 
 import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,64 @@ def test_validator_stays_zero_configuration_outside_a_runtime(tmp_path):
 
   assert result.returncode == 0, result.stderr
   assert "OK" in result.stdout
+
+
+def test_validator_help_and_icon_free_app_work_without_site_packages(tmp_path):
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  for args in (["--help"], [str(tmp_path)]):
+    result = subprocess.run(
+      [sys.executable, "-S", str(SCRIPT), *args],
+      capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("icon_name", ["icon.png", "icon.svg"])
+def test_validator_checks_package_budget_before_reading_icon(
+  tmp_path, monkeypatch, capsys, icon_name,
+):
+  from app.manifest_contract import PACKAGE_MAX_BYTES, package_limit_message
+
+  _write_app(tmp_path, "export default function App(){ return null }")
+  _declare(tmp_path, "icon", icon_name)
+  icon = tmp_path / icon_name
+  with icon.open("wb") as file:
+    file.truncate(PACKAGE_MAX_BYTES + 1)
+  script = runpy.run_path(str(SCRIPT))
+  original = Path.read_bytes
+  original_text = Path.read_text
+
+  def guarded_read(path):
+    if path == icon:
+      pytest.fail("oversized package icon was read")
+    return original(path)
+
+  def guarded_read_text(path, *args, **kwargs):
+    if path == icon:
+      pytest.fail("oversized package icon was read as text")
+    return original_text(path, *args, **kwargs)
+
+  monkeypatch.setattr(Path, "read_bytes", guarded_read)
+  monkeypatch.setattr(Path, "read_text", guarded_read_text)
+  monkeypatch.setattr(sys, "argv", [str(SCRIPT), str(tmp_path)])
+  assert script["main"]() == 1
+  total = (tmp_path / "index.jsx").stat().st_size + icon.stat().st_size
+  assert capsys.readouterr().err == (
+    f"[ERROR] mobius.json: {package_limit_message(total)}\n"
+  )
+
+
+def test_validator_explains_missing_icon_dependency(tmp_path):
+  _write_app(tmp_path, "export default function App(){ return null }")
+  _declare(tmp_path, "icon", "icon.png")
+  (tmp_path / "icon.png").write_bytes(b"not an image")
+
+  result = subprocess.run(
+    [sys.executable, "-S", str(SCRIPT), str(tmp_path)],
+    capture_output=True, text=True, check=False,
+  )
+  assert result.returncode == 1
+  assert "icon validation requires Pillow" in result.stderr
 
 
 def test_validator_rejects_a_bundle_compile_failure(tmp_path):
@@ -354,17 +413,81 @@ def test_validator_rejects_symlinked_manifest(tmp_path):
   assert "manifest must not be a symlink" in result.stderr
 
 
-def test_validator_rejects_oversized_local_icon(tmp_path):
-  _write_app(tmp_path, "export default function App(){ return null }")
-  icon = tmp_path / "icon.png"
-  icon.write_bytes(b"x" * (12 * 1024 * 1024 + 1))
+def _declare(tmp_path: Path, field: str, value) -> None:
   manifest = json.loads((tmp_path / "mobius.json").read_text())
-  manifest["icon"] = "icon.png"
+  manifest[field] = value
   (tmp_path / "mobius.json").write_text(json.dumps(manifest))
+
+
+def test_validator_accepts_a_data_file_larger_than_any_former_per_file_cap(
+  tmp_path,
+):
+  """Only the package total bounds a declared data file."""
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  (tmp_path / "data").mkdir()
+  with open(tmp_path / "data" / "cases.bin", "wb") as data:
+    data.truncate(16 * 1024 * 1024 + 1)
+  _declare(tmp_path, "source_files", ["data/cases.bin"])
+
+  result = _run(tmp_path)
+  assert result.returncode == 0, result.stderr
+
+
+def test_validator_rejects_a_package_over_the_limit_install_and_store_share(
+  tmp_path,
+):
+  from app.manifest_contract import PACKAGE_MAX_BYTES
+
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  half = PACKAGE_MAX_BYTES // 2 + 1
+  for name in ("a.bin", "b.bin"):
+    with open(tmp_path / name, "wb") as data:
+      data.truncate(half)
+  _declare(tmp_path, "source_files", ["a.bin"])
+  _declare(tmp_path, "static_assets", {"b.bin": "b.bin"})
 
   result = _run(tmp_path)
   assert result.returncode == 1
-  assert "local apply rejects the revision" in result.stderr
+  assert "MiB app package limit" in result.stderr
+
+
+def test_validator_accepts_inline_seeds(tmp_path):
+  """Inline object and array seeds live in the manifest, not in files."""
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  _declare(tmp_path, "storage_seeds", {"settings.json": {"on": True}, "rows.json": [1, 2]})
+
+  result = _run(tmp_path)
+  assert result.returncode == 0, result.stderr
+
+
+def test_validator_counts_every_declaration_of_a_shared_file(tmp_path):
+  """Install writes each declaration separately and charges it in full."""
+  from app.manifest_contract import PACKAGE_MAX_BYTES
+
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  with open(tmp_path / "shared.bin", "wb") as data:
+    data.truncate(PACKAGE_MAX_BYTES // 2 + 1)
+  _declare(tmp_path, "static_assets", {"a.bin": "shared.bin", "b.bin": "shared.bin"})
+
+  result = _run(tmp_path)
+  assert result.returncode == 1
+  assert "MiB app package limit" in result.stderr
+
+
+def test_validator_rejects_an_app_too_large_for_the_shell_to_load(tmp_path):
+  """A dataset imported into the bundle can make a module the shell refuses.
+  Validation says so, rather than the app installing and failing to open."""
+  _write_app(
+    tmp_path,
+    "import rows from './rows.json'\n"
+    "export default function App(){ return <div>{rows.length}</div> }",
+  )
+  (tmp_path / "rows.json").write_text(json.dumps(["x" * 1000] * 9000))
+  _declare(tmp_path, "source_files", ["rows.json"])
+
+  result = _run(tmp_path)
+  assert result.returncode == 1
+  assert "the shell can load" in result.stderr
 
 
 def test_validator_rejects_missing_declared_local_icon(tmp_path):
@@ -387,3 +510,22 @@ def test_validator_does_not_require_informational_offline_precache_files(tmp_pat
 
   result = _run(tmp_path)
   assert result.returncode == 0, result.stderr
+
+
+def test_validator_applies_the_icon_rule_apply_and_publication_use(tmp_path):
+  from PIL import Image
+
+  _write_app(tmp_path, "export default function App(){ return <div /> }")
+  manifest = json.loads((tmp_path / "mobius.json").read_text())
+  manifest["icon"] = "icon.png"
+  (tmp_path / "mobius.json").write_text(json.dumps(manifest))
+
+  Image.new("RGB", (5000, 4800), (40, 90, 180)).save(tmp_path / "icon.png")
+  accepted = _run(tmp_path)
+  assert accepted.returncode == 0, accepted.stderr
+
+  Image.new("1", (6000, 6000)).save(tmp_path / "icon.png")
+  refused = _run(tmp_path)
+  assert refused.returncode == 1
+  assert "manifest icon 'icon.png'" in refused.stderr
+  assert "32 million pixels" in refused.stderr

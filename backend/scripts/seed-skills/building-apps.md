@@ -147,8 +147,60 @@ When the partner asks to share a local-first app as a repo, make the existing so
 1. Keep `mobius.json` at the repo root with stable `id`, `name`, `version`, `description`, `entry`, `icon`, complete `source_files`, any `static_assets`, permissions, and offline flags.
 2. Keep runtime data, tokens, logs, generated reports, and local caches out of the repo; source plus declared static assets only.
 3. Initialize git in the app source if needed: `git init -b main`, commit, push to GitHub, and keep the package at repo root on `main` or a tag. Root packages give the installer a real `origin` clone and clean PR-friendly diffs; repo subdirs and branch names with slashes fall back to synthetic upstream tracking.
-4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally.
+4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally. Exit 3 (`INCONCLUSIVE`, or `build_stalled` from apply) means the machine was too busy to finish the build, not that the source is wrong: retry later instead of editing.
 5. Smoke-install from the raw GitHub `mobius.json` URL on a clean instance or under a test slug before calling it shareable.
+
+### Store listing — what the App Store shows before anyone installs
+
+Publishing from the App Store's **Publish** tab makes the app's last applied
+source public, and the Store refuses it without a listing. The listing is part
+of the app's source, so it is reviewed, versioned and published with the code:
+
+```json
+"icon": "icon.png",
+"store": {
+  "tagline": "One line on what it does for the owner (at most 120 bytes).",
+  "description": "Plain text: what it does, who it is for, what stays private (at most 4000 bytes).",
+  "hero": "static/store/hero.png",
+  "screenshots": [
+    {"src": "static/store/main.png", "alt": "What the image shows, concretely.", "label": "Optional short caption"}
+  ]
+}
+```
+
+- `icon` and every listing image must be committed files; listing images live
+  under `static/store/`. `hero` is optional; 1–5 screenshots are required,
+  each with concrete `alt` text (at most 300 bytes) and an optional `label`
+  (at most 120 bytes).
+- Every listing image, the icon included, must be a real PNG, JPEG or WebP
+  file of at most 6 MB, 8192 px on its longest side, and 32 million pixels in
+  all (so 8192x8192 is too large; 5000x5000 fits). The file extension alone
+  does not count. Images saved through the Store editor lose their EXIF,
+  location and text metadata.
+- Publishing makes the whole source public, so before it does, every
+  committed PNG, JPEG and WebP (not only listing art) is checked for hidden
+  metadata: EXIF and GPS, XMP, PNG text chunks, C2PA provenance, JPEG
+  comments and thumbnails, and bytes after the image ends. The preview's
+  `details` item names every such file. Clean one by re-saving its pixels,
+  e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); icc = im.info.get('icc_profile'); im.info.clear(); im.save('f.jpg', quality=95, icc_profile=icc)"`
+  (turning it upright first, since the orientation tag goes with the rest,
+  and keeping its colour profile;
+  the same works for PNG and WebP without `quality`), or remove it if
+  nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
+  exactly `Software` (the tool that wrote it) are allowed; any other text key
+  (`Author`, `Comment`, `Description`, XMP...) is not.
+- Screenshots must be truthful and private: capture the app's real UI in an
+  empty, demo, or fixture state, never the owner's own records, names,
+  accounts, chats, or machines. Build a small demo state if the app has none.
+- Apply the app so the listing is in its accepted source, then check it with
+  `mapi "/api/community/publications/github/preview?app_id=<id>"`. Its
+  `checklist` names every unmet item at once, and `ready` is true only when
+  `listing` is exactly what the Store will publish.
+- The owner can also write the listing by hand in the Store's Publish tab,
+  which saves it into this same source. An older app with no `mobius.json`
+  needs an agent to create one first, preserving its existing permissions,
+  capabilities, and any schedule; a listing save will not guess that contract.
+- Publishing itself stays the owner's action in the Store.
 
 **Don't hand-bump a version constant in app source.** If an app carries its released version inline (e.g. `const APP_VERSION = '1.2.0'`), leave that line alone — the catalog/installer sets it per release, not your edits. Bumping it locally guarantees a merge conflict on the *next* update: your bump and the new release's bump land on the same line, so every update stops to ask the owner to reconcile a version number. Git already tracks your edits — you never need a version bump to record them. (This is the single most common avoidable update conflict.)
 
@@ -259,13 +311,16 @@ manifest, layered by how always-on they are:
 - **A system-prompt fragment (always-on, while installed).**
   `"system_prompt": "<name>.md"` (also a root-level `source_files` entry) —
   the file is appended to the base system prompt for EVERY chat, but ONLY while
-  the app is installed; uninstall removes it. Use it for a short,
+  the app is installed; uninstall removes it. Chats read it from the app's
+  last applied version, so an edit reaches chats started after the next
+  apply, never while it is still being written. Use it for a short,
   always-relevant default the agent should carry without being asked, and keep
   it tight — it costs tokens on every session. Memory ships `memory-core.md`;
   Pages ships `pages-core.md`. Max 256 KB.
 - **Agent tools (callable by every agent run, while installed).** `"tools"`:
-  up to 16 entries of exactly `name` (`^[a-z][a-z0-9_]{0,39}$`),
-  `description`, and `input_schema` (a JSON Schema `object`). Requires a
+  up to 16 entries requiring `name` (`^[a-z][a-z0-9_]{0,39}$`),
+  `description`, and `input_schema` (a JSON Schema `object`). Optional boolean
+  `always_load` controls eager tool discovery. Requires a
   `service`: agents see `<app slug>_<name>`, and each call reaches the service
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
   app's own authority (`backend/app/app_tools.py`). Only the platform reaches
@@ -618,7 +673,9 @@ const res = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`, {
 ```
 
 The proxy is GET-only, requires the bearer in the header (never a query
-parameter), and truncates bodies at 2,097,152 bytes. Request small renditions,
+parameter), and truncates bodies at 2,097,152 bytes. GET follows up to five
+redirect hops, validating each destination against SSRF rules rather than
+returning upstream 3xx responses as-is. Request small renditions,
 not full-resolution media. A cross-origin `<img src>` cannot attach the bearer,
 so fetch through the proxy and convert the result to a `data:` URL before
 rendering it; the bundled CSP allows `data:` images but not blob object URLs.
@@ -654,6 +711,11 @@ and make the copyable element `user-select: all` so long-press/tap-to-select
 works on touch. Do not add `allow-same-origin` or an app-specific parent bridge
 to reach the clipboard; the shared helper already owns the attributed host
 fallback.
+
+## Managed-app update events
+
+Shell-mounted apps whose reviewed contract grants `data.manage_apps === true` receive each completed update synchronously as `{type: 'moebius:managed-app-event', event: {type: 'app_updated', appId}}` through `window`'s `message` event, with a string `appId`; check `event.source === window.parent` before consuming it.
+Events are not replayed, and standalone app pages do not receive them, so retain the ordinary initial load and refresh fallback.
 
 ## Host capabilities (microphone and future device/browser access)
 
@@ -830,6 +892,35 @@ useEffect(() => {
 
 ---
 
+## Pausing work while the app is hidden
+
+The shell keeps recently used apps loaded but hidden so switching back is
+instant. A hidden app frame's `document.hidden` stays `false` unless the whole
+browser tab is hidden, so a timer gated only on `document.hidden` keeps
+polling, animating, or playing audio for an app nobody can see. Gate that work
+on the runtime's combined signal instead:
+
+```jsx
+useEffect(() => {
+  let timer = null
+  const stop = window.mobius.onVisibilityChange((visible) => {
+    clearInterval(timer)
+    if (!visible) return
+    refresh() // catch up at once on return, then resume the cadence
+    timer = setInterval(refresh, 5000)
+  })
+  return () => { clearInterval(timer); stop() }
+}, [])
+```
+
+`window.mobius.visible` is `true` only while the shell shows this frame and the
+tab is visible. `onVisibilityChange(cb)` calls `cb(visible)` immediately and on
+every change, and returns an unsubscribe function. A Store app that may run on
+an older Möbius checks `window.mobius.runtimeFeatures?.frameVisibility` and
+otherwise falls back to `document.hidden` with `visibilitychange`.
+
+---
+
 ## Communicating with the shell
 
 ```jsx
@@ -858,11 +949,95 @@ app-to-shell messages use `'*'`. For reply protocols, require
 are routing guards, not authorization; privileged operations still require the
 app's server-verified bearer.
 
+### Unread badge on the sidebar row
+
+An app with its own notion of unread items (messages, mentions, tasks waiting
+on the owner) can show that number as a pill on its sidebar row. The app owns
+the count: report the current total whenever it changes, and `0` to clear it.
+The pill replaces the generic new-activity dot while it is shown.
+
+```jsx
+const reply = await fetch(`/api/apps/${appId}/badge`, {
+  method: 'PUT',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ count: unreadTotal, revision }),
+})
+// -> { count, revision, applied }: the stored badge and whether this report won
+```
+
+Report from wherever the count actually changes. If items can arrive while the
+app is closed, report from the app's service or job (with its `APP_TOKEN`), not
+only from the open frame. An app token can only set its own badge.
+
+**Ordering.** When reports can run concurrently, send `revision`: your own
+state revision for the data the count comes from, captured together with the
+count (for example, read under the same lock that writes it). The platform
+ignores a report whose revision is not newer than the stored one and answers
+`applied: false`, so a slow, stale report cannot overwrite a fresh one. Do not
+use clock time as a revision: clocks have coarse resolution and can move
+backwards. Wiping the app's data clears its badge, so revisions may restart
+from zero afterwards. If your revisions can otherwise go backwards (you restore
+your own data from a backup), recognise it when a report comes back
+`applied: false` with a stored `revision` newer than your current one, and send
+one report without `revision`: it always applies and resets the ordering.
+
+**Delivery.** Treat the badge as a projection that you reconcile: remember the
+last revision the platform acknowledged, and resend until it catches up. A
+failed report then repairs itself on a later request instead of leaving a
+stale count, and an installation that already has unread items reports them
+the first time it runs.
+
+### Shell shortcuts
+
+Shell shortcuts (Cmd/Ctrl+K search, Cmd/Ctrl+N new chat, Cmd/Ctrl+, back, and
+the rest of the shortcut reference) work in your app document by default,
+including while a text field has focus. The app frame captures exactly those
+chords and nothing else, so every other key reaches the app. Your app document
+needs no code for this; documents you nest in an iframe do (below).
+
+An app that needs those chords for its own UI, such as a code editor or a
+terminal, turns this off for the whole app in `mobius.json`:
+
+```json
+{ "shell_shortcuts": false }
+```
+
+Embedded agent chat (`window.mobius.chat(...)`) is covered automatically.
+Other documents you nest in an iframe are separate documents, and keys typed
+there never reach the app frame. If you author that document (for example an
+interactive HTML preview, or a packaged build a wrapper app mounts from
+`/app-embeds/by-id/<appId>/…`), add this script to it to give it the same shell
+shortcuts. It applies only to a direct child frame of your app document, and the
+app frame relays a child's shell action only while that child's iframe has
+keyboard focus, so a background embed cannot trigger one:
+
+```html
+<script>
+(() => {
+  const p = window.parent
+  let shortcuts = []
+  addEventListener('message', (e) => {
+    if (e.source === p && e.data?.type === 'moebius:frame-shortcuts') shortcuts = e.data.shortcuts || []
+  })
+  document.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.repeat || e.getModifierState?.('AltGraph')) return
+    const hit = shortcuts.find(({ binding: b }) => String(e.key || '').toLowerCase() === b.key.toLowerCase()
+      && (e.metaKey || e.ctrlKey) === !!b.mod && e.shiftKey === !!b.shift && e.altKey === !!b.alt)
+    if (!hit) return
+    e.preventDefault()
+    e.stopImmediatePropagation()
+    p.postMessage({ type: 'moebius:shell-shortcut', actionId: hit.actionId }, '*')
+  }, true)
+  p.postMessage({ type: 'moebius:frame-shortcuts-request' }, '*')
+})()
+</script>
+```
+
 ---
 
 ## Immersive mode — full-screen apps (games)
 
-The shell's top bar takes ~58px a game wants back. An app can ask the shell to hide its chrome and hand over the full viewport. Your background goes full-bleed automatically — it paints under the iPhone notch / Android punch-hole edge to edge (the iframe ships `viewport-fit=cover`, so its layout viewport extends under the cutout and there's no shell-coloured strip above your app):
+The shell's top bar takes ~58px a game wants back. An app can ask the shell to hide its chrome and hand over the available viewport. Your background fills that area. Android can paint beneath its punch-hole; the installed Möbius shell on iPhone uses an opaque OS status bar, so an in-shell app cannot paint behind the iPhone notch:
 
 ```jsx
 useEffect(() => {
@@ -874,7 +1049,7 @@ useEffect(() => {
 ```
 
 - `value: true` hides the top bar while your app is the active canvas; `value: false` (your effect cleanup) restores it. The shell also restores chrome on app switch or unmount on its own, so you can't strand the user — but post the cleanup anyway for the in-place case.
-- The background bleeds full-screen, but **keep your controls clear of the cutout**: pad HUD / score / buttons so the notch or punch-hole doesn't cover them. Use the canonical `--mobius-safe-top/right/bottom/left` CSS variables on `:root` — the top-level host resolves `env(safe-area-inset-*)` and forwards the concrete values into the opaque app frame, where direct `env()` values may be zero. The host **zeroes them while your app is windowed**, so `padding-top: max(12px, var(--mobius-safe-top))` clears the notch immersive and stays compact when not. It re-forwards on rotation, VisualViewport changes, and Home Screen resume, so a landscape flip or iOS restore re-pads correctly.
+- **Keep controls clear of cutouts and gesture areas** wherever the host allows edge-to-edge painting: pad HUD / score / buttons with the canonical `--mobius-safe-top/right/bottom/left` CSS variables on `:root`. The top-level host resolves `env(safe-area-inset-*)` and forwards concrete values into the opaque app frame, where direct `env()` values may be zero. The host **zeroes them while your app is windowed**, so `padding-top: max(12px, var(--mobius-safe-top))` stays compact when not immersive. It re-forwards on rotation, VisualViewport changes, and Home Screen resume.
 - The shell renders its own floating exit button at the top-left (safe-area inset) while immersive. Don't draw a competing exit control, and keep critical tap targets out of that corner. If the user taps it, the shell stays in normal chrome until your app remounts and posts again — respect that choice; don't re-post on a timer.
 - Standalone opens (`/apps/<slug>/`) use the same AppCanvas host without the
   workspace chrome. The host still receives this message and tracks immersive
@@ -884,10 +1059,10 @@ useEffect(() => {
 
 ### Requesting the most immersive OS presentation
 
-`viewport-fit=cover` lets the top-level host paint edge-to-edge, while the safe variables above keep controls clear. Hiding the Möbius toolbar is separate from asking the browser or OS to remove its own status bar:
+`viewport-fit=cover` allows edge-to-edge painting where the OS permits it, while the safe variables above keep controls clear. Every installed iPhone app at `/apps/<slug>/` reuses the shell’s opaque status-bar policy (`default` style, tinted to the active theme’s background), including `display: fullscreen` games: the app cannot paint under that OS-owned strip. Hiding the Möbius toolbar is separate from asking the browser or OS to remove its own status bar:
 
 - **Installed standalone PWA** — declare `"display": "fullscreen"` in your `mobius.json` to request the browser's most immersive supported launch. Supported Chromium installs can remove the OS status bar. iOS accepts the display mode but can retain its OS status bar, so safe-area padding remains mandatory. Valid values: `standalone` (default), `fullscreen`, `minimal-ui`, `browser`.
-- **In-shell (inside Möbius)** — Möbius itself is one `display: standalone` PWA, so the OS status bar can only be dropped at runtime via the Fullscreen API, which the browser grants **only on a user gesture**. Request it on the player's first tap (re-requesting after a system-gesture exit); the shell calls `exitFullscreen()` for you when the game is left:
+- **In-shell (inside Möbius)** — Möbius itself is one `display: standalone` PWA. On supported browsers, dropping the OS status bar at runtime requires the Fullscreen API, granted **only on a user gesture**. Request it on the player's first tap (re-requesting after a system-gesture exit); the shell calls `exitFullscreen()` for you when the game is left:
 
   ```js
   // in the game's own entry document — where the tap actually lands
@@ -974,8 +1149,10 @@ target**:
 
 - `owned` — the current AppCanvas host installed it; render the nested view.
 - `rejected` — the shell refused the request, so no back target exists; stay on
-  the current view.
-- `timeout` — shell ownership is unknown. Stay on the current view; the helper
+  the current view. With navigation-ready hosts, a hidden cached frame waits
+  until visible before sending; being hidden alone does not reject the request.
+- `timeout` — shell ownership is unknown after a sent request times out (the
+  visibility wait has no timeout). Stay on the current view; the helper
   keeps the request correlation briefly and removes a late-installed target.
 - `error` — the request could not be sent, so no back target exists; stay on the
   current view.
@@ -1060,7 +1237,7 @@ The shell installs a back-sentinel in its own history on `nav-push`, so the OS s
 - The host caps pending sentinels at 20 per app. On overflow it responds `{type:'moebius:nav-push-rejected', requestId}` — the helper above rejects its promise, so you simply don't render the nested view. If you bypass the helper, treat a rejection as a hard "stay where you are" and do NOT increment your local counter, or your count drifts above the host's permanently and the next `nav-pop` consumes the wrong sentinel.
 - The `requestId` is optional on the wire (the shell echoes whatever you send), but use a fresh id per push when multiple can be in flight — a stale ack can otherwise resolve a later promise.
 
-**Across app switches:** app-sentinels are preserved across drawer-driven app switches. Nest 2 levels in app A, drawer-tap to app B, and the user gets browser-style back (first back returns to app A showing its nested view, then unwinds app A, last back exits). Your iframe stays mounted in the LRU cache while invisible, so its state is preserved — just respond to `moebius:nav-back` correctly even when currently invisible (by the time it arrives, your iframe is visible again).
+**Across app switches:** app-sentinels are preserved across drawer-driven app switches. Nest 2 levels in app A, drawer-tap to app B, and the user gets browser-style back (first back returns to app A showing its nested view, then unwinds app A, last back exits). Your iframe stays mounted in the LRU cache while invisible, so its state is preserved until the frame is recreated (see *Keep your place across reloads*) — just respond to `moebius:nav-back` correctly even when currently invisible (by the time it arrives, your iframe is visible again).
 
 **Forward restoration:** the runtime retains each reversible entry's handlers.
 After Back it keeps the entry dormant; when browser Forward revisits the same
@@ -1072,3 +1249,40 @@ retires that ghost slot instead of swallowing the next Back. The
 internals: raw-protocol callers remain one-way and must not set `reversible`
 themselves. For multi-level navigation, each level needs its own reversible
 helper closure; labels are diagnostic, not a serialized navigation tree.
+
+### Keep your place across reloads
+
+The shell recreates an app's frame when its code changes (an agent apply or a
+Store update), when the bounded frame cache evicts it, after a crash, and when
+the shell itself reloads. In-memory state, including `nav.open` handlers, is
+gone then. Settings writes (pin, rename, permissions, icon) do not reload it.
+
+An app with nested views reads `window.mobius.nav.location` on start and reports
+its current place with `nav.setLocation(value)`.
+
+- The location is a small JSON value: at most 4 KiB as UTF-8 JSON
+  (`RangeError` above that, `TypeError` for non-JSON). Keep ids and view names
+  in it, and drafts or larger state in `window.mobius.storage`.
+  `setLocation(null)` clears it.
+- Finish asynchronous restoration before reporting: the first report replaces
+  the saved place. Restore outer views before inner views, and cancel a pending
+  restoration if a newer destination arrives or the component unmounts.
+- Restore through the same path as a user action, so a restored nested view
+  calls `nav.open(...)` and Back still works. Treat the saved value as untrusted
+  input: check its ids against loaded data and fall back to the start view.
+  `nav.open` waits for promotion and visibility. Restoration never moves pane
+  focus: reusing the current retired history slot proceeds even in a background
+  pane; adding a history entry waits for pane focus. `ready` and `outcome` can
+  stay pending until that focus arrives, without an ownership timeout running.
+  The timeout runs only while a sent request awaits an ownership reply. Closing
+  an unsent handle cancels it. Mount the app before awaiting restoration; do not
+  add timers to retry it.
+  Restoring several nested levels in the shell can leave inactive browser
+  history slots, requiring extra Back presses after the restored views close.
+- The shell keeps one location per app installation for the current browser
+  tab. It survives a shell reload, not closing the tab, and is cleared on sign
+  out, or when this shell wipes app data or uninstalls the app. Other apps never
+  receive it.
+- Feature-detect with `typeof window.mobius?.nav?.setLocation === 'function'`
+  (or `window.mobius.runtimeFeatures.navLocation`); without it the app starts at
+  its home view as before.

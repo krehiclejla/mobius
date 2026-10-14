@@ -13,7 +13,7 @@ for (const eventType of ['app_build_failed', 'shell_rebuild_failed']) {
     )
 
     assert.ok(failureBranch, 'Shell should explicitly document the silent failure policy')
-    assert.doesNotMatch(failureBranch[1], /showToast|setToast|alert\s*\(/,
+    assert.doesNotMatch(failureBranch[1], /notifyShell|setNotice|alert\s*\(/,
       'a safe watcher failure must not cover or block the composer')
   })
 }

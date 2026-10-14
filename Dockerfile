@@ -24,8 +24,18 @@ RUN npm ci --ignore-scripts && rm -rf /root/.npm
 COPY frontend/ .
 RUN npm run build && rm -rf /root/.npm
 
+# Build the fixed SQLite library for the same target architecture and libc as
+# the runtime. Compiler and parser-generation tools stay out of the final image.
+FROM python:3.12-slim-trixie AS python-runtime
+FROM python-runtime AS sqlite-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gcc libc6-dev libreadline-dev make tcl unzip zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY backend/sqlite_runtime/build.sh /tmp/build-sqlite.sh
+RUN bash /tmp/build-sqlite.sh /sqlite-runtime
+
 # -- Stage 2: backend + everything ------------------------------------
-FROM python:3.12-slim-trixie
+FROM python-runtime
 
 # Copy Node.js binary from the frontend stage instead of installing via
 # apt.  The debian nodejs/npm packages pull in ~200MB of system node
@@ -47,13 +57,29 @@ RUN useradd -m -s /bin/bash mobius
 # agent-browser looks by default). Chrome for Testing publishes no Linux
 # ARM64 build, so arm64 images install Debian's Chromium instead; the trusted
 # agent-browser config below points agent turns at it.
+# On amd64, Chrome for Testing's chrome-headless-shell for the same version
+# goes beside full Chrome and is the agents' default (config below): full
+# Chrome's ~280 MB binary plus 12-15 processes thrash a 1 GB container until
+# startup and screenshots time out, while the shell captures in seconds. Full
+# Chrome stays for extensions and other full-browser features. The directory
+# deliberately lacks agent-browser's `chrome-` prefix so its own installed-
+# Chrome discovery never selects the shell implicitly.
+# Trust decision: neither Chrome download is integrity-checked. Pinning
+# AGENT_BROWSER_VERSION does not pin Chrome: `agent-browser install` resolves
+# the current Stable from Chrome for Testing's last-known-good feed on every
+# build, and Chrome for Testing publishes no independent checksums. Both
+# browsers therefore trust TLS to storage.googleapis.com, the same as the full
+# Chrome download already did. The `--version | grep` below only confirms that
+# the right archive was unpacked; it is not an integrity check, because a
+# tampered binary could print any version. Pinning a version and sha256 for
+# both browsers, like tectonic below, is tracked in mobius-os/mobius#1849.
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
 ARG CODEX_VERSION=0.159.0
 ARG CODEX_SDK_VERSION=0.159.0
 ARG AGENT_BROWSER_VERSION=0.38.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    age ca-certificates cron curl git jq procps ripgrep sqlite3 sudo tini unzip util-linux xxd \
+    age ca-certificates cron curl git jq procps ripgrep sudo tini unzip util-linux xxd \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
@@ -66,13 +92,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          apt-get install -y --no-install-recommends chromium \
          && mkdir -p /root/.agent-browser; \
        else \
-         agent-browser install; \
+         agent-browser install \
+         && set -- /root/.agent-browser/browsers/chrome-* \
+         && [ "$#" -eq 1 ] \
+         && chrome_version="${1##*/chrome-}" \
+         && curl -fsSL -o /tmp/chrome-headless-shell.zip \
+           "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chrome-headless-shell-linux64.zip" \
+         && unzip -q /tmp/chrome-headless-shell.zip -d /tmp/chrome-headless-shell \
+         && mv /tmp/chrome-headless-shell/chrome-headless-shell-linux64 \
+           /root/.agent-browser/browsers/headless-shell \
+         && rm -rf /tmp/chrome-headless-shell /tmp/chrome-headless-shell.zip \
+         && /root/.agent-browser/browsers/headless-shell/chrome-headless-shell --version \
+           | grep -F "$chrome_version"; \
        fi \
     && mv /root/.agent-browser /opt/agent-browser \
     && chown -R mobius:mobius /opt/agent-browser \
     && git_version="$(git --version | awk '{print $3}')" \
     && [ "$(printf '%s\n' "2.38" "$git_version" | sort -V | head -n1)" = "2.38" ] \
     && rm -rf /root/.npm /var/lib/apt/lists/*
+
+# Use the pinned library for Python and other dynamically linked consumers,
+# not just the CLI. Keep Debian's package for its dependency metadata.
+COPY --from=sqlite-runtime /sqlite-runtime/usr/local/lib/libsqlite3.so* /usr/local/lib/
+COPY --from=sqlite-runtime /sqlite-runtime/usr/local/bin/sqlite3 /usr/local/bin/sqlite3
+COPY backend/sqlite_runtime/verify.py /tmp/verify-sqlite.py
+RUN ldconfig && python /tmp/verify-sqlite.py && rm /tmp/verify-sqlite.py
 
 # tectonic is a server-side subprocess; CSP connect-src 'self' applies only to
 # browser fetches from the mini-app iframe, not OS-level subprocesses — tectonic's
@@ -126,14 +170,15 @@ RUN ln -s /opt/agent-browser /root/.agent-browser \
 
 # Agent turns point AGENT_BROWSER_CONFIG here so untrusted workspace config
 # cannot register executable plugins. Runtime settings still travel through
-# explicit AGENT_BROWSER_* environment variables owned by chat.py. On arm64
-# this image-owned file also names the Debian Chromium installed above, since
-# no downloaded Chrome for Testing exists there.
+# explicit AGENT_BROWSER_* environment variables owned by chat.py. This
+# image-owned file also names the default browser installed above: the
+# headless shell on amd64, and Debian's Chromium on arm64, since no downloaded
+# Chrome for Testing exists there.
 RUN install -d -m 0755 /app \
     && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
          printf '{"executablePath": "/usr/bin/chromium"}\n'; \
        else \
-         printf '{}\n'; \
+         printf '{"executablePath": "/opt/agent-browser/browsers/headless-shell/chrome-headless-shell"}\n'; \
        fi > /app/agent-browser-config.json \
     && chmod 0644 /app/agent-browser-config.json
 
@@ -258,6 +303,7 @@ COPY Dockerfile /tmp/test-image-inputs/Dockerfile
 COPY backend/app/platform_activation.py /tmp/test-image-inputs/backend/app/platform_activation.py
 COPY backend/requirements.txt backend/requirements.lock /tmp/test-image-inputs/backend/
 COPY backend/legacy_runtime/ /tmp/test-image-inputs/backend/legacy_runtime/
+COPY backend/sqlite_runtime/build.sh backend/sqlite_runtime/verify.py /tmp/test-image-inputs/backend/sqlite_runtime/
 COPY frontend/package.json frontend/package-lock.json /tmp/test-image-inputs/frontend/
 RUN MOBIUS_TEST_IMAGE_INPUT_ROOT=/tmp/test-image-inputs \
       /tmp/test-image-inputs/scripts/test-image-fingerprint.sh \

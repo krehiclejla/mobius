@@ -6,7 +6,8 @@
    ║   pass quietly violates one, regression-hunt these first.  ║
    ║                                                            ║
    ║   1. `.chat__foot` is `position: absolute`, offset above   ║
-   ║      env(safe-area-inset-bottom),                           ║
+   ║      `--chat-foot-safe-bottom` (bottom safe area; 0 above  ║
+   ║      the keyboard; a quarter of it on installed iOS),      ║
    ║      with `pointer-events: none` — chat content scrolls    ║
    ║      *behind* the composer. Visible footer controls must   ║
    ║      opt back in through the allow-list beside the foot;   ║
@@ -14,8 +15,8 @@
    ║                                                            ║
    ║   2. `--composer-h` is published by the scroll controller's║
    ║      ResizeObserver on `.chat__foot`. `.chat__list`        ║
-   ║      reserves --composer-h + the same full safe-area       ║
-   ║      expression + 16px so the last message clears the      ║
+   ║      reserves --composer-h + the same safe-area value      ║
+   ║      + 16px so the last message clears the                  ║
    ║      pill and gesture area as it grows                     ║
    ║      (chips, queue tray, multi-line input).                ║
    ║                                                            ║
@@ -103,6 +104,14 @@
      keeps a pending attachment and a sent one the same square. */
   --attach-card: 96px;
   --chat-status-font-size: 12px;
+  /* The composer's gap above the bottom edge, shared by the foot, the
+     transcript clearance and the fade. The shell sets --chat-foot-bottom-inset
+     to 0 while fitted above a keyboard (chat-only for now); otherwise this is
+     the platform's share of the device bottom safe area. */
+  --chat-foot-safe-bottom: var(
+    --chat-foot-bottom-inset,
+    calc(env(safe-area-inset-bottom, 0px) * var(--chat-foot-inset-reserve, 1))
+  );
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -185,12 +194,12 @@
   /* Bottom padding clears the absolutely-positioned `.chat__foot`.
      Tracks the foot's measured height via the `--composer-h` CSS
      var (written by the scroll controller's ResizeObserver), the
-     full device safe-area gap below the foot (the SAME env()
-     expression as `.chat__foot`'s `bottom` — keep them in sync),
+     safe-area gap below the foot (the SAME `--chat-foot-safe-bottom`
+     as `.chat__foot`'s `bottom`),
      plus a small breathing-room margin so chips/queue tray growing
      the foot keeps the last message clear of the pill. Fallback
      80px is for the first paint before the RO fires. */
-  padding: 8px 6px calc(var(--composer-h, 80px) + env(safe-area-inset-bottom, 0px) + 16px);
+  padding: 8px 6px calc(var(--composer-h, 80px) + var(--chat-foot-safe-bottom) + 16px);
   display: flex;
   flex-direction: column;
   gap: 24px;
@@ -204,7 +213,7 @@
 /* A reply is one conversation item; source rows keep their anchors and
    compact block spacing without cancelling the surrounding conversation gap. */
 .chat__reply-rows { list-style: none; padding: 0; margin: 0; }
-.chat__reply-rows > .chat__msg + .chat__msg:not(:has(> .chat__assistant-copy-surface:empty)) {
+.chat__reply-rows > .chat__msg + .chat__msg:not(:has(> .chat__markdown-copy-surface:empty)) {
   margin-top: 8px;
 }
 
@@ -393,7 +402,7 @@
 
 /* Event-only owner for Markdown-aware native selection copy. `contents` keeps
    every prose/tool child in the message row's existing flex and gap geometry. */
-.chat__assistant-copy-surface { display: contents; }
+.chat__markdown-copy-surface { display: contents; }
 
 /* A search jump is a one-shot held position, not a new scrolling mode. The
    restrained row wash and text highlight make the destination legible without
@@ -603,6 +612,20 @@
   border-radius: 18px 18px 5px 18px;
   max-width: min(85%, 75ch);
   white-space: pre-wrap;
+}
+
+/* Markdown in your own bubble (colours live in index.css). The bubble already
+   pads its text, so the reply column's prose gutters drop away, and blocks sit
+   a little closer than in a reply. pre-wrap stays with plain bubble text;
+   code blocks keep their own white-space. */
+.chat__text--user .md-blocks {
+  gap: 0.5rem;
+  white-space: normal;
+}
+
+.chat__text--user :is(.md-paragraph, .md-heading) {
+  padding-left: 0;
+  padding-right: 0;
 }
 
 /* Boundary between owner messages delivered together in one bubble: a
@@ -923,6 +946,11 @@
   margin-top: var(--activity-row-gap, 4px);
 }
 .chat__text--assistant + .chat__text--assistant { margin-top: 0.75rem; }
+
+/* Lifecycle cards and the prose that follows are separate reading blocks. */
+.chat__goal-history + .chat__text--assistant {
+  margin-top: 16px;
+}
 
 .chat__tool {
   border-radius: 10px;
@@ -2293,12 +2321,14 @@
   --chat-foot-card-gap: 6px;
   --chat-foot-pad-block: 8px;
   position: absolute;
-  /* Interactive controls must stay wholly inside the device safe rectangle.
-     Android Chrome paints the shell's gesture backdrop in the unsafe band;
-     dipping the composer into that band makes the backdrop clip the pill.
-     Keep the same full inset in `.chat__list`'s bottom padding so composer
+  /* Android Chrome paints the shell's gesture backdrop in the unsafe band;
+     dipping the composer into that band makes the backdrop clip the pill, so
+     the full inset applies there. Installed iOS keeps only a quarter of its
+     Home-indicator area clear (see the rule below `.chat__foot::before`).
+     The keyboard covers the indicator, so the shell zeroes the gap while
+     fitted above it. `.chat__list` reserves the same value, so composer
      placement and transcript clearance remain one geometry contract. */
-  bottom: env(safe-area-inset-bottom, 0px);
+  bottom: var(--chat-foot-safe-bottom);
   left: 0;
   right: 0;
   padding: var(--chat-foot-pad-block) 12px;
@@ -2331,7 +2361,7 @@
   left: 0;
   right: 0;
   top: -100px;
-  bottom: calc(0px - env(safe-area-inset-bottom, 0px));
+  bottom: calc(0px - var(--chat-foot-safe-bottom));
   background: linear-gradient(
     to bottom,
     transparent 0%,
@@ -2344,6 +2374,24 @@
   z-index: -1;
 }
 
+/* Installed iOS: a deliberate product decision, not a tuning leftover. The
+   closed-keyboard composer matches the Android Möbius position (pill ~17 pt
+   above the edge on a portrait iPhone) rather than UIKit's native rest on the
+   full 34 pt safe area. It was chosen on a physical iPhone next to Android:
+   the full inset and 0.5 both read as too high. It was kept after review
+   (PR #1632), which asked for the native position. The Home indicator
+   occupies only the lowest few points, so a quarter of the inset keeps the
+   pill clear of it. Do not change this value or restore the full inset
+   without the product owner's sign-off. Android and browser tabs keep the
+   full inset; while the keyboard is up, the shell zeroes the gap entirely. */
+@supports (-webkit-touch-callout: none) {
+  @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
+    .chat {
+      --chat-foot-inset-reserve: 0.25;
+    }
+  }
+}
+
 /* In the embedded composer the app sheet owns the safe area, so there is no
    device gesture strip to fill and the shorter, flat-bottomed foot doesn't want
    the tall fade. Keep it subtle: just enough to soften content under the pill. */
@@ -2353,6 +2401,8 @@
 }
 
 .chat__foot .queued,
+.chat__foot .side-question,
+.chat__foot .chat__history-strip,
 .chat__foot .connection-status,
 .chat__foot .chat__attach-tray,
 .chat__foot .chat__question-nudge,
@@ -2429,6 +2479,121 @@
   color: var(--danger, #b42318);
   background: color-mix(in srgb, var(--danger, #b42318) 7%, var(--surface));
   text-align: center;
+}
+
+/* ── Composer history strip (ChatInputBar contract 8) ─────────────────────
+   Shown above the pill while ↑/↓ or the queue's pencil puts another message
+   in the box: what it is, what Enter does, and that the draft is kept. Same
+   column and quiet surface as the queue tray, so it reads as part of the
+   composer rather than a transcript notice. */
+.chat__history-strip {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 5px 6px 5px 12px;
+  border-radius: 12px;
+  background: var(--surface); /* CONTRACT: opaque card fill, like the queue tray */
+  border: 1px solid var(--border-light);
+  font-size: 12.5px;
+  line-height: 1.35;
+  animation: chat-foot-rise 0.16s var(--ease-out-soft, ease-out);
+}
+
+.chat__history-strip--warn {
+  border-color: color-mix(in srgb, var(--warning, #d8922f) 45%, var(--border-light));
+}
+
+.chat__history-strip-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__history-strip-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat__history-strip-hint {
+  color: var(--muted);
+}
+
+.chat__history-strip--warn .chat__history-strip-hint {
+  color: var(--text);
+}
+
+.chat__history-strip-draft {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  padding: 1px 9px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__history-strip-back {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* The visible well. The ::after below makes the tap target 44px. */
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+/* The well stays 26px, but the tap target is 44px. The strip's 5px padding
+   plus the 6px gaps above and below it leave room, so the extra area covers
+   no other control (the draft chip beside it is not interactive). */
+.chat__history-strip-back::after {
+  content: '';
+  position: absolute;
+  inset: -9px;
+}
+
+.chat__history-strip-back:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.chat__history-strip-back:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* Phones: the hint wraps under the title instead of hiding behind an
+   ellipsis, and the draft chip keeps one short line. */
+@media (max-width: 560px) {
+  .chat__history-strip { flex-wrap: wrap; row-gap: 4px; }
+  .chat__history-strip-text { white-space: normal; flex-basis: calc(100% - 40px); }
+  .chat__history-strip-draft { max-width: calc(100% - 40px); order: 3; }
+  .chat__history-strip-back { order: 2; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat__history-strip { animation: none; }
+}
+
+/* While history holds the box, the attached files stay with the set-aside
+   draft (an earlier message sent again goes without them), so they are dimmed
+   rather than reading as part of the message shown. */
+.chat__pill--draft-aside .chat__attach-tray {
+  opacity: 0.5;
 }
 
 /* The pill: TRANSLUCENT surface with backdrop-blur — chat content
@@ -3831,9 +3996,9 @@
   animation: progress-rail-in 0.22s ease both;
 }
 
-/* Expanded Goal and Waiting share the same translucent reading surface. */
+/* Expanded details need an opaque reading surface above the transcript. */
 .chat__progress-rail:has(.chat__goal-plan) {
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: var(--surface);
 }
 
 @keyframes progress-rail-in {
@@ -4053,6 +4218,13 @@
   color: var(--muted);
 }
 
+/* Waiting uses the same bordered surface as the Goal panel. */
+.chat__handoff-slot {
+  list-style: none;
+  padding: 0;
+  margin-top: 10px;
+}
+
 .chat__waits {
   max-width: 720px;
   margin: 0 auto var(--chat-foot-rail-gap);
@@ -4074,7 +4246,7 @@
 
 .chat__wait-card--expanded {
   border-color: color-mix(in srgb, var(--accent) 34%, var(--border-light));
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: var(--surface);
 }
 
 .chat__wait-summary {
@@ -4087,6 +4259,8 @@
   gap: 9px;
   min-width: 0;
   padding: 7px 12px;
+  min-height: 44px;
+  flex-wrap: wrap;
   border: 0;
   background: transparent;
   color: inherit;
@@ -4106,26 +4280,42 @@
 }
 
 .chat__wait-text {
+  flex: 1 1 160px;
   min-width: 0;
-  overflow: hidden;
   color: var(--text);
   font-size: var(--chat-status-font-size);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .chat__wait-meta {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   margin-left: auto;
   color: var(--muted);
   font-size: 12px;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
+
+.chat__panel-chevron { flex: 0 0 auto; }
+button[aria-expanded="true"] > .chat__panel-chevron,
+details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
+
+.chat__wait-description {
+  margin: 0;
+  padding: 0 12px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.chat__wait-action { padding: 0 12px 10px; }
+.chat__wait-cancel:disabled { opacity: .55; cursor: default; }
+.chat__wait-error { color: var(--danger); font-size: 12px; margin: 8px 0 0; }
 
 .chat__wait-details {
   display: flex;
-  align-items: flex-end;
-  gap: 16px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
   padding: 10px 12px 12px;
   border-top: 1px solid var(--border-light);
   animation: progress-rail-in 0.16s ease both;
@@ -4221,12 +4411,12 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 30px;
+  min-height: 44px;
   padding: 5px 9px;
   border: 1px solid var(--border-light);
   border-radius: 9px;
   background: transparent;
-  color: var(--muted);
+  color: var(--text);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -4234,9 +4424,9 @@
 
 @media (hover: hover) and (pointer: fine) {
   .chat__wait-cancel:hover {
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border-light));
-    background: color-mix(in srgb, var(--danger) 8%, transparent);
-    color: var(--danger);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border-light));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    color: var(--accent);
   }
 }
 
@@ -4247,7 +4437,9 @@
 
 @media (max-width: 560px) {
   .chat__wait-meta {
-    display: none;
+    order: 1;
+    flex-basis: 100%;
+    margin-left: 23px;
   }
 
   .chat__wait-details {
@@ -4264,6 +4456,8 @@
     align-self: flex-start;
   }
 }
+.chat__goal-result { margin: 0 10px 8px; color: var(--text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
+
 .chat__goal-plan {
   flex: 1 0 100%;
   display: flex;
@@ -4271,6 +4465,8 @@
   gap: 2px;
   max-height: min(42vh, 360px);
   overflow-y: auto;
+  /* Long saved helper questions scroll here without moving the transcript. */
+  overscroll-behavior: contain;
   margin-top: 2px;
   padding: 7px 0 1px;
   border-top: 1px solid var(--border-light);
@@ -4296,6 +4492,8 @@
 }
 
 .chat__goal-history--failed { --lifecycle-tone: var(--danger); }
+.chat__goal-history--cancelled { --lifecycle-tone: var(--muted); }
+.chat__goal-history-reason { color: var(--text); font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
 .chat__wait-history { --lifecycle-tone: var(--accent); }
 .chat__wait-history--attention { --lifecycle-tone: var(--warning, #d8922f); }
 .chat__wait-history--stopped { --lifecycle-tone: var(--muted); }
@@ -4359,17 +4557,29 @@
   font-size: 11px;
 }
 
-.chat__goal-history-details { margin-top: 5px; }
-
-.chat__goal-history-details > summary {
-  width: fit-content;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
+/* Keep the receipt scannable without shortening or rewriting its saved Goal. */
+.chat__goal-history-objective--preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
 
-.chat__goal-history-details[open] > summary { color: var(--text); }
+/* The whole receipt header discloses its plan, like the active Waiting header. */
+.chat__goal-history-details { grid-column: 1 / -1; width: 100%; min-width: 0; }
+.chat__goal-history-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  list-style: none;
+  cursor: pointer;
+  border-radius: 7px;
+}
+.chat__goal-history-summary::-webkit-details-marker { display: none; }
+.chat__goal-history-summary > .chat__goal-history-copy { flex: 1; }
+.chat__goal-history-summary > .chat__panel-chevron { margin-top: 7px; color: var(--muted); }
+.chat__goal-history-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.chat__goal-history-details[open] .chat__goal-history-objective { display: block; }
 
 .chat__goal-task {
   display: grid;
@@ -4423,9 +4633,13 @@
   color: var(--green);
 }
 
-.chat__goal-task--failed .chat__goal-task-marker,
-.chat__goal-task--blocked .chat__goal-task-marker {
+.chat__goal-task--failed .chat__goal-task-marker {
   border-color: var(--danger);
+}
+
+.chat__goal-task--blocked .chat__goal-task-marker {
+  border-color: var(--muted);
+  border-style: dashed;
 }
 
 .chat__goal-task--cancelled {
@@ -4613,63 +4827,26 @@
   text-overflow: ellipsis;
 }
 
-.queued__row--editing {
-  padding: 6px;
-  background: var(--bg);
+/* The queued message open in the chat box (ChatInputBar's history strip says
+   "Editing queued message N of M"). The row stays in place, tinted, and its
+   pencil becomes a quiet label so the owner can see where the edit will land. */
+.queued__row--in-composer {
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface)); /* CONTRACT: accent wash on opaque fill */
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
-.queued__editor {
-  flex: 1;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 4px;
+.queued__row--in-composer:hover {
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
 }
 
-.queued__editor-input {
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 56px;
-  max-height: 160px;
-  padding: 8px 10px;
-  /* Grow to fit the message being edited (capped by max-height, then scroll)
-     so a longer draft is visible instead of scrolling a cramped fixed box.
-     Browsers without field-sizing fall back to autoGrowTextarea's measurement. */
-  field-sizing: content;
-  overflow-y: auto;
-  resize: none;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  outline: none;
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-  /* Keep at 16px: iOS Safari zooms focused inputs below 16px (see contract above). */
-  font-size: 16px;
-  line-height: 1.4;
-}
-
-.queued__editor-input:focus {
-  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
-}
-
-.queued__editor-actions {
-  display: flex;
-  align-items: flex-start;
-}
-
-.queued__edit-save:not(:disabled) {
-  color: var(--accent);
-}
-
-.queued__editor-error {
-  grid-column: 1 / -1;
-  padding: 0 4px 2px;
-  color: var(--danger);
-  font-size: 11px;
-  line-height: 1.3;
+.queued__in-composer {
+  flex-shrink: 0;
+  align-self: center;
+  margin: 0 4px 0 2px;
+  font-size: 11.5px;
+  line-height: 1.2;
+  color: var(--accent); /* CONTRACT: matches the strip's draft chip */
+  white-space: nowrap;
 }
 
 /* Compact, evenly spaced send / edit / cancel wells. The button IS the visible
@@ -4763,9 +4940,10 @@
 
 .chat__progress-identity { display: inline-block; vertical-align: -2px; margin-right: 5px; flex-shrink: 0; }
 
-/* Tool-only continuation rows share one activity rhythm across message boundaries. */
-.chat__msg:has(> .chat__tools:last-child, > .chat__assistant-copy-surface > .chat__tools:last-child)
-  + .chat__msg:has(> .chat__tools:first-child, > .chat__assistant-copy-surface > .chat__tools:first-child) {
+/* Only the outer transcript owns the 24px conversation gap being cancelled.
+   Nested reply rows already own their compact spacing; never pull them upward. */
+.chat__list > .chat__msg:has(> .chat__tools:last-child, > .chat__markdown-copy-surface > .chat__tools:last-child)
+  + .chat__msg:has(> .chat__tools:first-child, > .chat__markdown-copy-surface > .chat__tools:first-child) {
   margin-block-start: calc(var(--activity-row-gap, 4px) - 24px);
 }
 .chat__msg--peer .chat__tools { width: 100%; }
@@ -4795,3 +4973,13 @@
   font-size: 14px;
   line-height: 1.4;
 }
+
+/* Execution records are secondary evidence, outside the counted work tree. */
+.chat__goal-execution { margin: 8px 10px 4px; border-top: 1px solid var(--border-light); }
+.chat__goal-execution summary { padding: 10px 0; cursor: pointer; color: var(--muted); font-size: 12px; }
+.chat__goal-execution summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chat__goal-execution p { margin: 0 0 8px; }
+.chat__goal-execution ul { list-style: none; margin: 0; padding: 0; }
+.chat__goal-execution li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; font-size: 12px; overflow-wrap: anywhere; }
+.chat__goal-helper-question { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--border-light); }
+.chat__goal-execution .chat__goal-helper-question p { margin: 0; white-space: pre-wrap; color: var(--text); }

@@ -11,6 +11,7 @@ import bcrypt
 import jwt
 from jwt.exceptions import InvalidTokenError
 
+from app.browser_access import BrowserLineage
 from app.config import get_settings
 
 
@@ -69,6 +70,8 @@ def create_access_token(
   data: dict,
   expires_delta: Optional[timedelta] = None,
   token_epoch: Optional[int] = None,
+  *,
+  browser: BrowserLineage | None = None,
 ) -> str:
   """Creates and returns a signed JWT from the given payload.
 
@@ -81,6 +84,10 @@ def create_access_token(
   """
   settings = get_settings()
   payload = data.copy()
+  if browser is not None:
+    # Every bearer derived from a guest keeps its grant (and session) lineage;
+    # deps._resolve_owner rechecks it on every use.
+    payload.update(browser.claims())
   expire = datetime.now(UTC) + (
     expires_delta or timedelta(days=30)
   )
@@ -126,6 +133,7 @@ def create_agent_token(
   delegation_id: str | None = None,
   delegation_chat: str | None = None,
   expires_delta: timedelta = AGENT_RUN_TOKEN_TTL,
+  browser: BrowserLineage | None = None,
 ) -> str:
   """Create the owner bearer used by one ordinary interactive chat agent.
 
@@ -156,6 +164,7 @@ def create_agent_token(
     claims,
     expires_delta=expires_delta,
     token_epoch=token_epoch,
+    browser=browser,
   )
 
 
@@ -175,6 +184,7 @@ def create_app_token(
   delegation_chat: str | None = None,
   service: str | None = None,
   job_secrets: list[str] | None = None,
+  browser: BrowserLineage | None = None,
 ) -> str:
   """Creates a short-lived JWT scoped to a specific mini-app.
 
@@ -223,6 +233,7 @@ def create_app_token(
     claims,
     expires_delta=expires_delta,
     token_epoch=token_epoch,
+    browser=browser,
   )
 
 
@@ -280,6 +291,7 @@ def create_delegation_token(
   token_epoch: int,
   *,
   expires_delta: timedelta = timedelta(hours=8),
+  browser: BrowserLineage | None = None,
 ) -> str:
   """Create a bearer confined to one delegated agent and direct children."""
   return create_access_token(
@@ -292,6 +304,7 @@ def create_delegation_token(
     },
     expires_delta=expires_delta,
     token_epoch=token_epoch,
+    browser=browser,
   )
 
 
@@ -318,7 +331,9 @@ def create_public_app_token(
   )
 
 
-def create_media_token(chat_id: str, owner_username: str, token_epoch: int) -> str:
+def create_media_token(chat_id: str, owner_username: str, token_epoch: int, *,
+  browser: BrowserLineage | None = None,
+) -> str:
   """Creates a short-lived JWT scoped to uploads and media for one chat.
 
   The token's `scope` is "media" and `media_chat` carries the chat_id so the
@@ -333,6 +348,7 @@ def create_media_token(chat_id: str, owner_username: str, token_epoch: int) -> s
     {"sub": owner_username, "scope": "media", "media_chat": chat_id},
     expires_delta=timedelta(minutes=15),
     token_epoch=token_epoch,
+    browser=browser,
   )
 
 
@@ -345,6 +361,7 @@ def create_chat_embed_media_token(
   chat_id: str,
   session_id: str,
   expires_delta: timedelta = timedelta(minutes=15),
+  browser: BrowserLineage | None = None,
 ) -> str:
   """Create a URL-safe media token chained to one live embed session."""
   return create_access_token(
@@ -358,6 +375,7 @@ def create_chat_embed_media_token(
     },
     expires_delta=expires_delta,
     token_epoch=token_epoch,
+    browser=browser,
   )
 
 
@@ -373,6 +391,7 @@ def create_chat_embed_session_token(
   role: str,
   operations: list[str],
   expires_delta: timedelta = timedelta(minutes=15),
+  browser: BrowserLineage | None = None,
 ) -> str:
   """Mint the in-memory bearer used by one authorized chat embed.
 
@@ -396,6 +415,7 @@ def create_chat_embed_session_token(
     },
     expires_delta=expires_delta,
     token_epoch=token_epoch,
+    browser=browser,
   )
 
 

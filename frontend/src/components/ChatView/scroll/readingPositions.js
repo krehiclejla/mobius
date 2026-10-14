@@ -1,3 +1,5 @@
+import { localStore } from '../../../lib/workspaceStorage.js'
+
 /**
  * Durable reading-position storage for chat scroll.
  *
@@ -9,13 +11,21 @@
 export const READING_POSITION_KEY = 'chat-reading-position'
 const READING_POSITION_LIMIT = 300
 
-const positions = (() => {
+// The memory copy mirrors exactly one store. A different store (another
+// shared grant) starts from that store's own positions.
+let cachedStore = null
+let cachedPositions = null
+function positions() {
+  const store = localStore()
+  if (cachedPositions && store === cachedStore) return cachedPositions
+  cachedStore = store
   try {
-    const parsed = JSON.parse(localStorage.getItem(READING_POSITION_KEY) || '{}')
-    return (parsed && typeof parsed === 'object') ? parsed : {}
+    const parsed = JSON.parse(store?.getItem(READING_POSITION_KEY) || '{}')
+    cachedPositions = (parsed && typeof parsed === 'object') ? parsed : {}
   }
-  catch { return {} }
-})()
+  catch { cachedPositions = {} }
+  return cachedPositions
+}
 
 // Logout is a terminal owner-session boundary. React/page lifecycle callbacks
 // may still run before reload; disabling writes prevents those late callbacks
@@ -25,40 +35,42 @@ let writesEnabled = true
 function persist() {
   if (!writesEnabled) return
   try {
-    const entries = Object.entries(positions)
+    const entries = Object.entries(cachedPositions)
     if (entries.length > READING_POSITION_LIMIT) {
       const expired = entries
         .sort((a, b) => (b[1]?.at || 0) - (a[1]?.at || 0))
         .slice(READING_POSITION_LIMIT)
-      for (const [chatId] of expired) delete positions[chatId]
+      for (const [chatId] of expired) delete cachedPositions[chatId]
     }
-    localStorage.setItem(READING_POSITION_KEY, JSON.stringify(positions))
+    cachedStore?.setItem(READING_POSITION_KEY, JSON.stringify(cachedPositions))
   }
   catch { /* best-effort position storage must never break scrolling */ }
 }
 
 export function readingPositionFor(chatId) {
-  return positions[String(chatId || '')] || null
+  return positions()[String(chatId || '')] || null
 }
 
 export function hasReadingPosition(chatId) {
-  return Object.hasOwn(positions, String(chatId || ''))
+  return Object.hasOwn(positions(), String(chatId || ''))
 }
 
 export function writeReadingPosition(chatId, mode) {
   const id = String(chatId || '')
+  const scopedPositions = positions()
   if (!id || !mode || mode.kind === 'INITIAL') {
-    if (id) delete positions[id]
+    if (id) delete scopedPositions[id]
   } else {
-    positions[id] = { ...mode, at: Date.now() }
+    scopedPositions[id] = { ...mode, at: Date.now() }
   }
   persist()
 }
 
 export function forgetReadingPosition(chatId) {
   const id = String(chatId || '')
-  if (!(id in positions)) return false
-  delete positions[id]
+  const scopedPositions = positions()
+  if (!(id in scopedPositions)) return false
+  delete scopedPositions[id]
   persist()
   return true
 }
@@ -82,12 +94,13 @@ export function savedReadingAnchorHasNestedPart(chatId) {
 /** Replace one saved alias before restore consumes it. */
 export function remapSavedReadingAnchor(chatId, fromKey, toKey) {
   const id = String(chatId || '')
-  const mode = positions[id]
+  const scopedPositions = positions()
+  const mode = scopedPositions[id]
   if (mode?.kind !== 'ANCHOR_AT'
       || mode.key !== fromKey
       || typeof toKey !== 'string'
       || !toKey) return false
-  positions[id] = { ...mode, key: toKey, at: Date.now() }
+  scopedPositions[id] = { ...mode, key: toKey, at: Date.now() }
   persist()
   return true
 }
@@ -96,6 +109,7 @@ export const retireSavedReadingPosition = forgetReadingPosition
 
 export function clearReadingPositions() {
   writesEnabled = false
-  for (const key of Object.keys(positions)) delete positions[key]
-  try { localStorage.removeItem(READING_POSITION_KEY) } catch {}
+  cachedPositions = {}
+  cachedStore = localStore()
+  try { cachedStore?.removeItem(READING_POSITION_KEY) } catch {}
 }

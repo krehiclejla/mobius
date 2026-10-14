@@ -30,7 +30,7 @@ def _selects():
 
 
 def _transcript_reads(statements):
-  return [sql for sql in statements if "chats.messages" in sql]
+  return [sql for sql in statements if "chat_messages.body" in sql]
 
 
 def _new_chat(client, auth, messages=None):
@@ -52,16 +52,16 @@ def _run(
     status=status, started_at=base + timedelta(seconds=start),
     ended_at=base + timedelta(seconds=end),
   )
+  plan = None
   if task_status:
-    run.goal_plan_json = {"version": 1, "tasks": [{
+    plan = {"version": 1, "tasks": [{
       "id": "verify", "title": "Verify", "status": task_status,
       "depends_on": [],
     }]}
-    run.goal_plan_revision = 1
   db.add(run)
   persist_goal_fixture(db, run, status=(
     "completed" if status == "completed" and task_status in (None, "completed", "cancelled") else "open"
-  ))
+  ), plan=plan, revision=1 if plan is not None else 0)
   db.commit()
   return run
 
@@ -104,7 +104,7 @@ def test_resumed_goal_only_hydrates_plan_at_final_anchor(
   assert list(result) == ([3] if expected else [])
   assert not _transcript_reads(statements)
   if not expected:
-    assert not any("chat_runs.goal_plan_json" in sql for sql in statements)
+    assert not any("chat_goals.plan_json" in sql for sql in statements)
   else:
     assert result[3][0]["plan"]["summary"]["can_complete"] is True
 
@@ -126,12 +126,12 @@ def test_history_preserves_failed_and_unfinished_goal_semantics(
   assert (result[0][0]["status"] if result else None) == expected
 
 
-def test_edit_diffs_reads_transcript_once_after_writer_fence(client, auth):
+def test_edit_diffs_without_candidates_never_hydrates_bodies_after_writer_fence(client, auth):
   chat_id = _new_chat(client, auth)
   with _selects() as statements:
     response = client.get(f"/api/chats/{chat_id}/edit-diffs", headers=auth)
   assert response.status_code == 200, response.text
-  assert len(_transcript_reads(statements)) == 1
+  assert not _transcript_reads(statements)
 
 
 def test_edit_diffs_barrier_failure_does_not_read_transcript(
@@ -181,6 +181,7 @@ def test_edit_diffs_rechecks_authoritative_state_after_fence(
     assert "+new committed text" in response.text
 
 
+@pytest.mark.converted_chats  # A converted chat's row reads.
 def test_detail_history_with_many_goals_reads_transcript_only_once(
   client, auth, db, monkeypatch,
 ):

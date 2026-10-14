@@ -1,6 +1,7 @@
 """Compiles JSX source strings to ES modules using Rolldown."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -9,10 +10,11 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from app import timeutil
+from app import timeutil, tracing
 from app.app_compile_contract import (
   COMPILED_RUNTIME_BANNER,
-  ROLLDOWN_TIMEOUT_SECS,
+  ROLLDOWN_WALL_LIMIT_SECS,
+  RolldownStalled,
   rolldown_command,
   rolldown_report_contract_error,
 )
@@ -317,38 +319,47 @@ def _remove_unsupported_output(out: Path) -> None:
 async def _run_rolldown(
   command: list[str], *, cwd: str | None,
 ) -> tuple[int, bytes]:
-  async with build_lease_async():
+  with tracing.span("app.build") as build_span:
+    async with contextlib.AsyncExitStack() as stack:
+      with tracing.span("app.build.wait_for_slot"):
+        await stack.enter_async_context(build_lease_async())
+      returncode, stderr = await _spawn_rolldown(command, cwd=cwd)
+    tracing.annotate(build_span, {"mobius.build.exit_code": returncode})
+    return returncode, stderr
+
+
+async def _spawn_rolldown(
+  command: list[str], *, cwd: str | None,
+) -> tuple[int, bytes]:
+  try:
+    proc = await asyncio.create_subprocess_exec(
+      *command,
+      cwd=cwd,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.PIPE,
+    )
+  except FileNotFoundError:
+    raise RuntimeError(
+      "Node.js is not installed or not on PATH. "
+      "The Docker image installs it automatically."
+    )
+  try:
+    _, stderr = await asyncio.wait_for(
+      proc.communicate(), timeout=ROLLDOWN_WALL_LIMIT_SECS,
+    )
+  except asyncio.TimeoutError:
+    proc.kill()
+    await proc.communicate()
+    raise RolldownStalled() from None
+  except asyncio.CancelledError:
+    # Shutdown must not leave a child writing after locks are released.
+    proc.kill()
     try:
-      proc = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-      )
-    except FileNotFoundError:
-      raise RuntimeError(
-        "Node.js is not installed or not on PATH. "
-        "The Docker image installs it automatically."
-      )
-    try:
-      _, stderr = await asyncio.wait_for(
-        proc.communicate(), timeout=ROLLDOWN_TIMEOUT_SECS,
-      )
-    except asyncio.TimeoutError:
-      proc.kill()
       await proc.communicate()
-      raise RuntimeError(
-        f"Rolldown timed out after {ROLLDOWN_TIMEOUT_SECS} seconds"
-      )
-    except asyncio.CancelledError:
-      # Shutdown must not leave a child writing after locks are released.
-      proc.kill()
-      try:
-        await proc.communicate()
-      except Exception:
-        pass
-      raise
-    return proc.returncode or 0, stderr
+    except Exception:
+      pass
+    raise
+  return proc.returncode or 0, stderr
 
 
 async def compile_jsx(
@@ -376,6 +387,8 @@ async def compile_jsx(
 
   Raises:
     CompileError: If the JSX is invalid or Rolldown rejects the source.
+    RolldownStalled: If the build outlived its wall-time limit; the source
+      was not judged.
   """
   # Fail loudly on malformed source before invoking Rolldown — the
   # silent-0-byte case produces a downstream "no default export" at
@@ -418,10 +431,9 @@ async def compile_jsx(
       cwd=compile_cwd,
     )
     if returncode != 0:
-      decoded_stderr = stderr.decode()
       raise CompileError(
         "Compilation failed.",
-        stderr=decoded_stderr,
+        stderr=stderr.decode(),
         source_path=entry_path,
       )
     try:

@@ -90,9 +90,11 @@ test('a malformed intent is dropped but the app still opens', () => {
 test('targets without an intent are unchanged', () => {
   assert.equal(safeTarget('/shell/?app=pages'), '/shell/?app=pages')
   assert.equal(safeTarget('/shell/?chat=abc'), '/shell/?chat=abc')
-  // The worker's click handler adds this focus instruction only for the
-  // answer-alert title; the generic sanitizer must not grant it to other push.
-  assert.equal(safeTarget('/shell/?chat=abc&focus=question'), '/shell/?chat=abc')
+  // An owner-input card's notification carries its focus instruction in the
+  // target itself; nothing else on a chat link survives the sanitizer.
+  assert.equal(safeTarget('/shell/?chat=abc&focus=question'), '/shell/?chat=abc&focus=question')
+  assert.equal(safeTarget('/shell/?chat=abc&focus=other'), '/shell/?chat=abc')
+  assert.equal(safeTarget('/shell/?chat=abc&intent=x'), '/shell/?chat=abc')
   assert.equal(safeTarget('/shell/'), '/shell/')
 })
 
@@ -107,6 +109,19 @@ test('an intent cannot smuggle in a different destination', () => {
     safeTarget('/shell/?app=pages&intent=' + encodeURIComponent('a&chat=evil')),
     '/shell/?app=pages',
   )
+})
+
+test('a Settings target keeps a well-shaped section and navigates the shell', () => {
+  assert.equal(safeTarget('/shell/?settings=ai-providers'), '/shell/?settings=ai-providers')
+  assert.equal(
+    safeTarget('https://mobius.test/shell/?settings=github&x=1'),
+    '/shell/?settings=github',
+  )
+  // The worker cannot know the section list; it only refuses a malformed id,
+  // and the shell narrows the rest to its known sections.
+  assert.equal(safeTarget('/shell/?settings=../x'), '/shell/?settings')
+  assert.equal(safeTarget('/shell/?settings'), '/shell/?settings')
+  assert.equal(safeTarget('/shell/?app=<x>&settings=github'), '/shell/')
 })
 
 test('out-of-scope targets still fall back to root', () => {

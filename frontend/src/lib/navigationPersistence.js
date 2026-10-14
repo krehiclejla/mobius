@@ -1,3 +1,6 @@
+import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+import { settingsSectionOrNull } from './settingsSections.js'
+
 const ACTIVE_CHAT_KEY = 'moebius_active_chat'
 const ACTIVE_VIEW_KEY = 'moebius_active_view'
 const ACTIVE_APP_KEY = 'moebius_active_app'
@@ -27,7 +30,7 @@ export function consumeReturnView(storage = globalThis.sessionStorage) {
 
 export function parseShellDeepLink(location = globalThis.location) {
   const path = location?.pathname || ''
-  if (/^\/shell\/?$/.test(path)) {
+  if (/^\/shell\/?$/.test(path) || isSharedBrowserRoute(path)) {
     try {
       const params = new URLSearchParams(location?.search || '')
       const app = params.get('app')
@@ -43,6 +46,10 @@ export function parseShellDeepLink(location = globalThis.location) {
       if (chat) return { view: 'chat', chatId: chat, intent, focusQuestion }
       if (project) return { view: 'project', projectId: project }
       if (projects === '1') return { view: 'projects' }
+      if (params.has('settings')) {
+        const section = settingsSectionOrNull(params.get('settings'))
+        return { view: 'settings', ...(section ? { section } : {}) }
+      }
     } catch { /* malformed query is an ordinary empty destination */ }
     return null
   }

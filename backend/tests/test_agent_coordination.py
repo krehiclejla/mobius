@@ -1,4 +1,7 @@
 """Provider-neutral global peer discovery, delivery, and confinement."""
+from sqlalchemy.orm import object_session
+from app import transcript_rows
+from app.chat_writer import create_chat
 
 from tests.goal_fixtures import goal_run as make_goal_run, persist_goal_fixture
 
@@ -53,29 +56,29 @@ def _network_fixture(db):
     source_dir="/tmp/subagents",
   )
   chats = {
-    "root": models.Chat(
+    "root": create_chat(
       id="room-root", title="Lead", messages=[], provider="codex",
     ),
-    "scout": models.Chat(
+    "scout": create_chat(
       id="room-scout", title="Scout", messages=[], provider="claude",
       created_by_app_id=1,
     ),
-    "builder": models.Chat(
+    "builder": create_chat(
       id="room-builder", title="Builder", messages=[], provider="codex",
       created_by_app_id=1,
     ),
-    "nested": models.Chat(
+    "nested": create_chat(
       id="room-nested", title="Nested verifier", messages=[],
       provider="claude", created_by_app_id=1,
     ),
-    "outsider": models.Chat(
+    "outsider": create_chat(
       id="outside-chat", title="Outside", messages=[], provider="codex",
     ),
-    "outside_helper": models.Chat(
+    "outside_helper": create_chat(
       id="outside-helper", title="Outside helper", messages=[],
       provider="codex", created_by_app_id=1,
     ),
-    "never": models.Chat(
+    "never": create_chat(
       id="never-agent", title="Never started", messages=[], provider="claude",
     ),
   }
@@ -425,13 +428,13 @@ def test_direct_mail_never_mutates_owner_transcripts_or_pending_messages(
   client, auth, db,
 ):
   chats, _ = _network_fixture(db)
-  chats["scout"].messages = [{"role": "assistant", "content": "Scout note"}]
+  transcript_rows.replace_all(object_session(chats['scout']), chats['scout'], [{"role": "assistant", "content": "Scout note"}])
   chats["scout"].pending_messages = [{"content": "Owner steer"}]
-  chats["builder"].messages = [{"role": "assistant", "content": "Builder note"}]
+  transcript_rows.replace_all(object_session(chats['builder']), chats['builder'], [{"role": "assistant", "content": "Builder note"}])
   chats["builder"].pending_messages = []
   db.commit()
   before = {
-    chat.id: (list(chat.messages or []), list(chat.pending_messages or []))
+    chat.id: (list(transcript_rows.history(chat)), list(chat.pending_messages or []))
     for chat in (chats["scout"], chats["builder"])
   }
   sent = client.post(
@@ -446,7 +449,7 @@ def test_direct_mail_never_mutates_owner_transcripts_or_pending_messages(
   db.expire_all()
   for key in ("scout", "builder"):
     chat = db.get(models.Chat, chats[key].id)
-    assert (chat.messages, chat.pending_messages) == before[chat.id]
+    assert (list(transcript_rows.history(chat)), chat.pending_messages) == before[chat.id]
 
 
 @pytest.mark.parametrize("provider", ["codex", "claude"])
@@ -535,7 +538,7 @@ def test_interrupt_delivery_steers_ordered_backlog_once(
   db.expire_all()
   stored = db.get(models.Chat, builder.id)
   assert stored.pending_messages in (None, [])
-  assert stored.messages[-1]["cid"] == carrier["cid"]
+  assert list(transcript_rows.history(stored))[-1]["cid"] == carrier["cid"]
   successor_context = _next_turn_context(
     db, builder, f"builder-after-{provider}-steer",
   )
@@ -1372,7 +1375,7 @@ def test_admitted_turn_without_provider_ack_does_not_consume_peer_context(db):
 
 def test_context_omits_unrelated_global_agents_when_nothing_arrived(db):
   _network_fixture(db)
-  chat = models.Chat(id="quiet-chat", title="Quiet", messages=[])
+  chat = create_chat(id="quiet-chat", title="Quiet", messages=[])
   run = make_goal_run(db,
     id="quiet-run", root_run_id="quiet-run", chat_id=chat.id,
     status="running", provider="codex",
@@ -1414,7 +1417,7 @@ def test_delegated_children_derive_project_scope_without_becoming_project_chats(
     compiled_path="/tmp/subagents.js", slug="subagents",
     source_dir="/tmp/subagents",
   )
-  parent = models.Chat(
+  parent = create_chat(
     id="project-parent", title="Project lead", messages=[],
     project_id=project.id,
   )
@@ -1465,7 +1468,8 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   monkeypatch.setattr(
     coordination, "paused_goal_run",
     lambda _db, chat_id: (
-      SimpleNamespace(id="builder-goal-run") if chat_id == builder.id else None
+      SimpleNamespace(id="builder-goal-run", goal_id=runs["builder"].goal_id)
+      if chat_id == builder.id else None
     ),
   )
   started = []
@@ -1495,6 +1499,9 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   )
   assert interrupted.status_code == 200, interrupted.text
   assert interrupted.json()["woken"] == [builder.id]
+  # The wake resumes under the paused Goal, not as Goal-less work.
+  assert started[-1]["goal_id"] == runs["builder"].goal_id
+  assert started[-1]["source_work_id"] == "builder-goal-run"
   assert len(started) == 1
   wake = started[0]
   assert wake["chat_id"] == builder.id
@@ -1635,7 +1642,7 @@ def _claim_owner_and_follower(db):
   """A running owner Goal holds CLAIM_KEY; another running Goal follows it."""
   for name in ("owner", "follower"):
     db.add_all([
-      models.Chat(id=f"claim-{name}", title=f"Claim {name}", messages=[],
+      create_chat(id=f"claim-{name}", title=f"Claim {name}", messages=[],
                   provider="codex"),
       models.ChatGoal(id=f"claim-{name}-goal", chat_id=f"claim-{name}",
                       objective=f"{name} objective"),
@@ -1713,7 +1720,7 @@ def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
   delivered = _record_deliveries(monkeypatch)
 
   async def stop_then_drain_settlement():
-    await chat_mod._finish_run("claim-owner", "", "stopped")
+    await chat_mod.stop_chat("claim-owner", actor="owner")
     await asyncio.gather(*list(coordination._SETTLEMENT_TASKS))
 
   asyncio.run(stop_then_drain_settlement())
@@ -1722,6 +1729,30 @@ def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
   assert claim.released_at is not None
   assert "You may claim it now" in notice.body
   assert delivered == [(["claim-follower"], "interrupt")]
+
+
+@pytest.mark.parametrize("terminal_status", ["stopped", "interrupted", "failed"])
+def test_process_termination_does_not_release_goal_claims_without_stop_intent(
+  client, auth, db, monkeypatch, terminal_status,
+):
+  import asyncio
+
+  import app.agent_coordination as coordination
+  from app import chat as chat_mod
+
+  _claim_owner_and_follower(db)
+  delivered = _record_deliveries(monkeypatch)
+
+  async def terminate_then_drain():
+    await chat_mod._finish_run("claim-owner", "claim-owner-run", terminal_status)
+    await asyncio.gather(*list(coordination._SETTLEMENT_TASKS))
+
+  asyncio.run(terminate_then_drain())
+
+  claim, notices = _claim_and_notices(db)
+  assert claim.released_at is None
+  assert notices == [] and delivered == []
+  assert db.get(models.ChatGoal, "claim-owner-goal").status == "open"
 
 
 def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
@@ -1737,7 +1768,7 @@ def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
   # Completion commits, then the process "dies" before any notice is sent.
   update_goal_record(
     db, db.get(models.ChatRun, "claim-owner-run"),
-    db.get(models.ChatGoal, "claim-owner-goal"), 0, result="Merged",
+    db.get(models.ChatGoal, "claim-owner-goal"), 0, complete="Merged",
   )
   claim, notices = _claim_and_notices(db)
   assert claim.notification_revision < claim.revision and notices == []
@@ -1751,3 +1782,39 @@ def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
   assert claim.notification_revision == claim.revision
   assert len(notices) == 1
   assert delivered == [(["claim-follower"], "interrupt")]
+
+
+def test_goal_parent_and_its_helper_share_one_coordination_scope(db):
+  """A Goal helper is keyed by its physical spawning root but owned by the
+  Goal. Coordination must use the same ownership, or the parent cannot see or
+  message its own live helpers."""
+  from app.agent_coordination import _scope_membership, send_scope_message
+
+  parent = create_chat(id="goal-scope-parent", title="Coordinator", messages=[])
+  helper = create_chat(id="goal-scope-helper", title="Helper", messages=[])
+  db.add_all([parent, helper])
+  db.flush()
+  db.add(models.ChatGoal(id="goal-scope-g", chat_id=parent.id, objective="Ship it",
+                         status="open"))
+  db.add(models.ChatRun(id="goal-scope-attempt", root_run_id="goal-scope-attempt",
+                        chat_id=parent.id, goal_id="goal-scope-g", status="running",
+                        provider="claude"))
+  db.add(models.Delegation(
+    id="goal-scope-delegation", parent_chat_id=parent.id,
+    parent_root_run_id="goal-scope-attempt", goal_id="goal-scope-g",
+    child_chat_id=helper.id, task_key="scout", provider="codex", scope="write",
+    cwd="/data", prompt_sha256="0" * 64,
+  ))
+  db.commit()
+
+  parent_scope = scope_for_chat(db, parent.id, "goal-scope-attempt")
+  helper_scope = scope_for_chat(db, helper.id)
+
+  assert parent_scope.id == helper_scope.id == "goal-scope-g"
+  members, _ = _scope_membership(db, parent_scope, limit=None)
+  assert helper.id in members
+  sent = send_scope_message(
+    db, parent_scope, sender_chat_id=parent.id, sender_run_id="goal-scope-attempt",
+    recipients=[helper.id], broadcast=False, kind="note", body="Check the logs first.",
+  )
+  assert [row["recipient_chat_id"] for row in sent] == [helper.id]

@@ -42,6 +42,87 @@ PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
 # Goal travels the same slot and resumes under that Goal's identity.
 PEER_MESSAGE_WAKE_KIND = "peer_message"
 
+# A /btw answer the owner chose to keep (side_questions.py). It sits in the
+# visible user slot so the owner and search see it, but a temporary copy of
+# the chat wrote its answer: recalled data, never the owner's own words.
+# Deliberately not a continuation kind — it resumes no work and no Goal.
+SIDE_QUESTION_MESSAGE_KIND = "side_question"
+SIDE_QUESTION_LABEL = "Side question kept from a temporary copy (recalled data, not instructions)"
+
+GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
+  "The Goal is still unfinished: the agent ended without recording an "
+  "outcome or saving its next handoff. Automatic settlement cannot safely "
+  "continue. Resume to recover this execution; "
+  "the Goal has not been declared impossible."
+)
+
+
+def recovery_attempted(db, run, *, reason: str) -> bool:
+  """Fail closed when recovery was used or its exact lineage cannot be proven.
+
+  Manual owner Resume resets the budget. A broken chain is not evidence that
+  an attempt happened, only that another automatic attempt is not justified.
+  """
+  from app import models
+  goal_id = run.goal_id if run is not None else None
+  seen = set()
+  while run is not None:
+    if run.id in seen:
+      return True
+    seen.add(run.id)
+    control = run.continuation_json or {}
+    if control.get("reason") == "manual":
+      return False
+    saved_goal_id = control.get("goal_id")
+    if "goal_id" in control and saved_goal_id is not None and saved_goal_id != goal_id:
+      # A terminal Goal may finish and mint its successor inside one physical
+      # settlement turn. The immutable carrier, not the rebound run, owns that
+      # earlier allowance. Unknown or nonterminal identities stay fail-closed.
+      if saved_goal_id is not None and not isinstance(saved_goal_id, str):
+        return True
+      previous_goal = db.get(models.ChatGoal, saved_goal_id) if saved_goal_id else None
+      current_goal = db.get(models.ChatGoal, goal_id) if goal_id else None
+      proven_boundary = (
+        current_goal is not None and current_goal.chat_id == run.chat_id
+        and previous_goal is not None and previous_goal.chat_id == run.chat_id
+        and previous_goal.status in {"completed", "cannot_complete", "cancelled"}
+      )
+      return not proven_boundary
+    if control.get("reason") == reason:
+      return True
+    predecessor = control.get("supersedes_run_token")
+    if not predecessor:
+      return False
+    previous = db.get(models.ChatRun, predecessor)
+    if previous is None or previous.chat_id != run.chat_id:
+      return True
+    if previous.goal_id != goal_id:
+      # Explicit Goal-less origin plus an actual Goal-less predecessor proves
+      # promotion; a NULL hint alone cannot bypass this Goal's earlier pass.
+      current_goal = db.get(models.ChatGoal, goal_id) if goal_id else None
+      return not ("goal_id" in control and saved_goal_id is None
+                  and previous.goal_id is None and current_goal is not None
+                  and current_goal.chat_id == run.chat_id)
+    run = previous
+  return False
+
+
+
+HELPER_ANSWER_REASON = "helper_answer"
+HELPER_ANSWER_CID_PREFIX = "helper-answer:"
+
+def helper_answer_question_id(message: Mapping[str, Any] | None) -> str | None:
+  """The question id a queued or admitted helper-answer row carries, if any."""
+  if not (
+    isinstance(message, Mapping)
+    and message.get("kind") == "continuation"
+    and message.get("continuation_reason") == HELPER_ANSWER_REASON
+  ):
+    return None
+  cid = message.get("cid")
+  if not isinstance(cid, str) or not cid.startswith(HELPER_ANSWER_CID_PREFIX):
+    return None
+  return cid.removeprefix(HELPER_ANSWER_CID_PREFIX) or None
 
 def pending_message_group_key(message: Mapping[str, Any]) -> tuple:
   """Return the causal turn boundary for one queued message."""
@@ -50,8 +131,12 @@ def pending_message_group_key(message: Mapping[str, Any]) -> tuple:
     bool(message.get("hidden")), kind, message.get("source_work_id"),
   )
   # Each product row already coalesces its own domain batch and owns one
-  # independent delivery latch. Never merge two such durable receipts.
-  if kind in PRODUCT_RESULT_MESSAGE_KINDS:
+  # independent delivery latch. Never merge two such durable receipts. A
+  # queued helper answer is its question's one reserved run, never a batch.
+  if (
+    kind in PRODUCT_RESULT_MESSAGE_KINDS
+    or helper_answer_question_id(message) is not None
+  ):
     return (*key, message.get("cid"))
   return key
 
@@ -59,7 +144,15 @@ def pending_message_group_key(message: Mapping[str, Any]) -> tuple:
 def product_result_run_token(
   chat_id: str, message: Mapping[str, Any],
 ) -> str | None:
-  """Return one stable physical identity for a queued product result."""
+  """Return one stable physical identity for a queued product result.
+
+  A helper answer queued behind its helper's running turn is promoted under
+  its question's reserved run id, exactly as a direct start would create it.
+  """
+  question_id = helper_answer_question_id(message)
+  if question_id is not None:
+    from app.delegations import helper_answer_run_id
+    return helper_answer_run_id(chat_id, question_id)
   kind = message.get("kind")
   source_work_id = message.get("source_work_id")
   cid = message.get("cid")
@@ -101,6 +194,20 @@ def is_continuation_message(message: Mapping[str, Any] | None) -> bool:
   )
 
 
+def not_owner_speech_label(message: Mapping[str, Any] | None) -> str | None:
+  """How history names a user-slot row the owner did not write, else None.
+
+  Readers that replay history as dialogue or measure owner activity (a
+  reseeded session, compaction, the recency clock, the fallback title) ask
+  this one question, so a product-written row never reads as the owner.
+  """
+  if is_continuation_message(message):
+    return continuation_actor_label(message)
+  if isinstance(message, Mapping) and message.get("kind") == SIDE_QUESTION_MESSAGE_KIND:
+    return SIDE_QUESTION_LABEL
+  return None
+
+
 def continuation_reason(message: Mapping[str, Any] | None) -> str:
   if not is_continuation_message(message):
     return ""
@@ -113,8 +220,8 @@ def continuation_reason(message: Mapping[str, Any] | None) -> str:
 def is_retired_goal_handoff(message: Mapping[str, Any] | None) -> bool:
   """A queued automatic-Goal control the pre-2026-09-27 writer left behind.
 
-  Goals no longer continue themselves. Such a row may still sit behind owner
-  input in a persisted queue; it is retired unrun, never promoted as input.
+  The former revision-budget loop is retired. Such a row may still sit behind
+  owner input; it must not become the new bounded settlement recovery.
   """
   return continuation_reason(message) == "goal_handoff"
 
@@ -124,6 +231,9 @@ def continuation_actor_label(message: Mapping[str, Any] | None) -> str:
   reason = continuation_reason(message)
   if reason == "manual":
     return "Manual continuation"
+  if reason == "helper_answer":
+    # delegations.HELPER_ANSWER_REASON: the parent agent's correlated answer.
+    return "Parent answer"
   return f"Automatic continuation ({reason})"
 
 
@@ -143,7 +253,23 @@ def continuation_protocol_source(
     "usage_limit": "Resume the interrupted owner work after a provider-limit check. Provider availability is not yet confirmed.",
     "memory": "Resume the interrupted owner work now that memory pressure has cleared.",
     "storage": "Resume the interrupted owner work now that storage pressure has cleared.",
+    "compaction": (
+      "The oversized provider session was replaced using the saved detailed handoff "
+      "and uncovered conversation. Continue the interrupted work from that briefing, "
+      "checking existing results before repeating any actions. This is the only "
+      "automatic size-recovery attempt for this logical turn."
+    ),
     "model_capacity": "Resume the interrupted owner work now that the selected model may be available.",
+    "goal_settlement": (
+      "The exact Goal remains open after a clean execution ended without an outcome or durable handoff. "
+      "This is one targeted settlement recovery, not permission to redo verified work or shrink the objective. "
+      "Read the saved Goal and reconcile its checklist. Complete only if the original promised outcome is verified. "
+      "Otherwise continue necessary authorized work in this run, or save a concrete owner question/approval "
+      "with instructions and meaningful choices. If unreachable, explain why, efforts and partial results, "
+      "and seek actionable owner input before declaring Cannot complete. Use a durable Wait/helper only "
+      "when it actually owns continuation. Do not end with optional Unpause or a prose promise. "
+      "This recovery will not automatically repeat."
+    ),
   }
   source = {
     "role": "user",
@@ -167,6 +293,7 @@ def continuation_control_envelope(
   *, reason: str, control_id: str,
   source_work_id: str | None = None, goal_id: str | None = None,
   supersedes_run_token: str | None = None,
+  goal_revision: int | None = None,
 ) -> dict:
   """Return the bounded durable half of a provider-only continuation."""
   envelope = {
@@ -179,7 +306,21 @@ def continuation_control_envelope(
     envelope["goal_id"] = goal_id
   if supersedes_run_token is not None:
     envelope["supersedes_run_token"] = supersedes_run_token
+  if goal_revision is not None:
+    envelope["goal_revision"] = goal_revision
   return envelope
+
+
+def manual_resume_matches(control, *, control_id, run_id=None,
+                          goal_id=None, goal_revision=None):
+  """A lost Resume receipt can acknowledge only the original exact target."""
+  if control.get("control_id") != control_id or control.get("reason") != "manual":
+    return False
+  if goal_id is not None or "goal_revision" in control:
+    return (goal_id == control.get("goal_id")
+            and goal_revision == control.get("goal_revision") and run_id is None)
+  recorded_run = control.get("supersedes_run_token")
+  return run_id is None or recorded_run is None or recorded_run == run_id
 
 
 def manual_continuation_run_token(chat_id: str, control_id: str) -> str:

@@ -38,6 +38,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app import transcript_rows
 from app import models
 from app.chat_message_identity import assistant_message_run_id
 from app.config import get_settings
@@ -46,6 +47,7 @@ from app.continuations import (
   WAIT_RESULT_MESSAGE_KIND,
 )
 from app.timeutil import now_naive_utc
+from app.wait_checks import GitHubChecks, read_check_observation
 
 _LOG = logging.getLogger("moebius.chat_waits")
 
@@ -100,6 +102,7 @@ def owed_wait_results(
     models.ChatWait.kind != "platform_activation",
     _FIRED_UNDELIVERED,
   ).order_by(models.ChatWait.created_at.asc()).all()
+  rows = [row for row in rows if not _closed_wait_goal(db, row) and not _held_wait_goal(db, row)]
   notices = [
     notice for notice in (
       _compose_resume_notice(row, _OUTCOMES[row.status]) for row in rows
@@ -139,6 +142,24 @@ _RESULT_MAX = 3000
 _OUTCOMES = {"met": "met", "expired": "deadline_expired", "failed": "check_failed"}
 _RESUME_RETRY = ".retry"
 
+def _closed_wait_goal(db: Session, row: models.ChatWait) -> bool:
+  """Never hand an old Goal's Wait to a later Goal on the same run."""
+  if row.goal_id is None:
+    # NULL is unowned (including ambiguous old rows), never the creating
+    # run's current Goal. The result may be delivered only as Goal-less work.
+    return False
+  goal = db.get(models.ChatGoal, row.goal_id)
+  # Missing ownership is ambiguous, not an invitation to adopt the current
+  # Goal. A stopped Goal is held, not terminal.
+  return goal is None or goal.chat_id != row.chat_id or goal.status in (
+    "completed", "cancelled", "cannot_complete",
+  )
+
+
+def _held_wait_goal(db: Session, row: models.ChatWait) -> bool:
+  goal = db.get(models.ChatGoal, row.goal_id) if row.goal_id else None
+  return goal is not None and goal.chat_id == row.chat_id and goal.status == "stopped"
+
 # Cancellation is synchronous at the API/chat-lifecycle boundary while checks
 # run in the supervisor's event loop. A None PID reserves an admission while
 # the durable row is checked and the subprocess starts. Cancellation markers
@@ -164,6 +185,7 @@ def declare_wait(
   interval_secs: int | None = None,
   deadline_secs: int | None = None,
   created_by_run_id: str | None = None,
+  github_checks: dict | None = None,
 ) -> models.ChatWait:
   """Validate and persist one armed wait for `chat_id`."""
   description = (description or "").strip()
@@ -172,13 +194,28 @@ def declare_wait(
   condition_owner = (condition_owner or "").strip()
   if len(condition_owner) > 160:
     raise WaitValidationError("condition_owner must not exceed 160 characters")
-  if kind not in ("command", "timer"):
-    raise WaitValidationError("kind must be 'command' or 'timer'")
+  if kind not in ("command", "timer", "github_checks"):
+    raise WaitValidationError("kind must be 'command', 'timer', or 'github_checks'")
+  condition = None
+  if kind == "github_checks":
+    if command or delay_secs is not None:
+      raise WaitValidationError("GitHub checks cannot also specify a command or timer")
+    try:
+      spec = GitHubChecks.model_validate(github_checks)
+    except ValueError as exc:
+      raise WaitValidationError("github_checks needs repository, pull_request, and head_sha") from exc
+    condition_owner = condition_owner or "GitHub"
+    # Store the typed spec, not a command line: the checker's interpreter and
+    # script path are resolved at each check so an image update cannot break
+    # an armed wait.
+    condition = spec.model_dump()
+  elif github_checks is not None:
+    raise WaitValidationError("github_checks is only valid for a GitHub wait")
   condition_owner = (condition_owner or "").strip() or None
   if kind == "command" and condition_owner is None:
     raise WaitValidationError("command waits need a condition owner")
-  if kind == "command" and deadline_secs is None:
-    raise WaitValidationError("command waits need an explicit deadline")
+  if kind in ("command", "github_checks") and deadline_secs is None:
+    raise WaitValidationError("command and GitHub waits need an explicit deadline")
 
   now = now_naive_utc()
   interval = int(
@@ -198,9 +235,10 @@ def declare_wait(
     )
 
   due_at = None
-  if kind == "command":
-    command = command if isinstance(command, str) else ""
-    if not command.strip():
+  if kind in ("command", "github_checks"):
+    if kind == "github_checks":
+      command = None
+    elif not (isinstance(command, str) and command.strip()):
       raise WaitValidationError("command waits need a check command")
     # Probe on the next supervisor tick. A malformed check should fail visibly
     # now, not after its whole polling interval, and an already-met condition
@@ -235,16 +273,25 @@ def declare_wait(
     )
 
   deadline_at = now + timedelta(seconds=deadline)
+  source = (
+    db.query(models.ChatRun).filter(
+      models.ChatRun.id == created_by_run_id,
+      models.ChatRun.chat_id == chat_id,
+    ).first() if created_by_run_id else None
+  )
   row = models.ChatWait(
     id=uuid.uuid4().hex,
     chat_id=chat_id,
     created_by_run_id=created_by_run_id,
+    root_run_id=(source.root_run_id or source.id) if source else None,
+    goal_id=source.goal_id if source else None,
     description=description[:500],
     condition_owner=(
       condition_owner or ("Time" if kind == "timer" else "External system")
     ),
     kind=kind,
     command=command,
+    condition_json=condition,
     due_at=due_at,
     interval_secs=interval,
     deadline_at=deadline_at,
@@ -661,6 +708,7 @@ def _compose_resume_notice(row: models.ChatWait, outcome: str) -> str:
     "outcome": outcome,
     "kind": row.kind,
     "command": row.command,
+    **({"github_checks": row.condition_json} if row.kind == "github_checks" else {}),
     "checks_count": row.checks_count,
     "last_exit_code": row.last_exit_code,
     "declared_at": row.created_at.isoformat() if row.created_at else None,
@@ -740,10 +788,12 @@ def safe_startup_writer_orphan(
     if row.created_by_run_id is not None else None
   )
   expected_root = (
-    (source.root_run_id or source.id)
-    if source is not None else physical.id
+    row.root_run_id or ((source.root_run_id or source.id)
+    if source is not None and row.goal_id is None else physical.id)
   )
   if (physical.root_run_id or physical.id) != expected_root:
+    return False
+  if not activation and _closed_wait_goal(db, row):
     return False
   outcome = _OUTCOMES[row.status]
   if activation:
@@ -757,8 +807,7 @@ def safe_startup_writer_orphan(
     expected_content = _compose_resume_notice(row, outcome)
     expected_cid = "wait-result-" + physical.id[len(prefix):]
     expected_kind = WAIT_RESULT_MESSAGE_KIND
-  messages = list(chat.messages or [])
-  continuation = messages[-1] if messages else None
+  continuation = transcript_rows.at(db, chat, -1)
   live = chat.live_assistant or {}
   return bool(
     isinstance(continuation, dict)
@@ -804,6 +853,12 @@ async def _deliver_resume(row_id: str) -> bool:
     chat_id = row.chat_id
     outcome = _OUTCOMES[row.status]
     activation = row.kind == "platform_activation"
+    if not activation and _closed_wait_goal(db, row):
+      row.resume_delivered_at = now_naive_utc()
+      db.commit()
+      return False
+    if not activation and _held_wait_goal(db, row):
+      return False
     if activation:
       from app.platform_restart import activation_notice
       content = activation_notice(
@@ -849,9 +904,9 @@ async def _deliver_resume(row_id: str) -> bool:
       # the result latches it; until then each next turn carries it.
       return False
     root_run_id = (
-      row.root_run_id if activation else
+      row.root_run_id if row.root_run_id is not None else
       (source.root_run_id or source.id)
-      if source is not None else (
+      if source is not None and row.goal_id is None else (
         resume_run_id
         if (
           existing_resume is not None
@@ -1050,6 +1105,7 @@ async def _check_one(row_id: str) -> bool:
       return False
     kind = row.kind
     command = row.command
+    condition = row.condition_json
     due_at = row.due_at
     deadline_at = row.deadline_at
     interval = int(row.interval_secs or DEFAULT_INTERVAL_SECS)
@@ -1073,6 +1129,14 @@ async def _check_one(row_id: str) -> bool:
     met = verdict == "met"
     check_failed = verdict == "failed"
     exit_code = 0 if met else (2 if check_failed else 1)
+  elif kind == "github_checks":
+    exit_code, output = await _run_check(
+      GitHubChecks.model_validate(condition).command(), wait_id=row_id,
+    )
+    observation = read_check_observation(exit_code, output)
+    met = observation.state == "met"
+    check_failed = observation.state == "failed"
+    output = observation.model_dump_json()
   else:
     exit_code, output = await _run_check(command or "false", wait_id=row_id)
     met = exit_code == 0
@@ -1080,7 +1144,7 @@ async def _check_one(row_id: str) -> bool:
     # predicate is silent exit 1; output is reserved for diagnostics or a met
     # result. This catches shell quoting, missing auth/environment, missing
     # executables, timeouts, and provider errors without guessing from brittle
-    # message substrings.
+    # message substrings. Only the typed GitHub checker reports progress.
     check_failed = not met and not (
       exit_code == 1 and not (output or "").strip()
     )
@@ -1146,17 +1210,10 @@ def outstanding_waits_for_chat(db: Session, chat_id: str) -> list[models.ChatWai
 
 
 def _goal_waits(db: Session, chat_id: str, goal_id: str):
-  """Waits declared by any attempt of one Goal in this chat."""
-  from sqlalchemy import func
-
-  return db.query(models.ChatWait).join(
-    models.ChatRun, models.ChatRun.id == models.ChatWait.created_by_run_id,
-  ).filter(
-    models.ChatRun.chat_id == chat_id,
+  """Immutable Wait affinity; migration backfills only proven old ownership."""
+  return db.query(models.ChatWait).filter(
     models.ChatWait.chat_id == chat_id,
-    func.coalesce(
-      models.ChatRun.goal_id, models.ChatRun.root_run_id, models.ChatRun.id,
-    ) == goal_id,
+    models.ChatWait.goal_id == goal_id,
   )
 
 

@@ -113,6 +113,9 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   chat_ids = sorted(chat_id_set)
 
   if delegation_ids:
+    db.query(models.DelegationQuestion).filter(
+      models.DelegationQuestion.delegation_id.in_(delegation_ids),
+    ).delete(synchronize_session=False)
     db.query(models.Delegation).filter(
       models.Delegation.id.in_(delegation_ids),
     ).delete(synchronize_session=False)
@@ -131,6 +134,7 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   )).delete(synchronize_session=False)
 
   dependent_models = (
+    models.ChatCompactionDraft,
     models.ChatActivityPosition,
     models.ChatLiveAssistant,
     models.ChatEmbedGrant,
@@ -198,12 +202,8 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   db.query(models.AgentWorkInterest).filter(
     models.AgentWorkInterest.chat_id.in_(chat_ids),
   ).delete(synchronize_session=False)
-  # Search rows are derived transcript data without a foreign key because the
-  # SQLite FTS trigger owns their lifecycle. Remove them in the same durable
-  # transaction as the source row rather than retaining a hard-deleted chat's
-  # prose until a future search happens to reconcile the index.
-  from app.chat_search import purge_chat_docs
-  purge_chat_docs(db, chat_ids)
+  # Transcript rows, search entries and damage copies go with each chat
+  # through the `chats_deleted` trigger, in this same transaction.
   db.query(models.Chat).filter(
     models.Chat.id.in_(chat_ids),
   ).delete(synchronize_session=False)

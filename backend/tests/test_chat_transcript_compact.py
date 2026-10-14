@@ -1,4 +1,6 @@
 """Compact chat reads keep the transcript light without changing stored truth."""
+from app import transcript_rows
+from sqlalchemy.orm import object_session
 
 import asyncio
 import json
@@ -831,6 +833,7 @@ def test_runtime_route_does_not_select_transcript_json(
   assert runtime.status_code == 200
   assert runtime.json() == {
     "running": True,
+    "compacting": None,
     "restart_observation_key": "[[],null]",
     "run_id": None,
     "run_status": None,
@@ -840,6 +843,7 @@ def test_runtime_route_does_not_select_transcript_json(
     "continuation_wait": None,
     "active_goal_objective": None,
     "goal": None,
+    "handoff": {"kind": "working", "reason": None},
     "pending_messages": [],
     "pending_question_id": None,
     "updated_at": created.json()["updated_at"],
@@ -931,7 +935,7 @@ def test_parked_question_exposes_its_tail_owner_without_live_json(
   )
   chat_id = created.json()["id"]
   chat = db.query(models.Chat).filter(models.Chat.id == chat_id).one()
-  chat.messages = [
+  transcript_rows.replace_all(object_session(chat), chat, [
     {"role": "user", "content": "earlier", "ts": 1},
     {
       "id": "assistant-older",
@@ -961,7 +965,7 @@ def test_parked_question_exposes_its_tail_owner_without_live_json(
         "questions": [{"id": "current", "question": "Current choice?"}],
       }],
     },
-  ]
+  ])
   chat.pending_question_id = "question-current"
   chat.live_assistant = None
   chat.active_assistant_message_id = "assistant-current"

@@ -55,7 +55,6 @@
     "src/components/Shell/__tests__/paneChatProps.test.js",
     "src/components/Shell/__tests__/shellFailurePresentation.test.js",
     "src/components/Shell/__tests__/tabStripHeight.test.js",
-    "src/components/Shell/__tests__/toastPlacement.test.js",
     "src/components/Shell/__tests__/workspacePlacement.test.js",
     "src/components/Shell/__tests__/workspaceUi.test.js",
     "src/hooks/__tests__/drawerCloseResilience.test.js",

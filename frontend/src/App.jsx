@@ -1,10 +1,10 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react'
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
-import { QueryClientProvider, useIsRestoring } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useIsRestoring } from '@tanstack/react-query'
 import ErrorBoundary from './components/ErrorBoundary/ErrorBoundary.jsx'
 import PlatformDegradedNotice from './components/ErrorBoundary/PlatformDegradedNotice.jsx'
 import './components/ErrorBoundary/RecoveryPanel.css'
-import { api, beginEphemeralAuth, getToken, setToken, BASE } from './api/client.js'
+import { api, beginEphemeralAuth, beginSharedBrowserAuth, getToken, setToken, BASE } from './api/client.js'
 import * as setupSession from './lib/setupSession.js'
 import { setupQueries, versionQueries } from './hooks/queries.js'
 import { queryClient, persistOptions } from './queryClient.js'
@@ -16,6 +16,8 @@ import { rememberProjectCopyRequest } from './lib/projectCopies.js'
 import { readStandaloneBoot } from './lib/standaloneBoot.js'
 import { shellReloadNavigationTransitionIsActive } from './lib/shellReloadNavigationTransition.js'
 import { opensDegradedRepairChat } from './lib/errorRecovery.js'
+import { consumeSharedBrowserEntry } from './lib/sharedBrowserInvite.js'
+import { isSharedBrowserRoute } from './lib/sharedBrowserWorkspace.js'
 
 // These flows are mutually exclusive. Keep setup, login, the full shell, and
 // the opaque embed out of one another's startup path; first boot should not
@@ -28,6 +30,11 @@ const StandaloneApp = lazy(() => import('./components/StandaloneApp/StandaloneAp
 const ProjectShare = lazy(() => import('./components/Projects/ProjectShare.jsx'))
 const ProjectCopyPage = lazy(() => import('./components/Projects/ProjectCopyPage.jsx'))
 const SharedApp = lazy(() => import('./components/Projects/SharedApp.jsx'))
+const SharedBrowserAccess = lazy(() => import('./components/SharedBrowserAccess/SharedBrowserAccess.jsx'))
+const SHARED_BROWSER_ROUTE = isSharedBrowserRoute(window.location.pathname)
+const sharedBrowserEntry = SHARED_BROWSER_ROUTE
+  ? consumeSharedBrowserEntry(window.location, window.history) : null
+const sharedBrowserQueryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30_000 } } })
 
 // True when this SPA load is the stripped-chrome chat embed
 // (capability A). The SPA catch-all serves index.html for any non-API
@@ -70,12 +77,14 @@ const SHARED_APP_INVITE_ROUTE = (() => {
   catch { return false }
 })()
 const STANDALONE_APP = readStandaloneBoot()
-if (!PROJECT_COPY_ROUTE && !PROJECT_SHARE_ROUTE && !EMBED_ROUTE && !SHARED_APP_ROUTE) {
+if (!PROJECT_COPY_ROUTE && !PROJECT_SHARE_ROUTE && !EMBED_ROUTE && !SHARED_APP_ROUTE && !SHARED_BROWSER_ROUTE) {
   // Identity sign-in leaves this page; retain only this one explicit copy
   // intent in tab-scoped storage, never in an OAuth URL or owner cache.
   try { rememberProjectCopyRequest(window.location.href, window.sessionStorage) } catch { /* fragment still works for local sign-in */ }
 }
-if (EMBED_ROUTE) {
+if (SHARED_BROWSER_ROUTE) {
+  beginSharedBrowserAuth()
+} else if (EMBED_ROUTE) {
   beginEphemeralAuth()
   beginEmbedBootstrap()
 } else if (PROJECT_SHARE_ROUTE || PROJECT_COPY_ROUTE || SHARED_APP_INVITE_ROUTE) {
@@ -100,6 +109,13 @@ function retryMobiusLogin() {
 }
 
 export default function App() {
+  if (SHARED_BROWSER_ROUTE) {
+    return <QueryClientProvider client={sharedBrowserQueryClient}>
+      <ErrorBoundary label="shared-browser-access" recoveryKey="shared-browser-access:root" canAskAgent={false}>
+        <Suspense fallback={<RouteLoading />}><SharedBrowserAccess initialEntry={sharedBrowserEntry} /></Suspense>
+      </ErrorBoundary>
+    </QueryClientProvider>
+  }
   if (EMBED_ROUTE) {
     return (
       <QueryClientProvider client={queryClient}>

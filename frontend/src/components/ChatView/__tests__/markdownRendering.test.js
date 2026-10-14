@@ -3,18 +3,10 @@ import assert from 'node:assert/strict'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { Marked } from 'marked'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { mathTokens } from '../markdown/mathTokens.js'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  // Inline markdown can reach the shared image-lightbox UI. Bundle its SDK UI
-  // dependency because that package intentionally uses extensionless ESM
-  // imports which native Node resolution cannot load during SSR.
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: InlineContent } = await vite.ssrLoadModule(
   '/src/components/ChatView/markdown/InlineContent.jsx',
 )

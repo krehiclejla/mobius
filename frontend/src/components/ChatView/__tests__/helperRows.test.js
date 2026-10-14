@@ -3,8 +3,8 @@ import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import React from 'react'
 import { renderWithModels } from './modelRegistryRender.js'
-import { createServer } from 'vite'
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
+const vite = await createSsrRenderServer()
 const { default: SubagentChips } = await vite.ssrLoadModule('/src/components/ChatView/SubagentChips.jsx')
 const { default: HelperResultCard, HelperResultGroupCard } = await vite.ssrLoadModule('/src/components/ChatView/HelperResultCard.jsx')
 const priorWindow = globalThis.window
@@ -100,7 +100,7 @@ test('a finished helper keeps its row with its engine and how long it took', () 
              provider: 'claude', model: 'claude-opus-4-8', duration_ms: 12_000, body: 'Done.' },
   }))
   assert.match(html, /audit-login/)
-  assert.match(html, /Opus 4.8 · Finished/)
+  assert.match(html, /Opus 4.8 · Helper finished/)
   assert.match(html, /12s/)
 })
 
@@ -178,7 +178,7 @@ test('a finished helper stays its launch step: one settled row, counted as done'
   assert.match(html, /1 done/)
   assert.equal(html.match(/chat__helper-row/g)?.length, 1, 'one row per helper')
   assert.doesNotMatch(html, /Started helper audit-login/)
-  assert.match(html, /Finished/)
+  assert.match(html, /Helper finished/)
   _resetDisclosureStateForTests()
 })
 

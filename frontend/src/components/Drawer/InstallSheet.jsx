@@ -17,6 +17,7 @@ import {
   isStandaloneDisplay,
 } from '../../utils/installPlatform.js'
 import './InstallSheet.css'
+import { isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
 
 // Home-screen names are short; the OS truncates long ones anyway and
 // `short_name` is the first 12 chars. Cap generously but keep it sane.
@@ -219,6 +220,10 @@ export default function InstallSheet({ app, onClose }) {
   }
 
   async function onContinue({ skipDirect = false } = {}) {
+    if (isSharedBrowserRoute()) {
+      setError('App installation opens outside shared access. Leave shared access and sign in as the owner to install it.')
+      return
+    }
     const name = draftName.trim()
     // Match the disabled primary button even when the form is submitted with
     // Enter. The explicit browser-steps action is still available when the
