@@ -9,16 +9,18 @@ bucket and allowance.
 A committed change to an app or a service alias in this process discards the
 snapshot, so an applied, removed, or re-accepted service (including a raised
 allowance) counts from its next request. A change written by another process
-is picked up within ``OUT_OF_PROCESS_RECHECK_SECONDS``, or sooner when the
-door resolves a service that no longer matches its entry and calls
-``discard``; the door then also charges the service's current bucket, so a
-stale entry never decides which reviewed cap applies.
+(a script or scheduled job writing the database; the API itself is a single
+uvicorn worker) is picked up within ``OUT_OF_PROCESS_RECHECK_SECONDS``, or
+sooner when the door resolves a service that no longer matches its entry and
+calls ``discard``; the door then also charges the service's current bucket, so
+a stale entry never decides which reviewed cap applies.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from typing import NamedTuple
 
 from fastapi import HTTPException
 from sqlalchemy import event, inspect
@@ -38,7 +40,15 @@ _PENDING_KEY = "mobius_public_services_changed"
 _lock = threading.Lock()
 _rebuild_lock = threading.Lock()
 _generation = 0
-_snapshot: tuple[int, float, dict[str, tuple[str, int]]] | None = None
+
+
+class Snapshot(NamedTuple):
+  generation: int
+  built_at: float
+  index: dict[str, tuple[str, int]]
+
+
+_snapshot: Snapshot | None = None
 
 
 def bucket(app, service: dict) -> tuple[str, int]:
@@ -48,41 +58,48 @@ def bucket(app, service: dict) -> tuple[str, int]:
   return str(app.id), app_services.public_requests_per_minute(service)
 
 
-def lookup(db: Session, service_id: str) -> tuple[str, int] | None:
-  """The bucket and allowance of the public service ``service_id`` names."""
+def lookup(db: Session, service_id: str) -> tuple[tuple[str, int] | None, Snapshot]:
+  """The bucket and allowance of the public service ``service_id`` names.
+
+  Also returns the snapshot that answered, for ``discard``.
+  """
   global _snapshot
-  index = _current()
-  if index is not None:
-    return index.get(service_id)
-  # One rebuild at a time: requests that find the snapshot stale while another
-  # rebuilds wait for it and reuse its result instead of scanning again.
-  with _rebuild_lock:
-    index = _current()
-    if index is None:
-      with _lock:
-        generation = _generation
-      index = _build(db)
-      with _lock:
-        # A change committed while building leaves this snapshot already stale.
-        _snapshot = (generation, time.monotonic(), index)
-  return index.get(service_id)
+  current = _current()
+  if current is None:
+    # One rebuild at a time: requests that find the snapshot stale while
+    # another rebuilds wait for it and reuse its result instead of scanning.
+    with _rebuild_lock:
+      current = _current()
+      if current is None:
+        with _lock:
+          generation = _generation
+        current = Snapshot(generation, time.monotonic(), _build(db))
+        with _lock:
+          # A change committed while building leaves this snapshot already stale.
+          _snapshot = current
+  return current.index.get(service_id), current
 
 
-def discard() -> None:
-  """Drop the snapshot after finding it out of date, so the next request rebuilds."""
+def discard(seen: Snapshot) -> None:
+  """Drop ``seen`` after finding it out of date, so the next request rebuilds.
+
+  Only that exact snapshot is dropped: a slower request still holding an
+  older one must not discard the fresh snapshot another request rebuilt.
+  """
   global _snapshot
   with _lock:
-    _snapshot = None
+    if _snapshot is seen:
+      _snapshot = None
 
 
-def _current() -> dict[str, tuple[str, int]] | None:
+def _current() -> Snapshot | None:
   with _lock:
     generation, current = _generation, _snapshot
   if (
-    current is not None and current[0] == generation
-    and time.monotonic() - current[1] < OUT_OF_PROCESS_RECHECK_SECONDS
+    current is not None and current.generation == generation
+    and time.monotonic() - current.built_at < OUT_OF_PROCESS_RECHECK_SECONDS
   ):
-    return current[2]
+    return current
   return None
 
 

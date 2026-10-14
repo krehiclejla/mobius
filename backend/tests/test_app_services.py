@@ -783,7 +783,7 @@ def _stale_snapshot(entries):
   from app import public_service_index
 
   with public_service_index._lock:
-    public_service_index._snapshot = (
+    public_service_index._snapshot = public_service_index.Snapshot(
       public_service_index._generation, clock.monotonic(), dict(entries),
     )
 
@@ -800,7 +800,7 @@ def test_stale_snapshot_never_decides_the_accepted_cap(
   # Another process lowered the cap from 600; this process still has 600 cached.
   _stale_snapshot({"lowered-service": (str(app.id), 600)})
   assert client.get("/api/app-services/lowered-service/status").status_code == 429
-  assert public_service_index.lookup(db, "lowered-service") == (str(app.id), 60)
+  assert public_service_index.lookup(db, "lowered-service")[0] == (str(app.id), 60)
 
 
 def test_moved_alias_is_charged_to_its_current_service(
@@ -817,7 +817,7 @@ def test_moved_alias_is_charged_to_its_current_service(
   })
 
   assert client.get("/api/app-services/moved/status").status_code == 201
-  assert public_service_index.lookup(db, "moved") == (str(current.id), 60)
+  assert public_service_index.lookup(db, "moved")[0] == (str(current.id), 60)
   for _ in range(59):
     assert client.get("/api/app-services/former-service/status").status_code == 201
   # The one stale charge came off the former service; its own ids keep the rest.
@@ -846,7 +846,7 @@ def test_concurrent_stale_lookups_rebuild_the_snapshot_once(monkeypatch):
   monkeypatch.setattr(public_service_index, "_snapshot", None)
   results = []
   threads = [
-    threading.Thread(target=lambda: results.append(public_service_index.lookup(None, "svc")))
+    threading.Thread(target=lambda: results.append(public_service_index.lookup(None, "svc")[0]))
     for _ in range(8)
   ]
   for thread in threads:
@@ -856,3 +856,29 @@ def test_concurrent_stale_lookups_rebuild_the_snapshot_once(monkeypatch):
 
   assert builds == [1]
   assert results == [("1", 60)] * 8
+
+
+def test_a_late_stale_request_keeps_the_rebuilt_snapshot(monkeypatch):
+  from app import public_service_index
+
+  builds = []
+
+  def build(_db):
+    builds.append(1)
+    return {"svc": ("1", 60)}
+
+  monkeypatch.setattr(public_service_index, "_build", build)
+  monkeypatch.setattr(public_service_index, "_snapshot", None)
+  _, early = public_service_index.lookup(None, "svc")
+  _, late = public_service_index.lookup(None, "svc")
+  assert late is early
+
+  # The first request to find the snapshot stale discards it and the next
+  # request rebuilds; the slower one holding the same old snapshot then
+  # reports it stale too.
+  public_service_index.discard(early)
+  _, rebuilt = public_service_index.lookup(None, "svc")
+  public_service_index.discard(late)
+
+  assert public_service_index.lookup(None, "svc")[1] is rebuilt
+  assert builds == [1, 1]

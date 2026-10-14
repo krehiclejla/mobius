@@ -25,6 +25,8 @@ router = APIRouter(tags=["app-services"])
 _limiter = Limiter(key_func=get_remote_address, key_style="endpoint")
 # The anonymous door counts each caller per public service, against that
 # service's accepted allowance (60 a minute unless its manifest declares more).
+# In-memory counters are exact because Mobius serves its API from a single
+# uvicorn worker; running several workers would need a shared store here.
 _public_window = FixedWindowRateLimiter(MemoryStorage())
 
 
@@ -213,25 +215,25 @@ async def public_app_service(
   # Count the request before any per-request database work: the snapshot
   # names each public service's bucket, and every other id shares the probe
   # bucket and is answered without a lookup.
-  public = public_service_index.lookup(db, slug)
+  public, seen = public_service_index.lookup(db, slug)
   if public is None:
     _admit_public_request(request, *public_service_index.bucket(None, {}))
     raise HTTPException(404, "Public app service not found.")
   _admit_public_request(request, *public)
   app = _service_app(db, slug)
   if app is None:
-    public_service_index.discard()
+    public_service_index.discard(seen)
     raise HTTPException(404, "Public app service not found.")
   try:
     service = app_services.service_contract(app, access="public")
   except HTTPException:
-    public_service_index.discard()
+    public_service_index.discard(seen)
     raise
   current = public_service_index.bucket(app, service)
   if current != public:
     # Another process changed this service after the snapshot: the accepted
     # contract decides the cap, and the next request reads a fresh snapshot.
-    public_service_index.discard()
+    public_service_index.discard(seen)
     _admit_public_request(request, *current)
   owner = db.query(models.Owner).first()
   if owner is None:
