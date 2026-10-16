@@ -57,10 +57,26 @@ RUN useradd -m -s /bin/bash mobius
 # agent-browser looks by default). Chrome for Testing publishes no Linux
 # ARM64 build, so arm64 images install Debian's Chromium instead; the trusted
 # agent-browser config below points agent turns at it.
+# On amd64, Chrome for Testing's chrome-headless-shell for the same version
+# goes beside full Chrome and is the agents' default (config below): full
+# Chrome's ~280 MB binary plus 12-15 processes thrash a 1 GB container until
+# startup and screenshots time out, while the shell captures in seconds. Full
+# Chrome stays for extensions and other full-browser features. The directory
+# deliberately lacks agent-browser's `chrome-` prefix so its own installed-
+# Chrome discovery never selects the shell implicitly.
+# Trust decision: neither Chrome download is integrity-checked. Pinning
+# AGENT_BROWSER_VERSION does not pin Chrome: `agent-browser install` resolves
+# the current Stable from Chrome for Testing's last-known-good feed on every
+# build, and Chrome for Testing publishes no independent checksums. Both
+# browsers therefore trust TLS to storage.googleapis.com, the same as the full
+# Chrome download already did. The `--version | grep` below only confirms that
+# the right archive was unpacked; it is not an integrity check, because a
+# tampered binary could print any version. Pinning a version and sha256 for
+# both browsers, like tectonic below, is tracked in mobius-os/mobius#1849.
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
-ARG CODEX_VERSION=0.159.0
-ARG CODEX_SDK_VERSION=0.159.0
+ARG CODEX_VERSION=0.162.0
+ARG CODEX_SDK_VERSION=0.162.0
 ARG AGENT_BROWSER_VERSION=0.38.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     age ca-certificates cron curl git jq procps ripgrep sudo tini unzip util-linux xxd \
@@ -76,13 +92,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          apt-get install -y --no-install-recommends chromium \
          && mkdir -p /root/.agent-browser; \
        else \
-         agent-browser install; \
+         agent-browser install \
+         && set -- /root/.agent-browser/browsers/chrome-* \
+         && [ "$#" -eq 1 ] \
+         && chrome_version="${1##*/chrome-}" \
+         && curl -fsSL -o /tmp/chrome-headless-shell.zip \
+           "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chrome-headless-shell-linux64.zip" \
+         && unzip -q /tmp/chrome-headless-shell.zip -d /tmp/chrome-headless-shell \
+         && mv /tmp/chrome-headless-shell/chrome-headless-shell-linux64 \
+           /root/.agent-browser/browsers/headless-shell \
+         && rm -rf /tmp/chrome-headless-shell /tmp/chrome-headless-shell.zip \
+         && /root/.agent-browser/browsers/headless-shell/chrome-headless-shell --version \
+           | grep -F "$chrome_version"; \
        fi \
     && mv /root/.agent-browser /opt/agent-browser \
     && chown -R mobius:mobius /opt/agent-browser \
     && git_version="$(git --version | awk '{print $3}')" \
     && [ "$(printf '%s\n' "2.38" "$git_version" | sort -V | head -n1)" = "2.38" ] \
     && rm -rf /root/.npm /var/lib/apt/lists/*
+
+# Only Liberation fonts are installed, and fontconfig then resolves the generic
+# serif and sans-serif families (and system-ui, which falls back to sans-serif)
+# to Liberation Mono. Pages and app screenshots would render monospace, unlike
+# an owner's device. Pin the generics to the matching proportional faces, and
+# fail the build if they ever stop resolving that way.
+RUN printf '%s\n' \
+      '<?xml version="1.0"?>' \
+      '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">' \
+      '<fontconfig>' \
+      '  <alias binding="same"><family>sans-serif</family><prefer><family>Liberation Sans</family></prefer></alias>' \
+      '  <alias binding="same"><family>serif</family><prefer><family>Liberation Serif</family></prefer></alias>' \
+      '</fontconfig>' > /etc/fonts/conf.d/61-mobius-fonts.conf \
+    && fc-cache -f \
+    && [ "$(fc-match --format '%{family}' sans-serif)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' system-ui)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' serif)" = "Liberation Serif" ]
 
 # Use the pinned library for Python and other dynamically linked consumers,
 # not just the CLI. Keep Debian's package for its dependency metadata.
@@ -143,14 +187,15 @@ RUN ln -s /opt/agent-browser /root/.agent-browser \
 
 # Agent turns point AGENT_BROWSER_CONFIG here so untrusted workspace config
 # cannot register executable plugins. Runtime settings still travel through
-# explicit AGENT_BROWSER_* environment variables owned by chat.py. On arm64
-# this image-owned file also names the Debian Chromium installed above, since
-# no downloaded Chrome for Testing exists there.
+# explicit AGENT_BROWSER_* environment variables owned by chat.py. This
+# image-owned file also names the default browser installed above: the
+# headless shell on amd64, and Debian's Chromium on arm64, since no downloaded
+# Chrome for Testing exists there.
 RUN install -d -m 0755 /app \
     && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
          printf '{"executablePath": "/usr/bin/chromium"}\n'; \
        else \
-         printf '{}\n'; \
+         printf '{"executablePath": "/opt/agent-browser/browsers/headless-shell/chrome-headless-shell"}\n'; \
        fi > /app/agent-browser-config.json \
     && chmod 0644 /app/agent-browser-config.json
 
@@ -233,11 +278,11 @@ RUN cd ./shell-src \
 RUN mkdir -p /tmp/pdfjs-install && cd /tmp/pdfjs-install \
     && npm init -y >/dev/null \
     && npm install --no-audit --no-fund --silent \
-      --engine-strict --strict-allow-scripts pdfjs-dist@6.3.289 \
-    && mkdir -p /app/static/vendor/pdfjs@6.3.289 \
-    && cp node_modules/pdfjs-dist/build/pdf.mjs /app/static/vendor/pdfjs@6.3.289/pdf.mjs \
-    && cp node_modules/pdfjs-dist/build/pdf.worker.mjs /app/static/vendor/pdfjs@6.3.289/pdf.worker.mjs \
-    && ln -s pdfjs@6.3.289 /app/static/vendor/pdfjs \
+      --engine-strict --strict-allow-scripts pdfjs-dist@6.4.299 \
+    && mkdir -p /app/static/vendor/pdfjs@6.4.299 \
+    && cp node_modules/pdfjs-dist/build/pdf.mjs /app/static/vendor/pdfjs@6.4.299/pdf.mjs \
+    && cp node_modules/pdfjs-dist/build/pdf.worker.mjs /app/static/vendor/pdfjs@6.4.299/pdf.worker.mjs \
+    && ln -s pdfjs@6.4.299 /app/static/vendor/pdfjs \
     && cd / && rm -rf /tmp/pdfjs-install /root/.npm
 
 # KaTeX browser assets — the package's JavaScript is bundled when an app imports
@@ -252,13 +297,13 @@ RUN mkdir -p /tmp/pdfjs-install && cd /tmp/pdfjs-install \
 RUN mkdir -p /tmp/katex-install && cd /tmp/katex-install \
     && npm init -y >/dev/null \
     && npm install --no-audit --no-fund --silent \
-      --engine-strict --strict-allow-scripts katex@0.18.9 \
-    && mkdir -p /app/static/vendor/katex@0.18.9/fonts \
-    && cp node_modules/katex/dist/katex.min.js /app/static/vendor/katex@0.18.9/ \
-    && cp node_modules/katex/dist/katex.mjs    /app/static/vendor/katex@0.18.9/ \
-    && cp node_modules/katex/dist/katex.min.css /app/static/vendor/katex@0.18.9/ \
-    && cp node_modules/katex/dist/fonts/*.woff2 /app/static/vendor/katex@0.18.9/fonts/ \
-    && ln -s katex@0.18.9 /app/static/vendor/katex \
+      --engine-strict --strict-allow-scripts katex@0.19.0 \
+    && mkdir -p /app/static/vendor/katex@0.19.0/fonts \
+    && cp node_modules/katex/dist/katex.min.js /app/static/vendor/katex@0.19.0/ \
+    && cp node_modules/katex/dist/katex.mjs    /app/static/vendor/katex@0.19.0/ \
+    && cp node_modules/katex/dist/katex.min.css /app/static/vendor/katex@0.19.0/ \
+    && cp node_modules/katex/dist/fonts/*.woff2 /app/static/vendor/katex@0.19.0/fonts/ \
+    && ln -s katex@0.19.0 /app/static/vendor/katex \
     && cd / && rm -rf /tmp/katex-install /root/.npm
 
 # Frontend static files + app-frame served by FastAPI, plus the full source
@@ -418,6 +463,27 @@ info = pathlib.Path("/app/build-info.json"); data = json.loads(info.read_text())
 data["image_inputs"] = json.loads(subprocess.run(["python3", "/app/platform-baked/backend/app/platform_activation.py", "--hashes", "/app/platform-baked"], check=True, capture_output=True, text=True).stdout); \
 info.write_text(json.dumps(data, sort_keys=True) + "\n")'; \
     chmod a+r /app/build-info.json
+
+# Every official commit the baked source descends from (`image_lineage`), so a
+# boot can prove the release its checkout records is older than this image
+# without that checkout holding the image's own history. A commits-only fetch
+# of the whole history is a few megabytes. A local-overlay build records its
+# public base; a build with no exact commit records nothing.
+RUN set -eux; \
+    _lineage_sha="$(cat /app/platform-baked/.baked-sha)"; \
+    if [ "${MOBIUS_USE_LOCAL_PLATFORM_SOURCE:-0}" = "1" ]; then \
+      _lineage_sha="$(printf '%s' "${MOBIUS_LOCAL_PLATFORM_BASE_SHA}" | tr 'A-F' 'a-f')"; \
+    fi; \
+    : > /app/platform-lineage; \
+    if printf '%s' "$_lineage_sha" | grep -Eq '^[0-9a-f]{40}$' \
+       && [ "$(python3 -c 'import json; print(json.load(open("/app/build-info.json"))["sha"])')" != unknown ]; then \
+      _lineage_repo="$(mktemp -d)"; \
+      git -C "$_lineage_repo" init -q; \
+      git -C "$_lineage_repo" fetch -q --filter=tree:0 "$MOBIUS_PLATFORM_ORIGIN" "$_lineage_sha"; \
+      git -C "$_lineage_repo" rev-list "$_lineage_sha" > /app/platform-lineage; \
+      rm -rf "$_lineage_repo"; \
+    fi; \
+    chmod a+r /app/platform-lineage
 
 # Initialize the runtime volume paths for the non-root agent user.
 RUN mkdir -p /data/db /data/apps /data/compiled /data/shared \

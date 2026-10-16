@@ -78,7 +78,7 @@ self.addEventListener('push', (e) => {
 // out-of-scope form opens a plain browser tab instead. The retired
 // `/app/<id>` and `/chat/<id>` legacy forms are no longer accepted (the last
 // one on prod predates this by weeks); they now fall through to root. We
-// preserve the query string so the page-side parser (Shell onSwMessage,
+// preserve the query string so the page-side parsers (shellLaunchTargets,
 // useNavigation deepLink) can read `?app=`/`?chat=`.
 function _safeTarget(raw) {
   if (typeof raw !== 'string' || !raw) return '/'
@@ -98,7 +98,8 @@ function _safeTarget(raw) {
       }
     }
   } catch { return '/' }
-  // In-scope shell deep-link: /shell/ or /shell with an ?app=/?chat= query.
+  // In-scope shell deep-link: /shell/ or /shell with an ?app=, ?chat= or
+  // ?settings= query.
   if (/^\/shell\/?$/.test(path)) {
     try {
       const params = new URLSearchParams(search)
@@ -121,6 +122,15 @@ function _safeTarget(raw) {
         return params.get('focus') === 'question'
           ? `/shell/?chat=${chat}&focus=question`
           : `/shell/?chat=${chat}`
+      }
+      // A Settings target only navigates. This unbundled worker cannot import
+      // the section list, so it keeps a well-shaped id and the shell narrows
+      // it to the sections it knows (lib/settingsSections.js).
+      if (!app && !chat && params.has('settings')) {
+        const section = params.get('settings')
+        return /^[a-z][a-z0-9-]{0,63}$/.test(section)
+          ? `/shell/?settings=${section}`
+          : '/shell/?settings'
       }
     } catch { /* fall through */ }
     return '/shell/'

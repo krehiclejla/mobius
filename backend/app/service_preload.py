@@ -48,6 +48,7 @@ from app.config import get_settings
 
 log = logging.getLogger(__name__)
 
+STDIO_CHUNK_BYTES = 64 * 1024
 IDLE_SECONDS = 600
 READY_TIMEOUT_SECONDS = 30
 # A live host forks within milliseconds; one that cannot is replaced.
@@ -300,11 +301,17 @@ async def shutdown() -> None:
 
 
 async def read_bounded(reader: asyncio.StreamReader, limit: int) -> bytes:
+  # Whole 64 KiB chunks however the writer splits its output, so per-chunk
+  # object overhead stays proportional to bytes, never to write calls. Asking
+  # for one byte past the limit refuses excess as soon as it arrives.
   chunks: list[bytes] = []
   total = 0
   while True:
-    chunk = await reader.read(64 * 1024)
-    if not chunk:
+    try:
+      chunk = await reader.readexactly(min(STDIO_CHUNK_BYTES, limit - total + 1))
+    except asyncio.IncompleteReadError as exc:
+      chunk = exc.partial
+      chunks.append(chunk)
       return b"".join(chunks)
     total += len(chunk)
     if total > limit:
@@ -332,7 +339,7 @@ async def run(
   tasks: list[asyncio.Task] = []
 
   async def wrap(sock: socket.socket):
-    reader, writer = await asyncio.open_connection(sock=sock)
+    reader, writer = await asyncio.open_connection(sock=sock, limit=STDIO_CHUNK_BYTES)
     unwrapped.discard(sock)
     writers.append(writer)
     return reader, writer

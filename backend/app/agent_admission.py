@@ -101,7 +101,25 @@ async def require_agent_turn_admission(
   status_reader: Callable[[str | Path], dict[str, Any]] = resource_status,
   scratch_sweeper: Callable[[], Awaitable[dict[str, Any]]] | None = None,
 ) -> None:
-  """Admit a turn, reclaiming idle scratch once before a real deferral.
+  """Admit a turn or raise its owner-facing :class:`AgentTurnDeferred`."""
+  deferral = await agent_turn_deferral(
+    data_dir, status_reader=status_reader, scratch_sweeper=scratch_sweeper,
+  )
+  if deferral is not None:
+    raise deferral
+
+
+async def agent_turn_deferral(
+  data_dir: str | Path,
+  *,
+  status_reader: Callable[[str | Path], dict[str, Any]] = resource_status,
+  scratch_sweeper: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+) -> AgentTurnDeferred | None:
+  """Why a new turn must wait now, reclaiming idle scratch once first.
+
+  The continuation sweep asks this before resuming a resource-parked turn, so
+  a wait that is still short stays one parked run instead of starting a turn
+  that only re-parks and saves another identical waiting card.
 
   Owner lifecycle cleanup should normally keep the system above the measured
   critical boundary. Unknown telemetry fails open for developer hosts and
@@ -110,10 +128,10 @@ async def require_agent_turn_admission(
   status = status_reader(data_dir)
   deferral = _deferral(status)
   if deferral is None:
-    return
+    return None
   if _storage_deferral(status) is None:
     # Deleting paused chats' scratch frees no memory.
-    raise deferral
+    return deferral
   if scratch_sweeper is None:
     from app.agent_scratch import START_RACE_GRACE_SECONDS, sweep_idle_scratch
 
@@ -128,6 +146,4 @@ async def require_agent_turn_admission(
     # wait into an unrelated setup failure; the fresh measurement below still
     # owns whether the turn may start.
     pass
-  deferral = _deferral(status_reader(data_dir))
-  if deferral is not None:
-    raise deferral
+  return _deferral(status_reader(data_dir))

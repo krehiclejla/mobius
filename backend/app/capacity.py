@@ -43,25 +43,41 @@ from app.resource_pressure import GIB, resource_status
 _DU_TIME_BUDGET_S = 15.0
 _DU_PER_DOMAIN_ENTRY_CAP = 100_000
 
-# Absolute free-byte alert ladder for /data, ordered least→most severe. This is
+# Free-byte alert ladder for /data, ordered least→most severe. This is
 # ADDITIONAL to resource_pressure's proportional admission thresholds, not a
-# replacement: it fires earlier (8/5/2 GiB) so operators get warning before
-# admission's ~1 GiB critical floor refuses turns.
-DATA_ALERT_TIERS: tuple[tuple[int, str], ...] = (
-  (8 * GIB, "notice"),
-  (5 * GIB, "warning"),
-  (2 * GIB, "critical"),
+# replacement: it fires before admission's critical floor (5% of the volume,
+# at most 1 GiB) refuses turns. Each tier is the smaller of an absolute amount
+# and a share of the volume. Absolute bands alone suit a large volume but left a
+# small one permanently inside a tier it had already announced, so a disk that
+# then ran out raised no alert at all.
+DATA_ALERT_TIERS: tuple[tuple[int, float, str], ...] = (
+  (8 * GIB, 0.30, "notice"),
+  (5 * GIB, 0.20, "warning"),
+  (2 * GIB, 0.10, "critical"),
 )
 
 TIER_RANK: dict[str, int] = {"none": 0, "notice": 1, "warning": 2, "critical": 3}
 
 
-def data_alert_tier(free_bytes: int | None) -> str | None:
+def data_alert_ladder(total_bytes: int | None) -> dict[str, int]:
+  """Each tier's free-byte threshold for a volume of ``total_bytes``."""
+  ladder = {}
+  for absolute, fraction, label in DATA_ALERT_TIERS:
+    threshold = absolute
+    if isinstance(total_bytes, int) and total_bytes > 0:
+      threshold = min(absolute, int(total_bytes * fraction))
+    ladder[label] = threshold
+  return ladder
+
+
+def data_alert_tier(
+  free_bytes: int | None, total_bytes: int | None = None,
+) -> str | None:
   """Most severe ladder tier whose threshold ``free_bytes`` falls below."""
   if not isinstance(free_bytes, int):
     return None
   tier = None
-  for threshold, label in DATA_ALERT_TIERS:
+  for label, threshold in data_alert_ladder(total_bytes).items():
     if free_bytes < threshold:
       tier = label
   return tier
@@ -270,14 +286,18 @@ def capacity_snapshot(
     "data": _mount_facts(str(data_dir), status_reader=reader),
   }
   data_free = mounts["data"].get("free_bytes")
-  tier = data_alert_tier(data_free if isinstance(data_free, int) else None)
+  data_total = mounts["data"].get("total_bytes")
+  data_total = data_total if isinstance(data_total, int) else None
+  tier = data_alert_tier(
+    data_free if isinstance(data_free, int) else None, data_total,
+  )
   snapshot: dict[str, Any] = {
     "captured_at": datetime.now(UTC).isoformat(),
     "mounts": mounts,
     "data_free_bytes": data_free if isinstance(data_free, int) else None,
     "data_total_bytes": mounts["data"].get("total_bytes"),
     "alert_tier": tier,
-    "alert_ladder": {label: threshold for threshold, label in DATA_ALERT_TIERS},
+    "alert_ladder": data_alert_ladder(data_total),
   }
   if include_domains:
     domain_fn = domains_reader or data_domains

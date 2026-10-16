@@ -31,12 +31,6 @@ function cadenceLabel(wait) {
   return `every ${hours} ${hours === 1 ? 'hour' : 'hours'}`
 }
 
-function helperTaskLabel(taskKey) {
-  return String(taskKey || '')
-    .replace(/[._-]+/g, ' ')
-    .replace(/^./, letter => letter.toUpperCase())
-}
-
 export const RESOURCE_PAUSE_KINDS = new Set(['memory', 'storage'])
 
 export function isResourcePause(block) {
@@ -45,7 +39,11 @@ export function isResourcePause(block) {
 
 export function resourcePausePresentation(block, handoff = null) {
   const kind = block?.pause?.kind
-  const next = clockLabel(pauseTiming(block?.pause).checkAt)
+  // A memory/storage park keeps its one saved card while the server keeps
+  // moving the next check later, so the time saved on the card goes stale.
+  const next = RESOURCE_PAUSE_KINDS.has(kind)
+    ? null
+    : clockLabel(pauseTiming(block?.pause).checkAt)
   const storage = kind === 'storage'
   const memory = kind === 'memory'
   const limit = ['rate_limit', 'usage_limit', 'limit'].includes(kind)
@@ -143,16 +141,17 @@ export function waitPresentation(wait) {
   }
 }
 
-export function helperPresentation(backgroundHelpers) {
+export function helperPresentation(backgroundHelpers, handoff = null) {
   const count = Number(backgroundHelpers?.count) || 0
   const tasks = (backgroundHelpers?.items || [])
-    .map(item => helperTaskLabel(item?.task_key))
+    .map(item => item?.title || 'Helper work')
     .filter(Boolean)
   return {
     count,
     tasks,
     summary: `Waiting on ${count} ${count === 1 ? 'helper' : 'helpers'}`,
     owner: `${count} ${count === 1 ? 'helper agent' : 'helper agents'}`,
-    usage: 'Helpers use their own turns · no separate monitor is polling',
+    automatic: handoff?.kind === 'automatic',
+    usage: 'Usage unknown',
   }
 }

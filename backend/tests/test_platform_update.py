@@ -4462,6 +4462,68 @@ def test_lock_update_the_image_may_not_install_still_needs_an_image(
   assert pu.image_input_drift(platform) == ["backend/requirements.lock"]
 
 
+def _shallow_seed_at(tmp_path, origin, sha: str) -> Path:
+  """A served checkout as an image seeds it: one commit deep, nothing fetched
+  since, so it holds neither a newer image's commit nor its history."""
+  seed = tmp_path / f"seed-{sha[:8]}"
+  _git(tmp_path, "init", "-q", str(seed))
+  _git(seed, "fetch", "-q", "--depth", "1", f"file://{origin}", sha)
+  _git(seed, "checkout", "-q", "-B", "main", "FETCH_HEAD")
+  _git(seed, "update-ref", "refs/remotes/origin/main", sha)
+  _git(seed, "branch", "-f", "upstream", sha)
+  return seed
+
+
+def _image_built_from(monkeypatch, tmp_path, platform, sha: str) -> None:
+  """Run as the image built from ``sha``: its package inputs and lineage."""
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "sha": sha,
+    "image_inputs": {
+      path: hashlib.sha256(
+        _git(platform, "show", f"{sha}:{path}").stdout.encode(),
+      ).hexdigest()
+      for path in pu._PYTHON_DEPENDENCY_INPUTS
+    },
+  })
+  lineage = tmp_path / f"lineage-{sha[:8]}"
+  lineage.write_text(_git(platform, "rev-list", sha).stdout)
+  monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(lineage))
+
+
+def test_container_only_upgrade_across_a_package_release_boots_on_a_shallow_seed(
+  clone_env, monkeypatch, tmp_path,
+):
+  """A newer image under its older release's source is a container-only
+  upgrade, even when the checkout never fetched the image's commit."""
+  origin, _ = clone_env
+  platform, base, target, _ = _lock_only_update(
+    clone_env, _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+  )
+  seed = _shallow_seed_at(tmp_path, origin, base)
+  _image_built_from(monkeypatch, tmp_path, platform, target)
+
+  assert pu.release_packages_missing_from_image(seed, target) is None
+
+  # Without the image's recorded lineage the seed cannot order the two.
+  monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(tmp_path / "absent"))
+  assert "newer release" in pu.release_packages_missing_from_image(seed, target)
+
+
+def test_image_rollback_under_a_newer_package_release_is_still_refused(
+  clone_env, monkeypatch, tmp_path,
+):
+  """The lineage proves only ancestry: an older image never serves source
+  from a release it does not descend from."""
+  origin, _ = clone_env
+  platform, base, target, _ = _lock_only_update(
+    clone_env, _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+  )
+  seed = _shallow_seed_at(tmp_path, origin, target)
+  _image_built_from(monkeypatch, tmp_path, platform, base)
+
+  assert "newer release" in pu.release_packages_missing_from_image(seed, base)
+
+
 @pytest.mark.asyncio
 async def test_source_apply_refuses_image_owned_update_before_mutation(clone_env):
   origin, platform = clone_env

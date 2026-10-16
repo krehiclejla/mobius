@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
-from app import models, chat_queue
+from app import chat_queue, models, settled
 from app.auth_helpers import TokenSource, get_auth_token_source
 from app.config import get_settings
 from app.database import get_db
@@ -28,7 +28,10 @@ from app.upload_lifecycle import is_draft, remove_upload_files, take_expired_dra
 
 router = APIRouter(prefix="/api/chats", tags=["uploads"])
 
-_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
+# Leave multipart framing headroom beneath main.py's 64 MiB request backstop.
+# An override can lower the limit, but cannot promise an upload that middleware
+# will reject before this route runs.
+_MAX_UPLOAD_BYTES = min(int(os.getenv("MAX_UPLOAD_MB", "50")), 50) * 1024 * 1024
 
 # Images are served inline; everything else is forced to download so the
 # browser never executes uploaded content (harmless for a single-owner app,
@@ -43,6 +46,21 @@ _INLINE_MIME_TYPES = {
 
 
 _UPLOAD_NAME_MAX_BYTES = 200
+
+
+@router.get("/{chat_id}/upload-limits")
+def upload_limit(
+  chat_id: str,
+  principal: Principal = Depends(get_owner_or_chat_embed_principal),
+  db: Session = Depends(get_db),
+):
+  """Expose the effective original-file cap to every chat attachment picker."""
+  validate_chat_id(chat_id)
+  if principal.scope == "app":
+    raise HTTPException(status_code=403, detail="App token is not valid here.")
+  require_chat_embed_operation(principal, "chat:uploads")
+  get_active_chat_for_principal(db, chat_id, principal)
+  return {"max_bytes": _MAX_UPLOAD_BYTES}
 
 
 def _safe_filename(filename: str) -> str:
@@ -135,11 +153,13 @@ async def upload_files(
     raise
   async with chat_queue.get_lock(chat_id):
     try:
-      expired = await run_in_threadpool(_record_uploads, db, chat, saved)
+      expired = await settled.run_settled(_record_uploads, db, chat, saved)
     except Exception:
       # The commit failed and rolled back. A cancelled request is left alone:
       # its commit may already have landed, and its files must then stay.
-      await run_in_threadpool(remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved])
+      await settled.run_settled(
+        remove_upload_files, upload_dir, [pathlib.Path(e["path"]) for e in saved],
+      )
       raise
   await run_in_threadpool(remove_upload_files, upload_dir, expired)
   return saved
@@ -243,7 +263,7 @@ async def delete_upload(
   # Serialize with send/answer admission (which holds this lock while the
   # writer claims): whichever wins, the other sees its committed result.
   async with chat_queue.get_lock(chat_id):
-    removed = await run_in_threadpool(_forget_draft, db, chat, filename)
+    removed = await settled.run_settled(_forget_draft, db, chat, filename)
   if removed:
     await run_in_threadpool(remove_upload_files, upload_dir, [file_path])
   return Response(status_code=204)

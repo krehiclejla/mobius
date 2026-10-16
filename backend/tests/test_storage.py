@@ -1,9 +1,12 @@
 """Storage API: tests for both envelope and inner-object PUT forms."""
 
+import asyncio
+import gc
 import hashlib
 import json
 from pathlib import Path
 import subprocess
+import tracemalloc
 
 import pytest
 
@@ -125,6 +128,23 @@ def test_put_binary_accepts_raw_bytes(client, auth, owner_token):
 
   r = client.get(f"/api/storage/apps/{app_id}/blob.bin", headers=auth)
   assert r.content == data
+
+
+def test_put_binary_accepts_fragmented_stream(client, auth, owner_token):
+  """The shared body reader keeps streamed storage bytes in order."""
+  app_id = _make_app(client, owner_token)
+  chunks = [b"\x00a", b"", b"\xff", b"tail"]
+  response = client.put(
+    f"/api/storage/apps/{app_id}/fragmented.bin",
+    content=iter(chunks),
+    headers={**auth, "Content-Type": "application/octet-stream"},
+  )
+  assert response.status_code == 204, response.text
+  stored = client.get(
+    f"/api/storage/apps/{app_id}/fragmented.bin", headers=auth,
+  )
+  assert stored.status_code == 200
+  assert stored.content == b"".join(chunks)
 
 
 def test_put_text_rejects_inner_object(client, auth, owner_token):
@@ -654,6 +674,237 @@ async def test_read_capped_body_rejects_oversize():
   with pytest.raises(HTTPException) as exc:
     await read_capped_body(req, cap=16)
   assert exc.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_fresh_single_byte_fragments_use_bounded_memory():
+  """Retaining every fresh fragment used ~129 MiB for a 1 MiB upload."""
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  size = 1024 * 1024
+  received = 0
+
+  async def receive():
+    nonlocal received
+    received += 1
+    # bytes(bytearray(...)) allocates a fresh source bytes object each time.
+    # Measuring inside receive includes that source allocation in the peak.
+    return {
+      "type": "http.request",
+      "body": bytes(bytearray(b"x")) if received <= size else b"",
+      "more_body": received <= size,
+    }
+
+  assert bytes(bytearray(b"x")) is not bytes(bytearray(b"x"))
+  request = Request({"type": "http", "headers": []}, receive)
+  gc.collect()
+  tracemalloc.start()
+  try:
+    body = await read_capped_body(request, cap=size)
+    _current, peak = tracemalloc.get_traced_memory()
+  finally:
+    tracemalloc.stop()
+  assert body == b"x" * size
+  assert received == size + 1
+  assert peak < 8 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_rejects_declared_oversize_without_receiving():
+  from fastapi import HTTPException
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  async def receive():
+    pytest.fail("oversize Content-Length must reject before receive")
+
+  request = Request(
+    {"type": "http", "headers": [(b"content-length", b"5")]}, receive,
+  )
+  with pytest.raises(HTTPException) as error:
+    await read_capped_body(request, cap=4, too_large="custom limit")
+  assert error.value.status_code == 413
+  assert error.value.detail == "custom limit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [b"bogus", b"1", b"4"])
+async def test_read_capped_body_checks_actual_stream_even_with_bad_length(declared):
+  from fastapi import HTTPException
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  messages = iter([
+    {"type": "http.request", "body": b"ab", "more_body": True},
+    {"type": "http.request", "body": b"cde", "more_body": False},
+  ])
+
+  async def receive():
+    return next(messages)
+
+  request = Request(
+    {"type": "http", "headers": [(b"content-length", declared)]},
+    receive,
+  )
+  with pytest.raises(HTTPException) as error:
+    await read_capped_body(request, cap=4)
+  assert error.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_accepts_exact_cap_despite_lying_length():
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  messages = iter([
+    {"type": "http.request", "body": b"ab", "more_body": True},
+    {"type": "http.request", "body": b"cd", "more_body": False},
+  ])
+
+  async def receive():
+    return next(messages)
+
+  request = Request(
+    {"type": "http", "headers": [(b"content-length", b"1")]}, receive,
+  )
+  assert await read_capped_body(request, cap=4) == b"abcd"
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_propagates_disconnect_and_cancellation():
+  from starlette.requests import ClientDisconnect, Request
+  from app.storage_io import read_capped_body
+
+  async def disconnected():
+    return {"type": "http.disconnect"}
+
+  request = Request({"type": "http", "headers": []}, disconnected)
+  with pytest.raises(ClientDisconnect):
+    await read_capped_body(request, cap=4)
+
+  async def cancelled():
+    raise asyncio.CancelledError()
+
+  request = Request({"type": "http", "headers": []}, cancelled)
+  with pytest.raises(asyncio.CancelledError):
+    await read_capped_body(request, cap=4)
+
+
+@pytest.fixture
+def body_copies(monkeypatch):
+  """Record read_capped_body's buffer growth and final copy, in order."""
+  from app import storage_io
+
+  events = []
+
+  class Buffer(bytearray):
+    def extend(self, chunk):
+      events.append(("extend", len(self) + len(chunk)))
+      super().extend(chunk)
+
+    def __bytes__(self):
+      events.append(("copy", len(self)))
+      return bytes(memoryview(self))
+
+  monkeypatch.setattr(storage_io, "bytearray", Buffer, raising=False)
+  return events
+
+
+def _streamed_request(chunks, headers=()):
+  from starlette.requests import Request
+
+  messages = iter([
+    {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
+    for index, chunk in enumerate(chunks)
+  ])
+
+  async def receive():
+    return next(messages)
+
+  return Request({"type": "http", "headers": list(headers)}, receive)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+  [], [(b"content-length", b"1")], [(b"content-length", b"6")],
+  [(b"transfer-encoding", b"chunked")],
+], ids=["no-length", "understated", "overstated", "chunked"])
+async def test_read_capped_body_admits_received_growth_before_each_buffer_copy(
+  body_copies, headers,
+):
+  from app.storage_io import read_capped_body
+
+  def admit(size):
+    body_copies.append(("admit", size))
+
+  request = _streamed_request([b"ab", b"", b"cde"], headers)
+  assert await read_capped_body(request, cap=8, admit_growth=admit) == b"abcde"
+  # Charged from bytes actually received, never from the length header; the
+  # final copy follows a charge that already covers it.
+  assert body_copies == [
+    ("admit", 2), ("extend", 2), ("admit", 5), ("extend", 5), ("copy", 5),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_refused_growth_buffers_nothing_more(body_copies):
+  from fastapi import HTTPException
+  from app.storage_io import read_capped_body
+
+  def admit(size):
+    if size > 2:
+      raise HTTPException(413, "budget")
+
+  request = _streamed_request([b"ab", b"cde"])
+  with pytest.raises(HTTPException) as refused:
+    await read_capped_body(request, cap=8, admit_growth=admit)
+  assert refused.value.detail == "budget"
+  assert body_copies == [("extend", 2)]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_byte_cap_precedes_growth_admission(body_copies):
+  from fastapi import HTTPException
+  from app.storage_io import read_capped_body
+
+  admitted = []
+  request = _streamed_request([b"ab", b"cde"])
+  with pytest.raises(HTTPException) as refused:
+    await read_capped_body(request, cap=4, too_large="cap", admit_growth=admitted.append)
+  assert refused.value.detail == "cap"
+  assert admitted == [2] and body_copies == [("extend", 2)]
+
+  async def never():
+    pytest.fail("declared oversize must reject before receive")
+
+  from starlette.requests import Request
+  declared = Request({"type": "http", "headers": [(b"content-length", b"5")]}, never)
+  with pytest.raises(HTTPException):
+    await read_capped_body(declared, cap=4, admit_growth=admitted.append)
+  assert admitted == [2]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_missing_length_http2_body_is_not_bodyless():
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  sent = []
+
+  async def receive():
+    if not sent:
+      sent.append(True)
+      return {"type": "http.request", "body": b'{"x":1}', "more_body": False}
+    return {"type": "http.disconnect"}
+
+  admitted = []
+  request = Request({
+    "type": "http", "method": "POST", "path": "/echo", "headers": [],
+    "query_string": b"", "http_version": "2",
+  }, receive)
+  assert await read_capped_body(request, 1024, admit_growth=admitted.append) == b'{"x":1}'
+  assert admitted == [7]
 
 
 def test_large_text_read_roundtrips(client, auth, owner_token):

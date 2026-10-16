@@ -54,8 +54,20 @@ MANAGED_CUTOVER_REQUEST_PATH = DATA_DIR / ".managed-cutover-request.json"
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_REQUEST_AGE_SECONDS = 120
+# A planned restart is accepted just before pid 1 stops, so its boot follows
+# within moments.
 MAX_ACCEPTED_AGE_SECONDS = 10 * 60
-MAX_CUTOVER_RECEIPT_AGE_SECONDS = 60 * 60
+# An external cutover's provider decides when the replacement boots: a managed
+# provider may first download a large new image while this container stays
+# drained. The managed account service waits up to 60 minutes for Railway to
+# prepare the image, then up to 15 more for the switch, so the latest
+# legitimate replacement boots about 75 minutes after acceptance. Keep this
+# above those budgets if they change.
+MANAGED_REPLACEMENT_MAX_BOOT_SECONDS = (60 + 15) * 60
+# The acceptance, its rollback receipt and a re-armed rollback acceptance all
+# live for the cutover, with a margin for the time between acceptance and
+# Railway starting the deployment.
+MAX_CUTOVER_AGE_SECONDS = MANAGED_REPLACEMENT_MAX_BOOT_SECONDS + 15 * 60
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
 SUPERVISOR_UID = 0
 SUPERVISOR_GID = 0
@@ -265,13 +277,22 @@ def begin_boot(boot_id: str, *, now: float | None = None) -> bool:
       accepted_at = float(accepted.get("accepted_at"))
     except (TypeError, ValueError):
       accepted_at = 0
+    # Whichever boot comes next consumes the acceptance. Inside a cutover's
+    # window that is usually the replacement, but a crash restart of the
+    # drained container or a provider rollback binds instead and resumes the
+    # same parked runs; the replacement then boots unbound.
+    max_age = (
+      MAX_CUTOVER_AGE_SECONDS
+      if accepted.get("action") == "external_cutover"
+      else MAX_ACCEPTED_AGE_SECONDS
+    )
     if (
       accepted.get("version") == PROTOCOL_VERSION
       and _valid_token(accepted.get("nonce"))
       and _valid_token(accepted.get("source_boot_id"))
       and accepted.get("source_boot_id") != boot_id
       and accepted_at <= current + 5
-      and current - accepted_at <= MAX_ACCEPTED_AGE_SECONDS
+      and current - accepted_at <= max_age
     ):
       authorized_payload = {
         **accepted,
@@ -463,7 +484,7 @@ def _matching_cutover_receipt(
     or not _valid_token(receipt.get("nonce"))
     or not _valid_token(receipt.get("source_boot_id"))
     or accepted_at > now + 5
-    or now - accepted_at > MAX_CUTOVER_RECEIPT_AGE_SECONDS
+    or now - accepted_at > MAX_CUTOVER_AGE_SECONDS
   ):
     return None
   return receipt

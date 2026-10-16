@@ -6,7 +6,7 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { promoteAssistantStream } from '../streamPromotion.js'
 import { assistantReplyGroups, presentAssistantReply } from '../assistantReplies.js'
 
@@ -25,11 +25,8 @@ const domPurifyStub = {
     : null),
 }
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui', 'dompurify'] },
+const vite = await createSsrRenderServer({
+  noExternal: ['dompurify'],
   plugins: [domPurifyStub],
 })
 const { default: MsgContent } = await vite.ssrLoadModule(
@@ -99,7 +96,7 @@ test('(a) stream promotion keeps known sizes and frames newer images', () => {
 test('(b) a live reply over a sized partial frames newly streamed images', () => {
   const partial = assistant(oldText, { media_dimensions: { [A]: sizeA } })
   const html = renderToStaticMarkup(createElement(AssistantReply, {
-    replyGroup: { rows: [{ message: partial, key: 'run', anchorKey: 'run', notes: [] }] },
+    replyGroup: assistantReplyGroups([partial]).get(0),
     activeMirrorMsg: partial,
     activitySourceBlocks: partial.blocks,
     useDbActivePayload: false,

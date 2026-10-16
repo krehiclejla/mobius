@@ -3,16 +3,12 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { ownsRecoveryAction } from '../recoveryCard.js'
 import { supersedeResumedPauseBlocks } from '../chatRuntimeState.js'
 import { streamItemsToAssistantPayload } from '../streamPromotion.js'
 
-const vite = await createServer({
-  appType: 'custom', logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: ErrorCard, errorCardViewModel } = await vite.ssrLoadModule('/src/components/ChatView/ErrorCard.jsx')
 const { default: MsgContent } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 after(() => vite.close())
@@ -35,7 +31,8 @@ test('a credits pause renders as a calm card without rewriting history', () => {
   const html = renderToStaticMarkup(createElement(ErrorCard, { block: creditBlock }))
   assert.match(html, /chat__text--parked/)
   assert.match(html, /Your progress is saved/)
-  assert.match(html, /Add credits to your workspace, then Resume/)
+  assert.match(html, /Your OpenAI Codex workspace is out of credits/)
+  assert.match(html, /Add credits, or ask whoever manages that workspace, then Resume/)
   assert.doesNotMatch(html, /role="alert"|>Error<|automatically|retry check|Rate limit/)
   assert.deepEqual(creditBlock, original)
 })

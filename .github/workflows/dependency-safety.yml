@@ -1,0 +1,66 @@
+name: Dependency safety
+
+# Comments on pull requests that change an npm lockfile. Known malware or
+# vulnerabilities in changed packages, or a lockfile it can't read, fail the
+# check; new packages, install scripts and downloads from outside the npm
+# registry are flagged for review.
+#
+# The check reads only the lockfile, which the pull request's author controls.
+# It is a tripwire for honest npm and Dependabot updates and a review aid, not
+# a defense against a hostile author: that is human review, with install
+# scripts kept off in CI.
+#
+# pull_request_target runs this workflow and the checker from main, so the
+# pull request's code never runs with the comment token. Its lockfiles are
+# fetched as Git objects and only parsed.
+on:
+  pull_request_target:
+    branches: [main]
+    # A push that undoes every lockfile change doesn't run this, so an earlier
+    # comment stays; it names the commit it checked so it reads as outdated.
+    # Clearing it would mean running on every push to every pull request.
+    paths: ['**/package-lock.json']
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: dependency-safety-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPORT: dependency-safety.md
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24
+      - name: Check changed packages
+        run: |
+          merge_base="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" --jq .merge_base_commit.sha)"
+          git fetch --no-tags --depth=1 origin "$merge_base" "$HEAD_SHA"
+          node scripts/dependency-safety/check.mjs --base "$merge_base" --head "$HEAD_SHA" --out "$REPORT"
+      - name: Post or update the comment
+        if: ${{ !cancelled() }}
+        run: |
+          [ -s "$REPORT" ] || exit 0
+          # Match the author too: anyone can post a comment that starts with the marker.
+          marker="$(head -n 1 "$REPORT")"
+          comment_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | head -n 1)"
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$REPORT" > /dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$REPORT" > /dev/null
+          fi

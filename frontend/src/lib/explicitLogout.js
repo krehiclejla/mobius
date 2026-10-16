@@ -1,3 +1,5 @@
+import { markExplicitSignOut } from './mobiusSignIn.js'
+
 /**
  * Revoke installation handoffs while the owner credential still exists, then
  * remove every local owner-scoped trace. Revocation is best effort so a broken
@@ -21,5 +23,8 @@ export async function clearExplicitOwnerSession({
     // Local privacy cleanup and sign-out remain authoritative when offline.
   }
   dropCredential()
+  // Tell the sign-in screen this was deliberate, so a mobius.you instance
+  // does not redirect straight back into a fresh session.
+  markExplicitSignOut()
   await clearOwnerCache()
 }

@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, text
 from app import auth as auth_module, models
 from app.chat_continuity import apply_checkpoint, note_path
 from app.chat_notes import extract_chat_summary, extract_full_digest, extract_section
-from app.chat_writer import StartTurn, get_writer
+from app.chat_writer import StartTurn, create_chat, get_writer
 from app.config import get_settings
 from app.memory import parse_frontmatter
 from app.schema_migrations import (
@@ -98,9 +98,37 @@ def test_only_the_chats_live_run_can_save(client, auth, chat, db):
 
   response = _save(client, {"Authorization": f"Bearer {stale}"}, chat_summary="Must not land.")
   assert response.status_code == 409
+  assert "no longer holds this run as the chat's owner" in response.json()["detail"]
   assert not note_path(get_settings().data_dir, chat.id).exists()
   # An owner browser session is not a run and cannot impersonate one.
   assert _save(client, auth, chat_summary="Nope.").status_code in {401, 403}
+
+
+def test_the_writer_names_why_a_run_is_not_the_chats_live_owner(chat, db):
+  _start(chat, "live-run")
+  writer = get_writer()
+  assert writer._live_run_refusal(db, chat.id, "live-run") is None
+  assert writer._live_run_refusal(db, chat.id, "never-recorded") == "run_unknown"
+  db.get(models.ChatRun, "live-run").status = "completed"
+  db.commit()
+  assert writer._live_run_refusal(db, chat.id, "live-run") == "run_not_running"
+  db.get(models.Chat, chat.id).deleted_at = datetime.now()
+  db.commit()
+  assert writer._live_run_refusal(db, chat.id, "live-run") == "chat_inactive"
+
+
+def test_a_run_learns_nothing_about_another_chats_activity(chat, db):
+  _start(chat, "live-run")
+  other = create_chat(id="other-chat", title="Other", messages=[])
+  db.add(other)
+  db.commit()
+  writer = get_writer()
+  # The same answer whether the other chat is active, deleted, or absent.
+  assert writer._live_run_refusal(db, "other-chat", "live-run") == "run_unknown"
+  other.deleted_at = datetime.now()
+  db.commit()
+  assert writer._live_run_refusal(db, "other-chat", "live-run") == "run_unknown"
+  assert writer._live_run_refusal(db, "absent-chat", "live-run") == "run_unknown"
 
 
 def test_existing_notes_keep_their_history_and_other_sections():

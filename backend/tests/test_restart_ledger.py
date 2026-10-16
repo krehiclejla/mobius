@@ -171,6 +171,75 @@ def test_managed_cutover_poller_opens_then_accepts_exact_handoff(
   assert _authorized(tmp_path, target_boot) == nonce
 
 
+def _accept_managed_cutover(supervisor, *, source_boot, nonce, now) -> float:
+  """Run the managed handoff through acceptance; returns its acceptance time."""
+  cutover_id = "replace_12345678"
+  supervisor.begin_boot(source_boot, now=now)
+  platform_ledger.request_managed_cutover(
+    boot_id=source_boot, cutover_id=cutover_id, now=now + 1,
+  )
+  assert supervisor.service_managed_cutover(source_boot, now=now + 1)
+  platform_ledger.publish_cutover_intent(
+    boot_id=source_boot, nonce=nonce, cutover_id=cutover_id, runs=[], now=now + 2,
+  )
+  assert supervisor.service_managed_cutover(source_boot, now=now + 2)
+  return now + 2
+
+
+@pytest.mark.parametrize("boot_delay", [
+  pytest.param(lambda s: 19 * 60, id="observed-first-download"),
+  pytest.param(
+    lambda s: s.MANAGED_REPLACEMENT_MAX_BOOT_SECONDS,
+    id="full-prepare-and-switch-budget",
+  ),
+])
+def test_managed_cutover_binds_a_replacement_booting_after_a_long_provider_download(
+  tmp_path, monkeypatch, boot_delay,
+):
+  """A managed provider can spend well over ten minutes downloading a new
+  image before it stops the drained container; its chats must still resume,
+  up to the account service's full prepare and switch budgets."""
+  supervisor = _load_supervisor()
+  _bind(supervisor, tmp_path, monkeypatch)
+  nonce = "nonce-12345678"
+  accepted_at = _accept_managed_cutover(
+    supervisor, source_boot="boot-source-1234", nonce=nonce, now=time.time(),
+  )
+
+  late_boot = accepted_at + boot_delay(supervisor)
+  assert supervisor.begin_boot("boot-target-1234", now=late_boot) is True
+  assert _authorized(tmp_path, "boot-target-1234") == nonce
+
+
+def test_managed_cutover_acceptance_expires_with_the_cutover(tmp_path, monkeypatch):
+  supervisor = _load_supervisor()
+  _bind(supervisor, tmp_path, monkeypatch)
+  accepted_at = _accept_managed_cutover(
+    supervisor, source_boot="boot-source-1234", nonce="nonce-12345678",
+    now=time.time(),
+  )
+
+  expired = accepted_at + supervisor.MAX_CUTOVER_AGE_SECONDS + 1
+  assert supervisor.begin_boot("boot-target-1234", now=expired) is False
+  assert _authorized(tmp_path, "boot-target-1234") is None
+  assert not supervisor.ACCEPTED_PATH.exists()
+
+
+def test_planned_restart_acceptance_keeps_its_short_window(tmp_path, monkeypatch):
+  """Only provider-timed cutovers wait longer: a planned restart stops pid 1
+  itself, so a much later boot is unrelated and stays manual."""
+  supervisor = _load_supervisor()
+  _bind(supervisor, tmp_path, monkeypatch)
+  now = time.time()
+  supervisor.begin_boot("boot-source-1234", now=now)
+  _request(boot="boot-source-1234", nonce="nonce-12345678", now=now)
+  assert supervisor.accept("boot-source-1234", now=now + 1) is True
+
+  late_boot = now + 1 + supervisor.MAX_ACCEPTED_AGE_SECONDS + 1
+  assert supervisor.begin_boot("boot-target-1234", now=late_boot) is False
+  assert _authorized(tmp_path, "boot-target-1234") is None
+
+
 def test_cutover_requires_matching_root_challenge(tmp_path, monkeypatch):
   supervisor = _load_supervisor()
   _bind(supervisor, tmp_path, monkeypatch)

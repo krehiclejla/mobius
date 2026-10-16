@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Fork an exact Claude or Codex session for Agent Coaching.
+"""Fork an exact Claude or Codex session for Agent Coaching and side questions.
 
 This module intentionally has one success path: the provider forks the named
-session and the coaching prompt runs inside that fork. Missing, expired, or
-unforkable sessions fail loudly. Stored chat messages are never used to seed a
+session and the prompt runs inside that fork. Missing, expired, or unforkable
+sessions fail loudly. Stored chat messages are never used to seed a
 replacement agent.
+
+An ``ephemeral`` fork is never written to the provider's session storage, so
+it leaves nothing behind to clean up, even when its process is killed. The
+composer's ``/btw`` side questions use it; coaching keeps its forks.
 
 ``after_call_id`` narrows the fork to a *call moment*. The id is the
 provider's own id for the model's call (Claude ``toolu_...`` tool_use id;
@@ -47,6 +51,7 @@ _CODEX_MCP_FEATURE_OVERRIDES = (
 _MAX_CODEX_MCP_SERVERS = 256
 _MAX_CODEX_MCP_NAME_CHARS = 256
 _MAX_CODEX_MCP_INVENTORY_CHARS = 1_000_000
+_MAX_CODEX_FEATURE_PAGES = 20
 
 
 class ForkError(RuntimeError):
@@ -83,6 +88,23 @@ class _CodexMcpSurfacePage(BaseModel):
   model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
   data: list[_CodexMcpSurface]
+  next_cursor: str | None = Field(default=None, alias="nextCursor")
+
+
+class _CodexFeature(BaseModel):
+  """A feature switch as the fork's loaded config resolved it."""
+
+  model_config = ConfigDict(extra="ignore")
+
+  name: str
+  enabled: bool
+  stage: str
+
+
+class _CodexFeaturePage(BaseModel):
+  model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+  data: list[_CodexFeature]
   next_cursor: str | None = Field(default=None, alias="nextCursor")
 
 
@@ -228,6 +250,43 @@ async def _assert_codex_mcp_isolated(codex: Any, thread_id: str) -> None:
     seen_cursors.add(cursor)
 
 
+async def _codex_features(codex: Any, thread_id: str) -> dict[str, _CodexFeature]:
+  """Read every feature switch as the forked thread's config resolved it."""
+  features: dict[str, _CodexFeature] = {}
+  params: dict[str, Any] = {"threadId": thread_id}
+  for _ in range(_MAX_CODEX_FEATURE_PAGES):
+    try:
+      page = await codex._client.request(
+        "experimentalFeature/list", params, response_model=_CodexFeaturePage,
+      )
+    except Exception as exc:
+      raise ForkError(
+        "Codex tool switches could not be verified; refusing the fork"
+      ) from exc
+    features.update((feature.name, feature) for feature in page.data)
+    if page.next_cursor is None:
+      return features
+    params = {"threadId": thread_id, "cursor": page.next_cursor}
+  raise ForkError("Codex listed too many feature pages; refusing the fork")
+
+
+async def _assert_codex_tools_off(codex: Any, thread_id: str) -> None:
+  """Fail before the prompt unless every tool switch is known and off.
+
+  Codex ignores a switch it does not know, so a renamed or removed feature
+  would otherwise leave its tool on with no error at all.
+  """
+  from app.providers import CODEX_TOOL_FEATURES_OFF
+
+  features = await _codex_features(codex, thread_id)
+  for name in CODEX_TOOL_FEATURES_OFF:
+    feature = features.get(name)
+    if feature is None or feature.stage == "removed" or feature.enabled:
+      raise ForkError(
+        f"Codex fork could not switch off its {name} tool; refusing the fork"
+      )
+
+
 def _validated_result(
   *,
   provider: str,
@@ -319,6 +378,8 @@ def _fork_claude(
   prompt: str,
   *,
   after_call_id: str | None = None,
+  model: str | None = None,
+  ephemeral: bool = False,
   runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> ForkResult:
   env = _coaching_env()
@@ -343,6 +404,10 @@ def _fork_claude(
       source_session_id,
       "--fork-session",
       *cut,
+      # Without --model the CLI answers with its own default model, not the
+      # one the chat runs on.
+      *(["--model", model] if model else []),
+      *(["--no-session-persistence"] if ephemeral else []),
       "--print",
       prompt,
       "--output-format",
@@ -434,6 +499,8 @@ async def _fork_codex_async(
   prompt: str,
   *,
   after_call_id: str | None = None,
+  model: str | None = None,
+  ephemeral: bool = False,
   sdk_loader: Callable[[], tuple[Any, Any, Any, Any, Any]] | None = None,
   mcp_inventory_runner: Callable[
     ..., subprocess.CompletedProcess[str]
@@ -457,13 +524,14 @@ async def _fork_codex_async(
       _codex_rollout(codex_home, source_session_id), after_call_id
     )
   )
-  from app.providers import CODEX_NATIVE_HELPERS_OFF
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOLS_OFF
 
+  # A fork answers from the conversation alone, like Claude's `--tools ""`.
   config_overrides = (*_codex_mcp_isolation_overrides(
     cwd,
     env,
     runner=mcp_inventory_runner,
-  ), *CODEX_NATIVE_HELPERS_OFF)
+  ), *CODEX_NATIVE_HELPERS_OFF, *CODEX_TOOLS_OFF)
   config = CodexConfig(
     codex_bin=shutil.which("codex"),
     cwd=cwd,
@@ -483,6 +551,9 @@ async def _fork_codex_async(
           approval_mode=ApprovalMode.deny_all,
           cwd=cwd,
           sandbox=Sandbox.read_only,
+          # Codex refuses an ephemeral fork unless it leaves the turns out of
+          # its reply; the model still sees the whole conversation.
+          **({"ephemeral": True, "include_turns": False} if ephemeral else {}),
         )
       else:
         # The SDK's thread_fork does not take the app-server's lastTurnId yet;
@@ -492,14 +563,17 @@ async def _fork_codex_async(
           "cwd": cwd,
           "approvalPolicy": "never",
           "sandbox": "read-only",
+          **({"ephemeral": True, "excludeTurns": True} if ephemeral else {}),
         })
         thread = AsyncThread(codex, forked.thread.id)
       await _assert_codex_mcp_isolated(codex, str(thread.id or ""))
+      await _assert_codex_tools_off(codex, str(thread.id))
       result = await thread.run(
         prompt,
         approval_mode=ApprovalMode.deny_all,
         cwd=cwd,
         sandbox=Sandbox.read_only,
+        **({"model": model} if model else {}),
       )
   finally:
     ownership.release()
@@ -522,6 +596,8 @@ def fork_session(
   prompt: str,
   *,
   after_call_id: str | None = None,
+  model: str | None = None,
+  ephemeral: bool = False,
 ) -> ForkResult:
   provider = provider.strip().lower()
   if provider not in {"claude", "codex"}:
@@ -537,7 +613,8 @@ def fork_session(
   if provider == "claude":
     try:
       return _fork_claude(
-        source_session_id, cwd, prompt, after_call_id=after_call_id
+        source_session_id, cwd, prompt, after_call_id=after_call_id,
+        model=model, ephemeral=ephemeral,
       )
     except ForkError:
       raise
@@ -546,7 +623,8 @@ def fork_session(
   try:
     return asyncio.run(
       _fork_codex_async(
-        source_session_id, cwd, prompt, after_call_id=after_call_id
+        source_session_id, cwd, prompt, after_call_id=after_call_id,
+        model=model, ephemeral=ephemeral,
       )
     )
   except ForkError:
@@ -560,6 +638,14 @@ def _parser() -> argparse.ArgumentParser:
     description="Fork and coach one exact Claude or Codex session"
   )
   parser.add_argument("--json", action="store_true", dest="as_json")
+  parser.add_argument(
+    "--model", default=None,
+    help="answer with this model instead of the provider's default",
+  )
+  parser.add_argument(
+    "--ephemeral", action="store_true",
+    help="never save the fork to the provider's session storage",
+  )
   parser.add_argument("provider_or_session")
   parser.add_argument("session_or_cwd")
   parser.add_argument("cwd_or_prompt")
@@ -587,7 +673,15 @@ def _parse_invocation(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
   args = _parse_invocation(argv)
   try:
-    result = fork_session(args.provider, args.session_id, args.cwd, args.prompt)
+    # Pass only the options a caller chose, so a coaching call's fork is
+    # exactly the one it always was.
+    options = {
+      **({"model": args.model} if args.model else {}),
+      **({"ephemeral": True} if args.ephemeral else {}),
+    }
+    result = fork_session(
+      args.provider, args.session_id, args.cwd, args.prompt, **options,
+    )
   except ForkError as exc:
     print(f"fork-session: {exc}", file=sys.stderr)
     return 1

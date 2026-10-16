@@ -8,6 +8,12 @@ import posixpath
 import re
 import shlex
 
+# One Store listing image (icon, banner or screenshot). Small enough that a
+# full listing upload (icon, banner and every screenshot, base64-encoded)
+# stays below the API's request body cap.
+STORE_LISTING_IMAGE_MAX_BYTES = 6 * 1024 * 1024
+MAX_STORE_SCREENSHOTS = 5
+
 REQUIRED_STRING_FIELDS = ("id", "name", "version", "description", "entry")
 RECOGNIZED_CAPABILITIES = (
   "manage_apps",
@@ -42,7 +48,15 @@ PROJECT_ARTIFACT_TYPES_COUNT_MAX = 12
 PROJECT_ARTIFACT_EXTENSIONS_COUNT_MAX = 16
 AGENT_ACTIVITIES_COUNT_MAX = 16
 SERVICE_REQUEST_MAX_BYTES = 8 * 1024 * 1024
+SERVICE_TRANSFER_MAX_BYTES = 60 * 1024 * 1024
 SERVICE_ALIASES_MAX = 4
+SERVICE_ROUTE_LIMITS_MAX = 16
+SERVICE_ROUTE_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+SERVICE_ROUTE_PATH_MAX = 512
+# A declared route is already in its one matched form: never percent-encoded
+# (exchanges match the once-decoded path), never a query or fragment, and no
+# whitespace or control characters that render ambiguously in review.
+_SERVICE_ROUTE_PATH_FORBIDDEN = re.compile(r"[%?#\s\x00-\x1f\x7f-\x9f]")
 AGENT_TOOLS_MAX = 16
 AGENT_TOOL_DESCRIPTION_MAX = 2000
 AGENT_TOOL_SCHEMA_MAX_BYTES = 8 * 1024
@@ -361,6 +375,18 @@ def static_asset_entries(value) -> dict[str, str]:
   _fail("Manifest `static_assets` must be an object or array.")
 
 
+# These runtime features can load dependencies beyond the JavaScript
+# bundle. The contract requires executable entries to be declared, so those
+# files are protected by package_input_paths/source_files. Keep a denylist:
+# an allowlist would reject inert Store metadata without improving the proof.
+# Unknown fields are inert because the platform never reads them; when adding
+# a runtime feature, include it here if it can load undeclared dependencies.
+EXECUTABLE_MANIFEST_FIELDS = frozenset({
+  "service", "setup", "schedule", "python", "agent_activities", "tools",
+  "project_templates", "model_provider",
+})
+
+
 def package_input_paths(manifest: Mapping) -> Iterator[str]:
   """Yield every repo-relative file declared by a validated manifest.
 
@@ -414,6 +440,120 @@ def package_limit_message(declared: int) -> str:
     f"This app declares {declared} bytes of files, more than the "
     f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit."
   )
+
+
+def service_route_key(path: str) -> str:
+  """The canonical route an exchange path is matched by: `/` plus its non-empty segments.
+
+  HTTP routes deliver the once-decoded path without a leading slash, tool calls
+  use `/tools/<name>` and platform policies a bare relative path; all three
+  name the same route through this one form. It never decodes again, resolves
+  dot segments, or folds case: the app owns its route identity.
+  """
+  return "/" + "/".join(segment for segment in path.split("/") if segment)
+
+
+def is_service_route_path(path) -> bool:
+  """Whether a declared route-limit path is already exactly its canonical key."""
+  return (
+    isinstance(path, str)
+    and 1 < len(path) <= SERVICE_ROUTE_PATH_MAX
+    and service_route_key(path) == path
+    and not any(segment in (".", "..") for segment in path.split("/"))
+    and _SERVICE_ROUTE_PATH_FORBIDDEN.search(path) is None
+  )
+
+
+def accepted_service_max_bytes(service: Mapping) -> int | None:
+  """A stored service's whole per-direction ceiling, or None when not exactly well formed.
+
+  The one reading of an accepted `max_request_bytes`/`max_response_bytes`
+  pair, shared by runtime enforcement and update review. Both directions must
+  be the same integer (not a bool or float that merely compares equal) within
+  the platform maximum. A service accepted before these fields existed had the
+  8 MiB default.
+  """
+  request_bytes = service.get("max_request_bytes", SERVICE_REQUEST_MAX_BYTES)
+  response_bytes = service.get("max_response_bytes", SERVICE_REQUEST_MAX_BYTES)
+  if (
+    type(request_bytes) is not int or type(response_bytes) is not int
+    or request_bytes != response_bytes
+    or not 1 <= request_bytes <= SERVICE_TRANSFER_MAX_BYTES
+  ):
+    return None
+  return request_bytes
+
+
+def accepted_service_route_limits(
+  route_limits, max_bytes: int | None = None,
+) -> dict[tuple[str, str], int] | None:
+  """Accepted route ceilings by (method, path), or None when not exactly well formed.
+
+  The one reading of a stored contract's `service.route_limits`, shared by
+  runtime enforcement and update review so neither can accept a shape the
+  other refuses. An accepted contract is not trusted: every entry must be
+  exactly what `contract_from_manifest` emits. `max_bytes` additionally
+  bounds each ceiling by the service's whole grant.
+  """
+  if not isinstance(route_limits, list) or len(route_limits) > SERVICE_ROUTE_LIMITS_MAX:
+    return None
+  routes: dict[tuple[str, str], int] = {}
+  for limit in route_limits:
+    if not isinstance(limit, dict) or set(limit) != {
+      "method", "path", "max_request_bytes", "max_response_bytes",
+    }:
+      return None
+    method, path = limit["method"], limit["path"]
+    request_bytes, response_bytes = limit["max_request_bytes"], limit["max_response_bytes"]
+    # Validate both selectors before using them as a key: an unhashable or
+    # non-canonical stored value is malformed, never an exception.
+    if not isinstance(method, str) or method not in SERVICE_ROUTE_METHODS:
+      return None
+    if not is_service_route_path(path):
+      return None
+    if (
+      type(request_bytes) is not int or type(response_bytes) is not int
+      or request_bytes != response_bytes or request_bytes < 1
+      or (max_bytes is not None and request_bytes > max_bytes)
+      or (method, path) in routes
+    ):
+      return None
+    routes[(method, path)] = request_bytes
+  return routes
+
+
+def validate_service_route_limits(route_limits, max_bytes: int) -> None:
+  """Validate the reviewed per-route ceilings that narrow a service's grant."""
+  if not isinstance(route_limits, list) or len(route_limits) > SERVICE_ROUTE_LIMITS_MAX:
+    _fail(
+      "Manifest `service.route_limits` must be an array with at most "
+      f"{SERVICE_ROUTE_LIMITS_MAX} entries."
+    )
+  seen: set[tuple[str, str]] = set()
+  for index, limit in enumerate(route_limits):
+    field = f"service.route_limits[{index}]"
+    if not isinstance(limit, Mapping) or set(limit) != {"method", "path", "max_bytes"}:
+      _fail(f"Manifest `{field}` must contain exactly `method`, `path`, and `max_bytes`.")
+    method = limit["method"]
+    if not isinstance(method, str) or method not in SERVICE_ROUTE_METHODS:
+      _fail(f"Manifest `{field}.method` must be one of GET, POST, PUT, PATCH, or DELETE.")
+    path = limit["path"]
+    if not is_service_route_path(path):
+      _fail(
+        f"Manifest `{field}.path` must be an absolute canonical path of non-empty "
+        f"segments, at most {SERVICE_ROUTE_PATH_MAX} characters, without a "
+        "trailing slash, dot segments, percent-encoding, query, fragment, "
+        "whitespace, or control characters."
+      )
+    route_bytes = limit["max_bytes"]
+    if type(route_bytes) is not int or not 1 <= route_bytes <= max_bytes:
+      _fail(
+        f"Manifest `{field}.max_bytes` must be an integer from 1 byte to the "
+        "service's `max_bytes`."
+      )
+    if (method, path) in seen:
+      _fail(f"Manifest `service.route_limits` repeats {method} {path}.")
+    seen.add((method, path))
 
 
 def _validate_running_label(running_label, field: str) -> None:
@@ -907,6 +1047,10 @@ def validate_manifest_contract(manifest) -> None:
     if path not in (source_files or []):
       _fail(f"Manifest `setup.steps[{index}]` must be listed in `source_files`.")
 
+  tools = manifest.get("tools")
+  if tools is not None:
+    validate_agent_tools(tools, has_service=manifest.get("service") is not None)
+
   agent_activities = manifest.get("agent_activities", {})
   if not isinstance(agent_activities, Mapping):
     _fail("Manifest `agent_activities` must be an object.")
@@ -916,10 +1060,7 @@ def validate_manifest_contract(manifest) -> None:
       f"(max {AGENT_ACTIVITIES_COUNT_MAX})."
     )
   declared_sources = set(source_files or []) if isinstance(source_files, list) else set()
-  declared_tools = {
-    tool.get("name") for tool in (manifest.get("tools") or [])
-    if isinstance(tool, Mapping)
-  } if isinstance(manifest.get("tools"), list) else set()
+  declared_tools = {tool["name"] for tool in tools or []}
   activity_entries: set[str] = set()
   activity_tools: set[str] = set()
   for activity_id, activity in agent_activities.items():
@@ -929,7 +1070,7 @@ def validate_manifest_contract(manifest) -> None:
     # by a simple shell invocation of one of its source files.
     if isinstance(activity, Mapping) and set(activity) == {"tool", "running_label"}:
       tool = activity.get("tool")
-      if tool not in declared_tools:
+      if not isinstance(tool, str) or tool not in declared_tools:
         _fail(f"Manifest `{field}.tool` must name one of the app's `tools`.")
       if tool in activity_tools:
         _fail("Manifest agent_activities must use distinct tools.")
@@ -964,11 +1105,11 @@ def validate_manifest_contract(manifest) -> None:
   service = manifest.get("service")
   if service is not None:
     if not isinstance(service, Mapping) or set(service) - {
-      "id", "aliases", "entry", "access",
+      "id", "aliases", "entry", "access", "max_bytes", "route_limits",
     }:
       _fail(
         "Manifest `service` must contain only `id`, `aliases`, `entry`, "
-        "and `access`."
+        "`access`, `max_bytes`, and `route_limits`."
       )
     if package_id is not None and "id" not in service:
       _fail("Manifest `service.id` is required when `package_id` is declared.")
@@ -1005,6 +1146,12 @@ def validate_manifest_contract(manifest) -> None:
       )
     if service.get("access", "self") not in {"self", "apps", "public"}:
       _fail("Manifest `service.access` must be `self`, `apps`, or `public`.")
+    max_bytes = service["max_bytes"] if "max_bytes" in service else SERVICE_REQUEST_MAX_BYTES
+    if type(max_bytes) is not int or not 1 <= max_bytes <= SERVICE_TRANSFER_MAX_BYTES:
+      _fail(
+        "Manifest `service.max_bytes` must be an integer from 1 byte to 60 MiB."
+      )
+    validate_service_route_limits(service.get("route_limits", []), max_bytes)
 
   # The app's own Python environment (app_python_env). Apply and install
   # check that the listed file exists in the accepted tree.
@@ -1062,10 +1209,6 @@ def validate_manifest_contract(manifest) -> None:
           f"Manifest `skills[{index}]` {entry!r} must list "
           f"`{entry}{FOLDER_SKILL_ENTRY}` in `source_files`."
         )
-
-  tools = manifest.get("tools")
-  if tools is not None:
-    validate_agent_tools(tools, has_service=service is not None)
 
   system_prompt = manifest.get("system_prompt")
   if system_prompt is not None:

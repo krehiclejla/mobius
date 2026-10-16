@@ -85,8 +85,13 @@ reason to hide or skip validation. Inside Möbius:
 - keep memory bounded: the container shares one memory limit with every
   running chat. Build the shell only through `npm run build` (it caps the heap
   and takes the build lock); never call `vite` directly. Frontend tests run one
-  worker by default (`MOBIUS_TEST_CONCURRENCY`, about 550 MB each); raise it
-  only when nothing else is running, and never run test suites in parallel;
+  worker by default (`MOBIUS_TEST_CONCURRENCY`; most workers need about 100 MB,
+  component-rendering workers reach about 900 MB, so three nearly fill a
+  4 GB container); raise it to at most 2, only when no other chat is running,
+  and never run test suites in parallel. A component test that
+  renders through Vite creates its server with `createSsrRenderServer` from
+  `frontend/src/lib/__tests__/ssrRenderServer.mjs`, never with `createServer`
+  directly;
 - if the worktree runner says the checkout lock differs from the image runtime,
   treat those results as useful but not dependency-authoritative and use a
   lock-matched environment or hosted checks for that contract; and

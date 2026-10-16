@@ -2083,6 +2083,23 @@ def _build_info() -> dict:
   return data if isinstance(data, dict) else {}
 
 
+def image_lineage() -> frozenset[str]:
+  """Every commit the running image's source descends from, recorded at build.
+
+  The served checkout cannot prove image ancestry by itself: images seed a
+  shallow clone, and a container-only upgrade fetches nothing. Empty when the
+  image recorded no lineage, so callers fall back to their checkout's proof.
+  """
+  path = Path(os.environ.get("MOBIUS_IMAGE_LINEAGE_PATH", "/app/platform-lineage"))
+  try:
+    text = path.read_text(encoding="ascii")
+  except (OSError, UnicodeError):
+    return frozenset()
+  return frozenset(
+    sha for sha in text.split() if re.fullmatch(r"[0-9a-f]{40}", sha)
+  )
+
+
 def frozen_image_sha() -> str | None:
   """The running image's own source commit, from its frozen build record.
 
@@ -3643,7 +3660,11 @@ def release_packages_missing_from_image(
   (``image_installs_python_input``) is judged on its own:
 
   - declared somewhere in this image's own history: not newer than the image,
-    so a newer image under older source (a container-only upgrade) is fine;
+    so a newer image under older source (a container-only upgrade) is fine.
+    The checkout need not hold the image's commit (an image seeds a shallow
+    clone, and a container-only upgrade fetches nothing), so the image's
+    build-recorded lineage (``image_lineage``) also proves the recorded
+    release's own declarations are not newer;
   - declared in the official history (``origin/main``) but never in the
     image's: a newer official release, so the checkout is refused;
   - declared in neither: a local package declaration, which stays allowed.
@@ -3661,11 +3682,14 @@ def release_packages_missing_from_image(
   # so only a complete clone may call an input local by its absence.
   official = "" if _is_shallow(repo) else _rev(repo, "refs/remotes/origin/main")
   release = recorded_upstream_sha(repo)
+  release_in_image = bool(release) and release in image_lineage()
   for path in _PYTHON_DEPENDENCY_INPUTS:
     served = _served_bytes(repo, path)
     if served is None or image_installs_python_input(repo, path, served):
       continue
     if image and _declared_in_history(repo, image, path, served):
+      continue
+    if release_in_image and _git_blob(repo, release, path) == served:
       continue
     if official:
       newer = _declared_in_history(repo, official, path, served)

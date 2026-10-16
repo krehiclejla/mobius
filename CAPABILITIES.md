@@ -148,8 +148,8 @@ The platform starts a fresh process from the exact accepted app revision for
 each request. It sends one JSON object on stdin and accepts one JSON response
 on stdout: `{ "status": 200, "body": ..., "headers": {...} }`. The platform
 owns authentication, immutable source selection, the short-lived app token,
-8 MiB request/response ceilings, timeout, concurrency, and response-header
-safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
+an 8 MiB default serialized request/response ceiling, timeout, concurrency,
+and response-header safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
 `ETag`, `Last-Modified`, and `Vary` pass, other headers are dropped, and an
 authenticated response may not opt into shared caching (`public`, `s-maxage`).
 Private and public requests use separate serialized lanes so a private
@@ -160,6 +160,180 @@ the same time can touch the same state, the app must
 provide its own file or database locking.
 The app owns its paths, policy, storage format, and domain behavior. This is a
 reviewed trusted process like an app job, not an operating-system sandbox.
+An app may request a larger per-direction ceiling with `service.max_bytes`
+(integer bytes, at most 60 MiB). This is a reviewed service grant, not an
+implicit upgrade for installed apps. The same limit covers the complete JSON
+request envelope and complete JSON response envelope (including base64 and
+metadata), before any binary response is decoded. Requests exceeding the
+accepted limit are rejected while streaming, before the whole body is buffered;
+the platform's independent 64 MiB HTTP request backstop remains in force.
+Service HTTP body reads have a **120-second total deadline**, not a deadline
+reset by each fragment. Incomplete reads return HTTP **408** and release their
+reservation; the separate 15-second service execution timeout is unchanged.
+Grant liveness is checked again before invocation. Pre-invocation body reads
+end on deadline, disconnect or caller cancellation; they are not yet part of
+the browser grant's attributed execution calls.
+Storage reads outside service routes do not inherit this deadline. Near-ceiling
+60 MiB service bodies therefore need roughly 512 KiB/s over that read lifetime.
+The shared streaming body reader accumulates bytes rather than retaining a
+list entry and source allocation for every transport fragment.
+
+A service can narrow that ceiling for exact small routes with
+`service.route_limits`, so control requests do not reserve a media-sized
+allowance:
+
+```json
+{
+  "service": {
+    "entry": "service.py",
+    "access": "public",
+    "max_bytes": 62914560,
+    "route_limits": [
+      { "method": "GET", "path": "/actor", "max_bytes": 1048576 },
+      { "method": "POST", "path": "/activity", "max_bytes": 1048576 }
+    ]
+  }
+}
+```
+
+At most 16 entries, each exactly `method` (`GET`, `POST`, `PUT`, `PATCH` or
+`DELETE`, uppercase), `path` and `max_bytes` (an integer from 1 byte to the
+service's `max_bytes`), unique per method and path. A path is already
+canonical: it starts with `/`, has only non-empty segments, no trailing slash,
+no `.` or `..` segment, no `%`, `?`, `#`, whitespace or control characters,
+and at most 512 characters. The reviewed contract records each entry as equal
+`max_request_bytes` and `max_response_bytes`, sorted by path then method, and
+omits the list when it is empty. Matching is exact and case-sensitive on the
+method and on the path the route already received once-decoded, written as `/`
+plus its non-empty segments; the query string is ignored. Same-app, shared and
+public HTTP routes, agent tools (`POST /tools/<name>`) and platform policies
+(`POST /<policy path>`) use that one match. There is no prefix match and no
+further decoding: the app owns its route identity, so a route it reaches only
+by decoding again is not matched. An unmatched route or method keeps the
+whole `max_bytes` grant. A matched route's ceiling bounds the request body
+read (before buffering), the serialized request, the service's stdout and a
+decoded binary response, and execution admission reserves three times that
+smaller ceiling plus bounded stdio overhead (described below). The ceiling
+governs admission accounting only; it promises no
+execution priority, queue position, availability under load or process RSS.
+Adding or lowering a route ceiling narrows the service in update review;
+removing, renaming or raising one widens it.
+
+Service exchange admission also bounds decoded resources independently of
+serialized bytes, in both directions: at most 524,288 work units, nesting
+depth 128, and a conservative 320 MiB decoded-resource estimate per direction.
+A unit is a structural mark (a string opening, container opening, comma or
+colon outside strings), 24 other characters outside strings, or a number
+token's measured extra parse cost: a decimal without an exponent 2 plus an
+eighth of its length up to 16 characters and 2 plus half its length up to 24;
+a token of at most 24 characters whose exponent field (after its sign,
+leading zeros included) has one or two digits 3 plus half its length up to
+exponent 22, or 8 plus half its length up to 99; any other exponent or a
+longer decimal its length plus 12, plus its length beyond 24 again; an int of
+more than 18 digits its digit count plus 4 over 16, plus its digit count
+squared over 7,000 (a minus sign costs only its character, wherever a chunk
+boundary or materialization puts it). A number cut by a chunk boundary is
+charged as the whole token once it ends. Invalid marks no valid document repeats
+(a closer with no open container, a backslash outside strings) cost a unit
+each. Units bound the one
+uninterruptible standard-library call per document, the parse, so a larger
+transfer grant buys media bytes, not denser JSON; the depth stays well inside
+the platform's own encoders and response validation. A body is scanned in
+16 KiB chunks with a cooperative cancellation/yield point per chunk; punctuation
+inside strings does not consume units, and string content (including
+escape-heavy input) is scanned natively rather than one Python iteration per
+escape. A number is examined only where a value can start (the document's
+start, or after a bracket, comma or colon), so other digits and short ints
+cost no Python step each. The scan reserves the chunks it keeps plus the next chunk's decode
+before decoding it, then makes the Unicode text once by whichever exactly
+charged copy is cheaper: joining those chunks, or letting the standard library
+decode the bytes into a byte-sized buffer copied per widening. The remaining
+estimate covers parsing (that text plus per-kind allocation bounds for each
+string, list, object, element, member and number, including container growth
+and the parser's key memo) and, for a response, rendering. All of it is
+reserved before the standard-library parser materializes either the HTTP
+request or service stdout. JSON syntax and values remain exclusively
+authoritative in the standard-library parser.
+
+A JSON response body is rendered part by part to exactly the bytes Starlette's
+`JSONResponse` would produce, inside the exchange reservation and yielding
+between parts, so its text is never held at its widest character's width.
+Request serialization works the same way. Both reserve the growing buffer, the
+largest string part (its escaped text with either its UTF-8 bytes or, when it
+follows a list separator, its separator-prefixed copy, whichever is larger) and the encoder's per-level state before
+encoding; request serialization adds what exceeds three serialized copies to
+its execution allowance. The complete request envelope, including tool and
+policy requests, has the same unit, depth and decoded-cost ceilings, counted on
+its compact JSON form with the envelope itself at depth 0, so a compact body
+gets the same verdict over HTTP as when materialized, except that an int
+beyond 64 bits is charged an upper bound of its digits (at most two more,
+without converting it) and can tip a body exactly at the limit; redundant raw
+text (whitespace, longer number spellings) is real parse work and costs more
+only over HTTP. Its retained estimate is each value's `sys.getsizeof` plus
+allocator slack, and that walk runs pinned to the accepted runtime. The walk
+reserves its own iterator stack, and every bounded copy it makes to size a long
+string, before making it, and yields by the work it has done, counting each
+16 KiB slice sized as many visited values. A browser grant's attribution belongs to the whole
+exchange, so revoking the grant also cancels an HTTP response that is still
+rendering. Large base64 scalars, 20 MiB
+originals/downloads, and galleries with Unicode captions fitting the reviewed
+60 MiB serialized grant remain supported in both directions. A single huge
+string containing a wide character is held at that width when decoded and
+again while encoded, so one beyond roughly 21 to 35 MiB (depending on
+direction and whether it is a list item) is refused before it is copied.
+Parsing a large
+Unicode document is still one uninterruptible call proportional to its bytes
+(about 0.3 s for a 58 MB gallery measured on the development host), so the
+platform does not promise event-loop responsiveness for the largest media
+bodies.
+
+One process-wide 512 MiB estimated exchange budget covers body/stdio reading,
+decoding, serialization, retained execution backlog and response handoff
+across all lanes. Anonymous HTTP reads additionally share a **192 MiB ingress
+sub-budget within that same 512 MiB total**, not an additional allowance. This
+prevents stalled public bodies from taking all private/tool admission. Once a
+public read completes, its sub-budget share is released while the same total
+reservation continues to own the body, decoding, execution and response.
+Each phase charges what it can actually hold. A body read is charged three
+copies of the bytes actually received (buffer growth, reallocation and the
+final copy) before each buffer growth, whatever its `Content-Length` says;
+a declared length over the ceiling is still refused before reading. A request
+waiting for its execution slot holds only its retained envelope estimate.
+Inside the slot, before the request is serialized or any process starts, the
+exchange reserves three times its accepted serialized ceiling for the input
+and two stdout copies, plus bounded stdio overhead: at most two 64 KiB pending
+input slices, chunk headers and bounded stderr. Each executing exchange also
+reserves the two readers' bounded receive-buffer overshoot and one 256 KiB
+selector-read transient (including object overhead), even for oversized
+responses on tiny routes. These conservatively charged costs stay inside the
+same total budget, even though callbacks run one at a time. Input writes yield
+under backpressure, and both
+execution paths collect whole 64 KiB output chunks regardless of service write
+sizes; neither unsent-input copies nor fragment headers grow unaccounted.
+The reservation is larger instead when encoding its largest string part needs
+more. When the budget cannot hold
+that allowance, the call answers a retryable HTTP **503** with `Retry-After`
+and no service runs. Rejected processes are killed and their remaining pipes
+drained without retaining their output before the runtime pin is released.
+Once the service answers, the allowance is replaced by three copies of its
+actual stdout plus any bounded diagnostic text, so finished responses awaiting
+handoff do
+not hold a media-sized allowance. Decoded cost is charged before
+materialization. Once request decoding is complete, its freed
+transient Unicode copy is replaced by the retained envelope estimate; the
+response estimate is added to that request cost, never substituted for it.
+The combined reservation stays held through HTTP response construction or the
+tool/policy result handoff. Budget exhaustion while reading or decoding a
+request rejects immediately rather than buffering more. Request
+resource/admission violations return
+HTTP 413; malformed requests within the resource bounds still return 400.
+Service response structural, decoded-cost or combined-budget violations
+return 502, as do malformed service responses. The existing serialized-output
+execution limits are unchanged. These are conservative admission estimates,
+not an operating-system RSS limit or a reduction of the reviewed serialized
+media allowance; both directions share the exchange budget. Outbound ASGI
+sending after Response construction and downstream consumers retaining a
+handed-off tool/policy result are outside this exchange reservation.
 
 Starting a fresh interpreter costs most services far more than their work
 (roughly a second for a FastAPI entry). An entry can declare a top-level

@@ -40,6 +40,7 @@ from app.chat_writer import (
   Barrier,
   FinishRun,
   ParkRun,
+  PostponeResourcePark,
   PrepareAutoResume,
   PromotePending,
   ResolvePark,
@@ -907,10 +908,10 @@ def test_manual_try_now_preserves_messages_queued_behind_future_limit_park(
     parked.root_run_id = parked.id
     parked.goal_objective = "Finish the durable Goal"
     parked.goal_id = parked.id
-    parked.goal_plan_json = {
+    plan = {
       "tasks": [{"id": "finish", "status": "running"}],
     }
-    persist_goal_fixture(setup_db, parked)
+    persist_goal_fixture(setup_db, parked, plan=plan)
     setup_db.commit()
   first = client.post(
     f"/api/chats/{cid}/messages",
@@ -3545,3 +3546,74 @@ async def test_setup_failure_is_saved_as_a_resumable_error_in_the_transcript(
   assert "AttributeError" in error["message"]
   assert "has no attribute 'messages'" not in error["message"]
   assert error["resumable"] is True
+
+
+@pytest.mark.parametrize("park_reason", ["storage", "memory"])
+def test_still_short_resource_park_waits_without_a_new_turn_or_card(
+  owner_token, monkeypatch, park_reason,
+):
+  """A due memory/storage park re-checks admission before resuming.
+
+  While the resource is still short, the same parked run moves its next check
+  later and nothing is scheduled, so the transcript keeps its one waiting card
+  instead of gaining an identical card every minute. Once admission would
+  succeed, the ordinary continuation starts.
+  """
+  del owner_token
+  monkeypatch.setattr(
+    "app.push.notify_owner_async", _async_notify(lambda *args, **kwargs: "n"),
+  )
+  scheduled = []
+  monkeypatch.setattr(
+    chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw),
+  )
+  monkeypatch.setattr(chat_mod, "_limit_auto_resume_now", lambda: 10**9)
+  hold = [chat_mod.AgentTurnDeferred("still short", resource=park_reason)]
+  checks = []
+
+  async def deferral(data_dir):
+    checks.append(data_dir)
+    return hold[0]
+
+  monkeypatch.setattr(chat_mod, "agent_turn_deferral", deferral)
+  cid = f"sweep-still-short-{park_reason}"
+  token = f"rt-{cid}"
+  _due_park(cid, token, auto_resume=False, park_reason=park_reason)
+  due_before = _run_row(token)["parked_until"]
+  try:
+    assert _run_sweep() == []
+    assert scheduled == []
+    row = _run_row(token)
+    assert row["status"] == "parked"
+    assert row["parked_until"] > datetime.now(UTC).replace(tzinfo=None)
+    assert row["parked_until"] > due_before
+    assert len(checks) == 1
+
+    hold[0] = None
+    with SessionLocal() as db:
+      db.query(models.ChatRun).filter(models.ChatRun.id == token).update({
+        "parked_until": datetime.now(UTC).replace(tzinfo=None)
+        - timedelta(minutes=1),
+      })
+      db.commit()
+    assert _run_sweep() == [cid]
+    assert len(scheduled) == 1
+    assert scheduled[0]["next_user"]["continuation_reason"] == park_reason
+  finally:
+    chat_mod.discard_starting(cid)
+
+
+def test_postpone_resource_park_leaves_other_parks_alone(owner_token):
+  """Only a still-parked memory/storage run can be postponed."""
+  del owner_token
+  cid = "postpone-limit-park"
+  token = f"rt-{cid}"
+  _due_park(cid, token, park_reason="usage_limit")
+  due_before = _run_row(token)["parked_until"]
+  moved = get_writer().submit(PostponeResourcePark(
+    chat_id=cid,
+    run_token=token,
+    parked_until=datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1),
+  )).result(timeout=5)
+  assert moved is False
+  assert _run_row(token)["parked_until"] == due_before

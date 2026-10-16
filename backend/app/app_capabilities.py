@@ -15,7 +15,9 @@ from copy import deepcopy
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES
+from app.manifest_contract import (
+  SERVICE_REQUEST_MAX_BYTES, accepted_service_max_bytes, accepted_service_route_limits,
+)
 
 
 CONTRACT_SCHEMA = 6
@@ -589,12 +591,29 @@ def contract_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
       "entry": service["entry"],
       "access": service.get("access", "self"),
       "protocol": "json-v1",
-      "max_request_bytes": SERVICE_REQUEST_MAX_BYTES,
-      "max_response_bytes": SERVICE_REQUEST_MAX_BYTES,
+      "max_request_bytes": service.get("max_bytes", SERVICE_REQUEST_MAX_BYTES),
+      "max_response_bytes": service.get("max_bytes", SERVICE_REQUEST_MAX_BYTES),
     }
     aliases = list(service.get("aliases") or [])
     if aliases:
       accepted_service["aliases"] = aliases
+    # Omitted when empty so services without route ceilings keep their
+    # existing review digest. A sorted list, not a path-keyed object, so
+    # update review compares it as one value instead of splitting slashes.
+    route_limits = sorted(
+      (
+        {
+          "method": limit["method"],
+          "path": limit["path"],
+          "max_request_bytes": limit["max_bytes"],
+          "max_response_bytes": limit["max_bytes"],
+        }
+        for limit in service.get("route_limits") or []
+      ),
+      key=lambda limit: (limit["path"], limit["method"]),
+    )
+    if route_limits:
+      accepted_service["route_limits"] = route_limits
     contract["service"] = accepted_service
   return contract
 
@@ -696,6 +715,7 @@ def contract_from_app_state(
     "public_access": public_access,
     "tools": tools,
   }
+  accepted_transfer: dict[str, Any] | None = None
   if service is _PRESERVE_ACCEPTED and isinstance(
     getattr(app, "capability_contract", None), dict,
   ):
@@ -708,6 +728,15 @@ def contract_from_app_state(
       }
       if accepted_service.get("aliases"):
         service["aliases"] = list(accepted_service["aliases"])
+      # Re-deriving transfer limits through manifest form could repair a
+      # grant the runtime refuses (re-enabling a disabled service) or drop a
+      # reviewed route ceiling (widening that route to the whole grant). Keep
+      # each accepted field verbatim, including an absent legacy whole grant
+      # and its 8 MiB default, so the runtime reads exactly what was accepted.
+      accepted_transfer = {
+        key: deepcopy(accepted_service[key])
+        for key in _TRANSFER_LIMIT_FIELDS if key in accepted_service
+      }
   if isinstance(service, dict):
     manifest["service"] = service
   if model_provider is _PRESERVE_ACCEPTED:
@@ -715,7 +744,12 @@ def contract_from_app_state(
     model_provider = accepted.get("model_provider") if isinstance(accepted, dict) else None
   if isinstance(model_provider, dict):
     manifest["model_provider"] = model_provider
-  return contract_from_manifest(manifest)
+  contract = contract_from_manifest(manifest)
+  if accepted_transfer is not None:
+    for key in _TRANSFER_LIMIT_FIELDS:
+      contract["service"].pop(key, None)
+    contract["service"].update(accepted_transfer)
+  return contract
 
 
 def contract_with_chat_log_access(
@@ -860,10 +894,24 @@ def diff_contracts(
   after = leaves(_semantic_contract(candidate))
   added = sorted(k for k in after.keys() - before.keys())
   removed = sorted(k for k in before.keys() - after.keys())
-  changed = sorted(k for k in before.keys() & after.keys() if before[k] != after[k])
+  changed = sorted(
+    k for k in before.keys() & after.keys()
+    if before[k] != after[k] or (
+      # Python equates 1, True and 1.0; only the integer is a valid ceiling.
+      k in _TRANSFER_LIMIT_PATHS and _exact_json(before[k]) != _exact_json(after[k])
+    )
+  )
   widens = any(
     _widens(path, before.get(path), after.get(path), after)
     for path in [*added, *removed, *changed]
+  ) or (
+    # Transfer limits the runtime refuses disable the service, so they cannot
+    # be ranked against anything, even when they compare equal or pruning made
+    # them look absent. While the service stays granted, either side being
+    # unreadable needs review. "Granted" is the same semantic test as complete
+    # revocation in _widens: an omitted or all-closed service has no leaf.
+    any(key.startswith("service.") for key in after)
+    and (_unreadable_transfer_limits(installed) or _unreadable_transfer_limits(candidate))
   )
   return {
     "unknown_previous": False,
@@ -897,6 +945,58 @@ _LIST_GRANTS = {
 }
 
 
+_ROUTE_LIMITS_PATH = "service.route_limits"
+# The accepted service fields the runtime reads to bound every exchange.
+_TRANSFER_LIMIT_FIELDS = ("max_request_bytes", "max_response_bytes", "route_limits")
+_TRANSFER_LIMIT_PATHS = {f"service.{field}" for field in _TRANSFER_LIMIT_FIELDS}
+
+
+def _exact_json(value: Any) -> str:
+  return json.dumps(value, sort_keys=True, separators=(",", ":"), default=repr)
+
+
+def _unreadable_transfer_limits(contract: dict[str, Any]) -> bool:
+  """Whether a stored service carries transfer limits the runtime would refuse.
+
+  The same shared readings the runtime enforces: the whole per-direction
+  grant (absent fields are the legacy 8 MiB default), then route ceilings
+  bounded by it, where absence and an empty list mean no ceilings. The
+  runtime disables a service when either is not exactly well formed, so such
+  a service is never ranked as narrower than one it actually serves.
+  """
+  service = contract.get("service")
+  if not isinstance(service, dict):
+    return False
+  ceiling = accepted_service_max_bytes(service)
+  return ceiling is None or accepted_service_route_limits(
+    service.get("route_limits", []), ceiling,
+  ) is None
+
+
+def _route_ceilings(value: Any) -> dict[tuple[str, str], int] | None:
+  """Accepted route ceilings by (method, path), or None when malformed.
+
+  A pruned (absent or empty) list has no ceilings. Everything else must pass
+  the same reading the runtime enforces, so a shape it would refuse is never
+  ranked as a narrower grant.
+  """
+  return {} if value is None else accepted_service_route_limits(value)
+
+
+def _route_limits_widen(before: Any, after: Any) -> bool:
+  """Whether a service that stays granted loses or raises a route ceiling.
+
+  A route ceiling only narrows its service's whole grant, so introducing or
+  lowering one narrows. Removing or renaming one returns that route to the
+  whole grant and raising one enlarges it; both need review, as does any
+  shape this cannot read.
+  """
+  old, new = _route_ceilings(before), _route_ceilings(after)
+  if old is None or new is None:
+    return True
+  return any(key not in new or new[key] > ceiling for key, ceiling in old.items())
+
+
 def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
   """Whether one semantic leaf change grants the app more than it had.
 
@@ -920,6 +1020,18 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     return not isinstance(before, list) or not isinstance(after, list) or any(
       item not in before for item in after
     )
+  if path in {"service.max_request_bytes", "service.max_response_bytes"}:
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a transfer allowance.
+    # Service transfer is a reviewed ceiling, not an unordered declaration.
+    # A legacy accepted service without these fields had the 8 MiB default.
+    old = SERVICE_REQUEST_MAX_BYTES if before is None else before
+    new = SERVICE_REQUEST_MAX_BYTES if after is None else after
+    return type(old) is not int or type(new) is not int or new > old
+  if path == _ROUTE_LIMITS_PATH:
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a route allowance.
+    return _route_limits_widen(before, after)
   for capability_id, definition in RUNTIME_CAPABILITY_DEFINITIONS.items():
     prefix = f"runtime.{capability_id}."
     if not path.startswith(prefix):

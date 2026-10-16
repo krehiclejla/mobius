@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import HTTPException, Request
@@ -174,6 +175,7 @@ async def read_capped_body(
   cap: int = MAX_STORAGE_BYTES,
   *,
   too_large: str = "Request body too large.",
+  admit_growth: Callable[[int], None] | None = None,
 ) -> bytes:
   """Reads a request body, refusing once it crosses `cap` bytes.
 
@@ -184,6 +186,11 @@ async def read_capped_body(
   round-8 #3, round-9 #4). Shared by the storage PUT, the icon upload, and
   workspace file saves — any route that reads a raw body should use this
   instead of `request.body()`.
+
+  ``admit_growth(total)`` runs before the buffer grows to ``total`` received
+  bytes and may raise to refuse that growth. It sees only bytes actually
+  received, never the declared length, and its charge for ``total`` must
+  also cover the buffer's growth slack and the final immutable copy.
   """
   cl = request.headers.get("content-length")
   if cl is not None:
@@ -193,14 +200,16 @@ async def read_capped_body(
       declared = None
     if declared is not None and declared > cap:
       raise HTTPException(status_code=413, detail=too_large)
-  chunks: list[bytes] = []
-  total = 0
+  body = bytearray()
   async for chunk in request.stream():
-    total += len(chunk)
-    if total > cap:
+    if not chunk:
+      continue
+    if len(body) + len(chunk) > cap:
       raise HTTPException(status_code=413, detail=too_large)
-    chunks.append(chunk)
-  return b"".join(chunks)
+    if admit_growth is not None:
+      admit_growth(len(body) + len(chunk))
+    body.extend(chunk)
+  return bytes(body)
 
 
 def app_dir_usage(app_dir: Path) -> int:

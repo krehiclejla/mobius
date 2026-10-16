@@ -361,8 +361,10 @@ mapi -X PATCH /api/apps/<app-id> -H 'Content-Type: application/json' -d '{...}'
 - An HTTP error exits non-zero and still prints the response body, so a failed
   request no longer reads as success. An empty success (often **204 No Content**
   after a write) prints `mapi: HTTP 204, empty response (success)` on stderr.
-- Use the exact path **including its trailing slash** (`/api/apps/`); slash-less
-  variants are a plain 404.
+- Use each endpoint's exact documented path. Collection routes are not
+  consistent about the trailing slash (`/api/apps/` needs it; `/api/chats` and
+  `/api/skills` must not have it), and the other form is a plain 404, not a
+  redirect. On an unexpected 404 for a collection, try the other form.
 - Background app jobs only have `$APP_TOKEN` and keep plain `curl`. Raw `curl`
   remains correct for anything that is not this instance's `/api`.
 
@@ -384,7 +386,9 @@ from the composer's `+` picker and prefer leaving effort unset.
 **The workspace.** Chats and mini-apps tile into panes on wide screens; a phone
 shows one at a time. Express intent and the shell handles layout. To open
 something, call the `open_item` tool: background activation unless the
-partner just asked for that item, never promise geometry.
+partner just asked for that item, never promise geometry. It can also take the
+partner to a Settings section when they want it; that only navigates, and
+signing in, credentials and every other change there stay their own taps.
 For runtime debugging, use the `platform-maintenance` recipes rather than adding
 temporary endpoints.
 

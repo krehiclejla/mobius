@@ -175,7 +175,10 @@ def static_embed_csp(
     "sandbox allow-scripts allow-forms allow-pointer-lock allow-popups "
     "allow-popups-to-escape-sandbox; "
     f"default-src {source}; "
-    f"script-src {source} 'unsafe-inline'; "
+    # Packaged games such as Godot compile Wasm inside this response-sandboxed,
+    # opaque frame. The narrow source permits that without general JS eval or
+    # granting the document the shell origin.
+    f"script-src {source} 'unsafe-inline' 'wasm-unsafe-eval'; "
     f"style-src {source} 'unsafe-inline'; "
     f"font-src {source} data:; "
     f"connect-src {source}; "

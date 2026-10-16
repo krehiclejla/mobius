@@ -16,6 +16,7 @@ import {
   clientLengthToLayout,
   clientPointToLayout,
 } from '../../../lib/layoutSpace.js'
+import { saveBlobAs } from '../../../lib/saveFile.js'
 
 function layoutPoint(x, y, space) {
   return clientPointToLayout({ x, y }, space)
@@ -444,13 +445,7 @@ export default function ImageLightbox({
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const blob = await response.blob()
       const urlPath = new URL(activeSrc, location.origin).pathname
-      const filename = urlPath.split('/').pop() || 'image.png'
-      const anchor = document.createElement('a')
-      const objectUrl = URL.createObjectURL(blob)
-      anchor.href = objectUrl
-      anchor.download = filename
-      anchor.click()
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+      saveBlobAs(blob, urlPath.split('/').pop() || 'image.png')
     } catch {
       setDownloadError(true)
       setTimeout(() => setDownloadError(false), 3000)

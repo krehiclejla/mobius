@@ -1,5 +1,6 @@
 import { fetchFreshShellList, letSystemStreamOwnListRefresh } from './shellListReconciliation.js'
 import { requestChatChanges } from '../../lib/chatChangesNavigation.js'
+import { clearAppNavLocation } from '../../lib/appNavLocationStore.js'
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useReducer, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -11,6 +12,11 @@ import {
   SettingsNavIcon,
 } from '../navigationIcons.js'
 import Drawer from '../Drawer/Drawer.jsx'
+import {
+  copyChatSettings as copyNewChatSettings,
+  withCopiedSettings,
+  startChatFromCommand as startNewChatFromCommand,
+} from './newChatCommand.js'
 import AppCanvas from '../AppCanvas/AppCanvas.jsx'
 import NotificationCenter from '../NotificationBell/NotificationCenter.jsx'
 import {
@@ -24,11 +30,13 @@ import { placeContextMenu } from '../../lib/contextMenuGeometry.js'
 import { captureLayoutSpace, clientPointToLayout } from '../../lib/layoutSpace.js'
 import { makeAppChatController } from '../../lib/appChatControl.js'
 import { handleAppProjectsRequest } from '../../lib/appProjectControl.js'
-import { parseNotificationTarget } from '../../lib/notificationTarget.js'
+import { subscribeShellLaunchTargets } from '../../lib/shellLaunchTargets.js'
 import { requestChatQuestionReveal } from '../../lib/chatQuestionReveal.js'
+import { settingsSectionOrNull } from '../../lib/settingsSections.js'
 import { recordClientError } from '../../lib/errorLog.js'
 import { setChatCompacting } from '../ChatView/chatCompactionStore.js'
 import useSystemEventStream from '../../hooks/useSystemEventStream.js'
+import { useManagedAppEvents } from '../../hooks/useManagedAppEvents.js'
 import useTheme from '../../hooks/useTheme.js'
 import useProviderAuthStatus from '../../hooks/useProviderAuthStatus.js'
 import {
@@ -88,12 +96,16 @@ import {
   workspaceRequestsForBuiltApps,
   ACTIVATE_FOREGROUND,
 } from './workspacePlacement.js'
-import { appCrashReportDraft } from '../../lib/appRecovery.js'
+import { appCrashReportDraft, appReportChatId } from '../../lib/appRecovery.js'
 import {
   acknowledgeAppActivity,
   appAttentionIds,
   freshChatBuiltApps,
   freshAppIds,
+  applyAppActivityEvent,
+  applyAppActivitySeenEvent,
+  reconcileSeenAppActivity,
+  rememberSeenAppActivity,
   withAppActivitySeen,
   withAppsFlagged,
   withoutAppFlagged,
@@ -207,12 +219,6 @@ import { HistoryDismissProvider } from '../../hooks/useHistoryDismiss.jsx'
 import { rememberRecentDestination } from '../../lib/recentSelections.js'
 import { isSharedBrowserRoute, sharedBrowserRoutePath, sharedBrowserStorageForGrant } from '../../lib/sharedBrowserWorkspace.js'
 
-const APP_SETTINGS_SECTIONS = new Set([
-  'ai-providers',
-  'background-agents',
-  'github',
-  'models',
-])
 const EMPTY_LIST = Object.freeze([])
 // Reconnect list reads order durable state ahead of buffered system events, so
 // they need a short deadline rather than holding notifications behind a stalled request.
@@ -693,8 +699,14 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // pre-delete NetworkFirst fallback) until a recovery succeeds.
   const deletedChatIdsRef = useRef(new Set())
   const deletedAppIdsRef = useRef(new Set())
+  // Highest acknowledged version per app lifetime. Retain old lifetimes for
+  // this mounted session so delayed receipts/events cannot cross ID reuse.
+  const appActivitySeenThroughRef = useRef(new Map())
   const reconcileApps = useCallback(
-    rows => withoutConfirmedDeletions(rows, deletedAppIdsRef.current),
+    rows => reconcileSeenAppActivity(
+      withoutConfirmedDeletions(rows, deletedAppIdsRef.current),
+      appActivitySeenThroughRef.current,
+    ),
     [],
   )
   const appsQuery = appQueries.list.useQuery({ reconcile: reconcileApps })
@@ -978,6 +990,13 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // per-render function declaration with volatile inputs — chats, streaming,
   // online — that would churn any callback listing it as a dep).
   const newChatRef = useRef(null)
+  // Chat panes are memoized on prop identity (paneChatProps.js), so they get
+  // one stable `/new` handler that calls this render's closure.
+  const startChatFromCommandRef = useRef(null)
+  const handleNewChatCommand = useCallback(
+    options => startChatFromCommandRef.current?.(options) ?? Promise.resolve(false),
+    [],
+  )
   // Latest-materialize ref so the deferred-New-Chat watcher (stable deps) runs this
   // render's live closure without depending on the function's identity (round 4 item 3).
   const materializeNewChatHomeRef = useRef(null)
@@ -1640,13 +1659,21 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     })
   }
 
-  async function createProjectChat(project, { title = 'New chat', prompt = null } = {}) {
+  async function createProjectChat(project, {
+    title = 'New chat', prompt = null, autoSend = false, settings = null,
+  } = {}) {
     if (!project?.id) return null
     const response = await api.projects.createChat(project.id, {
       title,
       recovery_request_id: crypto.randomUUID(),
     })
-    const chat = await jsonOrThrow(response, 'Project chat creation failed:')
+    const created = await jsonOrThrow(response, 'Project chat creation failed:')
+    // The copy lands before the chat opens, so an auto-sent first message
+    // already runs on the copied model, and every cache below holds the chat
+    // as the copy saved it rather than the pre-copy creation record.
+    const copy = await copyChatSettings(created.id, settings)
+    const chat = withCopiedSettings(created, copy.saved)
+    const sendsPrompt = !!prompt && autoSend && copy.ok
     knownExistingOffListChatIdsRef.current.add(String(chat.id))
     queryClient.setQueryData(projectQueries.keys.chats(project.id), current => [
       chat,
@@ -1667,12 +1694,45 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           : row)
         : current
     ))
+    // A staged auto-send is read by the chat as it opens, so stage it first.
+    if (sendsPrompt) stageComposerHandoff(chat.id, prompt, { autoSend: true })
     openProjectChat(project, chat)
-    if (prompt) {
+    if (prompt && !sendsPrompt) {
       stageComposerHandoff(chat.id, prompt, { autoSend: false })
       requestComposer(chat.id, { draft: prompt })
     }
     return chat
+  }
+
+  // `/new` and `/clear` (newChatCommand.js): the dependencies its two steps
+  // use, read from this render.
+  function newChatCommandDeps() {
+    return {
+      updateChat: (chatId, body) => api.chats.update(chatId, body),
+      // A created chat's first paint reads the detail cache seeded from the
+      // create response; show the copied model there, not the default.
+      onSaved: (chatId, saved) => queryClient.setQueryData(
+        chatMessagesQueryKey(chatId),
+        current => (current?.chatInfo
+          ? { ...current, chatInfo: withCopiedSettings(current.chatInfo, saved) }
+          : current),
+      ),
+      notify: notifyShell,
+      recordError: (where, error) => recordClientError({ where, error }),
+      findProject: projectId => projectsRef.current.find(
+        row => String(row.id) === String(projectId),
+      ) || null,
+      createProjectChat,
+      newChat,
+    }
+  }
+
+  function copyChatSettings(chatId, settings) {
+    return copyNewChatSettings(newChatCommandDeps(), chatId, settings)
+  }
+
+  function startChatFromCommand(options) {
+    return startNewChatFromCommand(newChatCommandDeps(), options)
   }
 
   async function createProjectFromTemplate(template) {
@@ -2306,15 +2366,22 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       const app = apps.find(row => Number(row.id) === appId)
       if (!app?.has_unseen_activity || !app?.unseen_activity_version) continue
       const observedActivityVersion = app.unseen_activity_version
+      const appCreatedAt = app.created_at
       acknowledgeAppActivity({
         appId,
         activityVersion: observedActivityVersion,
+        appCreatedAt,
         inFlight: appActivityAckRef.current,
         request: api.apps.markActivitySeen,
+        confirmSeen: (seenAppId, seenThroughVersion) => {
+          rememberSeenAppActivity(
+            appActivitySeenThroughRef.current, seenAppId, appCreatedAt, seenThroughVersion,
+          )
+        },
         clearCached: (seenAppId, seenThroughVersion) => {
           queryClient.setQueryData(
             appQueries.keys.all,
-            rows => withAppActivitySeen(rows, seenAppId, seenThroughVersion),
+            rows => withAppActivitySeen(rows, seenAppId, seenThroughVersion, appCreatedAt),
           )
         },
         restoreServerTruth: () => appQueries.list.invalidate(queryClient),
@@ -2640,8 +2707,18 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     navToRef,
   })
 
-  const handleNotificationOpen = useCallback((target) => {
-    if (target?.view === 'canvas') {
+  // The one way the shell opens Settings for someone else (a mini-app, the
+  // agent's open_item, a notification tap): navigate there and focus a known
+  // section. Navigation only; every action inside Settings stays the owner's.
+  const openSettingsSection = useCallback((section) => {
+    setSettingsFocusTarget(section ? { section, nonce: Date.now() } : null)
+    if (activeViewRef.current !== 'settings') navToRef.current('settings')
+  }, [activeViewRef])
+
+  const openShellTarget = useCallback((target) => {
+    if (target?.view === 'settings') {
+      openSettingsSection(target.section)
+    } else if (target?.view === 'canvas') {
       void openAppWithIntent(target.app, target.intent)
     } else if (target?.view === 'chat') {
       if (target.focusQuestion === true) requestChatQuestionReveal(target.chatId)
@@ -2656,7 +2733,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       if (project) openProjectRef.current(project)
       else navToRef.current('projects')
     }
-  }, [openAppWithIntent, requestComposer])
+  }, [openAppWithIntent, openSettingsSection, requestComposer])
 
   const coldDeepLinkHandledRef = useRef(false)
   useEffect(() => {
@@ -2711,7 +2788,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const appEntry = appsRef.current.find(a => String(a.id) === String(appId))
     const appName = appEntry?.name || `app ${appId}`
     const report = appCrashReportDraft(appName, error)
-    const buildingChatId = appEntry?.chat_id || chatId || null
+    const buildingChatId = appReportChatId(appEntry, chatId)
     const buildingChat = buildingChatId
       && chatsRef.current.find(c => c.id === buildingChatId)
     if (buildingChat) {
@@ -2757,7 +2834,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         await newChatRef.current?.({
           draft: request.draft || undefined,
           forceNew: true,
-          autoSend: request.autoSend,
         })
         return
       }
@@ -2794,13 +2870,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         await openAppWithIntent(request.appId, request.intent)
         return
       }
-      const section = APP_SETTINGS_SECTIONS.has(request.section)
-        ? request.section
-        : 'ai-providers'
-      setSettingsFocusTarget({ section, nonce: Date.now() })
-      if (activeViewRef.current !== 'settings') navToRef.current('settings')
+      openSettingsSection(settingsSectionOrNull(request.section) ?? 'ai-providers')
     })()
-  }, [openAppWithIntent, queryClient, refreshChats, requestComposer])
+  }, [openAppWithIntent, openSettingsSection, queryClient, refreshChats, requestComposer])
 
   // Restore the active chat after Shell mount. Two cache layers can
   // satisfy this effect: (1) the persisted TanStack cache hydrated
@@ -2953,8 +3025,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       chatsQuery.isFetchedAfterMount, dispatchWorkspace, applyModeDestination,
       requestEmptySingleNewChat, workspaceStateRef, activeChatIdRef])
 
+  const [subscribeManagedAppEvents, observeManagedAppEvent] = useManagedAppEvents()
+
   // Handle non-content SSE events: theme changes, app updates, shell rebuilds.
   const handleSystemEvent = useCallback((ev) => {
+    observeManagedAppEvent(ev)
     if (ev.type === 'agent_coordination_message') {
       // Mailbox hints refresh owner views without polling a model inbox.
       const affected = new Set([ev.senderChatId, ...(ev.recipientChatIds || [])])
@@ -2986,11 +3061,15 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // Allowance changes leave sign-in and available models unchanged.
       void settingsQueries.providerUsage.reset(queryClient, ev.provider)
     } else if (ev.type === 'app_activity') {
-      // A durable activity marker (an app-attributed notification) or the
-      // app's reported unread badge changed. A refetch surfaces the dot or
-      // pill; if the app is already visible, the effect
-      // above immediately acknowledges it instead of leaving a stale nudge.
-      void invalidateShellListCache('apps').then(refreshApps)
+      // Versioned notification activity updates one cached app. Badge changes
+      // and unknown markers still require the authoritative list.
+      if (!applyAppActivityEvent(
+        queryClient, appQueries.keys.all, ev, appActivitySeenThroughRef.current,
+      )) void invalidateShellListCache('apps').then(refreshApps)
+    } else if (ev.type === 'app_activity_seen') {
+      applyAppActivitySeenEvent(
+        queryClient, appQueries.keys.all, ev, appActivitySeenThroughRef.current,
+      )
     } else if (ev.type === 'chat_deleted') {
       // Exact mutation evidence from this or another live tab. Update the
       // in-memory drawer synchronously; the normal missing-active-chat effect
@@ -3059,6 +3138,10 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // copy, or a stale one, of a chat archived elsewhere.
       if (ev.chatId) refreshChatRows(ev.chatId)
       void projectQueries.list.invalidate(queryClient)
+    } else if (ev.type === 'chat_visibility_changed') {
+      // Membership comes from the scoped owner read, including an absent row
+      // when a companion hides its chat. Absence is not deletion evidence.
+      if (ev.chatId) refreshChatRows(ev.chatId)
     } else if (ev.type === 'chat_renamed') {
       // The committed event carries the exact changed row fields. Apply those
       // in place so renaming one chat cannot parse and reconcile all hundreds
@@ -3102,7 +3185,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // Refresh server truth before warming or placing. app_updated/app_created
       // remain lifecycle refreshes; app_preview_ready is the explicit
       // build-session action that reveals either a new app or an updated one.
-      // `updated_at` drives the iframe live-swap; the chat-artifact query above
+      // `frame_version` drives the iframe live-swap; the chat-artifact query above
       // owns the durable Icon Drop and unread-dot state.
       Promise.all([
         invalidateShellListCache('apps'),
@@ -3135,6 +3218,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           }
         }
       })
+    } else if (ev.type === 'open_item' && ev.itemKind === 'settings') {
+      // Settings is the shell's single Settings screen, not a placeable
+      // workspace item: the agent's open navigates there like a mini-app's
+      // moebius:open-settings. An id this shell does not know (a newer
+      // backend's section) still opens Settings, just without a focus.
+      openSettingsSection(settingsSectionOrNull(ev.itemId))
     } else if (ev.type === 'open_item') {
       // An explicit agent-initiated open (design §6.3), system-bus-only so it
       // fires exactly once. Confirm the item actually exists in fresh server
@@ -3192,12 +3281,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         if (!ev.compacting) markChatRunReconcile(ev.chatId)
       }
     } else if (ev.type === 'chat_wait_changed') {
-      if (ev.chatId) {
-        // Self-resuming handoffs are durable chat state, not a running turn.
-        // Reconcile ChatView immediately and refresh the compact list so its
-        // Waiting card and Recents marker agree across tabs and reconnects.
-        markChatRunReconcile(ev.chatId)
-        refreshChatRows(ev.chatId)
+      const changedChatId = ev.chat_id ?? ev.chatId
+      if (changedChatId) {
+        // Goal and Wait invalidations use the same always-live reconciliation owner.
+        markChatRunReconcile(changedChatId)
+        refreshChatRows(changedChatId)
       }
     } else if (ev.type === 'chat_run_started') {
       if (ev.chatId) {
@@ -3247,6 +3335,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           void queryClient.invalidateQueries({
             queryKey: ['projects', 'git', String(projectId)],
           })
+          // The same fact as the cursor's agent_run_completed row: an open
+          // project refreshes its selected file now instead of on its next poll.
+          window.dispatchEvent(new CustomEvent('mobius:project-change', {
+            detail: { projectId, change: { kind: 'agent_run_completed', path: null } },
+          }))
         }
         // Attention iff the finished chat is NOT visible in ANY pane — membership
         // in the visible set, not equality with one global id, so a chat visible
@@ -3315,9 +3408,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     confirmChatDeleted, confirmChatIdentityIsLive, confirmChatRecovered,
     loadTheme, markChatOwnerActivity, markChatRunActivity, markChatRunFinished, markChatRunReconcile,
     markChatOwnerInput, markChatRunState, markShellUpdateAvailable,
-    markStreamingAcknowledged, markStreamingEnd,
-    onNotificationCreated, placeInWorkspace, projectChatLookup, queryClient,
-    refreshApps, refreshChatRows, refreshChats, tombstoneRoute, warmAppCode,
+    markStreamingAcknowledged, markStreamingEnd, observeManagedAppEvent,
+    onNotificationCreated, openSettingsSection, placeInWorkspace, projectChatLookup,
+    queryClient, refreshApps, refreshChatRows, refreshChats, tombstoneRoute, warmAppCode,
   ])
 
   // Shell-level SSE subscription for system events. Stays open for
@@ -3383,31 +3476,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   })
   useVisibleAppPresence(systemSubscriptionId, visibleAppIds)
 
-  // Service-worker messages arrive on navigator.serviceWorker, not the window
-  // message bus used by AppCanvas. Keep this listener limited to notification
-  // routing; frame requests are source-attributed and normalized by AppCanvas.
-  useEffect(() => {
-    function onSwMessage(e) {
-      // Service-worker client.postMessage delivers here via
-      // navigator.serviceWorker — NOT via window.message. (Subtle
-      // browser API split: the SW spec routes them through the SW
-      // container, not the global.) sw.js fires this on
-      // notificationclick when an existing client is focused.
-      if (e.data?.type !== 'notification-click') return
-      const target = parseNotificationTarget(e.data.target)
-      if (target?.view === 'canvas') void openAppWithIntent(target.app, target.intent)
-      else if (target?.view === 'chat') navTo('chat', { chatId: target.chatId })
-    }
-
-    if (navigator.serviceWorker) {
-      navigator.serviceWorker.addEventListener('message', onSwMessage)
-    }
-    return () => {
-      if (navigator.serviceWorker) {
-        navigator.serviceWorker.removeEventListener('message', onSwMessage)
-      }
-    }
-  }, [navTo, openAppWithIntent])
+  // Installed-app launches and worker messages enter the same destination path
+  // as the notification centre, including revealing a pending answer card.
+  useEffect(() => subscribeShellLaunchTargets(openShellTarget), [openShellTarget])
 
   // Resolve a deferred candidate or allocate a fresh row. Ordinary Standard
   // New Chat never reaches this with the visible blank: that is a synchronous
@@ -4087,7 +4158,8 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // bootstrap) have no live typing surface to preserve. Owner-facing New Chat
   // actions must use startUserChat(), which mounts the final-UUID composer
   // synchronously before allocation begins.
-  async function newChat({ draft, forceNew, autoSend, recordHistory } = {}) {
+  // Resolves the chat id it opened, or null when no chat could be started.
+  async function newChat({ draft, forceNew, autoSend, recordHistory, settings } = {}) {
     let resolution
     try {
       resolution = await resolveNewChatId()
@@ -4102,8 +4174,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       if (reason === 'offline') notifyShell("You're offline.")
       else if (reason === 'error') notifyShell("Couldn't start a new chat — please try again.", { variant: 'error' })
       closeDrawer()
-      return
+      return null
     }
+    const { ok: settingsCopied } = await copyChatSettings(chatId, settings)
 
     const changesRoute = activeViewRef.current !== 'chat'
       || String(activeChatIdRef.current) !== String(chatId)
@@ -4112,7 +4185,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const suppliedDraft = draft ? String(draft) : ''
     if (suppliedDraft) {
       stageComposerHandoff(chatId, suppliedDraft, {
-        autoSend: !!autoSend,
+        autoSend: !!autoSend && settingsCopied,
       })
     }
     // Keep history writes inside useNavigation so the entry gets its route,
@@ -4128,6 +4201,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       const ws = workspaceStateRef.current.ws
       applyModeDestination({ view: 'chat', chatId, appId: null, paneId: ws.focusedPaneId })
     }
+    return chatId
   }
 
   // Single screen owns one compose surface; Builder treats New chat as an
@@ -4182,6 +4256,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // Keep the latest-newChat ref current so handleAppError's crash-report
   // fallback starts a chat with this render's live closure.
   newChatRef.current = newChat
+  startChatFromCommandRef.current = startChatFromCommand
   // Keep the latest-materialize ref current so the watcher effect (stable deps) always
   // runs this render's live closure without depending on the function's identity.
   materializeNewChatHomeRef.current = materializeNewChatHome
@@ -4410,6 +4485,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     // CLOSE_TAB(reason:'deleted') owns the view transition — the derived triple
     // follows the workspace to its recent tab or collapsed sibling; no global demote.
     retireAppHistory(id, 'deleted')
+    clearAppNavLocation(id)
     tombstoneRoute('app', id)
     const sid = String(id)
     dropFromWarmLru(cid => String(cid) === sid)
@@ -4431,9 +4507,10 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // Wipes an app's stored data back to empty while KEEPING it installed —
   // a separate, additive action from deleteApp (which tombstones the whole
   // app). Lives here, like deleteApp, so it has access to notifyShell and
-  // refreshApps. The app STAYS in the list; refreshApps picks up the bumped
-  // updated_at, which rotates versionForApp's cache-buster so an open iframe
-  // remounts against its now-empty storage — no manual cache eviction.
+  // refreshApps. The app STAYS in the list; refreshApps picks up the new
+  // storage generation in frame_version, which rotates versionForApp's
+  // cache-buster so an open iframe remounts against its now-empty storage —
+  // no manual cache eviction.
   async function deleteAppData(id) {
     let res
     try {
@@ -4455,6 +4532,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     // retire the old frame's physical history — its replacement starts with an
     // empty internal nav stack (contract §4.1.5) — and drop any warm-only frame.
     retireAppHistory(id, 'data-reset')
+    clearAppNavLocation(id)
     const sid = String(id)
     dropFromWarmLru(cid => String(cid) === sid)
     clearAppFrameStorage(id)
@@ -4660,7 +4738,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           <NotificationCenter
             ref={notificationCenterActionsRef}
             commands={shellCommands}
-            onOpenTarget={handleNotificationOpen}
+            onOpenTarget={openShellTarget}
             onRecoveryAction={recoverNotificationAction}
             updateAvailable={shellUpdateAvailable}
             onUpdateNow={applyShellUpdate}
@@ -4912,10 +4990,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               interactive={appRuntimeVisible
                 && !modalDrawerOpen && !modeBeatActive}
               version={versionForApp(id)}
+              storageGeneration={app?.storage_generation}
               appName={app?.name}
               appSlug={app?.slug}
               offlineCapable={!!app?.offline_capable}
               capabilityContract={app?.capability_contract || null}
+              subscribeManagedAppEvents={subscribeManagedAppEvents}
               pendingIntent={appIntents[String(id)] || null}
               immersiveMode={immersiveActive && String(immersiveAppId) === String(id)
                 ? immersiveMode
@@ -5044,6 +5124,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 newChatSession={newChatSession}
                 onNewChatSubmit={queueDraftFirstNewChat}
                 onNewChatRetry={retryDraftFirstNewChat}
+                onNewChatCommand={handleNewChatCommand}
                 artifactsAppId={artifactsAppId}
                 // Runtime activity and painting are independent during a handoff:
                 // staging owns the work while held remains the visual cover.

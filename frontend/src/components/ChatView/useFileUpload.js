@@ -7,7 +7,7 @@ import { getAuthHeaders, BASE } from '../../api/client.js'
  * @param {{ chatId: string, initialFiles?: Array }} options
  * @returns {{
  *   files: Array,
- *   addFiles: (fileList: File[]) => Promise<void>,
+ *   addFiles: (fileList: File[], group?: string) => Promise<void>,
  *   removeFile: (id: string) => void,
  *   discardFiles: () => void,
  *   clearFiles: (opts?: {revoke?: boolean}) => void,
@@ -24,6 +24,7 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     objectUrl: file.objectUrl || null,
     status: file.status || 'done',
     error: file.error || null,
+    group: file.group,
   }))
   const [files, setFiles] = useState(() => normalizedInitialFiles)
   // Keep a ref in sync so the unmount cleanup can revoke object URLs
@@ -33,6 +34,7 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   // In-flight uploads the caller already gave up on (removed, discarded or
   // unmounted): their late success is discarded instead of shown.
   const discardedIds = useRef(new Set())
+  const uploadLimitRef = useRef(null)
   const onFilesChangeRef = useRef(onFilesChange)
   onFilesChangeRef.current = onFilesChange
 
@@ -71,11 +73,14 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     }).catch(() => {})
   }, [chatId])
 
-  const addFiles = useCallback(async (fileList) => {
+  // `group` is an opaque caller label kept on each chip, so one upload list
+  // can serve several targets (a Question Box keeps each answer's files).
+  const addFiles = useCallback(async (fileList, group) => {
     if (!fileList.length) return
 
     const newChips = fileList.map(f => ({
       id: crypto.randomUUID(),
+      group,
       name: f.name,
       size: f.size,
       mime_type: f.type,
@@ -85,8 +90,45 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     }))
     commitFiles(prev => [...prev, ...newChips])
 
+    // Ask the owning upload route for its effective limit. A server override
+    // may lower it, so a client-side literal would mislead the picker.
+    if (uploadLimitRef.current?.chatId !== chatId) {
+      uploadLimitRef.current = {
+        chatId,
+        promise: fetch(`${BASE}/api/chats/${chatId}/upload-limits`, {
+          headers: getAuthHeaders(),
+        }).then(async res => {
+          if (!res.ok) throw new Error('Could not check upload limit. Try again.')
+          const maxBytes = (await res.json()).max_bytes
+          if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+            throw new Error('Upload limit is unavailable. Try again.')
+          }
+          return maxBytes
+        }),
+      }
+    }
+    let maxBytes
+    try {
+      maxBytes = await uploadLimitRef.current.promise
+    } catch (error) {
+      uploadLimitRef.current = null
+      for (const chip of newChips) discardedIds.current.delete(chip.id)
+      commitFiles(prev => prev.map(c => newChips.some(chip => chip.id === c.id)
+        ? { ...c, status: 'error', error: error.message } : c))
+      return
+    }
+
     for (let i = 0; i < newChips.length; i++) {
       const chip = newChips[i]
+      // Removal during limit discovery happens before any upload has started.
+      if (discardedIds.current.delete(chip.id)) continue
+      if (fileList[i].size > maxBytes) {
+        commitFiles(prev => prev.map(c => c.id === chip.id ? {
+          ...c, status: 'error',
+          error: `${chip.name} exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MiB upload limit.`,
+        } : c))
+        continue
+      }
       try {
         // Can't use apiFetch here: multipart requires the browser to set
         // Content-Type with the boundary, which apiFetch overrides with JSON.
@@ -98,7 +140,9 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
           body: fd,
         })
         if (!res.ok) {
-          const msg = await res.text().catch(() => 'Upload failed')
+          const body = await res.text().catch(() => '')
+          let msg = body || 'Upload failed'
+          try { msg = JSON.parse(body).detail || msg } catch { /* plain response */ }
           commitFiles(prev => prev.map(c =>
             c.id === chip.id ? { ...c, status: 'error', error: msg } : c
           ))

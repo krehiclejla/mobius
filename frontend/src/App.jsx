@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useCallback } from 'react'
+import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react'
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
 import { QueryClient, QueryClientProvider, useIsRestoring } from '@tanstack/react-query'
 import ErrorBoundary from './components/ErrorBoundary/ErrorBoundary.jsx'
@@ -12,6 +12,7 @@ import { beginEmbedBootstrap } from './lib/chatEmbedBootstrap.js'
 import { startInstallPromptCapture } from './lib/installPrompt.js'
 import { readInstallPass, withoutInstallPass } from './lib/installPassUrl.js'
 import { safeReturnPath } from './lib/safeReturnPath.js'
+import { clearSignInMarks, recordSignInRedirect, shouldRedirectToMobiusSignIn } from './lib/mobiusSignIn.js'
 import { rememberProjectCopyRequest } from './lib/projectCopies.js'
 import { readStandaloneBoot } from './lib/standaloneBoot.js'
 import { shellReloadNavigationTransitionIsActive } from './lib/shellReloadNavigationTransition.js'
@@ -205,6 +206,7 @@ function AppRoot() {
                     ? 'mobius-login-error'
                     : 'loading')))))
   const [status, setStatus] = useState(initialStatus)
+  const mobiusRedirectStarted = useRef(false)
   const [shellVisualReady, setShellVisualReady] = useState(false)
   const markShellVisualReady = useCallback(() => {
     setShellVisualReady(true)
@@ -265,6 +267,7 @@ function AppRoot() {
         const data = await response.json()
         if (!data?.access_token) throw new Error('MOBIUS_LOGIN_HANDOFF_FAILED')
         setToken(data.access_token)
+        clearSignInMarks()
         removeSplash()
         try {
           const current = new URL(window.location.href)
@@ -311,6 +314,15 @@ function AppRoot() {
     window.location.replace(ret)
   }, [hasToken])
 
+  // Coming back to the redirect page from the browser's back/forward cache
+  // would show a frozen splash; reload so the recorded redirect shows the card.
+  useEffect(() => {
+    if (status !== 'mobius-redirect') return undefined
+    const reloadIfRestored = (event) => { if (event.persisted) window.location.reload() }
+    window.addEventListener('pageshow', reloadIfRestored)
+    return () => window.removeEventListener('pageshow', reloadIfRestored)
+  }, [status])
+
   useEffect(() => {
     if (hasToken) {
       // Clear stale provider-wizard state from pre-contextual onboarding.
@@ -318,11 +330,31 @@ function AppRoot() {
       return
     }
     if (setupStatusQuery.isSuccess) {
-      // Do NOT auto-redirect to mobius.you when auth_mode is 'mobius': landing
-      // straight on an external site with no context reads as broken. Render the
-      // login screen instead — LoginForm shows a single "Sign in with
-      // mobius.you" button (the password form is never shown in mobius mode),
-      // and the owner taps it to start the 303 to mobius.you.
+      // A mobius.you instance has nothing to show a signed-out visitor but a
+      // button to mobius.you, so go there directly: it opens its sign-in
+      // dialog, which says why they are there. Keep the splash up meanwhile so
+      // the login card never flashes. The card still appears after an explicit
+      // sign-out and when we just redirected (see mobiusSignIn.js), and always
+      // in local mode, where the password form is the sign-in.
+      // Once the redirect has started, later runs (a refetch, StrictMode) must
+      // leave the splash alone: the mark now says "redirected", which would
+      // otherwise bring the card up while the page is navigating away.
+      if (mobiusRedirectStarted.current) return
+      if (
+        setupStatusQuery.data.configured
+        && shouldRedirectToMobiusSignIn({
+          authMode: setupStatusQuery.data.auth_mode,
+          standalone: Boolean(STANDALONE_APP),
+        })
+      ) {
+        // Navigate only once the mark that prevents a repeat is stored.
+        if (recordSignInRedirect()) {
+          mobiusRedirectStarted.current = true
+          setStatus('mobius-redirect')
+          window.location.replace(api.auth.mobius.startUrl())
+          return
+        }
+      }
       setStatus(setupStatusQuery.data.configured ? 'login' : 'setup')
       removeSplash()
     } else if (setupStatusQuery.isError) {
@@ -354,7 +386,7 @@ function AppRoot() {
   if (status === 'loading' || isRestoring) {
     return <RouteLoading />
   }
-  if (status === 'mobius-login') return <RouteLoading />
+  if (status === 'mobius-login' || status === 'mobius-redirect') return <RouteLoading />
   if (status === 'install-pass') return <RouteLoading />
   if (status === 'mobius-login-error') return (
     <StartupError

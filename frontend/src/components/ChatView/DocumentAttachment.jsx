@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Download } from '@openai/apps-sdk-ui/components/Icon'
 import { BASE, apiFetch } from '../../api/client.js'
 import { mediaTokenParam } from '../../api/mediaToken.js'
+import { saveFileAs } from '../../lib/saveFile.js'
 import { StandardMarkdown } from './markdown/BlockRenderer.jsx'
 import { MARKDOWN_EXCERPT_BYTES, MARKDOWN_READER_BYTES, readMarkdownPreview } from './markdownPreview.js'
 
@@ -146,14 +147,7 @@ export default function DocumentAttachment({
   async function download() {
     setDownloadError(false)
     try {
-      const href = await freshFileUrl(chatId, file.name)
-      const link = document.createElement('a')
-      link.href = href
-      link.download = file.name
-      link.style.display = 'none'
-      document.body.append(link)
-      link.click()
-      link.remove()
+      saveFileAs(await freshFileUrl(chatId, file.name), file.name)
     } catch {
       setDownloadError(true)
     }

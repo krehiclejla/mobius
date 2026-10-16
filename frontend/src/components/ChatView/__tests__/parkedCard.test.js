@@ -3,17 +3,12 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { upsertTerminalErrorItem } from '../streamReducers.js'
 import { ownsRecoveryAction } from '../recoveryCard.js'
 import { isProviderLimitPause, pauseTiming } from '../resetTime.js'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: ErrorCard } = await vite.ssrLoadModule(
   '/src/components/ChatView/ErrorCard.jsx',
 )
@@ -436,7 +431,9 @@ test('continuations render as product markers, not user bubbles', () => {
   assert.match(continuationCard, /Retry check due — trying the provider again/)
   assert.match(msgContent, /onClick=\{onResume\}/,
     'Resume delegates the lifecycle action instead of manufacturing owner text')
-  assert.match(chatView, /chat__msg--\$\{continuationMarker \? 'marker' : msg\.role\}/,
+  assert.match(chatView, /const markerRow = isContinuationMessage\(msg\)/,
+    'continuation rows are marker rows')
+  assert.match(chatView, /chat__msg--\$\{markerRow \? 'marker' : msg\.role\}/,
     'the row shell must not inherit owner-user alignment')
   assert.match(chatView, /supersedeResumedPauseBlocks\(messages,/,
     'a completed continuation replaces its stale actionable pause in the render projection')

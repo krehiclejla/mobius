@@ -13,6 +13,8 @@ import ChatPanePortal from '../ChatPanePortal.jsx'
 import { projectFileDownloadTarget, fetchProjectFileDownload } from './projectFileDownload.js'
 import { useHistoryDismiss } from '../../../hooks/useHistoryDismiss.jsx'
 import { captureLayoutSpace, clientLengthToLayout } from '../../../lib/layoutSpace.js'
+import { saveBlobAs } from '../../../lib/saveFile.js'
+import { isPlainLeftClick } from '../internalLink.js'
 import '../lightbox.css'
 
 const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:'])
@@ -101,14 +103,7 @@ function InlineToken({ token, onInternalNav, mediaDimensions }) {
         rel="noopener noreferrer"
         title={token.title || undefined}
         onClick={(event) => {
-          if (!onInternalNav) return
-          if (
-            event.metaKey
-            || event.ctrlKey
-            || event.shiftKey
-            || event.altKey
-            || event.button !== 0
-          ) return
+          if (!onInternalNav || !isPlainLeftClick(event)) return
           let url
           try {
             url = new URL(href, window.location.href)
@@ -187,13 +182,7 @@ function ProjectFileDownloadLink({ target, token }) {
     setBusy(true)
     setError(false)
     try {
-      const blob = await fetchProjectFileDownload(target, apiFetch)
-      const objectUrl = URL.createObjectURL(blob)
-      const anchor = document.createElement('a')
-      anchor.href = objectUrl
-      anchor.download = target.filename
-      anchor.click()
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+      saveBlobAs(await fetchProjectFileDownload(target, apiFetch), target.filename)
     } catch {
       setError(true)
     } finally {

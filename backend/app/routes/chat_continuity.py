@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.concurrency import run_in_threadpool
 
 from app import transcript_rows
-from app import chat_queue, models
+from app import chat_queue, models, settled
 from app.broadcast import get_system_broadcast
 from app.chat_continuity import apply_checkpoint, checkpoint_coverage, note_path, write_note
 from app.chat_titles import renamed_event
@@ -18,6 +17,16 @@ from app.deps import Principal, get_agent_principal, reject_cross_site
 
 
 router = APIRouter(tags=["chat-continuity"])
+
+# What each refusal code from ``AuthorizeCheckpoint`` means to the agent that
+# was refused, so a 409 is a one-read diagnosis.
+_STALE_RUN_REASONS = {
+  "chat_inactive": "the chat is no longer active",
+  "run_unknown": "this run is not recorded for the chat",
+  "run_not_running": "this run is no longer marked running",
+  "run_not_owner": "the server no longer holds this run as the chat's owner (for example after a restart)",
+  "run_not_latest": "a newer run exists for this chat",
+}
 
 
 class CheckpointBody(BaseModel):
@@ -73,8 +82,11 @@ async def checkpoint_chat(
       chat_id=chat_id, run_token=principal.run_id or "", title=title,
     )))
     if result.get("status") != "ok":
-      raise HTTPException(status_code=409, detail="This run can no longer save this chat.")
-    renamed = await run_in_threadpool(
+      reason = _STALE_RUN_REASONS.get(result.get("reason"), "it is not the chat's live run")
+      raise HTTPException(
+        status_code=409, detail=f"This run can no longer save this chat: {reason}.",
+      )
+    renamed = await settled.run_settled(
       _save_note, get_settings().data_dir, chat_id, body, principal.run_id or "",
     )
   if renamed is not None and result.get("title_applied"):
