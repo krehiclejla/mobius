@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import glob
 import hashlib
 import json
 import os
@@ -23,6 +22,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+from app.codex_rollouts import rollout_paths
 
 _SIGNATURES = (
   (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -32,7 +33,6 @@ _SIGNATURES = (
 )
 _EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
 SNAPSHOT_NAME = re.compile(r"^viewed-[0-9a-f]{64}\.(?:png|jpg|gif|webp)$")
-_THREAD_ID = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 _DATA_URL = re.compile(r"^data:(image/[a-z]+);base64,")
 # Cheap pre-filter: only output records are parsed, never every turn line.
 _OUTPUT_MARKER = b'"function_call_output"'
@@ -81,13 +81,9 @@ def store_snapshot(media_dir: Path, data: bytes, mime: str) -> str:
 
 
 def rollout_path(codex_home: str | os.PathLike, thread_id: str) -> Path | None:
-  """Codex writes ``sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl``."""
-  if not isinstance(thread_id, str) or not _THREAD_ID.fullmatch(thread_id):
-    return None
-  matches = glob.glob(str(
-    Path(codex_home) / "sessions" / "*" / "*" / "*" / f"rollout-*-{thread_id}.jsonl"
-  ))
-  return Path(matches[0]) if len(matches) == 1 else None
+  """The thread's one live rollout; several bind nothing, since none is provably it."""
+  matches = rollout_paths(codex_home, thread_id)
+  return matches[0] if len(matches) == 1 else None
 
 
 @dataclass(frozen=True)
