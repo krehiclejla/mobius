@@ -203,8 +203,8 @@ test('/context with trailing text is rejected with an explanation, not discarded
 
 test('a command typed in full is refused where the menu would mark it unavailable', () => {
   const btw = mobiusChatCommand('/btw what runs?')
-  assert.match(chatCommandRejection(btw, 'codex'), /‘\/btw’ isn’t available here\. Available in Claude chats\./,
-    'a hand-typed /btw on a Codex chat must not reach a server that refuses it')
+  assert.match(chatCommandRejection(btw, 'mobius'), /‘\/btw’ isn’t available here\. Available in Claude or Codex chats\./,
+    'a hand-typed /btw in a Möbius-subscription chat must not reach a server that refuses it')
   assert.match(chatCommandRejection(btw, undefined), /after this chat finishes loading/)
   assert.equal(chatCommandRejection(btw, 'claude'), null)
   for (const text of ['/compact', '/new', '/clear', '/context']) {
@@ -231,15 +231,15 @@ test('the bare menu lists /new once, under its own name', () => {
   assert.equal(applySlashCommand(newCommand), '/new ')
 })
 
-test('/btw is selectable only in Claude chats, whose forks run tool-less', () => {
+test('/btw is selectable only in Claude and Codex chats, whose forks run tool-less', () => {
   const [btw] = matchSlashCommands('/btw')
   assert.equal(btw.name, 'btw')
   assert.equal(slashCommandIsAvailable(btw, 'claude'), true)
-  assert.equal(slashCommandIsAvailable(btw, 'codex'), false)
+  assert.equal(slashCommandIsAvailable(btw, 'codex'), true)
   assert.equal(slashCommandIsAvailable(btw, 'mobius'), false)
   assert.equal(
-    slashCommandUnavailableReason(btw, 'codex'),
-    'Available in Claude chats.',
+    slashCommandUnavailableReason(btw, 'mobius'),
+    'Available in Claude or Codex chats.',
   )
 })
 

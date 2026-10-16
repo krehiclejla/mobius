@@ -325,6 +325,32 @@ def test_managed_bootstrap_creates_the_bound_owner(client, db, monkeypatch):
   assert login.headers["location"] == "http://launcher.test/identity/authorize"
 
 
+def test_login_start_failure_lands_on_the_retryable_error_screen(
+  client, db, monkeypatch,
+):
+  from app.routes import auth as auth_routes
+
+  settings = configure_managed_sso(monkeypatch)
+  configure_runtime_identity(monkeypatch, {
+    "linked": True,
+    "issuer": settings.mobius_sso_issuer,
+    "subject": "user_managed-owner",
+    "instance_id": settings.mobius_sso_instance_id,
+  })
+  # Bootstrap the managed owner, then make the broker unreachable.
+  assert client.get("/api/auth/setup/status").json()["auth_mode"] == "mobius"
+
+  async def broker_down(method, route, payload=None):
+    raise RuntimeError("broker unreachable")
+
+  monkeypatch.setattr(auth_routes, "_mobius_broker_request", broker_down)
+  login = client.get("/api/auth/mobius/login/start", follow_redirects=False)
+
+  assert login.status_code == 303
+  assert login.headers["location"] == "/shell/?mobius_login_error=1"
+  assert login.headers["cache-control"] == "no-store"
+
+
 def test_managed_bootstrap_repairs_an_accidental_local_owner(
   client, db, monkeypatch,
 ):

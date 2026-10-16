@@ -64,6 +64,12 @@ test('app token refresh is bounded for nearly-expired and malformed tokens', () 
   assert.equal(appTokenRefreshInterval('not-a-jwt', now), 5 * 60_000)
 })
 
+test('app token refresh never exceeds the largest browser timer delay', () => {
+  const now = Date.UTC(2026, 6, 13, 12, 0, 0)
+  // A longer setInterval delay overflows and fires immediately, every tick.
+  assert.equal(appTokenRefreshInterval(tokenWithExpiry(4102444800), now), 2 ** 31 - 1)
+})
+
 test('liveAppToken: app-scoped token always wins', () => {
   assert.equal(liveAppToken(APP, true, CACHED), APP)
   assert.equal(liveAppToken(APP, false, CACHED), APP)

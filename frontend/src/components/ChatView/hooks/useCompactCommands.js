@@ -11,7 +11,7 @@ import { isProviderSwitchBlocking } from '../providerSwitch.js'
 const COMPACTION_PROGRESS_TIMEOUT_MS = 15000
 
 export default function useCompactCommands({
-  chatId, provisionalNewChat, hidden, serverCompactingKind,
+  chatId, provisionalNewChat, hidden, embedded = false, serverCompactingKind,
   activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages, stopTurn,
   onCompacted,
 }) {
@@ -90,14 +90,16 @@ export default function useCompactCommands({
 
   useEffect(() => {
     // Read on entry and on the existing compaction edge, including other tabs.
-    // There is deliberately no polling and no automatic next POST.
-    compactProgressActiveRef.current = !hidden && !provisionalNewChat
+    // There is deliberately no polling and no automatic next POST. An embedded
+    // chat has no manual compaction: its routes answer only the installation
+    // owner, so an embedded read could only fail.
+    compactProgressActiveRef.current = !embedded && !hidden && !provisionalNewChat
     void refreshCompactProgress(chatId)
     return () => {
       compactProgressActiveRef.current = false
       cancelCompactProgress()
     }
-  }, [chatId, hidden, provisionalNewChat, serverCompactingKind, refreshCompactProgress, cancelCompactProgress])
+  }, [chatId, hidden, embedded, provisionalNewChat, serverCompactingKind, refreshCompactProgress, cancelCompactProgress])
 
   // "/compact" never becomes a message. It asks the backend to replace this
   // chat's live context with a fresh briefing and reset the provider session;

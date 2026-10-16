@@ -18,6 +18,16 @@ from app.deps import Principal, get_agent_principal, reject_cross_site
 
 router = APIRouter(tags=["chat-continuity"])
 
+# What each refusal code from ``AuthorizeCheckpoint`` means to the agent that
+# was refused, so a 409 is a one-read diagnosis.
+_STALE_RUN_REASONS = {
+  "chat_inactive": "the chat is no longer active",
+  "run_unknown": "this run is not recorded for the chat",
+  "run_not_running": "this run is no longer marked running",
+  "run_not_owner": "the server no longer holds this run as the chat's owner (for example after a restart)",
+  "run_not_latest": "a newer run exists for this chat",
+}
+
 
 class CheckpointBody(BaseModel):
   model_config = ConfigDict(extra="forbid")
@@ -72,7 +82,10 @@ async def checkpoint_chat(
       chat_id=chat_id, run_token=principal.run_id or "", title=title,
     )))
     if result.get("status") != "ok":
-      raise HTTPException(status_code=409, detail="This run can no longer save this chat.")
+      reason = _STALE_RUN_REASONS.get(result.get("reason"), "it is not the chat's live run")
+      raise HTTPException(
+        status_code=409, detail=f"This run can no longer save this chat: {reason}.",
+      )
     renamed = await settled.run_settled(
       _save_note, get_settings().data_dir, chat_id, body, principal.run_id or "",
     )

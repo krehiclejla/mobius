@@ -873,6 +873,48 @@ CODEX_NATIVE_HELPERS_OFF = (
   "features.multi_agent_v2.enabled=false",
 )
 
+# Codex has no tool allow-list (no single `tools=[]` flag): a built-in tool
+# stays on until it is switched off, and Codex silently ignores a switch it
+# does not know. Tool-less runs (compaction, and session forks for /btw and
+# Agent Coaching) pass CODEX_TOOLS_OFF last, so it wins over a provider's own
+# settings (the Möbius subscription turns web search on for chats).
+#
+# Traced on Codex 0.162.0 on 2026-10-16, through the real fork and compaction
+# paths: the tools in the `response.created` echo of a RUST_LOG=trace log,
+# plus an in-fork probe that runs `exec` to print ALL_TOOLS (deferred nested
+# tools are missing from exec's description). What stays reaches no file or
+# network: `exec`, which refuses to run with code_mode_host off, so its nested
+# apply_patch, clock and MCP resource readers are unreachable; `wait`, for exec
+# cells only; and request_user_input, for Plan mode only. `unified_exec` is
+# not listed: 0.162.0 keeps it on whatever the switch says, and
+# shell_tool=false already removes its exec_command and write_stdin tools.
+#
+# Re-trace the same way before changing CODEX_TOOLS_OFF_VERIFIED_FOR. A test
+# fails while it differs from the Dockerfile's CODEX_VERSION, and session
+# forks refuse to run unless Codex reports every feature below as known and off.
+CODEX_TOOLS_OFF_VERIFIED_FOR = "0.162.0"
+CODEX_TOOL_FEATURES_OFF = (
+  "shell_tool",
+  "apps",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "computer_use",
+  "image_generation",
+  "goals",
+  "view_image",
+  "sleep_tool",
+  "code_mode_host",
+  # Offers a plugin-install tool when plugins are on.
+  "tool_suggest",
+)
+CODEX_TOOLS_OFF = (
+  *(f"features.{name}=false" for name in CODEX_TOOL_FEATURES_OFF),
+  'web_search="disabled"',
+  # Skills need file reads, so their instructions would be prompt cost only.
+  "skills.include_instructions=false",
+)
+
 
 class CodexProvider(BaseProvider):
   """OpenAI Codex provider.

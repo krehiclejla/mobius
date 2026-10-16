@@ -361,8 +361,10 @@ mapi -X PATCH /api/apps/<app-id> -H 'Content-Type: application/json' -d '{...}'
 - An HTTP error exits non-zero and still prints the response body, so a failed
   request no longer reads as success. An empty success (often **204 No Content**
   after a write) prints `mapi: HTTP 204, empty response (success)` on stderr.
-- Use the exact path **including its trailing slash** (`/api/apps/`); slash-less
-  variants are a plain 404.
+- Use each endpoint's exact documented path. Collection routes are not
+  consistent about the trailing slash (`/api/apps/` needs it; `/api/chats` and
+  `/api/skills` must not have it), and the other form is a plain 404, not a
+  redirect. On an unexpected 404 for a collection, try the other form.
 - Background app jobs only have `$APP_TOKEN` and keep plain `curl`. Raw `curl`
   remains correct for anything that is not this instance's `/api`.
 

@@ -5,20 +5,7 @@ import { preserveTogglePosition } from './preserveTogglePosition.js'
 import { ActivityTypeIcon } from './ActivityLineHeader.jsx'
 import { useDisclosureState } from './disclosureState.js'
 import { toolActivityIcon, toolCallLabel } from './toolActivityLabel.js'
-
-function openInternal(event, href, onInternalNav) {
-  if (!onInternalNav || !href) return
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
-      || event.button !== 0) return
-  let url
-  try {
-    url = new URL(href, window.location.href)
-  } catch {
-    return
-  }
-  event.preventDefault()
-  onInternalNav(url)
-}
+import { openInternalLink } from './internalLink.js'
 
 export default function AppActivityCard({
   t, chatId, disclosureKey, onInternalNav,
@@ -103,7 +90,7 @@ export default function AppActivityCard({
                         <a
                           className="chat__app-activity-resource"
                           href={resource.href}
-                          onClick={event => openInternal(
+                          onClick={event => openInternalLink(
                             event, resource.href, onInternalNav,
                           )}
                         >

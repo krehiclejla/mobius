@@ -39,7 +39,11 @@ export function isResourcePause(block) {
 
 export function resourcePausePresentation(block, handoff = null) {
   const kind = block?.pause?.kind
-  const next = clockLabel(pauseTiming(block?.pause).checkAt)
+  // A memory/storage park keeps its one saved card while the server keeps
+  // moving the next check later, so the time saved on the card goes stale.
+  const next = RESOURCE_PAUSE_KINDS.has(kind)
+    ? null
+    : clockLabel(pauseTiming(block?.pause).checkAt)
   const storage = kind === 'storage'
   const memory = kind === 'memory'
   const limit = ['rate_limit', 'usage_limit', 'limit'].includes(kind)

@@ -532,7 +532,7 @@ class RuntimeSupervisors:
                 await push.notify_owner_async(
                   notification_db,
                   owner_row[0],
-                  title="Storage capacity alert",
+                  title="Möbius storage is running low",
                   body=result["body"],
                   source_type="capacity",
                   notification_id=notification_id,

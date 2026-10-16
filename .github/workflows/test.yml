@@ -386,8 +386,10 @@ jobs:
         # @tanstack/react-query (via hooks/queries.js). Without
         # node_modules the loader can't resolve the bare specifier
         # and the whole test suite fails on ERR_MODULE_NOT_FOUND.
+        # Install scripts stay off: no dependency needs one on Linux, and a
+        # hijacked release would otherwise run code here on install.
         working-directory: frontend
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Audit frontend runtime dependencies
         working-directory: frontend
         run: |
@@ -423,6 +425,8 @@ jobs:
           npm run test:coverage
       - name: Run static app packager tests
         run: npm run test:packager
+      - name: Run dependency safety check tests
+        run: node --test 'scripts/dependency-safety/*.test.mjs'
       - name: Install browser harness deps
         # The harness imports Playwright helpers even though it does not launch
         # a browser. Install the root lockfile instead of relying on the
@@ -675,7 +679,8 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - name: Install test deps
-        run: npm ci
+        # Browsers come from the next step, so no package needs its install script.
+        run: npm ci --ignore-scripts
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium

@@ -202,6 +202,8 @@ def test_static_embed_policy_authoritatively_replaces_route_headers(monkeypatch)
   assert "allow-popups-to-escape-sandbox" in policy
   assert "allow-same-origin" not in policy
   assert "allow-top-navigation" not in policy
+  assert "'wasm-unsafe-eval'" in policy
+  assert " 'unsafe-eval'" not in policy
   assert "x-frame-options" not in response.headers
 
 

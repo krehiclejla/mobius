@@ -4,6 +4,7 @@ import LifecycleIcon from './LifecycleIcon.jsx'
 import { ChevronRight, Clock, Pause, Warning } from '@openai/apps-sdk-ui/components/Icon'
 import MessageCopyButton from './MessageCopyButton.jsx'
 import { isResourcePause } from './waitingPresentation.js'
+import { providerInfoFor } from './providerRegistry.jsx'
 
 // The single renderer for the error/pause/park card family. MsgContent consumes
 // both persisted blocks and the converted live stream, so source selection
@@ -31,11 +32,14 @@ export function errorCardViewModel(block) {
   const parked = isProviderLimitPause(block.pause) || (!!checkAt && !block.pause?.kind)
   // Old saved handoff notes lacked the pause descriptor. Recognize only
   // that exact producer's prefix; unrelated resumable errors remain errors.
-  const goalHandoff = block.pause?.kind === 'goal_handoff' || (
-    !block.pause && block.resumable === true && block.message?.startsWith(
-      'This Goal paused repeatedly without a visible owner for the next action.',
+  // `goal_settlement_unfinished` is the writer's code for the same handoff
+  // when bounded Goal settlement could not continue on its own.
+  const goalHandoff = block.pause?.kind === 'goal_handoff'
+    || block.code === 'goal_settlement_unfinished' || (
+      !block.pause && block.resumable === true && block.message?.startsWith(
+        'This Goal paused repeatedly without a visible owner for the next action.',
+      )
     )
-  )
   const benign = !!block.pause || goalHandoff
   return {
     credits,
@@ -50,6 +54,13 @@ export function errorCardViewModel(block) {
     checkLabel: formatResetTime(checkAt),
     resetLabel: parked ? formatResetTime(resetAt) : null,
   }
+}
+
+// Credits belong to the provider account, which may be a shared workspace
+// someone else manages, so name it and offer both routes to a refill.
+function creditsCopy(provider) {
+  const where = provider ? `Your ${providerInfoFor(provider).label} workspace` : 'Your workspace'
+  return `${where} is out of credits. Your progress is saved. Add credits, or ask whoever manages that workspace, then Resume.`
 }
 
 // `children` is the slot for surface-specific affordances — MsgContent
@@ -151,7 +162,7 @@ export default function ErrorCard({
             </div>
             <div className="chat__recovery-copy">
               {platformHold ? recoveryCopy : vm.credits
-                ? 'Your workspace is out of credits. Your progress is saved. Add credits to your workspace, then Resume.'
+                ? creditsCopy(block.pause?.provider)
                 : vm.modelCapacityExhausted
                 ? 'Five automatic retries were used. Choose another model, then Resume to continue your saved work.'
                 : vm.goalHandoff

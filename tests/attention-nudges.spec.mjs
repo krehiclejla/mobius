@@ -70,6 +70,12 @@ for (const scenario of SCENARIOS) {
     expect(chat?.id).toBeTruthy()
 
     const goalObjective = 'Keep the guarded service boundary stable'
+    // Runtime and detail reads own the Goal presentation: the rail follows
+    // `goal`, as the server sends it, not the /goal message text.
+    const goal = {
+      id: `${scenario.label}-goal`, revision: 1, objective: goalObjective,
+      status: 'active', resumable: false,
+    }
     const paragraphs = Array.from({ length: 42 }, (_, i) => ({
       type: 'text',
       content: `Attention history ${i + 1}. ${'Enough content to overflow the viewport. '.repeat(8)}`,
@@ -110,6 +116,7 @@ for (const scenario of SCENARIOS) {
           // its stream, so its active goal owns the same progress rail.
           ...runtimeSnapshot({ running: true, pending_question_id: pendingQuestionId }),
           active_goal_objective: goalObjective,
+          goal,
         }),
       })
     })
@@ -121,6 +128,7 @@ for (const scenario of SCENARIOS) {
         body: JSON.stringify({
           ...runtimeSnapshot({ running: true, pending_question_id: pendingQuestionId }),
           active_goal_objective: goalObjective,
+          goal,
         }),
       })
     })

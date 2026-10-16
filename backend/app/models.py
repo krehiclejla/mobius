@@ -34,6 +34,8 @@ from app.tool_output_storage import CompressedToolOutputText
 
 CONTINUATION_RUN_STATUSES = ("parked", "resume_pending")
 NONTERMINAL_RUN_STATUSES = ("running", *CONTINUATION_RUN_STATUSES)
+# Parks that wait for this installation's own memory or storage headroom.
+RESOURCE_PARK_REASONS = frozenset({"memory", "storage"})
 
 
 class Owner(Base):

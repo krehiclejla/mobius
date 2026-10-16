@@ -51,6 +51,7 @@ _CODEX_MCP_FEATURE_OVERRIDES = (
 _MAX_CODEX_MCP_SERVERS = 256
 _MAX_CODEX_MCP_NAME_CHARS = 256
 _MAX_CODEX_MCP_INVENTORY_CHARS = 1_000_000
+_MAX_CODEX_FEATURE_PAGES = 20
 
 
 class ForkError(RuntimeError):
@@ -87,6 +88,23 @@ class _CodexMcpSurfacePage(BaseModel):
   model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
   data: list[_CodexMcpSurface]
+  next_cursor: str | None = Field(default=None, alias="nextCursor")
+
+
+class _CodexFeature(BaseModel):
+  """A feature switch as the fork's loaded config resolved it."""
+
+  model_config = ConfigDict(extra="ignore")
+
+  name: str
+  enabled: bool
+  stage: str
+
+
+class _CodexFeaturePage(BaseModel):
+  model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+  data: list[_CodexFeature]
   next_cursor: str | None = Field(default=None, alias="nextCursor")
 
 
@@ -230,6 +248,43 @@ async def _assert_codex_mcp_isolated(codex: Any, thread_id: str) -> None:
         "Codex MCP isolation pagination repeated; refusing coaching"
       )
     seen_cursors.add(cursor)
+
+
+async def _codex_features(codex: Any, thread_id: str) -> dict[str, _CodexFeature]:
+  """Read every feature switch as the forked thread's config resolved it."""
+  features: dict[str, _CodexFeature] = {}
+  params: dict[str, Any] = {"threadId": thread_id}
+  for _ in range(_MAX_CODEX_FEATURE_PAGES):
+    try:
+      page = await codex._client.request(
+        "experimentalFeature/list", params, response_model=_CodexFeaturePage,
+      )
+    except Exception as exc:
+      raise ForkError(
+        "Codex tool switches could not be verified; refusing the fork"
+      ) from exc
+    features.update((feature.name, feature) for feature in page.data)
+    if page.next_cursor is None:
+      return features
+    params = {"threadId": thread_id, "cursor": page.next_cursor}
+  raise ForkError("Codex listed too many feature pages; refusing the fork")
+
+
+async def _assert_codex_tools_off(codex: Any, thread_id: str) -> None:
+  """Fail before the prompt unless every tool switch is known and off.
+
+  Codex ignores a switch it does not know, so a renamed or removed feature
+  would otherwise leave its tool on with no error at all.
+  """
+  from app.providers import CODEX_TOOL_FEATURES_OFF
+
+  features = await _codex_features(codex, thread_id)
+  for name in CODEX_TOOL_FEATURES_OFF:
+    feature = features.get(name)
+    if feature is None or feature.stage == "removed" or feature.enabled:
+      raise ForkError(
+        f"Codex fork could not switch off its {name} tool; refusing the fork"
+      )
 
 
 def _validated_result(
@@ -469,13 +524,14 @@ async def _fork_codex_async(
       _codex_rollout(codex_home, source_session_id), after_call_id
     )
   )
-  from app.providers import CODEX_NATIVE_HELPERS_OFF
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOLS_OFF
 
+  # A fork answers from the conversation alone, like Claude's `--tools ""`.
   config_overrides = (*_codex_mcp_isolation_overrides(
     cwd,
     env,
     runner=mcp_inventory_runner,
-  ), *CODEX_NATIVE_HELPERS_OFF)
+  ), *CODEX_NATIVE_HELPERS_OFF, *CODEX_TOOLS_OFF)
   config = CodexConfig(
     codex_bin=shutil.which("codex"),
     cwd=cwd,
@@ -495,7 +551,9 @@ async def _fork_codex_async(
           approval_mode=ApprovalMode.deny_all,
           cwd=cwd,
           sandbox=Sandbox.read_only,
-          **({"ephemeral": True} if ephemeral else {}),
+          # Codex refuses an ephemeral fork unless it leaves the turns out of
+          # its reply; the model still sees the whole conversation.
+          **({"ephemeral": True, "include_turns": False} if ephemeral else {}),
         )
       else:
         # The SDK's thread_fork does not take the app-server's lastTurnId yet;
@@ -505,10 +563,11 @@ async def _fork_codex_async(
           "cwd": cwd,
           "approvalPolicy": "never",
           "sandbox": "read-only",
-          **({"ephemeral": True} if ephemeral else {}),
+          **({"ephemeral": True, "excludeTurns": True} if ephemeral else {}),
         })
         thread = AsyncThread(codex, forked.thread.id)
       await _assert_codex_mcp_isolated(codex, str(thread.id or ""))
+      await _assert_codex_tools_off(codex, str(thread.id))
       result = await thread.run(
         prompt,
         approval_mode=ApprovalMode.deny_all,

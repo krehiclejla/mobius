@@ -1203,15 +1203,13 @@ async def test_codex_synthesis_disables_tools_and_isolates_cwd(
   captured = {}
 
   class _Provider:
-    def codex_config_overrides(self):
-      return []
-
     def build_env(self, **_kwargs):
       captured["provider_env"] = True
       return {"SELECTED_PROVIDER": "mobius"}
 
     def codex_config_overrides(self):
-      return ['model_provider="mobius_trial"']
+      # The Möbius subscription turns web search on for its chats.
+      return ['model_provider="mobius_trial"', 'web_search="live"']
 
   class _Process:
     returncode = 0
@@ -1248,21 +1246,22 @@ async def test_codex_synthesis_disables_tools_and_isolates_cwd(
   assert "--ignore-rules" in captured["cmd"]
   assert 'model_provider="mobius_trial"' in captured["cmd"]
   assert captured["env"]["SELECTED_PROVIDER"] == "mobius"
-  disabled = {
-    captured["cmd"][index + 1]
-    for index, value in enumerate(captured["cmd"][:-1])
-    if value == "--disable"
-  }
-  assert {"shell_tool", "unified_exec", "apps", "browser_use"} <= disabled
-  configured = {
+  configured = [
     captured["cmd"][index + 1]
     for index, value in enumerate(captured["cmd"][:-1])
     if value == "--config"
-  }
+  ]
   # Native sub-agents come back via the model catalog unless agents are off.
   assert {
     "agents.enabled=false", "features.multi_agent_v2.enabled=false",
-  } <= configured
+  } <= set(configured)
+  assert {
+    "features.shell_tool=false", "features.code_mode_host=false",
+    "features.view_image=false",
+  } <= set(configured)
+  # Tools go off last, so a provider's own web search cannot come back on.
+  web_search = [value for value in configured if value.startswith("web_search=")]
+  assert web_search[-1] == 'web_search="disabled"'
 
 
 def test_latest_compaction_brief_reads_newest_portable_seed(db):

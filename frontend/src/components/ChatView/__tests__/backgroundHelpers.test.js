@@ -89,6 +89,23 @@ test('a platform resource park uses the same visible Waiting handoff', () => {
   )
 })
 
+test('a resource wait does not show the check time saved on its card', () => {
+  // The server keeps one memory/storage card and moves the next check later
+  // while headroom stays short, so the saved time would soon be in the past.
+  const pause = { check_at: '2026-09-04T18:50:00Z' }
+  for (const kind of ['storage', 'memory']) {
+    assert.equal(
+      resourcePausePresentation({ pause: { ...pause, kind } }).next,
+      'checks again automatically',
+    )
+  }
+  const model = resourcePausePresentation(
+    { pause: { ...pause, kind: 'model_capacity' } },
+    { kind: 'automatic', reason: 'model_capacity' },
+  )
+  assert.match(model.next, /^checks again (?!automatically)/)
+})
+
 test('only eligible handoffs claim an automatic Goal wake', async () => {
   for (const blocker of ['manual_resume', 'resume_failed', 'restart']) {
     assert.equal(classifyChatHandoff({ waits: [{ delivery_pending: true, resume_blocker: blocker }] }), 'recovery')

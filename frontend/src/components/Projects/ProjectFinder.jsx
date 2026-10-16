@@ -59,6 +59,7 @@ import ProjectPdfPreview from './ProjectPdfPreview.jsx'
 import ImageLightbox from '../ChatView/markdown/ImageLightbox.jsx'
 import ProjectPreviewFrame from './ProjectPreviewFrame.jsx'
 import { highlightCode } from '../ChatView/markdown/highlight.js'
+import { saveBlobAs } from '../../lib/saveFile.js'
 import './Projects.css'
 
 // A scan that settles inside this window swaps content with no spinner at all —
@@ -744,12 +745,7 @@ export default function ProjectFinder({
     try {
       const res = await source.readFile(target, { download: true })
       if (!res.ok) throw new Error(`Download failed: ${res.status}`)
-      const url = URL.createObjectURL(await res.blob())
-      const anchor = document.createElement('a')
-      anchor.href = url
-      anchor.download = target.split('/').pop()
-      anchor.click()
-      setTimeout(() => URL.revokeObjectURL(url), 0)
+      saveBlobAs(await res.blob(), target.split('/').pop())
     } catch (cause) {
       setError(cause?.message || 'Could not download that file.')
     }

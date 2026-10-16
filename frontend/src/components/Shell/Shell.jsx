@@ -30,7 +30,7 @@ import { placeContextMenu } from '../../lib/contextMenuGeometry.js'
 import { captureLayoutSpace, clientPointToLayout } from '../../lib/layoutSpace.js'
 import { makeAppChatController } from '../../lib/appChatControl.js'
 import { handleAppProjectsRequest } from '../../lib/appProjectControl.js'
-import { parseNotificationTarget } from '../../lib/notificationTarget.js'
+import { subscribeShellLaunchTargets } from '../../lib/shellLaunchTargets.js'
 import { requestChatQuestionReveal } from '../../lib/chatQuestionReveal.js'
 import { settingsSectionOrNull } from '../../lib/settingsSections.js'
 import { recordClientError } from '../../lib/errorLog.js'
@@ -2715,7 +2715,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     if (activeViewRef.current !== 'settings') navToRef.current('settings')
   }, [activeViewRef])
 
-  const handleNotificationOpen = useCallback((target) => {
+  const openShellTarget = useCallback((target) => {
     if (target?.view === 'settings') {
       openSettingsSection(target.section)
     } else if (target?.view === 'canvas') {
@@ -2834,7 +2834,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         await newChatRef.current?.({
           draft: request.draft || undefined,
           forceNew: true,
-          autoSend: request.autoSend,
         })
         return
       }
@@ -3477,32 +3476,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   })
   useVisibleAppPresence(systemSubscriptionId, visibleAppIds)
 
-  // Service-worker messages arrive on navigator.serviceWorker, not the window
-  // message bus used by AppCanvas. Keep this listener limited to notification
-  // routing; frame requests are source-attributed and normalized by AppCanvas.
-  useEffect(() => {
-    function onSwMessage(e) {
-      // Service-worker client.postMessage delivers here via
-      // navigator.serviceWorker — NOT via window.message. (Subtle
-      // browser API split: the SW spec routes them through the SW
-      // container, not the global.) sw.js fires this on
-      // notificationclick when an existing client is focused.
-      if (e.data?.type !== 'notification-click') return
-      const target = parseNotificationTarget(e.data.target)
-      if (target?.view === 'canvas') void openAppWithIntent(target.app, target.intent)
-      else if (target?.view === 'chat') navTo('chat', { chatId: target.chatId })
-      else if (target?.view === 'settings') openSettingsSection(target.section)
-    }
-
-    if (navigator.serviceWorker) {
-      navigator.serviceWorker.addEventListener('message', onSwMessage)
-    }
-    return () => {
-      if (navigator.serviceWorker) {
-        navigator.serviceWorker.removeEventListener('message', onSwMessage)
-      }
-    }
-  }, [navTo, openAppWithIntent, openSettingsSection])
+  // Installed-app launches and worker messages enter the same destination path
+  // as the notification centre, including revealing a pending answer card.
+  useEffect(() => subscribeShellLaunchTargets(openShellTarget), [openShellTarget])
 
   // Resolve a deferred candidate or allocate a fresh row. Ordinary Standard
   // New Chat never reaches this with the visible blank: that is a synchronous
@@ -4762,7 +4738,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           <NotificationCenter
             ref={notificationCenterActionsRef}
             commands={shellCommands}
-            onOpenTarget={handleNotificationOpen}
+            onOpenTarget={openShellTarget}
             onRecoveryAction={recoverNotificationAction}
             updateAvailable={shellUpdateAvailable}
             onUpdateNow={applyShellUpdate}

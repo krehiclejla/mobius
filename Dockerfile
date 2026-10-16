@@ -75,8 +75,8 @@ RUN useradd -m -s /bin/bash mobius
 # both browsers, like tectonic below, is tracked in mobius-os/mobius#1849.
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
-ARG CODEX_VERSION=0.159.0
-ARG CODEX_SDK_VERSION=0.159.0
+ARG CODEX_VERSION=0.162.0
+ARG CODEX_SDK_VERSION=0.162.0
 ARG AGENT_BROWSER_VERSION=0.38.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     age ca-certificates cron curl git jq procps ripgrep sudo tini unzip util-linux xxd \
@@ -110,6 +110,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git_version="$(git --version | awk '{print $3}')" \
     && [ "$(printf '%s\n' "2.38" "$git_version" | sort -V | head -n1)" = "2.38" ] \
     && rm -rf /root/.npm /var/lib/apt/lists/*
+
+# Only Liberation fonts are installed, and fontconfig then resolves the generic
+# serif and sans-serif families (and system-ui, which falls back to sans-serif)
+# to Liberation Mono. Pages and app screenshots would render monospace, unlike
+# an owner's device. Pin the generics to the matching proportional faces, and
+# fail the build if they ever stop resolving that way.
+RUN printf '%s\n' \
+      '<?xml version="1.0"?>' \
+      '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">' \
+      '<fontconfig>' \
+      '  <alias binding="same"><family>sans-serif</family><prefer><family>Liberation Sans</family></prefer></alias>' \
+      '  <alias binding="same"><family>serif</family><prefer><family>Liberation Serif</family></prefer></alias>' \
+      '</fontconfig>' > /etc/fonts/conf.d/61-mobius-fonts.conf \
+    && fc-cache -f \
+    && [ "$(fc-match --format '%{family}' sans-serif)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' system-ui)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' serif)" = "Liberation Serif" ]
 
 # Use the pinned library for Python and other dynamically linked consumers,
 # not just the CLI. Keep Debian's package for its dependency metadata.
@@ -261,11 +278,11 @@ RUN cd ./shell-src \
 RUN mkdir -p /tmp/pdfjs-install && cd /tmp/pdfjs-install \
     && npm init -y >/dev/null \
     && npm install --no-audit --no-fund --silent \
-      --engine-strict --strict-allow-scripts pdfjs-dist@6.3.289 \
-    && mkdir -p /app/static/vendor/pdfjs@6.3.289 \
-    && cp node_modules/pdfjs-dist/build/pdf.mjs /app/static/vendor/pdfjs@6.3.289/pdf.mjs \
-    && cp node_modules/pdfjs-dist/build/pdf.worker.mjs /app/static/vendor/pdfjs@6.3.289/pdf.worker.mjs \
-    && ln -s pdfjs@6.3.289 /app/static/vendor/pdfjs \
+      --engine-strict --strict-allow-scripts pdfjs-dist@6.4.299 \
+    && mkdir -p /app/static/vendor/pdfjs@6.4.299 \
+    && cp node_modules/pdfjs-dist/build/pdf.mjs /app/static/vendor/pdfjs@6.4.299/pdf.mjs \
+    && cp node_modules/pdfjs-dist/build/pdf.worker.mjs /app/static/vendor/pdfjs@6.4.299/pdf.worker.mjs \
+    && ln -s pdfjs@6.4.299 /app/static/vendor/pdfjs \
     && cd / && rm -rf /tmp/pdfjs-install /root/.npm
 
 # KaTeX browser assets — the package's JavaScript is bundled when an app imports
@@ -280,13 +297,13 @@ RUN mkdir -p /tmp/pdfjs-install && cd /tmp/pdfjs-install \
 RUN mkdir -p /tmp/katex-install && cd /tmp/katex-install \
     && npm init -y >/dev/null \
     && npm install --no-audit --no-fund --silent \
-      --engine-strict --strict-allow-scripts katex@0.18.9 \
-    && mkdir -p /app/static/vendor/katex@0.18.9/fonts \
-    && cp node_modules/katex/dist/katex.min.js /app/static/vendor/katex@0.18.9/ \
-    && cp node_modules/katex/dist/katex.mjs    /app/static/vendor/katex@0.18.9/ \
-    && cp node_modules/katex/dist/katex.min.css /app/static/vendor/katex@0.18.9/ \
-    && cp node_modules/katex/dist/fonts/*.woff2 /app/static/vendor/katex@0.18.9/fonts/ \
-    && ln -s katex@0.18.9 /app/static/vendor/katex \
+      --engine-strict --strict-allow-scripts katex@0.19.0 \
+    && mkdir -p /app/static/vendor/katex@0.19.0/fonts \
+    && cp node_modules/katex/dist/katex.min.js /app/static/vendor/katex@0.19.0/ \
+    && cp node_modules/katex/dist/katex.mjs    /app/static/vendor/katex@0.19.0/ \
+    && cp node_modules/katex/dist/katex.min.css /app/static/vendor/katex@0.19.0/ \
+    && cp node_modules/katex/dist/fonts/*.woff2 /app/static/vendor/katex@0.19.0/fonts/ \
+    && ln -s katex@0.19.0 /app/static/vendor/katex \
     && cd / && rm -rf /tmp/katex-install /root/.npm
 
 # Frontend static files + app-frame served by FastAPI, plus the full source
@@ -446,6 +463,27 @@ info = pathlib.Path("/app/build-info.json"); data = json.loads(info.read_text())
 data["image_inputs"] = json.loads(subprocess.run(["python3", "/app/platform-baked/backend/app/platform_activation.py", "--hashes", "/app/platform-baked"], check=True, capture_output=True, text=True).stdout); \
 info.write_text(json.dumps(data, sort_keys=True) + "\n")'; \
     chmod a+r /app/build-info.json
+
+# Every official commit the baked source descends from (`image_lineage`), so a
+# boot can prove the release its checkout records is older than this image
+# without that checkout holding the image's own history. A commits-only fetch
+# of the whole history is a few megabytes. A local-overlay build records its
+# public base; a build with no exact commit records nothing.
+RUN set -eux; \
+    _lineage_sha="$(cat /app/platform-baked/.baked-sha)"; \
+    if [ "${MOBIUS_USE_LOCAL_PLATFORM_SOURCE:-0}" = "1" ]; then \
+      _lineage_sha="$(printf '%s' "${MOBIUS_LOCAL_PLATFORM_BASE_SHA}" | tr 'A-F' 'a-f')"; \
+    fi; \
+    : > /app/platform-lineage; \
+    if printf '%s' "$_lineage_sha" | grep -Eq '^[0-9a-f]{40}$' \
+       && [ "$(python3 -c 'import json; print(json.load(open("/app/build-info.json"))["sha"])')" != unknown ]; then \
+      _lineage_repo="$(mktemp -d)"; \
+      git -C "$_lineage_repo" init -q; \
+      git -C "$_lineage_repo" fetch -q --filter=tree:0 "$MOBIUS_PLATFORM_ORIGIN" "$_lineage_sha"; \
+      git -C "$_lineage_repo" rev-list "$_lineage_sha" > /app/platform-lineage; \
+      rm -rf "$_lineage_repo"; \
+    fi; \
+    chmod a+r /app/platform-lineage
 
 # Initialize the runtime volume paths for the non-root agent user.
 RUN mkdir -p /data/db /data/apps /data/compiled /data/shared \

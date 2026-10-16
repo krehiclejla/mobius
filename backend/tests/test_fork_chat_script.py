@@ -19,6 +19,7 @@ from fork_session import (  # noqa: E402
   ForkError,
   ForkResult,
   _assert_codex_mcp_isolated,
+  _assert_codex_tools_off,
   _codex_mcp_isolation_overrides,
   _codex_turn_of_call,
   _fork_claude,
@@ -27,6 +28,19 @@ from fork_session import (  # noqa: E402
   _parse_invocation,
 )
 from fork_chat import _chat_session, coach_chat, main as fork_chat_main  # noqa: E402
+from app.providers import CODEX_TOOL_FEATURES_OFF  # noqa: E402
+
+
+def _app_server_page(method, *, features=None):
+  """An empty MCP surface, or every tool switch off as a fork reports it."""
+  if method != "experimentalFeature/list":
+    return {"data": [], "nextCursor": None}
+  if features is None:
+    features = [
+      {"name": name, "enabled": False, "stage": "stable"}
+      for name in CODEX_TOOL_FEATURES_OFF
+    ]
+  return {"data": features, "nextCursor": None}
 
 
 def test_platform_coaching_helpers_are_directly_executable():
@@ -225,7 +239,7 @@ def test_codex_uses_sdk_thread_fork_and_read_only_turn(tmp_path, monkeypatch):
   class FakeClient:
     async def request(self, method, params, *, response_model):
       calls.setdefault("mcp_checks", []).append((method, params))
-      return response_model.model_validate({"data": [], "nextCursor": None})
+      return response_model.model_validate(_app_server_page(method))
 
   class FakeCodex:
     def __init__(self, config):
@@ -285,19 +299,38 @@ def test_codex_uses_sdk_thread_fork_and_read_only_turn(tmp_path, monkeypatch):
     "agents.enabled=false",
     "features.multi_agent=false",
     "features.multi_agent_v2.enabled=false",
+    # Built-in tools off, like a Claude fork's --tools "": no shell, file or
+    # image reads, browser, apps, or web, and no code runner.
+    "features.shell_tool=false",
+    "features.apps=false",
+    "features.browser_use=false",
+    "features.browser_use_external=false",
+    "features.browser_use_full_cdp_access=false",
+    "features.computer_use=false",
+    "features.image_generation=false",
+    "features.goals=false",
+    "features.view_image=false",
+    "features.sleep_tool=false",
+    "features.code_mode_host=false",
+    "features.tool_suggest=false",
+    'web_search="disabled"',
+    "skills.include_instructions=false",
   )
   assert all(
     name not in calls["config"]["env"]
     for name in ("API_BASE_URL", "AGENT_TOKEN", "CHAT_ID", "MOBIUS_RUN_TOKEN")
   )
-  assert calls["mcp_checks"] == [(
-    "mcpServerStatus/list",
-    {
-      "threadId": "forked-codex-thread",
-      "detail": "full",
-      "limit": 100,
-    },
-  )]
+  assert calls["mcp_checks"] == [
+    (
+      "mcpServerStatus/list",
+      {
+        "threadId": "forked-codex-thread",
+        "detail": "full",
+        "limit": 100,
+      },
+    ),
+    ("experimentalFeature/list", {"threadId": "forked-codex-thread"}),
+  ]
   assert calls["mcp_inventory"][0] == ["codex", "mcp", "list", "--json"]
   assert calls["mcp_inventory"][1]["cwd"] == "/data"
   assert calls["exclusive_during_fork"] is None
@@ -333,7 +366,7 @@ def test_codex_side_question_fork_is_ephemeral_and_uses_the_chats_model(
 
   class FakeClient:
     async def request(self, method, params, *, response_model):
-      return response_model.model_validate({"data": [], "nextCursor": None})
+      return response_model.model_validate(_app_server_page(method))
 
   class FakeCodex:
     def __init__(self, config):
@@ -361,6 +394,8 @@ def test_codex_side_question_fork_is_ephemeral_and_uses_the_chats_model(
 
   assert result.answer == "side answer"
   assert calls["fork"]["ephemeral"] is True
+  # Codex refuses an ephemeral fork that would return its turns.
+  assert calls["fork"]["include_turns"] is False
   assert calls["fork"]["sandbox"] == "read-only"
   assert calls["run"]["model"] == "gpt-5.5"
 
@@ -430,6 +465,49 @@ def test_codex_fails_before_coaching_when_effective_mcp_tools_survive():
 
   with pytest.raises(ForkError, match="exposed an MCP capability"):
     asyncio.run(_assert_codex_mcp_isolated(fake_codex, "forked-thread"))
+
+
+def _features_client(pages):
+  class FakeClient:
+    async def request(self, method, params, *, response_model):
+      assert method == "experimentalFeature/list"
+      return response_model.model_validate(pages[params.get("cursor")])
+
+  return SimpleNamespace(_client=FakeClient())
+
+
+@pytest.mark.parametrize(
+  "view_image",
+  [
+    None,  # a switch this Codex does not know
+    {"name": "view_image", "enabled": True, "stage": "stable"},
+    {"name": "view_image", "enabled": False, "stage": "removed"},
+  ],
+)
+def test_codex_fork_refuses_a_tool_switch_that_did_not_take(view_image):
+  features = [
+    {"name": name, "enabled": False, "stage": "stable"}
+    for name in CODEX_TOOL_FEATURES_OFF if name != "view_image"
+  ] + ([view_image] if view_image else [])
+  codex = _features_client({
+    None: _app_server_page("experimentalFeature/list", features=features),
+  })
+
+  with pytest.raises(ForkError, match="could not switch off its view_image tool"):
+    asyncio.run(_assert_codex_tools_off(codex, "forked-thread"))
+
+
+def test_codex_fork_reads_every_page_of_tool_switches():
+  def page(names, cursor):
+    return {
+      "data": [{"name": name, "enabled": False, "stage": "stable"} for name in names],
+      "nextCursor": cursor,
+    }
+
+  first, rest = CODEX_TOOL_FEATURES_OFF[:1], CODEX_TOOL_FEATURES_OFF[1:]
+  codex = _features_client({None: page(first, "page-2"), "page-2": page(rest, None)})
+
+  asyncio.run(_assert_codex_tools_off(codex, "forked-thread"))
 
 
 def test_codex_default_loader_accepts_persisted_completed_subagent_activity():
@@ -712,7 +790,7 @@ def test_codex_call_moment_forks_the_session_through_the_calls_turn(
 
     async def request(self, method, params, *, response_model):
       calls["requests"].append((method, params))
-      return response_model.model_validate({"data": []})
+      return response_model.model_validate(_app_server_page(method))
 
   class FakeCodex:
     def __init__(self, config):
@@ -753,7 +831,9 @@ def test_codex_call_moment_forks_the_session_through_the_calls_turn(
     "approvalPolicy": "never",
     "sandbox": "read-only",
   })
-  assert [method for method, _ in calls["requests"]] == ["mcpServerStatus/list"]
+  assert [method for method, _ in calls["requests"]] == [
+    "mcpServerStatus/list", "experimentalFeature/list",
+  ]
   assert calls["requests"][0][1]["threadId"] == "moment-thread"
   assert calls["run"] == (
     "coach",

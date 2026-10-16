@@ -57,10 +57,9 @@ export const SLASH_COMMANDS = [
     args: '<side question>',
     summary: 'Ask a side question',
     detail: 'A temporary copy of this chat answers. The agent isn’t interrupted.',
-    // Answers come from a fork of the provider's own session. Claude-only:
-    // only a Claude fork can run with every tool turned off, and a copy that
-    // kept file reads could leak owner data to the provider (PR #1836 review).
-    providers: ['claude'],
+    // Answers come from a fork of the provider's own session, run with its
+    // tools off; only Claude and Codex forks can (side_questions.py).
+    providers: ['claude', 'codex'],
   },
 ]
 
@@ -107,7 +106,8 @@ export function mobiusChatCommand(text) {
  * the context breakdown and takes no text: running it anyway would silently
  * discard the trailing words, so the composer keeps them and shows this.
  * A command typed in full skips the menu, so the menu's provider rule is
- * enforced here too: `/btw` on a Codex chat is refused before any request.
+ * enforced here too: `/btw` in a Möbius-subscription chat is refused before
+ * any request.
  */
 export function chatCommandRejection(command, provider) {
   if (!command) return null

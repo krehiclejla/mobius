@@ -82,6 +82,15 @@ test('resolved compact POST releases busy and admission while optional status GE
   assert.equal(posts.length, 2, 'readback never auto-continues')
 })
 
+test('an embedded chat never reads the owner-only compaction progress', async t => {
+  const { hook, props, reads } = setup(t, { embedded: true })
+  await flush()
+  assert.equal(reads.length, 0)
+  hook.rerender({ ...props, serverCompactingKind: 'compact' })
+  await flush()
+  assert.equal(reads.length, 0)
+})
+
 test('a completed compaction reports its chat so cached context sizes drop', async t => {
   const compacted = []
   const { hook, posts } = setup(t, { onCompacted: chatId => compacted.push(chatId) })

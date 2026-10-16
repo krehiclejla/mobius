@@ -86,8 +86,9 @@ reason to hide or skip validation. Inside Möbius:
   running chat. Build the shell only through `npm run build` (it caps the heap
   and takes the build lock); never call `vite` directly. Frontend tests run one
   worker by default (`MOBIUS_TEST_CONCURRENCY`; most workers need about 100 MB,
-  component-rendering workers up to about 550 MB); raise it only when nothing
-  else is running, and never run test suites in parallel. A component test that
+  component-rendering workers reach about 900 MB, so three nearly fill a
+  4 GB container); raise it to at most 2, only when no other chat is running,
+  and never run test suites in parallel. A component test that
   renders through Vite creates its server with `createSsrRenderServer` from
   `frontend/src/lib/__tests__/ssrRenderServer.mjs`, never with `createServer`
   directly;

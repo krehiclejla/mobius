@@ -355,11 +355,13 @@ for (const action of ['edit', 'cancel']) {
     const row = f.surface.locator('.queued__row')
     await expect(row).toHaveCount(1)
     if (action === 'edit') {
+      // The pencil opens the queued message in the chat box.
       await row.getByRole('button', { name: 'Edit queued message' }).click()
-      await row.getByRole('textbox', { name: 'Edit queued message' }).fill('REVISED-LOCAL-MESSAGE')
-      await row.getByRole('button', { name: 'Save queued message edit' }).click()
+      await expect(f.composer).toHaveValue(marker)
+      await f.composer.fill('REVISED-LOCAL-MESSAGE')
+      await f.surface.getByRole('button', { name: 'Save queued message' }).click()
       await expect(row).toContainText('REVISED-LOCAL-MESSAGE')
-      await expect(row.getByRole('textbox')).toHaveCount(0)
+      await expect(f.surface.getByRole('button', { name: 'Save queued message' })).toHaveCount(0)
     } else {
       await row.getByRole('button', { name: 'Cancel queued message' }).click()
       await expect(row).toHaveCount(0)
@@ -430,11 +432,14 @@ for (const action of ['edit', 'cancel']) {
     }))
     try {
       if (action === 'edit') {
+        // The edit stays in the chat box while delivery is confirmed.
         await row.getByRole('button', { name: 'Edit queued message' }).click()
-        await row.getByRole('textbox', { name: 'Edit queued message' }).fill('UNCONFIRMED-EDIT')
-        await row.getByRole('button', { name: 'Save queued message edit' }).click()
-        await expect(row.getByRole('textbox', { name: 'Edit queued message' })).toHaveValue('UNCONFIRMED-EDIT')
-        await expect(row.getByRole('status')).toBeVisible()
+        await f.composer.fill('UNCONFIRMED-EDIT')
+        await f.surface.getByRole('button', { name: 'Save queued message' }).click()
+        await expect(f.surface.locator('.chat__history-strip'))
+          .toContainText('Delivery is being confirmed. Your edit is kept here.')
+        await expect(f.composer).toHaveValue('UNCONFIRMED-EDIT')
+        await expect(row).toContainText('CONFIRMED-QUEUE-MESSAGE')
       } else {
         await row.getByRole('button', { name: 'Cancel queued message' }).click()
         await expect(f.surface.getByText('Delivery is not confirmed yet. Try cancelling after delivery is confirmed.')).toBeVisible()

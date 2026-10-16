@@ -2913,6 +2913,26 @@ async def test_can_use_tool_read_of_skill_file_emits_skill_loaded(
 
 
 @pytest.mark.asyncio
+async def test_owner_turn_pins_default_permission_mode(monkeypatch):
+  # Newer bundled CLIs start in auto mode when no mode is given; its
+  # classifier would judge tool calls before Möbius's can_use_tool.
+  captured: dict = {}
+  real_options = claude_sdk_runner.ClaudeAgentOptions
+
+  def capture_options(**kwargs):
+    captured["kwargs"] = dict(kwargs)
+    return real_options(**kwargs)
+
+  monkeypatch.setattr(claude_sdk_runner, "ClaudeAgentOptions", capture_options)
+  _install_fake_client(monkeypatch)
+
+  await _run_turn("owner-permission-mode", bc=_Bus(), prompt="hi", cwd="/data")
+
+  assert captured["kwargs"]["permission_mode"] == "default"
+  assert captured["kwargs"]["can_use_tool"] is not None
+
+
+@pytest.mark.asyncio
 async def test_delegated_claude_keeps_parent_tools_without_hidden_budget(
   monkeypatch,
 ):

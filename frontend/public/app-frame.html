@@ -486,7 +486,7 @@
     <div class="error-detail" id="error-detail"></div>
     <div class="error-actions">
       <button class="error-btn error-btn--reload" onclick="location.reload()">Reload app</button>
-      <button class="error-btn error-btn--report" id="report-btn" onclick="reportError()">Report to agent</button>
+      <button class="error-btn error-btn--report" id="report-btn" onclick="reportErrorToAgent()">Report to agent</button>
     </div>
   </div>
 
@@ -525,7 +525,10 @@
       )
     }
 
-    function reportError() {
+    // Never name this `reportError`: a global function declaration replaces
+    // the browser's window.reportError, which React uses for every error it
+    // reports. Shadowing it turned each one into an empty crash report.
+    function reportErrorToAgent() {
       window.parent.postMessage({
         type: 'moebius:app-error',
         appId: _FRAME_APP_ID,
@@ -1377,6 +1380,22 @@
       reportAppError('app:unhandledrejection', (r && r.message) || String(r), r && r.stack);
     });
 
+    // React calls this when an error escaped every error boundary and it has
+    // already unmounted the whole tree. Unlike a stray window error after mount,
+    // which leaves a working UI on screen, nothing of the app remains, so this
+    // is terminal at any point in its life: record it and show the error panel
+    // with the real message, whose "Report to agent" hands it to the shell.
+    function handleUncaughtAppError(error, errorInfo) {
+      const detail = (error && (error.stack || error.message)) || String(error);
+      const componentStack = errorInfo && errorInfo.componentStack;
+      reportAppError(
+        'app:react-uncaught',
+        (error && error.message) || String(error),
+        componentStack ? detail + '\n' + componentStack : detail
+      );
+      showErr('Runtime error', detail);
+    }
+
     async function loadModule() {
       const token = currentToken;
       if (!token) {
@@ -1452,7 +1471,9 @@
           return;
         }
         await settleOwnedFontsBeforeMount();
-        mountedRoot = createRoot(document.getElementById('root'));
+        mountedRoot = createRoot(document.getElementById('root'), {
+          onUncaughtError: handleUncaughtAppError,
+        });
         mountedComponent = Component;
         renderMountedComponent();
         // frame-mounted is posted by MountSignal's commit ref (above).

@@ -1,6 +1,10 @@
 """The default test entrypoint stays fast, hermetic, and checkout-owned."""
 
+import json
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "test.sh"
@@ -104,3 +108,142 @@ def test_image_runtime_reports_when_its_python_lock_differs():
   assert 'elif [ -r /app/requirements.lock ]' in source
   assert "checkout requirements.lock differs from the image runtime" in source
   assert "not dependency-authoritative" in source
+
+
+def _git(cwd, *args):
+  subprocess.run(
+    ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+    cwd=cwd, check=True, capture_output=True,
+  )
+
+
+# A lockfile shaped like the real one around the backend's Node tools: rolldown
+# has a hoisted dependency and an optional platform binding, and esrecurse uses
+# a nested estraverse that shadows a different hoisted copy only vite uses.
+_LOCKED = {
+  "node_modules/rolldown": {
+    "version": "1.0.0",
+    "dependencies": {"@oxc-project/types": "^0.1.0"},
+    "optionalDependencies": {"@rolldown/binding-linux-x64-gnu": "1.0.0"},
+  },
+  "node_modules/@oxc-project/types": {"version": "0.1.0"},
+  "node_modules/@rolldown/binding-linux-x64-gnu": {"version": "1.0.0", "optional": True},
+  "node_modules/acorn": {"version": "8.0.0"},
+  "node_modules/eslint-scope": {"version": "9.0.0", "dependencies": {"esrecurse": "^4.3.0"}},
+  "node_modules/esrecurse": {"version": "4.3.0", "dependencies": {"estraverse": "^5.2.0"}},
+  "node_modules/esrecurse/node_modules/estraverse": {"version": "5.3.0"},
+  "node_modules/estraverse": {"version": "4.3.0"},
+  "node_modules/vite": {"version": "7.0.0", "dependencies": {"estraverse": "^4.0.0"}},
+}
+
+
+def _lockfile(changes=None, omit=()):
+  """The fixture lockfile, with ``changes`` (path → fields) applied on top and
+  the ``omit`` entries left out."""
+  packages = {}
+  for path, entry in _LOCKED.items():
+    if path in omit:
+      continue
+    entry = {**entry, **(changes or {}).get(path, {})}
+    entry.setdefault("integrity", f"sha512-{path}@{entry['version']}")
+    packages[path] = entry
+  return json.dumps({"lockfileVersion": 3, "packages": {"": {}, **packages}})
+
+
+def _checkout_with_fake_backend_node_tools(root, lock):
+  """A primary checkout whose frontend tree holds just the verified surface."""
+  modules = root / "frontend" / "node_modules"
+  (modules / ".bin").mkdir(parents=True)
+  (modules / ".bin" / "rolldown").write_text("#!/bin/sh\n")
+  (modules / ".bin" / "rolldown").chmod(0o755)
+  for package in ("acorn", "eslint-scope"):
+    (modules / package).mkdir()
+    (modules / package / "package.json").write_text('{"name": "%s", "main": "index.js"}' % package)
+    (modules / package / "index.js").write_text("module.exports = {}\n")
+  (root / "frontend" / "package-lock.json").write_text(lock)
+  (root / "backend").mkdir()
+  (root / "backend" / "test_probe.py").write_text("def test_probe():\n  assert True\n")
+  (root / ".gitignore").write_text("node_modules\n")
+  _git(root, "init", "-q", "-b", "main")
+  _git(root, "add", "-A")
+  _git(root, "commit", "-q", "-m", "base")
+
+
+def _run_host_runner_in_worktree(tmp_path, worktree_lock=None, break_acorn=False, main_lock=None):
+  main = tmp_path / "main"
+  main.mkdir()
+  _checkout_with_fake_backend_node_tools(main, main_lock or _lockfile())
+  if break_acorn:
+    (main / "frontend" / "node_modules" / "acorn" / "package.json").unlink()
+    (main / "frontend" / "node_modules" / "acorn" / "index.js").unlink()
+  worktree = tmp_path / "worktree"
+  _git(main, "worktree", "add", "-q", "-b", "bump", str(worktree))
+  if worktree_lock is not None:
+    (worktree / "frontend" / "package-lock.json").write_text(worktree_lock)
+  return subprocess.run(
+    [str(HOST_RUNNER), "test_probe.py", "-q"],
+    cwd=worktree, capture_output=True, text=True, timeout=60,
+  )
+
+
+@pytest.mark.parametrize("changes", [
+  pytest.param({"node_modules/vite": {"version": "7.1.0"}}, id="unrelated-package"),
+  # Only vite uses the hoisted estraverse; esrecurse resolves its nested copy.
+  pytest.param({"node_modules/estraverse": {"version": "4.4.0"}}, id="shadowed-hoisted-copy"),
+])
+def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages_differ(
+  tmp_path, changes,
+):
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(changes))
+  if result.returncode == 78:
+    pytest.skip("no pytest runtime available for the host runner here")
+  assert result.returncode == 0, result.stdout + result.stderr
+  assert "package-lock.json differs" in result.stderr
+  assert "locks the backend's Node tools (rolldown, acorn, eslint-scope) identically" in result.stderr
+
+
+@pytest.mark.parametrize("changes", [
+  pytest.param({"node_modules/rolldown": {"version": "1.1.0"}}, id="direct-tool"),
+  pytest.param({"node_modules/@oxc-project/types": {"version": "0.2.0"}}, id="hoisted-dependency"),
+  pytest.param(
+    {"node_modules/@rolldown/binding-linux-x64-gnu": {"integrity": "sha512-rebuilt"}},
+    id="optional-platform-binding-integrity",
+  ),
+  pytest.param(
+    {"node_modules/esrecurse/node_modules/estraverse": {"version": "5.4.0"}},
+    id="nested-dependency",
+  ),
+])
+def test_host_runner_refuses_a_lockfile_that_changes_the_backend_node_tools(tmp_path, changes):
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(changes))
+  assert result.returncode == 1, result.stdout + result.stderr
+  assert "no verified backend Node dependencies match this worktree" in result.stderr
+
+
+@pytest.mark.parametrize("missing", [
+  pytest.param(("node_modules/@oxc-project/types",), id="hoisted-dependency"),
+  pytest.param(("node_modules/@rolldown/binding-linux-x64-gnu",), id="optional-platform-binding"),
+  # Without its nested copy esrecurse would resolve the hoisted one, so drop both.
+  pytest.param(
+    ("node_modules/esrecurse/node_modules/estraverse", "node_modules/estraverse"),
+    id="nested-dependency",
+  ),
+])
+def test_host_runner_refuses_lockfiles_that_both_leave_a_backend_dependency_unresolved(
+  tmp_path, missing,
+):
+  # Both lockfiles omit the same required package and differ elsewhere: the
+  # missing package is pinned by neither, so equal gaps must not count as a match.
+  result = _run_host_runner_in_worktree(
+    tmp_path,
+    main_lock=_lockfile(omit=missing),
+    worktree_lock=_lockfile({"node_modules/vite": {"version": "7.1.0"}}, omit=missing),
+  )
+  assert result.returncode == 1, result.stdout + result.stderr
+  assert "no verified backend Node dependencies match this worktree" in result.stderr
+
+
+def test_host_runner_still_refuses_when_no_tree_can_run_the_backend_node_tools(tmp_path):
+  result = _run_host_runner_in_worktree(tmp_path, break_acorn=True)
+  assert result.returncode == 1, result.stdout + result.stderr
+  assert "no verified backend Node dependencies match this worktree" in result.stderr

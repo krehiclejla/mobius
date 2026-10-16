@@ -190,11 +190,11 @@ test('a refused request offers no Try again; a later or failed one does', async 
   const { hook, asks } = setup(t)
   const asking = hook.result.current.ask('what runs?')
   asks[0].resolve(Response.json(
-    { detail: 'Side questions work in Claude chats for now.' }, { status: 422 },
+    { detail: 'Side questions work in Claude and Codex chats.' }, { status: 422 },
   ))
   await asking
   assert.equal(hook.result.current.sideQuestion.status, 'failed')
-  assert.match(hook.result.current.sideQuestion.error, /Claude chats/)
+  assert.match(hook.result.current.sideQuestion.error, /Claude and Codex chats/)
   assert.equal(hook.result.current.sideQuestion.retryable, false,
     'asking the same chat again would be refused the same way')
 

@@ -25,14 +25,28 @@ test('standalone route selects the shared opaque AppCanvas host', () => {
 test('standalone navigation delegates chat ownership and shares crash recovery', () => {
   const standalone = read('src/components/StandaloneApp/StandaloneApp.jsx')
   assert.match(standalone, /stageComposerHandoff\(request\.chatId, request\.draft\)/)
-  assert.match(standalone,
-    /stageComposerHandoff\(chat\.id, request\.draft, \{ autoSend: request\.autoSend \}\)/)
+  assert.match(standalone, /stageComposerHandoff\(chat\.id, request\.draft\)/)
+  assert.doesNotMatch(standalone, /autoSend/,
+    'an app new-chat request stages an editable draft, never a submitted turn')
   assert.doesNotMatch(standalone, /sessionStorage\.(?:setItem|removeItem)/)
 
   const boundary = read('src/components/ErrorBoundary/ErrorBoundary.jsx')
 
   assert.match(standalone, /<RecoveryPanel/)
   assert.match(boundary, /<RecoveryPanel/)
+})
+
+test('only the owner\'s own /new command can auto-send a new workspace chat', () => {
+  const shell = read('src/components/Shell/Shell.jsx')
+  const newChat = shell.match(/async function newChat\(\{([^}]*)\}[^]*?\n  \}\n/)
+  assert.ok(newChat, 'Shell defines newChat')
+  assert.match(newChat[1], /\bautoSend\b/, '/new <message> passes autoSend to newChat')
+  assert.match(newChat[0], /stageComposerHandoff\(chatId, suppliedDraft, \{\s*autoSend: !!autoSend && settingsCopied,?\s*\}\)/)
+
+  const appRequest = shell.match(/request\.type === 'moebius:new-chat'\) \{[^]*?\n      \}\n/)
+  assert.ok(appRequest, 'Shell handles an app new-chat request')
+  assert.doesNotMatch(appRequest[0], /autoSend/,
+    'an app new-chat request stages an editable draft, never a submitted turn')
 })
 
 test('workspace and standalone hosts share the Projects controller and response bridge', () => {

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable
 from datetime import UTC, datetime
 import hashlib
 import io
@@ -12,7 +11,6 @@ import logging
 import re
 import subprocess
 import unicodedata
-import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -472,6 +470,9 @@ def check_listing_image(content: bytes, what: str) -> str:
 
 # Only chunks that shape how the image looks are kept; anything else (EXIF,
 # XMP, text, provenance manifests, unknown or future chunks) is dropped.
+# The colour profile (iCCP, and ICC data in JPEG and WebP) stays because
+# dropping it changes the colours, so its free-text name, description and
+# copyright fields are published as-is.
 _PNG_KEPT_CHUNKS = {
   b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"cHRM", b"gAMA", b"iCCP",
   b"sBIT", b"sRGB", b"cICP", b"mDCV", b"cLLI", b"bKGD", b"pHYs",
@@ -479,13 +480,9 @@ _PNG_KEPT_CHUNKS = {
 }
 # A bare last-modified timestamp (tIME) says nothing about who or where, and
 # many editors add one to every PNG; stripping still drops it, but it alone
-# does not hold a listing back.
+# does not hold a listing back. Text chunks always count, whatever their key:
+# a "Software" value is free text, so it can hold a name or an address.
 _PNG_HARMLESS_CHUNKS = _PNG_KEPT_CHUNKS | {b"tIME"}
-# A text chunk keyed exactly "Software" names the tool that wrote the file,
-# not a person or place; every other key (Author, Comment, XMP...) counts.
-_PNG_TEXT_CHUNKS = {b"tEXt", b"zTXt", b"iTXt"}
-# A tool name is short; a longer "Software" chunk could carry anything.
-_PNG_SOFTWARE_TEXT_MAX_BYTES = 256
 _WEBP_KEPT_CHUNKS = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
 # Tables, frame headers, restart intervals and scans: what draws a JPEG.
 _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
@@ -494,58 +491,13 @@ _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
 _EXIF_ORIENTATION = 0x0112
 
 
-def _png_chunk_draws(kind: bytes, data: bytes) -> bool:
-  return kind in _PNG_KEPT_CHUNKS
-
-
-def _png_chunk_harmless(kind: bytes, data: bytes) -> bool:
-  """Drawing chunks, a bare timestamp, or text naming only the producing tool."""
-  return kind in _PNG_HARMLESS_CHUNKS or (
-    kind in _PNG_TEXT_CHUNKS and _png_short_software_text(kind, data)
-  )
-
-
-def _png_short_software_text(kind: bytes, data: bytes) -> bool:
-  """Whether a text chunk is keyed "Software" with a short value, decompressed.
-
-  zTXt and iTXt may be compressed, so the cap applies to the inflated text,
-  inflating at most one byte past it; anything longer counts as metadata.
-  """
-  keyword, separator, rest = data.partition(b"\0")
-  if keyword != b"Software" or not separator:
-    return False
-  if kind == b"zTXt":
-    compressed, text = True, rest[1:]
-  elif kind == b"iTXt":
-    if len(rest) < 2:
-      return False
-    compressed = rest[0] == 1
-    # Language tag and translated keyword, each NUL-terminated, then text.
-    parts = rest[2:].split(b"\0", 2)
-    if len(parts) < 3:
-      return False
-    text = parts[2]
-  else:
-    compressed, text = False, rest
-  if not compressed:
-    return len(text) <= _PNG_SOFTWARE_TEXT_MAX_BYTES
-  try:
-    inflate = zlib.decompressobj()
-    value = inflate.decompress(text, _PNG_SOFTWARE_TEXT_MAX_BYTES + 1)
-  except zlib.error:
-    return False
-  return len(value) <= _PNG_SOFTWARE_TEXT_MAX_BYTES and not inflate.unconsumed_tail
-
-
-def _png_chunks_kept(
-  content: bytes, keep: Callable[[bytes, bytes], bool] = _png_chunk_draws,
-) -> bytes:
+def _png_chunks_kept(content: bytes, kept: set[bytes] = _PNG_KEPT_CHUNKS) -> bytes:
   out, at = [content[:8]], 8
   while at + 12 <= len(content):
     length = int.from_bytes(content[at:at + 4], "big")
     kind = content[at + 4:at + 8]
     end = at + 12 + length
-    if keep(kind, content[at + 8:at + 8 + length]):
+    if kind in kept:
       out.append(content[at:end])
     if kind == b"IEND":
       break  # Anything after the end of the image is not part of it.
@@ -621,7 +573,7 @@ def listing_image_has_metadata(content: bytes) -> bool:
   multi-picture JPEG's extra images count, through its MPF segment.
   """
   if content.startswith(b"\x89PNG\r\n\x1a\n"):
-    return _png_chunks_kept(content, _png_chunk_harmless) != content
+    return _png_chunks_kept(content, _PNG_HARMLESS_CHUNKS) != content
   if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
     return _webp_chunks_kept(content) != content
   if content.startswith(b"\xff\xd8\xff"):

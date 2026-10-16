@@ -4141,7 +4141,7 @@ export default function ChatView({
     preparing: preparingCompaction, compactionProgress,
     runCompactCommand, continueCompaction, stopCompactCommand, stopComposerWork,
   } = useCompactCommands({
-    chatId, provisionalNewChat, hidden, serverCompactingKind,
+    chatId, provisionalNewChat, hidden, embedded, serverCompactingKind,
     activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages,
     stopTurn: handleStop,
     // /context measures the parts on demand with a short-lived cache; a

@@ -72,7 +72,8 @@ export async function checkHiddenReplyContinuity(page, chat, base, provider = 'c
   await expect(paragraph).toHaveText(prefix)
   await page.evaluate(suffix => window.__emitReplyFixture({ type: 'text', content: suffix, text_item_id: 'reply-next' }), answer.slice('This sentence'.length))
   await expect(paragraph).toHaveText(answer)
-  await expect(surface.locator('.chat__text p')).toHaveCount(1)
+  // The owner's own message renders Markdown paragraphs too; count the reply's.
+  await expect(surface.locator('.chat__text:not(.chat__text--user) p')).toHaveCount(1)
   expect(await page.evaluate(firstKey => window.__originalReplyRow === [...document.querySelectorAll('[data-chat-surface="painted"] [data-key]')].find(row => row.dataset.key === firstKey), firstKey)).toBe(true)
   const liveKey = await surface.locator('[data-active-assistant="true"]').getAttribute('data-key')
   await expect(surface.locator('.chat__sources')).toHaveCount(0)

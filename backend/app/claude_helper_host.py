@@ -1051,6 +1051,8 @@ def _host_options(
       # Without this the SDK forwards helper tools, but not the text that
       # owns its visible answer.
       forward_subagent_text=True,
+      # Pinned like the chat runner: an unset mode is auto mode on newer CLIs.
+      permission_mode="default",
       can_use_tool=allow_all,
       disallowed_tools=[
         *_CLAUDE_NATIVE_SCHEDULING_TOOLS,

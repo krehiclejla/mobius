@@ -1407,6 +1407,11 @@ async def run_claude_sdk_turn(
       # internally queued steering. Native @file and /command shortcuts are
       # deliberately unavailable in Möbius chats.
       "verbatim_prompts": True,
+      # can_use_tool owns permission decisions. Pin the mode: newer bundled
+      # CLIs start in auto mode when none is given, whose classifier then
+      # judges (and can block) tool calls before this callback runs.
+      # Delegated turns override this with acceptEdits below.
+      "permission_mode": "default",
       "can_use_tool": can_use_tool,
       "disallowed_tools": [
         *_CLAUDE_BUILTIN_HELPER_TOOLS,

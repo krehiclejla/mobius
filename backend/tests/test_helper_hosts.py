@@ -746,6 +746,7 @@ def test_every_hosted_helper_gets_the_claude_register_and_text_stream(tmp_path, 
     with ExitStack() as stack:
       options = factory(host, resume, stack)
     assert options.include_partial_messages and options.forward_subagent_text
+    assert options.permission_mode == "default"
     assert "replay-user-messages" in options.extra_args
     assert "PostToolUseFailure" in options.hooks
     assert all("SubagentHandback" in agent.disallowedTools for agent in options.agents.values())

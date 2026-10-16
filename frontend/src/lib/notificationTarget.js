@@ -3,8 +3,8 @@
 // TRUST BOUNDARY: notification rows are writable by app-scoped tokens
 // (POST /api/notifications/send), and the backend does not validate `target`,
 // so every consumer must treat it as hostile input. This parser is consumed by
-// BOTH the NotificationsView row click and Shell's warm-tap notification-click
-// handler, so the two can never drift; the push worker keeps its own
+// BOTH the NotificationsView row click and shellLaunchTargets' installed-app /
+// worker-message delivery, so they cannot drift; the push worker keeps its own
 // `_safeTarget` copy (public/sw-push.js is served unbundled and cannot import
 // this) with the same posture. Never navigate a raw target.
 //

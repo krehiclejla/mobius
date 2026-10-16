@@ -5,6 +5,7 @@ import { appIconUrl } from '../../appIcon.js'
 import { appQueries } from '../../../hooks/queries.js'
 import AppLinkPreview from './AppLinkPreview.jsx'
 import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
+import { openInternalLink } from '../internalLink.js'
 
 export default function AppLinkCard({ card, onInternalNav }) {
   const appsQuery = appQueries.list.useQuery()
@@ -17,18 +18,7 @@ export default function AppLinkCard({ card, onInternalNav }) {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      onClick={(event) => {
-        if (
-          !onInternalNav
-          || event.metaKey
-          || event.ctrlKey
-          || event.shiftKey
-          || event.altKey
-          || event.button !== 0
-        ) return
-        event.preventDefault()
-        onInternalNav(new URL(href, window.location.href))
-      }}
+      onClick={event => openInternalLink(event, href, onInternalNav)}
     >
       <AppLinkPreview appId={app?.id} card={card} fallbackIcon={iconSrc} />
       <span className="md-app-card__copy">

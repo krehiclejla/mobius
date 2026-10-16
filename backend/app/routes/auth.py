@@ -1112,14 +1112,15 @@ async def mobius_login_callback(
 
 # -- mobius.you OAuth completion and owner login (either/or with local) -----
 #
-# When the singleton owner is in ``auth_mode == "mobius"``, the login screen
-# offers one "Sign in with mobius.you" button that navigates to
-# ``/mobius/login/start``. Trust comes entirely from the TLS + PKCE receipt the
-# callback fetches itself from mobius.you ``/identity/token`` (mirroring the
-# account-link callback above): the app holds no SaaS secret and verifies no
-# signature. This is login only — the owner row and its bound ``sso_subject``
-# already exist; the setup-status reconciliation created them from the root
-# broker's verified first-boot identity.
+# When the singleton owner is in ``auth_mode == "mobius"``, the shell sends a
+# signed-out visitor straight to ``/mobius/login/start`` (after an explicit
+# sign-out, or when that redirect just happened, the login screen offers one
+# "Sign in with mobius.you" button to the same address). Trust comes entirely
+# from the TLS + PKCE receipt the callback fetches itself from mobius.you
+# ``/identity/token`` (mirroring the account-link callback above): the app holds
+# no SaaS secret and verifies no signature. This is login only — the owner row
+# and its bound ``sso_subject`` already exist; the setup-status reconciliation
+# created them from the root broker's verified first-boot identity.
 
 
 def _mobius_authorization_issuer() -> str:
@@ -1328,14 +1329,21 @@ async def mobius_web_login_start(
     raise HTTPException(
       status_code=404, detail="mobius.you sign-in is not enabled."
     )
-  identity = await _mobius_broker_request("GET", "/identity")
-  # mobius.you only accepts the account-link callback path as the
-  # redirect_uri (_valid_identity_redirect hardcodes it), so the login
-  # rides the shared /provider/mobius/callback and is told apart there by
-  # the browser-binding cookie.
-  url, state = await _begin_mobius_pkce(
-    identity, owner.username, select_account=select_account,
-  )
+  # The shell navigates here automatically for a signed-out visitor, so a
+  # broker or launcher failure must land on the retryable error screen rather
+  # than a bare JSON page with no way back.
+  try:
+    identity = await _mobius_broker_request("GET", "/identity")
+    # mobius.you only accepts the account-link callback path as the
+    # redirect_uri (_valid_identity_redirect hardcodes it), so the login
+    # rides the shared /provider/mobius/callback and is told apart there by
+    # the browser-binding cookie.
+    url, state = await _begin_mobius_pkce(
+      identity, owner.username, select_account=select_account,
+    )
+  except Exception:
+    log.warning("mobius login start failed", exc_info=True)
+    return _mobius_login_error_redirect()
   response = RedirectResponse(url=url, status_code=303)
   # One-use browser binding: the callback requires this cookie to equal the
   # echoed state, so a callback link opened in a different browser cannot

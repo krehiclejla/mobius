@@ -151,7 +151,8 @@ class FakeAnthropic:
         return [{"type": "text", "text": "SUB-AFTER-M1"}]
       if "_slow_" in tid:
         return [{"type": "text", "text": "SUB-AFTER-SLOW"}]
-    if len(messages) == 1:
+    # Newer CLIs append environment context as a role=system message.
+    if sum(m.get("role") != "system" for m in messages) == 1:
       if "TASK-MCP" in text:
         return [
           {"type": "text", "text": "SUB-PRE-M1 calling the stop tool"},
@@ -421,7 +422,9 @@ class Probe:
       strict_mcp_config=True, setting_sources=None,
       mcp_servers={"probe": probe_server},
       include_partial_messages=True, forward_subagent_text=True,
-      can_use_tool=allow_all,
+      # Pin the host's mode: newer CLIs default to auto mode, whose safety
+      # classifier would replace the host's own permission callback.
+      permission_mode="default", can_use_tool=allow_all,
       disallowed_tools=["Workflow"],
       agents={AGENT_TYPE: AgentDefinition(
         description="A probe helper.", prompt=HELPER_SYS,
@@ -581,10 +584,13 @@ async def test_hook_stop_ends_only_the_subagent_and_it_resumes(scrubbed_env, fak
     flat = json.dumps(first)
     assert task in flat and STOP_MARKER in flat
     # Same prior transcript: [prompt, assistant(text + stop tool_use),
-    # user(stop tool_result + the follow-up text)].
-    assert [m["role"] for m in first] == ["user", "assistant", "user"]
-    last_user = json.dumps(first[-1])
-    assert "FOLLOWUP-1" in last_user and "hook stopped continuation" in last_user
+    # user(stop tool_result + the follow-up text)]. Newer CLIs interleave
+    # role=system context, which can also carry the hook-stop notice.
+    conversation = [m for m in first if m["role"] != "system"]
+    assert [m["role"] for m in conversation] == ["user", "assistant", "user"]
+    last_user = json.dumps(conversation[-1])
+    after_stop = json.dumps(first[first.index(conversation[1]) + 1:])
+    assert "FOLLOWUP-1" in last_user and "hook stopped continuation" in after_stop
     # The resumed run ends normally and fires SubagentStop with its own text.
     stops = [e for e in probe.events if e["ev"] == "SubagentStop"]
     assert [e["last"] for e in stops] == ["SUB-DONE-2"]

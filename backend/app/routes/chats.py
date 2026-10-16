@@ -3087,7 +3087,7 @@ class SideQuestionKeep(BaseModel):
   # shown can always be added.
   answer: str = Field(min_length=1, max_length=side_questions.MAX_ANSWER_CHARS)
   # Matches FORKABLE_PROVIDERS: only a provider whose fork can run tool-less.
-  provider: Literal["claude"]
+  provider: Literal["claude", "codex"]
 
 
 # How often the ``/btw`` route checks whether its client is still there.

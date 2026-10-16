@@ -39,6 +39,10 @@ import { ReachabilityPhase } from './connectivityStore.js'
 const APP_TOKEN_REFRESH_SKEW_MS = 5 * 60_000
 const APP_TOKEN_MIN_REFRESH_MS = 30_000
 const APP_TOKEN_FALLBACK_REFRESH_MS = 5 * 60_000
+// Browsers keep timer delays in a signed 32-bit integer; a longer interval
+// overflows and fires at once, repeatedly. A far-future expiry must not turn
+// the refresh into a fetch loop.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
 export const AppTokenStartupState = Object.freeze({
   READY: 'ready',
@@ -102,7 +106,10 @@ export function appTokenRefreshInterval(token, now = Date.now()) {
     const payload = JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')))
     const expiresAt = Number(payload.exp) * 1000
     if (!Number.isFinite(expiresAt)) return APP_TOKEN_FALLBACK_REFRESH_MS
-    return Math.max(APP_TOKEN_MIN_REFRESH_MS, expiresAt - now - APP_TOKEN_REFRESH_SKEW_MS)
+    return Math.min(
+      MAX_TIMER_DELAY_MS,
+      Math.max(APP_TOKEN_MIN_REFRESH_MS, expiresAt - now - APP_TOKEN_REFRESH_SKEW_MS),
+    )
   } catch {
     return APP_TOKEN_FALLBACK_REFRESH_MS
   }

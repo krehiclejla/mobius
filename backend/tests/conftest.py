@@ -45,6 +45,10 @@ os.environ["MOEBIUS_SKIP_BOOTSTRAP"] = "1"
 os.environ["MOBIUS_SSO_ISSUER"] = ""
 os.environ["MOBIUS_SSO_INSTANCE_ID"] = ""
 os.environ["MOBIUS_IDENTITY_BROKER_SOCKET"] = f"{_tmp}/no-identity-broker.sock"
+# Nor may it inherit a Railway host's deployment identity: those markers switch
+# update, domain, and version behavior. Railway tests opt in with monkeypatch.
+for _name in [name for name in os.environ if name.startswith("RAILWAY_")]:
+  del os.environ[_name]
 
 # Production entrypoint proves the image-owned filesystem half before FastAPI
 # starts. Reproduce that boundary in the host-only runtime so startup can
@@ -76,6 +80,7 @@ os.environ["MOBIUS_FRONTEND_DIR"] = str(
 # point the override at the stub below (created before app.main imports).
 os.environ["MOBIUS_BAKED_STATIC_DIR"] = str(_static)
 os.environ["MOBIUS_BUILD_INFO_PATH"] = str(_Path(_tmp) / "missing-build-info.json")
+os.environ["MOBIUS_IMAGE_LINEAGE_PATH"] = str(_Path(_tmp) / "missing-platform-lineage")
 os.environ["MOBIUS_SERVING_SOURCE_FILE"] = str(_Path(_tmp) / "serving-source")
 os.environ["MOBIUS_SERVING_SHA_FILE"] = str(_Path(_tmp) / "serving-sha")
 if not (_static / "index.html").is_file():

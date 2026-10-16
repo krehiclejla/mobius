@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 
+import pytest
+
 import app.codex_skills as codex_skills
 
 from app.codex_skills import (
@@ -289,3 +291,146 @@ def test_safe_dir_name_sanitizes():
   assert _safe_dir_name("a/b c") == "a-b-c"
   assert _safe_dir_name("..") is None
   assert _safe_dir_name("") is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_codex_skill_sync_runs_off_the_event_loop(monkeypatch, enabled):
+  import asyncio
+
+  seen = []
+
+  def sync(data_dir, requested):
+    try:
+      asyncio.get_running_loop()
+      seen.append("on loop")
+    except RuntimeError:
+      seen.append("worker thread")
+    assert data_dir == "/tmp"
+    assert requested is enabled
+    return enabled
+
+  monkeypatch.setattr(codex_skills, "sync_codex_skills_for_prompt", sync)
+  assert asyncio.run(codex_skills.codex_native_skills_ready("/tmp", enabled)) is enabled
+  assert seen == ["worker thread"]
+
+
+def test_codex_skill_sync_propagates_failure(monkeypatch):
+  import asyncio
+
+  def fail(*args):
+    raise OSError("skill cache unavailable")
+
+  monkeypatch.setattr(codex_skills, "sync_codex_skills_for_prompt", fail)
+  with pytest.raises(OSError, match="skill cache unavailable"):
+    asyncio.run(codex_skills.codex_native_skills_ready("/tmp", True))
+
+
+def _run_codex_turn_with_skill_sync(chat, monkeypatch, during_sync):
+  """Run a first Codex turn, calling ``during_sync`` while its skill sync awaits."""
+  import asyncio
+  from app import chat as chat_mod, schemas
+  from app.broadcast import create_broadcast, remove_broadcast
+  from tests.test_chat_agent_settings import _start_provider_turn
+
+  runner_calls = []
+
+  async def ready(_data_dir, _enabled):
+    during_sync()
+    await asyncio.sleep(0)
+    return False
+
+  async def fake_runner(**kwargs):
+    runner_calls.append(kwargs)
+    return {"session_id": "s", "cost_usd": 0.0, "error": None}
+
+  monkeypatch.setattr(codex_skills, "codex_native_skills_ready", ready)
+  monkeypatch.setattr(
+    "app.codex_sdk_runner.run_codex_sdk_turn", fake_runner,
+  )
+  monkeypatch.setattr(
+    "app.providers.CodexProvider.check_auth", lambda *_args: None,
+  )
+
+  async def scenario():
+    bc = create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat, "codex")
+    try:
+      result = await chat_mod._run_chat_impl(
+        messages=[schemas.ChatMessage(role="user", content="hi")],
+        chat_id=chat.id,
+        session_id=None,
+        provider_id="codex",
+        run_gen=chat_mod.current_run_generation(chat.id),
+        run_token=run_token,
+      )
+    finally:
+      remove_broadcast(chat.id)
+    return result, list(bc.event_log)
+
+  result, events = asyncio.run(scenario())
+  return result, events, runner_calls
+
+
+def _stored_chat(chat_id):
+  from app import models
+  from app.database import SessionLocal
+
+  fresh = SessionLocal()
+  try:
+    row = fresh.get(models.Chat, chat_id)
+    return row.agent_settings_json, row.system_prompt_snapshot_id
+  finally:
+    fresh.close()
+
+
+def test_picker_choice_during_codex_skill_sync_reaches_the_runner(
+  chat, db, monkeypatch,
+):
+  """The first-send settings snapshot must not overwrite a concurrent pick."""
+  from app import models
+  from app.database import SessionLocal
+  from tests.test_chat_agent_settings import _write_global_settings
+
+  _write_global_settings({"model": "gpt-global", "effort": "medium"})
+  chat.agent_settings_json = None
+  chat.provider = "codex"
+  db.commit()
+  picked = {"model": "gpt-picked", "effort": "high"}
+
+  def pick_model():
+    # The picker's PATCH commits from another request while the sync awaits.
+    other = SessionLocal()
+    try:
+      other.get(models.Chat, chat.id).agent_settings_json = dict(picked)
+      other.commit()
+    finally:
+      other.close()
+
+  _result, _events, runner_calls = _run_codex_turn_with_skill_sync(
+    chat, monkeypatch, pick_model,
+  )
+
+  assert _stored_chat(chat.id)[0] == picked
+  assert len(runner_calls) == 1
+  assert runner_calls[0]["agent_settings"]["model"] == "gpt-picked"
+  assert runner_calls[0]["agent_settings"]["effort"] == "high"
+
+
+def test_stop_during_codex_skill_sync_leaves_the_chat_untouched(
+  chat, db, monkeypatch,
+):
+  """A run stopped while its skill sync awaits writes and launches nothing."""
+  from app import chat as chat_mod, chat_queue
+
+  chat.agent_settings_json = None
+  chat.provider = "codex"
+  db.commit()
+
+  result, events, runner_calls = _run_codex_turn_with_skill_sync(
+    chat, monkeypatch, lambda: chat_mod.bump_run_generation(chat.id),
+  )
+
+  assert result is chat_queue.TerminalDisposition.STALE_NO_ACTION
+  assert _stored_chat(chat.id) == (None, None)
+  assert events == []
+  assert runner_calls == []

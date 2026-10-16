@@ -88,6 +88,60 @@ matching_contrib_node_modules() {
   return 1
 }
 
+# The lockfile entries of the Node packages backend tests execute (the same
+# rolldown/acorn/eslint-scope surface as above) and their whole dependency
+# closure, one "path version integrity" line each, using npm's nested-then-
+# hoisted resolution. A dependency the lockfile cannot resolve makes the
+# whole signature invalid (no output, nonzero exit): such a lockfile does not
+# pin what would run, so it can never justify borrowing a tree.
+backend_node_lock() {
+  node -e '
+    const pk = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).packages || {};
+    const find = (from, name) => {
+      for (let base = from; ; base = base.slice(0, Math.max(base.lastIndexOf("/node_modules/"), 0))) {
+        const key = (base ? base + "/" : "") + "node_modules/" + name;
+        if (pk[key]) return key;
+        if (!base) return null;
+      }
+    };
+    const lines = new Set();
+    const visit = (from, name) => {
+      const key = find(from, name);
+      if (!key) process.exit(1);
+      const line = `${key} ${pk[key].version} ${pk[key].integrity}`;
+      if (lines.has(line)) return;
+      lines.add(line);
+      const entry = pk[key];
+      for (const dep of Object.keys({...entry.dependencies, ...entry.optionalDependencies})) visit(key, dep);
+    };
+    ["rolldown", "acorn", "eslint-scope"].forEach((name) => visit("", name));
+    console.log([...lines].sort().join("\n"));
+  ' "$1" 2>/dev/null
+}
+
+# Last resort when no installed tree has this checkout's exact lockfile (a
+# bump of an unrelated frontend package, or an upstream merge into the
+# branch): the primary checkout, then reviewed contrib siblings, whose lockfile
+# pins the backend-executed packages exactly as this checkout does and which
+# passes the same verified-surface check. A lockfile that changes those
+# packages never borrows another tree, so compiler tests always run the
+# versions this checkout locks.
+backend_lock_matching_node_modules() {
+  local frontend want have
+  want="$(backend_node_lock "$ROOT/frontend/package-lock.json")" && [ -n "$want" ] \
+    || return 1
+  for frontend in "$MAIN/frontend" "$CONTRIB_ROOT"/*/worktree/frontend; do
+    [ "$frontend" != "$ROOT/frontend" ] || continue
+    have="$(backend_node_lock "$frontend/package-lock.json")" || continue
+    [ "$have" = "$want" ] || continue
+    if backend_test_node_deps "$frontend"; then
+      printf '%s\n' "$frontend/node_modules"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if backend_test_node_deps "$ROOT/frontend"; then
   NODE_MODULES="$WORKTREE_NODE_MODULES"
 elif [ "$ROOT" != "$MAIN" ] \
@@ -96,8 +150,10 @@ elif [ "$ROOT" != "$MAIN" ] \
   NODE_MODULES="$SHARED_NODE_MODULES"
 elif NODE_MODULES="$(matching_contrib_node_modules)"; then
   echo "wt-pytest: reusing exact-lock backend-test dependencies from $(dirname "$NODE_MODULES")" >&2
+elif NODE_MODULES="$(backend_lock_matching_node_modules)"; then
+  echo "wt-pytest: frontend package-lock.json differs from $(dirname "$NODE_MODULES"), but it locks the backend's Node tools (rolldown, acorn, eslint-scope) identically; reusing them" >&2
 else
-  echo "wt-pytest: no verified backend Node dependencies match this worktree" >&2
+  echo "wt-pytest: no verified backend Node dependencies match this worktree's locked rolldown, acorn, and eslint-scope" >&2
   echo "  install them with: (cd \"$ROOT/frontend\" && npm ci)" >&2
   exit 1
 fi

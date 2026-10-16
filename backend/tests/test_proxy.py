@@ -833,8 +833,11 @@ def test_proxy_get_final_error_cannot_erase_redirect_cache_restrictions(
   assert all(hop.closed for hop in hops)
 
 
-def test_proxy_get_error_policy_is_request_local_and_does_not_grant_freshness():
+def test_proxy_get_error_policy_is_request_local_and_does_not_grant_freshness(monkeypatch):
   from app.routes.proxy import _PrivateBrowserCacheHeaders
+
+  # This checks request-local policy, not elapsed time or float clock rounding.
+  monkeypatch.setattr("app.routes.proxy.monotonic", lambda: 100.0)
 
   redirected = _PrivateBrowserCacheHeaders()
   redirected(_upstream(302, {"cache-control": "no-store"}))

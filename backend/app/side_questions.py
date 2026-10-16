@@ -36,12 +36,9 @@ MAX_ANSWER_CHARS = 20000
 # Appended inside MAX_ANSWER_CHARS when a fork's answer had to be cut, so the
 # card shows exactly what "Add to chat" can store.
 _TRUNCATION_NOTE = "\n\n*(Answer shortened to fit in the chat.)*"
-# Claude forks run genuinely tool-less (--restricted --tools ""). A Codex fork
-# keeps its built-in shell — the pinned SDK cannot switch it off — and its
-# read-only sandbox still permits file reads, so a prompt-injected copy could
-# read owner data. Side questions stay Claude-only until a Codex fork can run
-# with no tools at all.
-FORKABLE_PROVIDERS = ("claude",)
+# Providers whose fork runs with its tools off (fork_session.py), so a
+# prompt-injected copy cannot read owner files or reach the web.
+FORKABLE_PROVIDERS = ("claude", "codex")
 
 _FORK_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "fork_session.py"
 
@@ -144,7 +141,7 @@ def plan_side_question(
   question = clean_question(question)
   provider = (chat.provider or "claude").strip().lower()
   if provider not in FORKABLE_PROVIDERS:
-    raise SideQuestionError(422, "Side questions work in Claude chats for now.")
+    raise SideQuestionError(422, "Side questions work in Claude and Codex chats.")
   session_id = _forkable_session(db, chat, provider)
   if not session_id:
     raise SideQuestionError(

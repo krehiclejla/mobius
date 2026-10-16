@@ -1,8 +1,12 @@
 version: 2
+# Hijacked releases are usually detected and pulled within days, so version
+# updates wait a week after a release before proposing it. Security updates
+# ignore cooldown and still arrive immediately.
 updates:
   - package-ecosystem: pip
     directory: /backend
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
     open-pull-requests-limit: 5
     versioning-strategy: lockfile-only
     groups:
@@ -12,6 +16,7 @@ updates:
   - package-ecosystem: npm
     directory: /frontend
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
     open-pull-requests-limit: 5
     versioning-strategy: increase-if-necessary
     groups:
@@ -39,4 +44,5 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
     open-pull-requests-limit: 5

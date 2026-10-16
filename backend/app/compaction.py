@@ -585,7 +585,7 @@ async def _run_codex_summarize_turn(
   effort: str | None,
 ) -> str:
   """Run an ephemeral, read-only Codex turn and return its final message."""
-  from app.providers import CODEX_NATIVE_HELPERS_OFF, get_provider
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOLS_OFF, get_provider
 
   provider = get_provider(provider_id)
 
@@ -606,23 +606,11 @@ async def _run_codex_summarize_turn(
     "--color",
     "never",
   ]
-  # Codex has no single `tools=[]` flag. Disable every feature that can expose
-  # shell, app, browser, computer, delegation, or image tools. The read-only
-  # sandbox remains defense in depth for any future built-in that ignores a
-  # feature gate.
-  for feature in (
-    "shell_tool",
-    "unified_exec",
-    "apps",
-    "browser_use",
-    "browser_use_external",
-    "browser_use_full_cdp_access",
-    "computer_use",
-    "image_generation",
-    "goals",
+  # The read-only sandbox remains defense in depth for any future built-in
+  # that ignores a feature gate.
+  for override in (
+    *CODEX_NATIVE_HELPERS_OFF, *provider.codex_config_overrides(), *CODEX_TOOLS_OFF,
   ):
-    cmd.extend(("--disable", feature))
-  for override in (*CODEX_NATIVE_HELPERS_OFF, *provider.codex_config_overrides()):
     cmd.extend(("--config", override))
   if model:
     cmd.extend(("--model", model))

@@ -10,11 +10,8 @@ test('chat markdown intercepts only actionable unmodified shell-root clicks', ()
   const source = read('../markdown/InlineContent.jsx')
   const clickHandler = source.slice(source.indexOf('onClick={(event) => {'))
 
-  assert.match(clickHandler, /event\.metaKey/)
-  assert.match(clickHandler, /event\.ctrlKey/)
-  assert.match(clickHandler, /event\.shiftKey/)
-  assert.match(clickHandler, /event\.altKey/)
-  assert.match(clickHandler, /event\.button !== 0/)
+  // Which clicks count as plain is pinned by behaviour in internalLink.test.js.
+  assert.match(clickHandler, /!isPlainLeftClick\(event\)/)
   assert.match(clickHandler, /new URL\(href, window\.location\.href\)/)
   assert.match(clickHandler, /url\.origin === location\.origin/)
   assert.match(clickHandler, /\^\\\/shell\\\/\?\$\/\.test\(url\.pathname\)/)

@@ -78,7 +78,7 @@ self.addEventListener('push', (e) => {
 // out-of-scope form opens a plain browser tab instead. The retired
 // `/app/<id>` and `/chat/<id>` legacy forms are no longer accepted (the last
 // one on prod predates this by weeks); they now fall through to root. We
-// preserve the query string so the page-side parser (Shell onSwMessage,
+// preserve the query string so the page-side parsers (shellLaunchTargets,
 // useNavigation deepLink) can read `?app=`/`?chat=`.
 function _safeTarget(raw) {
   if (typeof raw !== 'string' || !raw) return '/'
