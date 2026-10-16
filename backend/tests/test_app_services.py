@@ -863,7 +863,7 @@ def _stale_snapshot(entries):
 
   with public_service_index._lock:
     public_service_index._snapshot = public_service_index.Snapshot(
-      public_service_index._generation, clock.monotonic(), dict(entries),
+      public_service_index._generation, clock.monotonic(), dict(entries), set(),
     )
 
 
@@ -882,7 +882,7 @@ def test_stale_snapshot_never_decides_the_accepted_cap(
   assert public_service_index.lookup(db, "lowered-service")[0] == (str(app.id), 60)
 
 
-def test_moved_alias_is_charged_to_its_current_service(
+def test_moved_alias_is_charged_only_to_its_current_service(
   client, auth, db, fresh_public_door,
 ):
   from app import public_service_index
@@ -897,14 +897,50 @@ def test_moved_alias_is_charged_to_its_current_service(
 
   assert client.get("/api/app-services/moved/status").status_code == 201
   assert public_service_index.lookup(db, "moved")[0] == (str(current.id), 60)
-  for _ in range(59):
+  # The stale entry spent nothing of the former service's allowance.
+  for _ in range(60):
     assert client.get("/api/app-services/former-service/status").status_code == 201
-  # The one stale charge came off the former service; its own ids keep the rest.
   assert client.get("/api/app-services/former-service/status").status_code == 429
-  # The moved request also counted once against the service it reached.
+  # The moved request counted once, against the service it reached.
   for _ in range(59):
     assert client.get("/api/app-services/current-service/status").status_code == 201
   assert client.get("/api/app-services/current-service/status").status_code == 429
+
+
+def test_a_stale_exhausted_bucket_never_refuses_the_current_service(
+  client, auth, db, fresh_public_door,
+):
+  former = _service_app(db, access="public", slug="spent-service")
+  current = _service_app(db, access="public", slug="open-service", aliases=("moved-on",))
+  for _ in range(60):
+    assert client.get("/api/app-services/spent-service/status").status_code == 201
+
+  # Another process moved the alias; this process still maps it to the spent bucket.
+  _stale_snapshot({
+    "spent-service": (str(former.id), 60),
+    "open-service": (str(current.id), 60),
+    "moved-on": (str(former.id), 60),
+  })
+  assert client.get("/api/app-services/moved-on/status").status_code == 201
+
+  # Likewise a raised allowance the snapshot has not seen yet.
+  _set_public_allowance(db, former, 600)
+  _stale_snapshot({"spent-service": (str(former.id), 60)})
+  assert client.get("/api/app-services/spent-service/status").status_code == 201
+
+
+def test_an_unconfirmed_refusal_costs_one_lookup_per_snapshot(
+  client, auth, db, fresh_public_door,
+):
+  app = _service_app(db, access="public", slug="steady-service")
+  for _ in range(60):
+    assert client.get("/api/app-services/steady-service/status").status_code == 201
+
+  _stale_snapshot({"steady-service": (str(app.id), 60)})
+  fresh_public_door.clear()
+  for _ in range(20):
+    assert client.get("/api/app-services/steady-service/status").status_code == 429
+  assert fresh_public_door == ["steady-service"]
 
 
 def test_concurrent_stale_lookups_rebuild_the_snapshot_once(monkeypatch):

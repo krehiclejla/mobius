@@ -31,11 +31,24 @@ _public_window = FixedWindowRateLimiter(MemoryStorage())
 
 
 def _admit_public_request(request: Request, bucket: str, per_minute: int) -> None:
+  if not _public_window.hit(
+    RateLimitItemPerMinute(per_minute), get_remote_address(request), bucket,
+  ):
+    _refuse_public_request(request, bucket, per_minute)
+
+
+def _public_request_has_room(request: Request, bucket: str, per_minute: int) -> bool:
+  """Whether ``bucket`` would admit this caller, without counting the request."""
+  return _public_window.test(
+    RateLimitItemPerMinute(per_minute), get_remote_address(request), bucket,
+  )
+
+
+def _refuse_public_request(request: Request, bucket: str, per_minute: int):
   allowance = RateLimitItemPerMinute(per_minute)
-  caller = get_remote_address(request)
-  if _public_window.hit(allowance, caller, bucket):
-    return
-  reset_at, _ = _public_window.get_window_stats(allowance, caller, bucket)
+  reset_at, _ = _public_window.get_window_stats(
+    allowance, get_remote_address(request), bucket,
+  )
   raise HTTPException(
     429,
     f"Rate limit exceeded: {allowance.amount} per 1 minute",
@@ -212,29 +225,36 @@ async def public_app_service(
   request: Request,
   db: Session = Depends(get_db),
 ):
-  # Count the request before any per-request database work: the snapshot
-  # names each public service's bucket, and every other id shares the probe
-  # bucket and is answered without a lookup.
+  # The snapshot names each public service's bucket; every other id shares
+  # the probe bucket and is answered without a lookup. An over-limit caller
+  # of an id the snapshot has confirmed is refused without one too.
   public, seen = public_service_index.lookup(db, slug)
   if public is None:
     _admit_public_request(request, *public_service_index.bucket(None, {}))
     raise HTTPException(404, "Public app service not found.")
-  _admit_public_request(request, *public)
+  if (
+    not _public_request_has_room(request, *public)
+    and public_service_index.confirmed(seen, slug)
+  ):
+    _refuse_public_request(request, *public)
+  # Charge only the service this id resolves to now: another process may
+  # have moved the alias or changed the allowance since the snapshot. An id
+  # that no longer names a public service is counted as a probe.
   app = _service_app(db, slug)
-  if app is None:
-    public_service_index.discard(seen)
-    raise HTTPException(404, "Public app service not found.")
   try:
+    if app is None:
+      raise HTTPException(404, "Public app service not found.")
     service = app_services.service_contract(app, access="public")
   except HTTPException:
     public_service_index.discard(seen)
+    _admit_public_request(request, *public_service_index.bucket(None, {}))
     raise
   current = public_service_index.bucket(app, service)
-  if current != public:
-    # Another process changed this service after the snapshot: the accepted
-    # contract decides the cap, and the next request reads a fresh snapshot.
+  if current == public:
+    public_service_index.confirm(seen, slug)
+  else:
     public_service_index.discard(seen)
-    _admit_public_request(request, *current)
+  _admit_public_request(request, *current)
   owner = db.query(models.Owner).first()
   if owner is None:
     raise HTTPException(503, "Owner setup is incomplete.")

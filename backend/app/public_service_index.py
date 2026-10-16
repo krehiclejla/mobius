@@ -12,8 +12,13 @@ allowance) counts from its next request. A change written by another process
 (a script or scheduled job writing the database; the API itself is a single
 uvicorn worker) is picked up within ``OUT_OF_PROCESS_RECHECK_SECONDS``, or
 sooner when the door resolves a service that no longer matches its entry and
-calls ``discard``; the door then also charges the service's current bucket, so
-a stale entry never decides which reviewed cap applies.
+calls ``discard``.
+
+The door charges only the bucket of the service an id resolves to now, so a
+stale entry never spends another service's allowance. It refuses from the
+snapshot alone only for an id the snapshot has ``confirm``ed against the
+database; an unconfirmed id is resolved first, at most once per snapshot, so
+a moved alias or raised allowance is never refused against an old bucket.
 """
 
 from __future__ import annotations
@@ -46,6 +51,8 @@ class Snapshot(NamedTuple):
   generation: int
   built_at: float
   index: dict[str, tuple[str, int]]
+  # Ids whose entry a request has matched against the database.
+  confirmed: set[str]
 
 
 _snapshot: Snapshot | None = None
@@ -73,7 +80,7 @@ def lookup(db: Session, service_id: str) -> tuple[tuple[str, int] | None, Snapsh
       if current is None:
         with _lock:
           generation = _generation
-        current = Snapshot(generation, time.monotonic(), _build(db))
+        current = Snapshot(generation, time.monotonic(), _build(db), set())
         with _lock:
           # A change committed while building leaves this snapshot already stale.
           _snapshot = current
@@ -90,6 +97,18 @@ def discard(seen: Snapshot) -> None:
   with _lock:
     if _snapshot is seen:
       _snapshot = None
+
+
+def confirm(seen: Snapshot, service_id: str) -> None:
+  """Record that ``service_id``'s entry in ``seen`` matches the database."""
+  with _lock:
+    seen.confirmed.add(service_id)
+
+
+def confirmed(seen: Snapshot, service_id: str) -> bool:
+  """Whether ``seen`` may refuse ``service_id`` without resolving it."""
+  with _lock:
+    return service_id in seen.confirmed
 
 
 def _current() -> Snapshot | None:
