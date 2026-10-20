@@ -1072,6 +1072,12 @@ def test_only_raising_the_public_allowance_widens_review():
   assert diff_contracts(accepted, contract(public_requests_per_minute=120))["widens"] is False
   assert diff_contracts(accepted, contract())["widens"] is False
   assert diff_contracts(contract(), contract(public_requests_per_minute=61))["widens"] is True
+  # Review compares the ceiling exactly: 60.0 is not the accepted 60.
+  as_float = contract(public_requests_per_minute=60)
+  as_float["service"]["public_requests_per_minute"] = 60.0
+  assert "service.public_requests_per_minute" in diff_contracts(
+    contract(public_requests_per_minute=60), as_float,
+  )["changed"]
 
 
 def test_editing_a_local_app_keeps_its_accepted_public_allowance(client, auth, db):

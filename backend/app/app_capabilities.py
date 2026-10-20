@@ -903,7 +903,7 @@ def diff_contracts(
     k for k in before.keys() & after.keys()
     if before[k] != after[k] or (
       # Python equates 1, True and 1.0; only the integer is a valid ceiling.
-      k in _TRANSFER_LIMIT_PATHS and _exact_json(before[k]) != _exact_json(after[k])
+      k in _EXACT_CEILING_PATHS and _exact_json(before[k]) != _exact_json(after[k])
     )
   )
   widens = any(
@@ -954,6 +954,8 @@ _ROUTE_LIMITS_PATH = "service.route_limits"
 # The accepted service fields the runtime reads to bound every exchange.
 _TRANSFER_LIMIT_FIELDS = ("max_request_bytes", "max_response_bytes", "route_limits")
 _TRANSFER_LIMIT_PATHS = {f"service.{field}" for field in _TRANSFER_LIMIT_FIELDS}
+# Integer ceilings review compares by exact JSON, so 60 and 60.0 differ.
+_EXACT_CEILING_PATHS = _TRANSFER_LIMIT_PATHS | {"service.public_requests_per_minute"}
 
 
 def _exact_json(value: Any) -> str:

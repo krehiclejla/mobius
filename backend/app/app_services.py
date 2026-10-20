@@ -35,6 +35,7 @@ from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, run
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
 from app.manifest_contract import (
+  PUBLIC_SERVICE_REQUESTS_PER_MINUTE, PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX,
   SERVICE_REQUEST_MAX_BYTES,
   accepted_service_max_bytes, accepted_service_route_limits, service_route_key,
 )
@@ -904,10 +905,6 @@ def public_requests_per_minute(service: dict) -> int:
   Like the transfer limits below, an accepted value the manifest contract
   could not have produced disables the service rather than being clamped.
   """
-  from app.manifest_contract import (
-    PUBLIC_SERVICE_REQUESTS_PER_MINUTE,
-    PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX,
-  )
   value = service.get("public_requests_per_minute", PUBLIC_SERVICE_REQUESTS_PER_MINUTE)
   if type(value) is not int or not (
     PUBLIC_SERVICE_REQUESTS_PER_MINUTE <= value <= PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX
