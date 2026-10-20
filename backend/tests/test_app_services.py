@@ -922,6 +922,11 @@ def test_public_service_may_declare_a_capped_request_allowance():
   assert service["public_requests_per_minute"] == 480
   assert app_services.public_requests_per_minute(service) == 480
   assert app_services.public_requests_per_minute({"access": "public"}) == 60
+  # An accepted value the manifest could not have produced disables the
+  # service, like malformed transfer limits, instead of being clamped.
+  for corrupt in (10, 1000, 120.0, True, "120"):
+    with pytest.raises(app_services.ServiceBoundaryError):
+      app_services.public_requests_per_minute({"public_requests_per_minute": corrupt})
 
   for bad in (59, 601, 120.0, True, "120"):
     with pytest.raises(ManifestContractError, match="public_requests_per_minute"):
@@ -1036,6 +1041,37 @@ def test_moved_alias_counts_against_its_new_service_from_the_next_request(
   db.commit()
   assert client.get("/api/app-services/moving/status").status_code == 201
   assert client.get("/api/app-services/spent-service/status").status_code == 429
+
+
+def test_unreadable_public_service_answers_503_like_the_other_doors(
+  client, auth, db, fresh_public_door,
+):
+  _service_app(
+    db, access="public", slug="broken-limits", service_id="broken-limits",
+    route_limits=[_route_limit("GET", "actor", 1024)],
+  )
+  broken_allowance = _service_app(db, access="public", slug="broken-allowance")
+  _set_public_allowance(db, broken_allowance, 1000)
+
+  public = client.get("/api/app-services/broken-limits/status")
+  assert public.status_code == 503
+  assert public.json()["detail"] == "Accepted app service route limits are invalid."
+  shared = client.get("/api/services/broken-limits/status", headers=auth)
+  assert shared.status_code == 503
+  assert client.get("/api/app-services/broken-allowance/status").status_code == 503
+
+
+def test_only_raising_the_public_allowance_widens_review():
+  from app.app_capabilities import contract_from_manifest, diff_contracts
+
+  def contract(**service):
+    return contract_from_manifest(_public_manifest(**service))
+
+  accepted = contract(public_requests_per_minute=480)
+  assert diff_contracts(accepted, contract(public_requests_per_minute=600))["widens"] is True
+  assert diff_contracts(accepted, contract(public_requests_per_minute=120))["widens"] is False
+  assert diff_contracts(accepted, contract())["widens"] is False
+  assert diff_contracts(contract(), contract(public_requests_per_minute=61))["widens"] is True
 
 
 def test_editing_a_local_app_keeps_its_accepted_public_allowance(client, auth, db):

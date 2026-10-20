@@ -16,7 +16,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from app.manifest_contract import (
-  SERVICE_REQUEST_MAX_BYTES, accepted_service_max_bytes, accepted_service_route_limits,
+  PUBLIC_SERVICE_REQUESTS_PER_MINUTE, SERVICE_REQUEST_MAX_BYTES,
+  accepted_service_max_bytes, accepted_service_route_limits,
 )
 
 
@@ -1031,6 +1032,13 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     # A legacy accepted service without these fields had the 8 MiB default.
     old = SERVICE_REQUEST_MAX_BYTES if before is None else before
     new = SERVICE_REQUEST_MAX_BYTES if after is None else after
+    return type(old) is not int or type(new) is not int or new > old
+  if path == "service.public_requests_per_minute":
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a request allowance.
+    # A public allowance is a reviewed ceiling; omitted means the default.
+    old = PUBLIC_SERVICE_REQUESTS_PER_MINUTE if before is None else before
+    new = PUBLIC_SERVICE_REQUESTS_PER_MINUTE if after is None else after
     return type(old) is not int or type(new) is not int or new > old
   if path == _ROUTE_LIMITS_PATH:
     if not any(key.startswith("service.") for key in after_leaves):

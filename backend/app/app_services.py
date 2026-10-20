@@ -894,22 +894,28 @@ def service_contract(app, *, access: str) -> dict:
   if not isinstance(entry, str) or not entry.endswith(".py"):
     raise ServiceBoundaryError("invalid_declaration", 503, "Accepted app service declaration is invalid.")
   _accepted_transfer_limits(service)
+  public_requests_per_minute(service)
   return service
 
 
 def public_requests_per_minute(service: dict) -> int:
-  """One anonymous caller's per-minute allowance for this accepted public service."""
+  """One anonymous caller's per-minute allowance for this accepted public service.
+
+  Like the transfer limits below, an accepted value the manifest contract
+  could not have produced disables the service rather than being clamped.
+  """
   from app.manifest_contract import (
     PUBLIC_SERVICE_REQUESTS_PER_MINUTE,
     PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX,
   )
   value = service.get("public_requests_per_minute", PUBLIC_SERVICE_REQUESTS_PER_MINUTE)
-  if isinstance(value, bool) or not isinstance(value, int):
-    return PUBLIC_SERVICE_REQUESTS_PER_MINUTE
-  return max(
-    PUBLIC_SERVICE_REQUESTS_PER_MINUTE,
-    min(PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX, value),
-  )
+  if type(value) is not int or not (
+    PUBLIC_SERVICE_REQUESTS_PER_MINUTE <= value <= PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX
+  ):
+    raise ServiceBoundaryError(
+      "invalid_declaration", 503, "Accepted public request allowance is invalid.",
+    )
+  return value
 
 
 def service_max_bytes(service: dict) -> int:

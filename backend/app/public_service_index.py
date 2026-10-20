@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app import app_services, commit_watch, models
+from app.manifest_contract import PUBLIC_SERVICE_REQUESTS_PER_MINUTE
 
 
 PROBE_BUCKET = "unknown"
@@ -62,8 +63,13 @@ def _build(db: Session) -> dict[str, tuple[str, int]]:
   for app in apps:
     try:
       public[app.id] = bucket(app, app_services.service_contract(app, access="public"))
+    except app_services.ServiceBoundaryError:
+      # Public, but its accepted declaration is unreadable: keep it under its
+      # own bucket so the door resolves it and answers 503, as the other
+      # service doors do, instead of treating it as an unknown id.
+      public[app.id] = (str(app.id), PUBLIC_SERVICE_REQUESTS_PER_MINUTE)
     except HTTPException:
-      continue
+      continue  # Not a public service.
   index: dict[str, tuple[str, int]] = {}
   for app in apps:
     if app.service_id is None and app.id in public:
