@@ -896,7 +896,19 @@ def test_outbound_routes_use_connect_manage_capability(
     "online": True,
     "created_at": 1,
   }
-  monkeypatch.setattr(connect_outbound, "list_profiles", lambda: [public])
+  # Profile files are read under the outbound lock pairing also holds, so
+  # the listing runs off the event loop.
+  listed_on_loop = []
+
+  def list_profiles():
+    try:
+      asyncio.get_running_loop()
+      listed_on_loop.append(True)
+    except RuntimeError:
+      listed_on_loop.append(False)
+    return [public]
+
+  monkeypatch.setattr(connect_outbound, "list_profiles", list_profiles)
 
   denied = _app_auth(client, auth, granted=False)
   assert client.get("/api/connect/outbound", headers=denied).status_code == 403
@@ -904,6 +916,7 @@ def test_outbound_routes_use_connect_manage_capability(
   assert client.get("/api/connect/outbound", headers=granted).json() == {
     "connections": [public], "agent_access": True,
   }
+  assert listed_on_loop == [False]
 
 
 def test_outbound_mutations_require_permission_and_report_domain_failures(

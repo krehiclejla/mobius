@@ -84,3 +84,18 @@ def test_standard_check_details_cross_the_tool_boundary_without_shell_scripting(
   assert payload["kind"] == "github_checks"
   assert payload["github_checks"] == args["github_checks"]
   assert payload["command"] is None and payload["delay_secs"] is None
+
+
+def test_wait_for_decision_is_exact_top_level_operation_not_an_external_poll(monkeypatch):
+  control = _control(monkeypatch)
+  captured = []
+  monkeypatch.setattr(control._WAITS, "_call", lambda *args: captured.append(args) or {"status": "waiting"})
+  assert control.WAIT_FOR_DECISION_TOOL in control.OWNER_TOOLS
+  assert control.WAIT_FOR_DECISION_TOOL not in control.DELEGATED_TOOLS
+  assert control._call_wait_for_decision({"chat_id": "source", "question_id": "card"}) == {"status": "waiting"}
+  assert captured == [("POST", "/api/chat-waits/decision", {"chat_id": "source", "question_id": "card"})]
+  assert "wait_for_decision" in control.DECLARE_WAIT_DESCRIPTION
+  for bad in ({}, {"chat_id": "source", "question_id": "card", "deadline_secs": 1},
+              {"chat_id": "source", "question_id": ""}):
+    with pytest.raises(ValueError):
+      control._call_wait_for_decision(bad)

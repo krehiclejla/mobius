@@ -1,5 +1,5 @@
 // A notification can ask an already-mounted chat to reveal its one actionable
-// question. This is intentionally transient: it must not replace the owner's
+// question, or one exact saved decision (including an answered card). This is transient: it must not replace the owner's
 // saved reading position or replay after a reload.
 const requests = new Map()
 const listeners = new Map()
@@ -9,10 +9,10 @@ function notify(chatId) {
   for (const listener of listeners.get(chatId) || []) listener()
 }
 
-export function requestChatQuestionReveal(chatId) {
+export function requestChatQuestionReveal(chatId, questionId = null) {
   const id = String(chatId || '')
   if (!id) return null
-  const request = { id: ++serial }
+  const request = { id: ++serial, ...(questionId ? { questionId } : {}) }
   requests.set(id, request)
   notify(id)
   return request
@@ -42,4 +42,11 @@ export function subscribeChatQuestionReveal(chatId, listener) {
     set.delete(listener)
     if (set.size === 0) listeners.delete(id)
   }
+}
+
+/** Exact-card requests must never fall back to a different pending card. */
+export function questionRevealElement(root, questionId, pendingElement) {
+  if (!questionId) return pendingElement
+  return [...(root?.querySelectorAll('[data-question-id]') || [])]
+    .find(element => element.dataset.questionId === questionId) || null
 }

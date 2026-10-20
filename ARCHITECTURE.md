@@ -1242,9 +1242,88 @@ saved card, or genuine automatic wake. The existing writer/continuation runner
 admits one bounded settlement pass after a clean unhanded ending; another such
 ending records a visible technical recovery failure, not a fabricated outcome.
 No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
-Goal labels derive only from that Goal's cards, Waits, helpers and eligible parks;
+Settlement and Goal labels share `chat_handoffs.goal_handoffs`: typed records
+for that exact Goal's cards, Waits, self-resuming helpers, claim dependencies,
+and eligible parks. A viable pending claim follow or owed automatic outcome
+prevents settlement; a missing or failed source is manual recovery, not a
+healthy handoff. The Goal presentation names the source chat and condition
+without implying a polling deadline;
 chat-wide handoff guards conflicting actions without borrowing another task's
 question. Retired revision-budget columns remain inert historical schema.
+
+
+Claim follows are `GoalDependency` rows, separate from observable/timed Waits.
+A collision or approval de-duplication registers the exact open top-level Goal
+against the claim's **acquisition UUID**, atomically with the ownership decision.
+Transfers retain that UUID; release then reacquisition gets a new UUID. Helpers,
+Goal-less callers, self-follows and direct A↔B cycles receive explicit no-follow
+results. Transfer checks existing subscribers too and rolls back if the former
+open Goal cannot retain its follow. The policy is 64 outstanding claim follows
+per Goal, independent of the eight-Wait cap. Longer cycles are not forbidden by
+admission; a detected chain of stalled sources is recovery, not promised progress.
+Graph mutation holds the tenant fence and refreshes acquisition ownership before
+checking any edge, including an existing follow. A former follower becoming the
+executor is suppressed by exact Goal, not by chat and not withdrawn: other
+Goals in that chat remain subscribed. A valid round-trip transfer can restore
+its pending follow after quota and cycle checks. Withdrawn or settled rows never
+revive this way. Same-chat Goal ownership rebinds use this same transition,
+so changing physical executors cannot strand a previously suppressed Goal.
+
+`goal_dependency_sources` owns registration and immutable source outcomes. Finish,
+release, Goal hold/end and chat deletion stamp subscribed outcomes in the same
+transaction as the source transition. A failed or clean-ended source without an
+exact-Goal native continuation produces factual `owner_not_progressing`, never
+automatic takeover. Another Goal's run or card is not proof of source liveness.
+Native progress ownership is shared with `goal_handoffs`, including accepted
+exact-Goal queued continuations between answer commit and run admission. Source
+nonviability reconciliation is a writer command serialized with those queue/run
+transitions, not a foreign-session snapshot or a cross-chat asyncio lock.
+`goal_dependencies` owns selection and delivery through the existing continuation
+queue, writer and supervisor. Scheduling is not receipt: only successful provider
+execution of the exact waiting Goal acknowledges its admitted result set. Held
+Goals retain results without reopening; terminal Goals retire them; dependent
+chat deletion withdraws them even if the chat is restored. Exhausted/ambiguous
+carriers surface manual recovery; there is no unlimited retry or new runner.
+
+Migration 0090 creates the dependency schema and claim acquisition identities.
+It performs **no legacy interest backfill**, even for apparently running sources
+or saved cards. A persisted running marker is not proof of a live executor after
+startup recovery. Every `AgentWorkInterest` stays unchanged in the old table as
+non-waking audit history; only a new follow creates a `GoalDependency`. This
+avoids inventing acquisition identity, receipt or wake authority for old work.
+Runtime follows and chat retention never read or write that table. The original
+schema is retained: audit rows have no retention guarantee after their chat is
+hard-purged. The existing chat FK may cascade-delete them; with FK enforcement
+off they may remain as inert historical provenance. Nothing reads those rows or
+relies on their presence after purge. No audit-table rebuild or destructive
+migration is applied. Completion and release send no follower peer
+notice and use no notification latch: immutable dependency outcomes drive
+exact-Goal delivery. The retry-safe claim notice and `notification_revision`
+remain solely for prompt transfer/revocation interrupts to the former executor.
+A separate `transfer_notice_revision` preserves the transfer event identity when
+completion or release advances the claim revision before its interrupt is sent.
+Ordinary peer messages and ambiguous historical messages remain intact.
+
+The same exact dependency projection supplies drawer, runtime and Goal details.
+Deliberate holds use a distinct quiet square; a stalled work source never promises
+an automatic dependency wake. Source cards and the Goal owning a live acquisition
+show deduplicated, owner-only `needed_by` chat backlinks in their existing details.
+These are read-side context, not requests, notifications or new attention.
+Exact-chat embeds receive only dependency facts already saved in their own chat,
+without foreign-chat enrichment or navigation IDs (including nested outcomes).
+Settled dependencies use Waiting's clock and typed outcome in transcript history,
+anchored only to a visible segment of the exact receiving or declaring run.
+Retiring an unresolved subscription retains safe source identity without inventing
+a source result or receiving-run receipt. The owner can **Stop following** one
+pending or owed dependency in expanded Goal details. Its authenticated route
+submits `WithdrawGoalDependency`: the writer preserves any saved outcome, stamps
+`withdrawn`, removes only its queued notices and invalidates its unentered
+carrier. Already-entered work is not stopped, but cannot receipt that withdrawn
+edge. Source cards/claims, other follows and the open/held Goal are unchanged;
+with no handoff left, ordinary settlement or Resume remains accountable.
+Repeat registration and transfers never re-arm a withdrawn edge. The bounded unfinished-settlement error
+code remains durable, but reads as calm recovery with explicit Resume rather than
+an alarm; unrelated execution failures retain their failure presentation.
 
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired
@@ -1266,8 +1345,8 @@ No model summarizer, delta cache, extra focus record,
 or duplicate copy of the incoming message is involved. Agents continue working
 in their current run rather than ending turns to refresh context. Task additions and updates operate on the existing record. Completion
 is an explicit revision-checked operation with verification evidence and no
-unfinished tasks or running helpers. It takes delivery of the Goal's fired
-Waits so they do not wake a finished Goal; an open card or armed Wait does not
+unfinished tasks or running helpers. It retires the Goal's fired
+Waits without claiming provider receipt, so they do not wake a finished Goal; an open card or armed Wait does not
 block it. A green plan alone is not completion.
 
 Workspace `AgentWorkClaim` rows are narrower: they serialize one shared action
@@ -1354,9 +1433,26 @@ admission, and process-group cleanup uses the session leader PID even after the
 shell has exited while children still hold output pipes.
 
 A terminal result has one deterministic message/run identity. Its delivery
-latch advances only after provider-task admission or proven adoption by a later
-completed owner turn, never merely after queue persistence. Fresh programmatic
-continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
+receipt advances only after a successful provider call on the exact Goal's
+receiving run, never merely after admission or queue persistence. Unowned Waits
+retain chat-wide delivery. Selection, writer admission and acknowledgement all
+check the receiving run's Goal; admission freezes the carried IDs in
+`ChatRun.admitted_wait_results_json`, and `received_run_id` records the successful
+carrier. Success cannot receipt a result that fired after its prompt snapshot.
+The activation exception retains its earlier scheduling receipt (`scheduled`).
+New ordinary dispositions distinguish `delivered`, `retired_by_goal_outcome`
+and `withdrawn`; old ambiguous timestamps become `legacy_consumed`, with no
+fabricated receiving run and no historical wake storm. A Goal-owned carrier
+superseded before proven provider entry uses the existing single retry identity
+only with writer-stamped `owner_superseded_by_run_id` evidence;
+an unrelated turn cannot adopt its result. Stop/hold still blocks that wake.
+Delivery and recovery presentation select the same bounded carrier. After that
+retry fails, is interrupted, or completes without a successful receipt, the result
+stays owed for the Goal's next authorized turn and presents manual recovery,
+never another automatic replay.
+A crash after provider execution but before acknowledgement remains ambiguous:
+results stay owed, not proof of exactly-once model execution or external effects.
+Fresh programmatic continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
 parks, and manual restart holds retain authority. Exact already-committed,
 empty continuations remain attachable; ambiguous partial execution is not
 blindly replayed. Legacy source-less Wait rows and stored `auto_continuation`
@@ -1367,13 +1463,34 @@ Goal completed. A warning means a failed check or unmet deadline, not necessaril
 failure of the external work. Goal recovery uses the declaring run and will not
 restore a stopped/dismissed Goal. The wait itself is independent: chat Stop ends
 a turn/questions/consumer but does not cancel armed monitors. Deletion cancels
-armed monitors. A remaining product decision is whether Stop should also dismiss
-terminal, queued wait results: currently their undelivered row can requeue a
-notice cleared by Stop, and the wait cancel action accepts only armed rows.
+armed monitors. For Goal-less waits, the existing undelivered row can still
+requeue a notice cleared by Stop; Goal-owned results remain blocked by their
+Goal's hold. The wait cancel action continues to accept only armed rows.
 Do not broaden Stop silently while cleaning up the implementation.
 
-History markers derive from durable wait rows, using assistant timestamps as
-temporary/final anchors; no duplicate outcomes are written into chat messages.
+The ordinary Wait lifecycle remains:
+
+| Event | Armed monitor | Fired, unreceived result |
+| --- | --- | --- |
+| Stop / owner hold | Keeps observing | Kept owed; no automatic Goal reopening |
+| Later owner continuation of that Goal | Unchanged | Eligible for that exact Goal's successful receipt |
+| Explicit Goal outcome | Keeps observing | Retired, not delivered |
+| Stop waiting | Withdrawn without a wake | Existing armed-only action does not apply |
+| Chat deletion | Withdrawn in lifecycle transaction | Existing supervisor cancels on observing deletion |
+
+Deletion/restore timing for ordinary results is unchanged: restore before the
+supervisor observes deletion can retain an owed result. Goal-less waits also
+retain their existing Stop behavior. Neither is a new cross-chat dependency
+policy: dependencies share the handoff projection and exact-Goal receipt seam,
+but retain their own source-outcome and withdrawal lifecycle.
+
+History markers derive from durable wait rows, using exact receiving-run identity
+for new receipts and timestamps only for legacy or temporary anchors; no duplicate outcomes are written into chat messages.
+Explicit retirement/withdrawal markers carry their disposition and stay beside
+the declaring answer or another visible answer of their owning Goal, never an
+invented recipient. They cannot become an answer's starting cause. Legacy
+ambiguous receipts and the activation scheduling exception retain their prior
+placement; a page with no visible owning answer omits the non-waking marker.
 This currently scans terminal history and can move a temporary marker to the
 wake's answer. Measure before changing that projection or adding a history index.
 

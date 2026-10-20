@@ -201,13 +201,13 @@ test('genuine hidden failures have durable red drawer attention while restart pa
   assert.match(shell, /invalidateShellListCache\('chats'\)\.then\(refreshChats\)/)
   assert.match(shell, /api\.chats\.markFailureSeen/)
   assert.match(drawer, /needsOwnerInput[\s\S]*streaming[\s\S]*waiting[\s\S]*failed[\s\S]*building/)
-  assert.match(drawer, /className="drawer__failure-dot"/)
-  assert.match(drawer, /aria-label="Latest run failed"/)
+  assert.match(drawer, /<DrawerStatusMarker/)
+  // Accessible marker names and recovery/failure precedence are mounted in dependencyPresentation.test.js.
   const failureRule = drawerCss.match(/\.drawer__failure-dot\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(failureRule, /border-radius:\s*50%/)
   assert.match(failureRule, /background:\s*var\(--danger\)/)
   assert.doesNotMatch(failureRule, /transform:/)
-  assert.match(drawer, /recovery \? \([\s\S]*?className="drawer__recovery-icon"/)
+  assert.match(drawer, /recoveryLabel, failed, building, attentionDot/)
   const recoveryRule = drawerCss.match(/\.drawer__recovery-icon\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(recoveryRule, /border:/)
   assert.doesNotMatch(recoveryRule, /--danger/)
@@ -945,12 +945,9 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
     /for \(const cid of visibleChatIds\) clearChatAttention\(cid\)/,
     'viewing a chat must clear its completion dot',
   )
-  assert.match(
-    drawer,
-    /ownerRequired \? \([\s\S]*?drawer__owner-input-dot[\s\S]*?: streaming \? \([\s\S]*?drawer__streaming-dot[\s\S]*?: waiting \? \([\s\S]*?drawer__waiting-icon[\s\S]*?: attentionDot \? \([\s\S]*?drawer__attention-dot/,
-    'owner input and active work must precede durable waiting and unseen completion',
-  )
-  assert.match(drawer, /drawer__attention-diamond drawer__owner-input-dot/)
+  assert.match(drawer, /<DrawerStatusMarker/, 'the single marker owner is mounted in each drawer row')
+  // Shape, accessible names and precedence are rendered behavior contracts in
+  // dependencyPresentation.test.js, rather than a second source-code copy.
   assert.doesNotMatch(
     drawer,
     /drawer__contribution-pending|chatFlags|pendingContribution/,

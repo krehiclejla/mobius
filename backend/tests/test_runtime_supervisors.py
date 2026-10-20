@@ -426,3 +426,64 @@ async def test_boot_file_cache_reclaim_runs_off_the_event_loop_and_failure_stays
   assert [data_dir for data_dir, _thread in calls] == ["/tmp"]
   assert calls[0][1] != loop_thread
   await supervisors.stop()
+
+
+@pytest.mark.asyncio
+async def test_capacity_tick_releases_accumulated_cache_after_the_boot_pass(
+  monkeypatch,
+):
+  """The whole point of the periodic release is that it rides the existing
+  capacity tick, off the event loop, and skips the first tick because boot
+  just advised the same paths. Without this the wiring could be deleted and
+  every file_cache unit test would still pass."""
+  import app.broadcast as broadcast_module
+  import app.capacity_monitor as capacity_module
+  import app.chat as chat_module
+  import app.chat_writer as chat_writer_module
+  import app.file_cache as file_cache_module
+  import app.resource_pressure as pressure_module
+  import app.runtime_supervisors as supervisors_module
+  from app.config import get_settings
+
+  broadcast = SystemBroadcast()
+  events = []
+  release_threads = []
+  loop_thread = threading.get_ident()
+
+  async def no_chats(*_args, **_kwargs):
+    return chat_module.ContinuationSweepResult()
+
+  def capacity_tick(*_args, **_kwargs):
+    events.append("tick")
+    return {"alerted": False, "notification_id": None, "tier": None, "snapshot": {}}
+
+  def release(data_dir):
+    events.append(data_dir)
+    release_threads.append(threading.get_ident())
+    return None
+
+  monkeypatch.setattr(broadcast_module, "get_system_broadcast", lambda: broadcast)
+  monkeypatch.setattr(supervisors_module, "SessionLocal", _EmptySession)
+  monkeypatch.setattr(supervisors_module, "CAPACITY_MONITOR_INTERVAL_SECS", 0)
+  monkeypatch.setattr(chat_module, "sweep_reset_parks", no_chats)
+  monkeypatch.setattr(capacity_module, "run_capacity_tick", capacity_tick)
+  monkeypatch.setattr(
+    pressure_module, "resource_status",
+    lambda *_a, **_k: {"pressure": {"disk": {"state": "normal"}}},
+  )
+  monkeypatch.setattr(
+    chat_writer_module, "rearm_transcript_conversion", lambda *_a: False,
+  )
+  monkeypatch.setattr(file_cache_module, "reclaim_accumulated_cache", release)
+
+  supervisors = _supervisors()
+  await supervisors._start_chat_supervisors()
+  for _ in range(200):
+    if len(events) >= 3:
+      break
+    await asyncio.sleep(0.01)
+  await supervisors.stop()
+
+  data_dir = get_settings().data_dir
+  assert events[:3] == ["tick", "tick", data_dir]
+  assert release_threads[0] != loop_thread

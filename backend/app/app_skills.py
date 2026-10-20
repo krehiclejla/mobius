@@ -365,11 +365,88 @@ async def deactivate_app_skills(app_id: int) -> list[str]:
   return warnings
 
 
+def holds_restorable_skill(db: Session, skills_dir: Path, skill_id: str) -> bool:
+  """Whether a set-aside app skill could still come back under ``skill_id``.
+
+  An inactive record exists while its app is deleted but recoverable, or after
+  a restore left the skill aside because another skill had taken the name.
+  It reserves the name only while restore could still use it: the preserved
+  bytes exist and the app row does (soft-deleted rows stay until purge). A
+  record a failed purge left behind must not block the name forever, the same
+  rule the sync phase applies to a hard-purged owner.
+  """
+  _, records = _read_app_skill_records(skills_dir)
+  for rel, rec in records.items():
+    if (
+      not isinstance(rec, dict)
+      or rec.get("active", True) is not False
+      or _app_skill_id(rel) != skill_id
+    ):
+      continue
+    app_id = rec.get("app_id")
+    preserved = skills_dir / ".inactive" / str(app_id) / rel
+    if not preserved.is_file():
+      continue
+    if db.query(models.App.id).filter(models.App.id == app_id).first():
+      return True
+  return False
+
+
+def _restore_blocker(skills_dir: Path, rel: str, installed: dict) -> str | None:
+  """Why another skill now holds this record's id, or None when it is free.
+
+  Mirrors the sync phase's collision rule: an installed skill keeps its name,
+  and one id never holds both shapes. A same-shape file without install
+  provenance is not a blocker; restore preserves it under ``conflicts/``.
+  """
+  skill_id = _app_skill_id(rel)
+  if isinstance(installed.get(skill_id), dict):
+    return f"installed skill {skill_id!r} now holds this name"
+  other_shape = skills_dir / (skill_id if "/" not in rel else f"{skill_id}.md")
+  if os.path.lexists(other_shape):
+    return f"{other_shape.name!r} now holds this name in the other shape"
+  return None
+
+
+def _restore_one(skills_dir: Path, app_id: int, rel: str, rec: dict) -> str | None:
+  """Move one preserved skill file back into place; returns any warning."""
+  inactive = skills_dir / ".inactive" / str(app_id) / rel
+  target = skills_dir / rel
+  warning = None
+  target.parent.mkdir(parents=True, exist_ok=True)
+  if target.exists():
+    if target.read_bytes() != inactive.read_bytes():
+      conflict = skills_dir / ".inactive" / str(app_id) / "conflicts" / rel
+      conflict.parent.mkdir(parents=True, exist_ok=True)
+      os.replace(target, conflict)
+      warning = f"skill {rel}: preserved a file created while app was inactive"
+    else:
+      target.unlink()
+  os.replace(inactive, target)
+  rec["active"] = True
+  rec.pop("inactive_path", None)
+  rec.pop("inactive_sha256", None)
+  rec["restored_at"] = datetime.now(UTC).isoformat()
+  return warning
+
+
 async def restore_app_skills(app_id: int) -> list[str]:
-  """Restore exact tombstoned skill bytes and their discovery records."""
+  """Restore exact tombstoned skill bytes and their discovery records.
+
+  A skill whose id another skill took meanwhile stays set aside, bytes and
+  inactive record intact, and the restore reports it instead of displacing
+  the newer skill.
+  """
+  from app import skills as skills_mod
+
   warnings: list[str] = []
   skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
   async with fs_locks.shared_skills_lock():
+    # Settle a crash-interrupted direct install first so its name is decided.
+    skills_mod.reconcile_installed(skills_dir)
+    installed = skills_mod._read_sidecar(
+      skills_dir / skills_mod.INSTALLED_SKILLS_SIDECAR
+    )
     sidecar, records = _read_app_skill_records(skills_dir)
     changed = False
     for rel, rec in records.items():
@@ -382,33 +459,21 @@ async def restore_app_skills(app_id: int) -> list[str]:
       if not _is_app_skill_rel(rel):
         warnings.append(f"skill record {rel!r}: invalid path")
         continue
-      inactive = skills_dir / ".inactive" / str(app_id) / rel
-      target = skills_dir / rel
-      if not inactive.is_file():
+      if not (skills_dir / ".inactive" / str(app_id) / rel).is_file():
         warnings.append(f"skill {rel}: preserved bytes are missing")
         continue
+      blocker = _restore_blocker(skills_dir, rel, installed)
+      if blocker:
+        warnings.append(f"skill {rel}: not restored, {blocker}")
+        continue
       try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-          if target.read_bytes() != inactive.read_bytes():
-            conflict = (
-              skills_dir / ".inactive" / str(app_id) / "conflicts" / rel
-            )
-            conflict.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(target, conflict)
-            warnings.append(
-              f"skill {rel}: preserved a file created while app was inactive"
-            )
-          else:
-            target.unlink()
-        os.replace(inactive, target)
-        rec["active"] = True
-        rec.pop("inactive_path", None)
-        rec.pop("inactive_sha256", None)
-        rec["restored_at"] = datetime.now(UTC).isoformat()
-        changed = True
+        warning = _restore_one(skills_dir, app_id, rel, rec)
       except OSError as exc:
         warnings.append(f"skill {rel}: could not restore ({exc})")
+        continue
+      changed = True
+      if warning:
+        warnings.append(warning)
     if changed:
       atomic_write(
         sidecar,

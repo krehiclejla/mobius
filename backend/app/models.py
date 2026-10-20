@@ -15,6 +15,7 @@ separate encrypted app-secrets API.
 
 import secrets
 import json
+import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -418,6 +419,14 @@ class ChatRun(Base):
   # ambiguous even with no transcript output. NULL preserves that ambiguity
   # for pre-admission-ledger runs upgraded from an older backend.
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
+  # The exact ordinary Wait result set verified at provider entry. Success
+  # cannot receipt a result that fired after this immutable prompt snapshot.
+  admitted_wait_results_json = Column(JSON, nullable=True, default=None)
+  # Exact dependency results admitted to this physical provider run.
+  admitted_dependency_results_json = Column(JSON, nullable=True, default=None)
+  # Proof that an owner send, rather than crash recovery, displaced this
+  # never-entered Wait carrier. Its exact Goal can safely retry once.
+  owner_superseded_by_run_id = Column(String(64), nullable=True, default=None)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
   # Upgraded databases may also keep a retired, unused browser_grant_epoch.
@@ -726,10 +735,13 @@ class ChatWait(Base):
   last_checked_at = Column(DateTime, nullable=True, default=None)
   met_at = Column(DateTime, nullable=True, default=None)
   cancelled_at = Column(DateTime, nullable=True, default=None)
-  # Retry latch for the resume, stamped after the wake turn starts or queues.
-  # At-least-once across a crash between transactions, matching delegations:
-  # a redelivered result beats a silently lost one.
+  # Ordinary results are acknowledged only by a successful exact-Goal run.
+  # Activation retains its separate scheduling receipt. Old ambiguous latches
+  # are preserved as legacy_consumed, never invented provider receipts.
   resume_delivered_at = Column(DateTime, nullable=True, default=None)
+  result_disposition = Column(String(32), nullable=True, default=None)
+  result_disposed_at = Column(DateTime, nullable=True, default=None)
+  received_run_id = Column(String(64), nullable=True, default=None)
   created_at = Column(DateTime, nullable=False, default=lambda: now_naive_utc())
 
 
@@ -1598,6 +1610,10 @@ class AgentWorkClaim(Base):
   )
 
   id = Column(String(64), primary_key=True)
+  # Stable through transfer, new on reacquisition. Revision is ownership state,
+  # not acquisition identity.
+  acquisition_id = Column(String(64), nullable=True, index=True,
+                          default=lambda: uuid.uuid4().hex)
   owner_id = Column(Integer, ForeignKey("owner.id", ondelete="CASCADE"),
                     nullable=False, index=True)
   work_key = Column(String(256), nullable=False)
@@ -1614,6 +1630,7 @@ class AgentWorkClaim(Base):
   notification_revision = Column(
     Integer, nullable=False, default=1, server_default="1"
   )
+  transfer_notice_revision = Column(Integer, nullable=True)
   claimed_at = Column(DateTime, nullable=False, default=now_naive_utc)
   updated_at = Column(DateTime, nullable=False, default=now_naive_utc)
   released_at = Column(DateTime, nullable=True)
@@ -1622,7 +1639,7 @@ class AgentWorkClaim(Base):
 
 
 class AgentWorkInterest(Base):
-  """A Goal following work that another chat currently owns."""
+  """Non-waking audit history of the retired chat-wide claim follow."""
 
   __tablename__ = "agent_work_interests"
   __table_args__ = (
@@ -1643,6 +1660,56 @@ class AgentWorkInterest(Base):
   goal_id = Column(String(64), nullable=False, index=True)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
   resolved_at = Column(DateTime, nullable=True)
+
+
+class SavedDecisionCard(Base):
+  """Safe identity and disposition of one saved Q&A/approval, never secrets.
+
+  Source retention removes this row; subscribed outcomes survive independently.
+  """
+  __tablename__ = "saved_decision_cards"
+  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True)
+  question_id = Column(String(64), primary_key=True)
+  source_goal_id = Column(String(64), nullable=True)
+  family = Column(String(16), nullable=False)
+  summary = Column(Text, nullable=False)
+  outcome_json = Column(JSON, nullable=True)
+  resolved_at = Column(DateTime, nullable=True)
+
+
+class GoalDependency(Base):
+  """One Goal's durable subscription to an exact external acquisition/card.
+
+  Legacy interests remain only in AgentWorkInterest as non-waking history.
+  """
+
+  __tablename__ = "goal_dependencies"
+  __table_args__ = (
+    UniqueConstraint("waiting_goal_id", "target_key", name="uq_goal_dependency_target"),
+    Index("ix_goal_dependencies_owed", "waiting_goal_id", "resolved_at", "result_disposition"),
+    Index("ix_goal_dependencies_source", "target_kind", "target_acquisition_id", "resolved_at"),
+  )
+
+  id = Column(String(64), primary_key=True)
+  waiting_goal_id = Column(String(64), nullable=False, index=True)
+  waiting_chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
+  created_by_run_id = Column(String(64), nullable=True)
+  task_id = Column(String(64), nullable=True)
+  target_kind = Column(String(32), nullable=False)
+  target_key = Column(String(160), nullable=False)
+  target_claim_id = Column(String(64), nullable=True, index=True)
+  target_acquisition_id = Column(String(64), nullable=True)
+  target_chat_id = Column(String(64), nullable=True)
+  target_question_id = Column(String(64), nullable=True)
+  outcome_json = Column(JSON, nullable=True)
+  resolved_at = Column(DateTime, nullable=True)
+  result_disposition = Column(String(32), nullable=True)
+  result_disposed_at = Column(DateTime, nullable=True)
+  received_run_id = Column(String(64), nullable=True)
+  withdrawn_at = Column(DateTime, nullable=True)
+  # Temporary self-follow suppression on transfer, never a user withdrawal.
+  owner_suppressed_at = Column(DateTime, nullable=True)
+  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
 class ProjectPresence(Base):

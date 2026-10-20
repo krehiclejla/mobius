@@ -728,7 +728,10 @@ async def list_outbound_access(
   _owner: models.Owner = Depends(get_owner_or_app_with_connect_manage),
 ) -> dict:
   # ``agent_access`` tells Connect this platform can grant agent access.
-  return {"connections": connect_outbound.list_profiles(), "agent_access": True}
+  # Profile files are read under the outbound lock, which pairing also holds;
+  # neither the reads nor that wait may block the event loop.
+  connections = await asyncio.to_thread(connect_outbound.list_profiles)
+  return {"connections": connections, "agent_access": True}
 
 
 @router.post(

@@ -800,3 +800,112 @@ test('an owner command restored from tab storage and sent unedited stays when ac
   await action
   assert.equal(view(pane).input, '/compact Restored', 'the guest partition is never written')
 })
+
+
+// The command leaves the box when the server announces that it started
+// compacting, not when the compaction ends: a long compaction must not leave
+// "/compact" looking unsent. The edge is the shared store's `compacting` value
+// reaching this hook as serverCompactingKind.
+const serverStartsCompacting = (pane, props) => pane.rerender({ ...props, serverCompactingKind: 'compact' })
+
+test('the command leaves the chat box when the server starts compacting, before the compaction ends', async t => {
+  const chatId = 'edge-clears'
+  const { posts } = installApi(t)
+  persistComposerDraft(chatId, '', [attachment])
+  const { pane, props } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep the plan')
+  serverStartsCompacting(pane, props)
+  await flush()
+  assert.deepEqual(view(pane), { input: '', files: ['plan.pdf'], sendFailure: null }, 'uploads are not the command')
+  assert.deepEqual(readComposerDraft(chatId), { input: '', attachments: [attachment] })
+  completed(posts[0])
+  await action
+  assert.deepEqual(view(pane), { input: '', files: ['plan.pdf'], sendFailure: null })
+  assert.equal(posts.length, 1)
+})
+
+for (const [name, edit] of Object.entries(newerEdits)) {
+  test(`a newer ${name} wins over the server starting to compact`, async t => {
+    const chatId = `edge-fence-${name}`
+    const { posts } = installApi(t)
+    persistComposerDraft(chatId, '', [attachment])
+    const { pane, props } = mountPane(t, chatId)
+    const action = submitFromPane(pane, chatId, '/compact Old command')
+    edit(pane.result.current.draft)
+    const newer = view(pane)
+    serverStartsCompacting(pane, props)
+    await flush()
+    assert.deepEqual(view(pane), newer)
+    assert.equal(readComposerDraft(chatId).input, newer.input)
+    completed(posts[0])
+    await action
+    assert.deepEqual(view(pane), newer)
+  })
+}
+
+test('a pane that did not submit the command keeps it when the server starts compacting', async t => {
+  const chatId = 'edge-other-pane'
+  installApi(t)
+  persistComposerDraft(chatId, '/compact Typed in another pane')
+  const { pane, props } = mountPane(t, chatId)
+  serverStartsCompacting(pane, props)
+  await flush()
+  assert.equal(view(pane).input, '/compact Typed in another pane')
+})
+
+test('a refused request never starts compacting, so the command is still there to edit', async t => {
+  const chatId = 'edge-refused'
+  const { posts } = installApi(t)
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep refused')
+  posts[0].resolve(Response.json({ detail: 'Chat is busy' }, { status: 409 }))
+  await action
+  assert.equal(view(pane).input, '/compact Keep refused')
+  assert.match(view(pane).sendFailure, /couldn’t send/)
+})
+
+test('after the server started compacting, a failed or paused batch leaves the box clear and the progress card owns the outcome', async t => {
+  const chatId = 'edge-then-pause'
+  const { posts } = installApi(t)
+  const { pane, props } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep paused')
+  serverStartsCompacting(pane, props)
+  await flush()
+  posts[0].resolve(Response.json({ ok: false, progress: { state: 'paused', recovery_id: 'r-edge' } }))
+  await action
+  assert.equal(view(pane).input, '')
+  assert.equal(pane.result.current.compact.compactionProgress.recovery_id, 'r-edge', 'Continue stays available')
+})
+
+test('A to B to A: the server starting to compact runs no setter from the retired activation', async t => {
+  const chatA = 'edge-retire-a', chatB = 'edge-retire-b'
+  const submitted = '/compact Keep it'
+  const writes = []
+  persistComposerDraft(chatA, submitted)
+  const { hook, props, posts } = setup(t, {
+    ...boundDraft(chatA, writes), inputValueRef: { current: submitted },
+  })
+  const action = hook.result.current.runCompactCommand('Keep it', submitted)
+  hook.rerender({ ...props, ...boundDraft(chatB, writes) })
+  hook.rerender(props)
+  hook.rerender({ ...props, serverCompactingKind: 'compact' })
+  await flush()
+  assert.deepEqual(writes, [])
+  assert.equal(readComposerDraft(chatA).input, submitted)
+  completed(posts[0])
+  await action
+  assert.deepEqual(writes, [])
+})
+
+test('a guest command stays when the server starts compacting', async t => {
+  const chatId = 'edge-guest'
+  const space = workspaces(t)
+  space.guest()
+  installApi(t)
+  const { pane, props } = mountPane(t, chatId)
+  await flush()
+  submitFromPane(pane, chatId, '/compact Guest command')
+  serverStartsCompacting(pane, props)
+  await flush()
+  assert.equal(view(pane).input, '/compact Guest command')
+})

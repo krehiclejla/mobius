@@ -2126,7 +2126,11 @@ async def delete_project(
         from app.shared_app_retention import stage_project_shared_app_delete
         stage_project_shared_app_delete(db, str(project.id), deleted_at)
         from app.chat_waits import stage_cancel_waits_for_chat
+        from app.decision_cards import stage_delete_decisions
+        from app.goal_dependencies import stage_retire_chat_dependencies
         for chat in chats:
+          stage_delete_decisions(db, chat)
+          stage_retire_chat_dependencies(db, chat.id)
           stage_cancel_waits_for_chat(db, chat.id)
           chat.deleted_at = deleted_at
         recovery_notification_id = stage_recovery_notification(

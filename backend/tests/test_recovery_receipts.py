@@ -602,7 +602,7 @@ def test_recovery_waits_for_all_destructive_cleanup_before_starting_a_new_run(
   asyncio.run(race())
 
 
-def test_follower_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
+def test_dependency_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
   client, auth, db, chat, monkeypatch,
 ):
   import httpx
@@ -625,10 +625,8 @@ def test_follower_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
     title_source="Before deletion",
   )).result(timeout=5)
   monkeypatch.setattr("app.agent_work_claims.stage_release_claims_for_chat", lambda *_: [
-    ReleasedClaim("claim-id", "test:cleanup-followers", 2, ["follower-id"]),
+    ReleasedClaim("claim-id", "test:cleanup-followers", 2),
   ])
-  monkeypatch.setattr("app.agent_coordination.send_work_claim_notice", lambda *_args, **_kwargs: None)
-  monkeypatch.setattr("app.agent_work_claims.acknowledge_notice", lambda *_args, **_kwargs: None)
 
   async def race():
     delivering = asyncio.Event()
@@ -641,7 +639,7 @@ def test_follower_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
       delivering.set()
       await release_delivery.wait()
 
-    monkeypatch.setattr("app.agent_coordination.deliver_peer_recipients", deliver)
+    monkeypatch.setattr("app.goal_dependencies.deliver_pending_dependencies", deliver)
     async with httpx.AsyncClient(
       transport=httpx.ASGITransport(app=application), base_url="http://test",
     ) as ac:

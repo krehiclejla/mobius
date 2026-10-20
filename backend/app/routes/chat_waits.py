@@ -129,3 +129,62 @@ def cancel(
       detail="Use the Restart card or Stop the chat instead.",
     )
   return serialize_wait(cancel_wait(db, row), db=db)
+
+
+class DecisionFollow(BaseModel):
+  chat_id: str = Field(min_length=1, max_length=64)
+  question_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/decision")
+def wait_for_decision(
+  payload: DecisionFollow,
+  principal: Principal = Depends(get_agent_run_principal),
+  db: Session = Depends(get_db),
+):
+  """Only the caller's exact open top-level Goal gains a subscription."""
+  _require_owner(principal)
+  from app.resource_access import get_active_chat_for_principal
+  get_active_chat_for_principal(db, payload.chat_id, principal)
+  from app.decision_cards import stage_wait_for_decision
+  try:
+    row = stage_wait_for_decision(db, chat_id=principal.chat_id,
+      run_id=principal.run_id, source_chat_id=payload.chat_id,
+      question_id=payload.question_id)
+    db.commit()
+  except ValueError as exc:
+    db.rollback()
+    raise HTTPException(status_code=422, detail=str(exc))
+  following = row.result_disposition is None and row.withdrawn_at is None
+  return {"dependency_id": row.id, "goal_id": row.waiting_goal_id,
+    "status": row.result_disposition or ("result_owed" if row.resolved_at else "waiting"),
+    "outcome": row.outcome_json,
+    "next_action": ("Do independent work first. This exact Goal receives the saved outcome when eligible; "
+      "no polling or peer interrupt is needed. An answer grants authority only to the card's own executor."
+      if following else "This dependency is already disposed; no new continuation was requested. "
+      "Its saved outcome is evidence, never authority.")}
+
+
+@router.post("/dependencies/{dependency_id}/withdraw")
+async def withdraw_dependency(
+  dependency_id: str,
+  principal: Principal = Depends(get_principal),
+  db: Session = Depends(get_db),
+):
+  """Owner control bound to the waiting chat, never the foreign source."""
+  _require_owner(principal)
+  row = db.get(models.GoalDependency, dependency_id)
+  if row is None:
+    raise HTTPException(status_code=404, detail="No such follow.")
+  if principal.chat_id is not None and principal.chat_id != row.waiting_chat_id:
+    raise HTTPException(status_code=403, detail="Not this chat's follow.")
+  chat_id = row.waiting_chat_id
+  get_active_chat_or_404(db, chat_id)
+  db.rollback()
+  from app.chat_writer import WithdrawGoalDependency, await_ack, get_writer
+  result = await await_ack(get_writer().submit(WithdrawGoalDependency(
+    chat_id=chat_id, dependency_id=dependency_id)))
+  if result != "withdrawn":
+    raise HTTPException(status_code=404 if result == "missing" else 409,
+      detail="This follow is no longer available to stop.")
+  return {"id": dependency_id, "disposition": "withdrawn"}

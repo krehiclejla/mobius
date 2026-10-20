@@ -212,7 +212,7 @@ def _seed_provider_turn(monkeypatch, provider_id, cid, token):
   # Provider objects are process singletons. Patch their class, not a bound
   # instance method: restoring an instance override would shadow later tests'
   # class patches after this test's teardown.
-  provider_type = type(chat_mod.get_provider(provider_id))
+  provider_type = type(chat_mod.registered_provider(provider_id))
   monkeypatch.setattr(provider_type, "check_auth", lambda self, _data_dir: None)
 
   async def ready(self, _data_dir):
@@ -311,7 +311,11 @@ def test_empty_queue_terminal_clears_marker(monkeypatch):
 
 
 def test_settled_turn_reclaims_caches_without_retired_summary_publisher(monkeypatch):
-  """Removing routine summaries must not remove upstream terminal cleanup."""
+  """Removing routine summaries must not remove upstream terminal cleanup.
+
+  The allocator trim and page-cache reclaim run in a worker; there is no
+  explicit full collection, which held the GIL and froze the loop."""
+  import gc
   from app import allocator, file_cache
 
   _seed_owner_and_creds()
@@ -322,8 +326,15 @@ def test_settled_turn_reclaims_caches_without_retired_summary_publisher(monkeypa
   )
   _patch_claude_runner(monkeypatch)
   calls = []
-  monkeypatch.setattr(chat_mod.gc, "collect", lambda: calls.append("gc"))
-  monkeypatch.setattr(allocator, "trim_glibc", lambda: calls.append("trim"))
+  monkeypatch.setattr(gc, "collect", lambda *_gen: calls.append("gc"))
+
+  def trim():
+    try:
+      asyncio.get_running_loop()
+    except RuntimeError:
+      calls.append("trim off loop")
+
+  monkeypatch.setattr(allocator, "trim_glibc", trim)
   monkeypatch.setattr(
     file_cache, "reclaim_settled_cache",
     lambda data_dir, chat_id: calls.append((data_dir, chat_id)),
@@ -335,8 +346,8 @@ def test_settled_turn_reclaims_caches_without_retired_summary_publisher(monkeypa
     run_gen=chat_mod.current_run_generation("settled-reclaim"),
   )
 
-  assert "gc" in calls
-  assert "trim" in calls
+  assert "gc" not in calls
+  assert "trim off loop" in calls
   assert any(item[1] == "settled-reclaim" for item in calls if isinstance(item, tuple))
   assert not hasattr(chat_mod, "_ensure_chat_note")
 
@@ -972,7 +983,7 @@ def test_unsupported_provider_cleanup_clears_marker_and_pending(monkeypatch, sup
     running="running",
   )
 
-  # Force an unsupported provider: stub get_provider to return a provider
+  # Force an unsupported provider: stub registered_provider to return a provider
   # whose name matches neither SDK branch and whose check_auth passes.
   auth_checked = []
   class _Unsupported:
@@ -985,7 +996,7 @@ def test_unsupported_provider_cleanup_clears_marker_and_pending(monkeypatch, sup
     def build_env(self, **kwargs):
       return {}
 
-  monkeypatch.setattr(chat_mod, "get_provider", lambda pid: _Unsupported())
+  monkeypatch.setattr(chat_mod, "registered_provider", lambda pid: _Unsupported())
 
   def runtime_kind(_provider):
     if superseded == "before_close" and auth_checked:
@@ -2055,13 +2066,13 @@ def test_stop_during_provider_setup_does_not_dispatch_runner(
     async def stopping_ensure_auth(self, data_dir):
       await stop()
 
-    monkeypatch.setattr(type(chat_mod.get_provider(provider_id)), "ensure_auth", stopping_ensure_auth)
+    monkeypatch.setattr(type(chat_mod.registered_provider(provider_id)), "ensure_auth", stopping_ensure_auth)
   elif stop_during == "check_auth":
     real_in_threadpool = chat_mod.run_in_threadpool
 
     async def stopping_check_auth(function, *args, **kwargs):
       result = await real_in_threadpool(function, *args, **kwargs)
-      if getattr(function, "__self__", None) is chat_mod.get_provider(provider_id):
+      if getattr(function, "__self__", None) is chat_mod.registered_provider(provider_id):
         await stop()
       return result
 

@@ -972,6 +972,7 @@
 /* The owner-input handoff is the one diamond-shaped row marker; it leads the
    title so it reads as "you are needed here". */
 .drawer__attention-diamond {
+  display: inline-block;
   flex-shrink: 0;
   width: 6px;
   height: 6px;
@@ -1105,4 +1106,15 @@
 .drawer__tab-separator {
   color: var(--border);
   user-select: none;
+}
+
+/* A quiet solid square is deliberate hold, not Waiting's two-bar silhouette. */
+.drawer__hold-icon {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
 }

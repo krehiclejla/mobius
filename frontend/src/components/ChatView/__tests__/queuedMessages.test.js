@@ -81,3 +81,72 @@ test('screen readers learn that ↑ browses history, and how to move and leave o
   assert.equal(composerHistoryKeyHint({ hasEntries: false }), null, 'nothing to browse, nothing to announce')
   assert.equal(composerHistoryKeyHint({ hasEntries: true, touch: true }), null, 'touch input has no arrow keys')
 })
+
+
+test('a queued preview never cuts an emoji in half', async () => {
+  const { queuedPreview } = await import('../queuedPreview.js')
+  const text = `a${'😀'.repeat(40)}`
+  const { preview, needsTruncation } = queuedPreview(text)
+
+  assert.equal(needsTruncation, true)
+  assert.ok(preview.endsWith('😀…'), preview)
+  assert.equal(preview.isWellFormed(), true)
+})
+
+
+test('a queued preview keeps short and multi-line text readable', async () => {
+  const { queuedPreview } = await import('../queuedPreview.js')
+
+  assert.deepEqual(queuedPreview('hi'), { preview: 'hi', needsTruncation: false })
+  assert.deepEqual(
+    queuedPreview('first\nsecond'),
+    { preview: 'first …', needsTruncation: true },
+  )
+  assert.equal(queuedPreview('x'.repeat(81)).preview, `${'x'.repeat(80)}…`)
+})
+
+
+test('a queued message that is only a picture shows its file name, never a blank row', () => {
+  const picture = { name: 'image.png', size: 30000, mime_type: 'image/png' }
+  const sentForm = { cid: 'q1', content: '', attachments: [picture] }
+  // Once the server has the message, its text is only the hidden file manifest.
+  const storedForm = {
+    cid: 'q2',
+    content: '\n\n[Files in this session:\n- image.png → /data/chats/c/uploads/image.png (image/png, 30 KB)]',
+    attachments: [picture],
+  }
+  for (const item of [sentForm, storedForm]) {
+    const html = renderToStaticMarkup(createElement(QueuedMessages, { items: [item] }))
+    assert.match(html, /queued__files queued__files--only[^>]*>[\s\S]*image\.png/, item.cid)
+    assert.doesNotMatch(html, /queued__text/, `${item.cid} has no text to show`)
+  }
+})
+
+test('a queued message with text and files keeps its text and names the files after it', () => {
+  const html = renderToStaticMarkup(createElement(QueuedMessages, {
+    items: [{
+      cid: 'q1',
+      content: 'Check this layout',
+      attachments: [{ name: 'a.png' }, { name: 'b.png' }, { name: 'c.png' }],
+    }],
+  }))
+  assert.match(html, /queued__text[^>]*>Check this layout[\s\S]*queued__files"[^>]*>[\s\S]*a\.png \+2 more/)
+})
+
+test('a rejected picture-only message still says it was kept, beside its file', () => {
+  const html = renderToStaticMarkup(createElement(QueuedMessages, {
+    items: [{ cid: 'q1', content: '', attachments: [{ name: 'image.png' }], recoveryAvailable: true }],
+  }))
+  assert.match(html, /Send rejected\. Your message is kept here\.[\s\S]*queued__files--only[\s\S]*image\.png/)
+})
+
+test('a queued message without files shows no file label', async () => {
+  const { queuedFilesLabel } = await import('../queuedPreview.js')
+  assert.equal(queuedFilesLabel(undefined), '')
+  assert.equal(queuedFilesLabel([]), '')
+  assert.equal(queuedFilesLabel([{ name: 'one.pdf' }]), 'one.pdf')
+  assert.doesNotMatch(
+    renderToStaticMarkup(createElement(QueuedMessages, { items })),
+    /queued__files/,
+  )
+})

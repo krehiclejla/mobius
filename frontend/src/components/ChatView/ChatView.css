@@ -4480,6 +4480,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 }
 
 .chat__goal-history {
+  width: 100%;
+  min-width: 0;
   --lifecycle-tone: var(--green);
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);
@@ -4502,6 +4504,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 
 /* What started an answer sits above its first line. */
 .chat__answer-cause {
+  width: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -4827,6 +4831,35 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   text-overflow: ellipsis;
 }
 
+/* Files attached to a queued message. A message that is only a picture has no
+   text, so this is the whole row; with text it sits after it. */
+.queued__files {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted); /* CONTRACT: low-contrast text on opaque fill */
+}
+
+.queued__files--only {
+  flex: 1;
+  max-width: none;
+}
+
+.queued__files svg {
+  flex-shrink: 0;
+}
+
+.queued__files-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* The queued message open in the chat box (ChatInputBar's history strip says
    "Editing queued message N of M"). The row stays in place, tinted, and its
    pencil becomes a quiet label so the owner can see where the edit will land. */
@@ -4983,3 +5016,48 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 .chat__goal-execution li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; font-size: 12px; overflow-wrap: anywhere; }
 .chat__goal-helper-question { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--border-light); }
 .chat__goal-execution .chat__goal-helper-question p { margin: 0; white-space: pre-wrap; color: var(--text); }
+
+.chat__dependency-backlinks, .qcard__related-work {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.chat__dependency-backlinks { margin: 8px 0; }
+.chat__dependency-backlinks a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+.chat__dependency-backlinks ul { margin: 8px 0; padding-left: 20px; }
+.chat__dependency-backlinks summary, .qcard__related-work > summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.chat__dependency-backlinks summary::-webkit-details-marker,
+.qcard__related-work > summary::-webkit-details-marker { display: none; }
+.chat__dependency-backlinks summary:focus-visible,
+.qcard__related-work > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.qcard__related-work { margin: 10px 0; }
+
+/* Dependency navigation keeps the same small type in the rail and transcript. */
+.chat__dependency-link {
+  display: inline-block;
+  align-self: flex-start;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 3px 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+.chat__dependency-link:hover { color: var(--accent); }
+.chat__dependency-backlinks a:focus-visible,
+.chat__dependency-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+.chat__dependency-history-detail { margin: 6px 0 0 38px; font-size: 12px; }
+
+.chat__dependency-actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.chat__dependency-stop { display: flex; flex-direction: column; gap: 4px; }
+button.chat__dependency-link { cursor: pointer; background: none; border: 0; text-align: left; }
+button.chat__dependency-link:disabled { cursor: default; opacity: .55; }

@@ -990,6 +990,15 @@ def test_manual_resume_defers_product_receipt_until_original_turn_finishes(
     "ts": 1,
   }
   with SessionLocal() as setup_db:
+    if kind == "wait_result":
+      # A notice is only a carrier: admission now requires its durable Wait,
+      # not merely a correctly shaped message. Keep this result unowned.
+      setup_db.add(models.ChatWait(
+        id="manual-product", chat_id=cid, created_by_run_id=result["source_work_id"],
+        description="Preserved product result", kind="timer", status="met",
+        next_check_at=datetime.now(UTC).replace(tzinfo=None),
+        deadline_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1),
+      ))
     target = setup_db.get(models.Chat, cid)
     target.agent_settings_json = {"model": "claude-opus-4-8"}
     target.pending_messages = [result]
@@ -1022,6 +1031,9 @@ def test_manual_resume_defers_product_receipt_until_original_turn_finishes(
   assert response.json()["status"] == "started"
   with SessionLocal() as check_db:
     assert check_db.get(models.ChatRun, expected_run) is None
+    if kind == "wait_result":
+      saved_wait = check_db.get(models.ChatWait, "manual-product")
+      assert saved_wait.resume_delivered_at is None and saved_wait.result_disposition is None
   assert claimed_waits == []
   assert _chat_row(cid)["pending"] == [result]
 

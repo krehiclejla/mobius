@@ -10,7 +10,11 @@ import pytest
 from app import chat_queue, chat_waits, chat_writer, models
 from app.database import SessionLocal
 from app.platform_restart import activation_notice
-from tests.test_platform_restart_cards import _install, _submit
+# These scenarios use the same card helpers and must inherit their hermetic
+# source preflight, rather than importing the live platform during a fake action.
+from tests.test_platform_restart_cards import (
+  _install, _submit, isolated_restart_source,
+)
 
 
 def _activation_command(chat_id, wait_id, root_id, **kw):

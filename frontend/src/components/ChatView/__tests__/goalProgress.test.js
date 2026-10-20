@@ -40,6 +40,11 @@ test('runtime is authoritative including explicit clear and ordinary absence', (
   assert.doesNotMatch(chatView, /goal_activated|goal_plan_updated|goal_cleared|activeGoalPlan|newestGoalPlan|planForGoal|\/goal-plan/)
 })
 
+test('claim follow presentation preserves its exact work and source', () => {
+  const dependency = { id: 'dep', condition: 'Host repair', source_chat_title: 'Watch platform update', automatic: true }
+  assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependencies: [dependency] } }).dependencies, [dependency])
+})
+
 test('same Goal reattachment keeps its plan and disclosure identity until a new snapshot arrives', () => {
   const before = goalPresentationFromRuntime({ goal })
   const after = goalPresentationFromRuntime({ goal: { ...goal, revision: 2 } })
@@ -438,4 +443,12 @@ test('parallel helpers and retries label their work once, not their execution ro
   }
   assert.deepEqual(visibleGoalTasks(plan).map(task => task.id), ['check'])
   assert.deepEqual(visibleGoalTasks({ tasks: [], delegations: plan.delegations }), [])
+})
+
+test('foreign card is purple Waiting rather than local owner-input attention', () => {
+  const dependency = { id: 'card-dep', target_kind: 'owner_card', condition: 'Which release?', source_chat_title: 'Repair', automatic: true }
+  const waiting = goalPresentationFromRuntime({ goal: { ...goal, status: 'paused', dependencies: [dependency], handoff: { kind: 'automatic', reason: 'dependency' } } })
+  assert.equal(goalStatusLabel(waiting), 'Waiting')
+  const history = [{ ...dependency, disposition: 'delivered', outcome: { kind: 'answered' } }]
+  assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependency_history: history } }).dependency_history, history)
 })

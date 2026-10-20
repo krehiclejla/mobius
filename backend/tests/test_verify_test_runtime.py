@@ -281,24 +281,20 @@ def test_node_runtime_satisfies_the_pinned_agent_browser_engine():
 def test_amd64_agents_default_to_the_headless_shell_matching_full_chrome():
   """A 1 GB container cannot start full Chrome; the lean shell must be default.
 
-  Full Chrome stays installed for full-browser features, so the shell is
-  downloaded for exactly the version `agent-browser install` fetched and is
-  kept out of agent-browser's own `chrome-*` discovery.
+  Full Chrome stays installed for full-browser features. Both come from the
+  same pinned Chrome for Testing version, and only full Chrome sits where
+  agent-browser's own `chrome-*` discovery looks.
   """
   dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
   shell = "/browsers/headless-shell/chrome-headless-shell"
-  install_layer = dockerfile[
-    dockerfile.index("# System deps and global npm packages"):
-    dockerfile.index("# tectonic is a server-side subprocess")
+  browser_layer = dockerfile[
+    dockerfile.index("ARG CHROME_VERSION="):
+    dockerfile.index("# Only Liberation fonts are installed")
   ]
-  assert "agent-browser install" in install_layer
-  assert '[ "$#" -eq 1 ]' in install_layer
-  assert (
-    "chrome-for-testing-public/${chrome_version}/linux64/"
-    "chrome-headless-shell-linux64.zip"
-  ) in install_layer
-  assert f'/root/.agent-browser{shell} --version' in install_layer
-  assert 'grep -F "$chrome_version"' in install_layer
+  assert 'mv /tmp/cft/chrome-linux64 "${browsers}/chrome-${CHROME_VERSION}"' in browser_layer
+  assert 'mv /tmp/cft/chrome-headless-shell-linux64 "${browsers}/headless-shell"' in browser_layer
+  assert f'"${{browsers}}/headless-shell/chrome-headless-shell" --version' in browser_layer
+  assert "chown -R mobius:mobius /opt/agent-browser" in browser_layer
 
   config_layer = dockerfile[
     dockerfile.index("RUN install -d -m 0755 /app"):
@@ -308,6 +304,32 @@ def test_amd64_agents_default_to_the_headless_shell_matching_full_chrome():
     f"printf '{{\"executablePath\": \"/opt/agent-browser{shell}\"}}\\n';"
   ) in config_layer
   assert "printf '{}\\n';" not in config_layer
+
+
+def test_chrome_for_testing_downloads_are_pinned_and_sha256_verified():
+  """Chrome for Testing publishes no checksums, so the image pins its own.
+
+  An unpinned `agent-browser install` took whatever Stable was current at
+  build time and trusted it on TLS alone (mobius-os/mobius#1849).
+  """
+  dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+  assert not re.search(r"^\s*agent-browser install\b", dockerfile, re.MULTILINE)
+  assert re.search(r"^ARG CHROME_VERSION=\d+\.\d+\.\d+\.\d+$", dockerfile, re.MULTILINE)
+  for argument in ("CHROME_SHA256", "CHROME_HEADLESS_SHELL_SHA256"):
+    assert re.search(rf"^ARG {argument}=[0-9a-f]{{64}}$", dockerfile, re.MULTILINE)
+  browser_layer = dockerfile[
+    dockerfile.index("ARG CHROME_VERSION="):
+    dockerfile.index("# Only Liberation fonts are installed")
+  ]
+  assert (
+    'base="https://storage.googleapis.com/chrome-for-testing-public/'
+    '${CHROME_VERSION}/linux64"'
+  ) in browser_layer
+  assert '"$CHROME_SHA256" /tmp/chrome.zip' in browser_layer
+  assert '"$CHROME_HEADLESS_SHELL_SHA256" /tmp/headless-shell.zip' in browser_layer
+  assert "| sha256sum -c -; \\" in browser_layer
+  # Verification happens before either archive is unpacked.
+  assert browser_layer.index("sha256sum -c -") < browser_layer.index("unzip")
 
 
 def test_tectonic_release_is_verified_for_supported_image_architectures():

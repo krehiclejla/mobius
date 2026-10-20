@@ -51,28 +51,9 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 RUN useradd -m -s /bin/bash mobius
 
 # System deps and global npm packages in a single layer.
-# agent-browser downloads its own Chromium during `install`; we move it
-# to /opt/agent-browser so both root and the mobius user share a single
-# Chromium copy via the symlinks below (~/.agent-browser is where
-# agent-browser looks by default). Chrome for Testing publishes no Linux
-# ARM64 build, so arm64 images install Debian's Chromium instead; the trusted
-# agent-browser config below points agent turns at it.
-# On amd64, Chrome for Testing's chrome-headless-shell for the same version
-# goes beside full Chrome and is the agents' default (config below): full
-# Chrome's ~280 MB binary plus 12-15 processes thrash a 1 GB container until
-# startup and screenshots time out, while the shell captures in seconds. Full
-# Chrome stays for extensions and other full-browser features. The directory
-# deliberately lacks agent-browser's `chrome-` prefix so its own installed-
-# Chrome discovery never selects the shell implicitly.
-# Trust decision: neither Chrome download is integrity-checked. Pinning
-# AGENT_BROWSER_VERSION does not pin Chrome: `agent-browser install` resolves
-# the current Stable from Chrome for Testing's last-known-good feed on every
-# build, and Chrome for Testing publishes no independent checksums. Both
-# browsers therefore trust TLS to storage.googleapis.com, the same as the full
-# Chrome download already did. The `--version | grep` below only confirms that
-# the right archive was unpacked; it is not an integrity check, because a
-# tampered binary could print any version. Pinning a version and sha256 for
-# both browsers, like tectonic below, is tracked in mobius-os/mobius#1849.
+# Chrome for Testing publishes no Linux ARM64 build, so arm64 images install
+# Debian's Chromium here; the trusted agent-browser config below points agent
+# turns at it. amd64 browsers come from the pinned layer that follows.
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
 ARG CODEX_VERSION=0.162.0
@@ -89,27 +70,49 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       "@openai/codex@${CODEX_VERSION}" \
       "agent-browser@${AGENT_BROWSER_VERSION}" \
     && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
-         apt-get install -y --no-install-recommends chromium \
-         && mkdir -p /root/.agent-browser; \
-       else \
-         agent-browser install \
-         && set -- /root/.agent-browser/browsers/chrome-* \
-         && [ "$#" -eq 1 ] \
-         && chrome_version="${1##*/chrome-}" \
-         && curl -fsSL -o /tmp/chrome-headless-shell.zip \
-           "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chrome-headless-shell-linux64.zip" \
-         && unzip -q /tmp/chrome-headless-shell.zip -d /tmp/chrome-headless-shell \
-         && mv /tmp/chrome-headless-shell/chrome-headless-shell-linux64 \
-           /root/.agent-browser/browsers/headless-shell \
-         && rm -rf /tmp/chrome-headless-shell /tmp/chrome-headless-shell.zip \
-         && /root/.agent-browser/browsers/headless-shell/chrome-headless-shell --version \
-           | grep -F "$chrome_version"; \
+         apt-get install -y --no-install-recommends chromium; \
        fi \
-    && mv /root/.agent-browser /opt/agent-browser \
-    && chown -R mobius:mobius /opt/agent-browser \
     && git_version="$(git --version | awk '{print $3}')" \
     && [ "$(printf '%s\n' "2.38" "$git_version" | sort -V | head -n1)" = "2.38" ] \
     && rm -rf /root/.npm /var/lib/apt/lists/*
+
+# amd64 agent browsers: Chrome for Testing, pinned and sha256-verified like
+# tectonic below. Chrome for Testing publishes no checksums of its own, so
+# scripts/update-agent-runtimes.py records each archive's sha256 when it
+# proposes a version bump for review; a mismatch fails the build. Full Chrome
+# unpacks where agent-browser's installed-Chrome discovery looks
+# (browsers/chrome-<version>/chrome). chrome-headless-shell for the same
+# version goes beside it and is the agents' default (config below): full
+# Chrome's ~280 MB binary plus 12-15 processes thrash a 1 GB container until
+# startup and screenshots time out, while the shell captures in seconds. Full
+# Chrome stays for extensions and other full-browser features. The shell's
+# directory deliberately lacks the `chrome-` prefix so agent-browser's own
+# discovery never selects it implicitly. Both live in /opt/agent-browser so
+# root and the mobius user share one copy via the symlinks below. A separate
+# layer after apt/npm, so a Chrome bump does not reinstall system packages.
+ARG CHROME_VERSION=155.0.8059.84
+ARG CHROME_SHA256=cf0f049892dea22e6a6db26d47ed0d7776b7158edcbec4634086633df8bafcbc
+ARG CHROME_HEADLESS_SHELL_SHA256=a5d71b91aa996fef00517cd212b2dfb816b43055edefbe727e6fd562d4ae1f9c
+RUN set -eu; \
+    browsers=/opt/agent-browser/browsers; \
+    mkdir -p "$browsers"; \
+    if [ "$(dpkg --print-architecture)" = amd64 ]; then \
+      base="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64"; \
+      curl -fsSL "${base}/chrome-linux64.zip" -o /tmp/chrome.zip; \
+      curl -fsSL "${base}/chrome-headless-shell-linux64.zip" -o /tmp/headless-shell.zip; \
+      printf '%s  %s\n' \
+        "$CHROME_SHA256" /tmp/chrome.zip \
+        "$CHROME_HEADLESS_SHELL_SHA256" /tmp/headless-shell.zip \
+        | sha256sum -c -; \
+      unzip -q /tmp/chrome.zip -d /tmp/cft; \
+      unzip -q /tmp/headless-shell.zip -d /tmp/cft; \
+      mv /tmp/cft/chrome-linux64 "${browsers}/chrome-${CHROME_VERSION}"; \
+      mv /tmp/cft/chrome-headless-shell-linux64 "${browsers}/headless-shell"; \
+      rm -rf /tmp/cft /tmp/chrome.zip /tmp/headless-shell.zip; \
+      "${browsers}/chrome-${CHROME_VERSION}/chrome" --version | grep -F "$CHROME_VERSION"; \
+      "${browsers}/headless-shell/chrome-headless-shell" --version | grep -F "$CHROME_VERSION"; \
+    fi; \
+    chown -R mobius:mobius /opt/agent-browser
 
 # Only Liberation fonts are installed, and fontconfig then resolves the generic
 # serif and sans-serif families (and system-ui, which falls back to sans-serif)

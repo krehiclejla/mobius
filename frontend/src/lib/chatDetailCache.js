@@ -25,6 +25,8 @@ export function assistantAnchorKey(index) {
 export function messageMatchesKey(message, index, key) {
   if (!message || key == null) return false
   const target = String(key)
+  if (target.startsWith('question:')) return (message.blocks || []).some(block =>
+    block.type === 'question' && block.question_id === target.slice('question:'.length))
   if (messageKey(message, index) === target) return true
   if (message.cid != null && String(message.cid) === target) return true
   const role = message.role
@@ -75,6 +77,7 @@ export function chatCacheEntryState(
     const baseOffset = Number.isInteger(cached.offset) ? cached.offset : 0
     containsAnchor = cached.messages.some((message, index) => (
       messageKey(message, baseOffset + index) === String(savedAnchorKey)
+      || (String(savedAnchorKey).startsWith('question:') && messageMatchesKey(message, baseOffset + index, savedAnchorKey))
       || (
         message?.role === 'assistant'
         && !message.hidden
@@ -220,6 +223,14 @@ export function chatDetailCacheValue(data = {}) {
       project: data.project || null,
     },
   }
+}
+
+/** A bounded historical reveal is not the conversation tail. */
+export function hasUnloadedNewerMessages(window) {
+  return Number.isInteger(window?.total)
+    && Number.isInteger(window?.offset)
+    && Array.isArray(window?.messages)
+    && window.total > window.offset + window.messages.length
 }
 
 export function compactPersistedChatDetailCacheValue(

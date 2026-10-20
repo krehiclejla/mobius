@@ -34,6 +34,7 @@ from tests.test_apps_install import (  # noqa: F401
   _stub_resolver_run_chat,
   bypass_url_validation,
 )
+from tests.test_skills_platform import _fake_fetch
 
 BASE = "https://skills.test/repo/"
 SKILL_V1 = "# contributing v1\nStudy existing work first.\n"
@@ -378,6 +379,115 @@ def test_tombstoned_skill_basename_remains_reserved(
     for warning in other.json()["warnings"]
   )
   assert not (_skills_dir() / "contributing.md").exists()
+
+
+def test_direct_install_cannot_take_a_deleted_apps_restorable_skill_name(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  from app.routes import skills as skills_routes
+
+  shutil.rmtree(_skills_dir(), ignore_errors=True)
+  owner = _install(client, auth, _skill_manifest(), {
+    "index.jsx": JSX, "contributing.md": SKILL_V1,
+  })
+  assert owner.status_code == 201, owner.text
+  assert client.delete(
+    f"/api/apps/{owner.json()['id']}", headers=auth,
+  ).status_code == 204
+
+  url = "https://raw.githubusercontent.com/o/r/main/contributing.md"
+  monkeypatch.setattr(
+    skills_routes.install, "_http_get",
+    _fake_fetch({url: b"# public contributing skill\n"}),
+  )
+  try:
+    r = client.post("/api/skills/install", headers=auth, json={"url": url})
+    assert r.status_code == 409, r.text
+    assert "can still be restored" in r.json()["detail"]
+    assert not (_skills_dir() / "contributing").exists()
+  finally:
+    shutil.rmtree(_skills_dir(), ignore_errors=True)
+
+
+@pytest.mark.parametrize("leftover", ["app_gone", "bytes_gone"])
+def test_leftover_inactive_record_does_not_block_a_skill_install(
+  client, auth, bypass_url_validation, monkeypatch, leftover,
+):
+  """A record a failed purge left behind cannot be restored, so it must not
+  reserve the name forever."""
+  from app.routes import skills as skills_routes
+
+  shutil.rmtree(_skills_dir(), ignore_errors=True)
+  owner = _install(client, auth, _skill_manifest(), {
+    "index.jsx": JSX, "contributing.md": SKILL_V1,
+  })
+  assert owner.status_code == 201, owner.text
+  app_id = owner.json()["id"]
+  assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
+  if leftover == "app_gone":
+    records = _sidecar()
+    records["contributing.md"]["app_id"] = 987654
+    (_skills_dir() / ".app-skills.json").write_text(json.dumps(records))
+    preserved = _skills_dir() / ".inactive" / "987654" / "contributing.md"
+    preserved.parent.mkdir(parents=True)
+    preserved.write_text(SKILL_V1)
+  else:
+    (_skills_dir() / ".inactive" / str(app_id) / "contributing.md").unlink()
+
+  url = "https://raw.githubusercontent.com/o/r/main/contributing.md"
+  monkeypatch.setattr(
+    skills_routes.install, "_http_get",
+    _fake_fetch({url: b"# public contributing skill\n"}),
+  )
+  try:
+    r = client.post("/api/skills/install", headers=auth, json={"url": url})
+    assert r.status_code == 201, r.text
+    assert (_skills_dir() / "contributing" / "SKILL.md").is_file()
+  finally:
+    shutil.rmtree(_skills_dir(), ignore_errors=True)
+
+
+def _place_installed_dir_skill(name: str, body: str) -> Path:
+  """An install-provenance directory skill that reached disk some other way."""
+  folder = _skills_dir() / name
+  folder.mkdir(parents=True)
+  (folder / "SKILL.md").write_text(body)
+  (_skills_dir() / ".installed-skills.json").write_text(
+    json.dumps({name: {"url": f"https://example.test/{name}/SKILL.md"}}),
+  )
+  return folder
+
+
+@pytest.mark.parametrize("shape", ["folder", "flat"])
+def test_restore_keeps_a_skill_installed_under_the_same_name(
+  client, auth, bypass_url_validation, caplog, shape,
+):
+  shutil.rmtree(_skills_dir(), ignore_errors=True)
+  if shape == "folder":
+    manifest, files = _folder_manifest(), _folder_files()
+    rel = "contributing/SKILL.md"
+  else:
+    manifest = _skill_manifest()
+    files = {"index.jsx": JSX, "contributing.md": SKILL_V1}
+    rel = "contributing.md"
+  r = _install(client, auth, manifest, files)
+  assert r.status_code == 201, r.text
+  app_id = r.json()["id"]
+  assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
+  installed = _place_installed_dir_skill("contributing", "# installed\n")
+  try:
+    with caplog.at_level("WARNING", logger="mobius.apps"):
+      recovered = client.post(f"/api/apps/{app_id}/recover", headers=auth)
+    assert recovered.status_code == 200, recovered.text
+
+    assert (installed / "SKILL.md").read_text() == "# installed\n"
+    assert not (_skills_dir() / "contributing.md").exists()
+    assert not (_skills_dir() / ".inactive" / str(app_id) / "conflicts").exists()
+    assert (_skills_dir() / ".inactive" / str(app_id) / rel).is_file()
+    assert _sidecar()[rel]["active"] is False
+    assert f"skill {rel}: not restored" in caplog.text
+  finally:
+    shutil.rmtree(_skills_dir(), ignore_errors=True)
 
 
 def test_update_dropping_skill_retires_and_releases_record(

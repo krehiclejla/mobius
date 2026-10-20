@@ -109,3 +109,8 @@ test('unknown views, paths, and junk parse to null', () => {
   assert.equal(parseNotificationTarget(null), null)
   assert.equal(parseNotificationTarget(42), null)
 })
+
+test('saved decision navigation focuses the named card even after answer', () => {
+  assert.deepEqual(parseNotificationTarget('/shell/?chat=source&focus=question&question=saved-card'),
+    { view: 'chat', chatId: 'source', focusQuestion: true, questionId: 'saved-card' })
+})

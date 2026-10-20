@@ -145,3 +145,8 @@ test('active navigation mirrors cold state without retaining a stale app', () =>
   })
   assert.equal(store.values.has('moebius_active_app'), false)
 })
+
+test('decision link retains the exact question identity, not just current input focus', () => {
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?chat=source&focus=question&question=saved-card' }),
+    { view: 'chat', chatId: 'source', intent: null, focusQuestion: true, questionId: 'saved-card' })
+})

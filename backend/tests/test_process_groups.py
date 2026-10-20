@@ -252,11 +252,17 @@ def test_the_chats_browser_is_left_to_its_own_graceful_owner(tmp_path):
   must not kill it first."""
   import os
   import subprocess
+  import sys
+  # The sweep recognises the browser by its executable name. Stand in with
+  # Python, which runs under any name: multicall coreutils builds (uutils)
+  # refuse to run `sleep` as `chrome`.
   chrome = tmp_path / "chrome"
-  chrome.symlink_to("/bin/sleep")
+  chrome.symlink_to(sys.executable)
   marker = f"browser-{uuid4().hex}"
   env = dict(os.environ, **{process_groups.RUN_MARKER_ENV: marker})
-  browser = subprocess.Popen([str(chrome), "60"], env=env, start_new_session=True)
+  browser = subprocess.Popen(
+    [str(chrome), "-c", "import time; time.sleep(60)"], env=env, start_new_session=True,
+  )
   try:
     assert process_groups.terminate_run_processes(
       marker, logger=logging.getLogger(__name__), label="test",

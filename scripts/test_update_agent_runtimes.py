@@ -19,6 +19,9 @@ class RuntimeUpdateTests(unittest.TestCase):
         (self.root / "Dockerfile").write_text(
             "ARG CODEX_VERSION=1.2.3\n"
             "ARG CODEX_SDK_VERSION=1.2.3\n"
+            "ARG CHROME_VERSION=1.0.0.1\n"
+            f"ARG CHROME_SHA256={'0' * 64}\n"
+            f"ARG CHROME_HEADLESS_SHELL_SHA256={'0' * 64}\n"
             "pip install --no-deps \"openai-codex==${CODEX_SDK_VERSION}\"\n"
             "pip install \"openai-codex-cli-bin==${CODEX_SDK_VERSION}\"\n"
         )
@@ -26,7 +29,9 @@ class RuntimeUpdateTests(unittest.TestCase):
         self.codex = "1.2.4"
         self.codex_sdk = "1.2.4"
         self.claude = "1.2.4"
+        self.chrome = "1.0.0.1"
         self.urls = []
+        self.hashed = []
 
     def fetch(self, url):
         self.urls.append(url)
@@ -39,10 +44,26 @@ class RuntimeUpdateTests(unittest.TestCase):
             }})
         if "pypi.org/pypi/claude-agent-sdk/" in url:
             return json.dumps({"info": {"version": self.claude}})
+        if url == UPDATER["CHROME_FEED"]:
+            return json.dumps({"channels": {"Stable": {
+                "version": self.chrome,
+                "downloads": {name: [
+                    {"platform": "mac-arm64", "url": f"https://example.invalid/{name}.zip"},
+                    {"platform": "linux64", "url": self.chrome_url(name)},
+                ] for name in ("chrome", "chrome-headless-shell")},
+            }}})
         self.fail(f"Unexpected registry URL: {url}")
 
+    def chrome_url(self, name):
+        return (f"https://storage.googleapis.com/chrome-for-testing-public/"
+                f"{self.chrome}/linux64/{name}-linux64.zip")
+
+    def digest(self, url):
+        self.hashed.append(url)
+        return ("a" if "headless-shell" in url else "b") * 64
+
     def propose(self):
-        return UPDATER["propose"](self.root, self.fetch)
+        return UPDATER["propose"](self.root, self.fetch, self.digest)
 
     def test_matches_codex_cli_and_sdk_releases_without_writing(self):
         files, changes = self.propose()
@@ -57,13 +78,37 @@ class RuntimeUpdateTests(unittest.TestCase):
     def test_no_new_release_does_not_resolve_tags_or_create_churn(self):
         self.codex = self.codex_sdk = self.claude = "1.2.3"
         self.assertEqual(self.propose(), ({}, []))
-        self.assertEqual(len(self.urls), 3)
+        self.assertEqual(len(self.urls), 4)
+        self.assertEqual(self.hashed, [])
 
     def test_claude_only_leaves_codex_untouched(self):
         self.codex = self.codex_sdk = "1.2.3"
         files, _ = self.propose()
         self.assertEqual(set(files), {"backend/requirements.txt"})
-        self.assertEqual(len(self.urls), 3)
+        self.assertEqual(len(self.urls), 4)
+
+    def test_new_chrome_pins_version_with_hashes_of_the_urls_the_build_fetches(self):
+        self.codex = self.codex_sdk = self.claude = "1.2.3"
+        self.chrome = "1.0.0.12"
+        files, changes = self.propose()
+        self.assertEqual(changes, ["Chrome for Testing: 1.0.0.1 → 1.0.0.12"])
+        self.assertEqual(set(files), {"Dockerfile"})
+        self.assertIn("ARG CHROME_VERSION=1.0.0.12\n", files["Dockerfile"])
+        self.assertIn(f"ARG CHROME_SHA256={'b' * 64}\n", files["Dockerfile"])
+        self.assertIn(f"ARG CHROME_HEADLESS_SHELL_SHA256={'a' * 64}\n", files["Dockerfile"])
+        self.assertEqual(self.hashed, [self.chrome_url("chrome"),
+                                       self.chrome_url("chrome-headless-shell")])
+
+    def test_chrome_downgrade_or_unexpected_download_is_refused(self):
+        self.codex = self.codex_sdk = self.claude = "1.2.3"
+        self.chrome = "1.0.0.0"
+        with self.assertRaisesRegex(ValueError, "downgrade"):
+            self.propose()
+        self.chrome = "1.0.0.2"
+        self.chrome_url = lambda name: f"https://example.invalid/{name}-linux64.zip"
+        with self.assertRaisesRegex(ValueError, "does not list"):
+            self.propose()
+        self.assertEqual(self.hashed, [])
 
     def test_codex_only_leaves_python_lock_input_untouched(self):
         self.claude = "1.2.3"
@@ -96,7 +141,7 @@ class RuntimeUpdateTests(unittest.TestCase):
             raise OSError("Unavailable")
         before = (self.root / "Dockerfile").read_bytes()
         with self.assertRaises(OSError):
-            UPDATER["propose"](self.root, unavailable)
+            UPDATER["propose"](self.root, unavailable, self.digest)
         self.assertEqual(before, (self.root / "Dockerfile").read_bytes())
 
     def test_source_drift_is_a_visible_failure_not_a_partial_pin_update(self):

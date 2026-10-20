@@ -777,7 +777,8 @@ async def preview_app_install(
 ):
   """Validate and normalize the capabilities an install would apply.
 
-  This intentionally fetches only the manifest.  The install endpoint repeats
+  This intentionally fetches only the manifest (plus the response headers that
+  size its declared files, never their contents).  The install endpoint repeats
   the fetch and binds it to ``reviewed_capability_digest`` before fetching app
   code or mutating durable state, closing the catalog-preview/install race.
   """
@@ -794,8 +795,9 @@ async def preview_app_install(
   source = body.manifest_url if body.manifest_url is not None else raw_base
   # Release the request session first: the worker opens its own short one.
   db.close()
-  installed_contract = await settled.run_settled(
-    _installed_contract_for_preview, manifest, source,
+  installed_contract, download_bytes = await asyncio.gather(
+    settled.run_settled(_installed_contract_for_preview, manifest, source),
+    install.package_download_bytes(manifest, raw_base),
   )
   return schemas.AppPreviewOut(
     manifest=manifest,
@@ -803,6 +805,7 @@ async def preview_app_install(
     capability_digest=digest,
     installed_contract=installed_contract,
     capability_diff=diff_contracts(installed_contract, contract),
+    download_bytes=download_bytes,
   )
 
 

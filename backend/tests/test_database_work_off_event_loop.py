@@ -7,6 +7,8 @@ freezes every request and stream; in a worker thread it only slows its own.
 
 import asyncio
 
+import pytest
+
 from app import delegations
 
 
@@ -89,3 +91,339 @@ def test_parent_wake_skips_the_history_scan_without_a_running_run(
 
   assert delegations._plan_parent_wake(chat.id, "source-run") is None
   assert read == [chat.id]
+
+
+def _freeze_provider_clock(monkeypatch, start=1_000_000.0):
+  """A controllable monotonic clock for the app-provider throttle only."""
+  import time as real_time
+  from app import providers
+
+  clock = [start]
+
+  class Clock:
+    def monotonic(self):
+      return clock[0]
+
+    def __getattr__(self, name):
+      return getattr(real_time, name)
+
+  monkeypatch.setattr(providers, "time", Clock())
+  return clock
+
+
+def test_turn_start_reads_off_the_loop_and_keeps_a_concurrent_pick(monkeypatch):
+  # Each of these froze the loop at turn start in the stall recorder: the
+  # app-provider declarations, the peer roster and inbox, the helper status
+  # hint, the recency transcript scan and the app activity manifests. The
+  # four context reads share one worker session, and a model pick that lands
+  # while they run wins over the first-send settings snapshot.
+  from app import agent_activity_provider, agent_coordination, models, providers
+  from app.database import SessionLocal
+  import app.chat as chat_mod
+  from tests.test_terminal_completion import (
+    _patch_claude_runner, _run_real_chat, _seed_chat, _seed_owner_and_creds,
+  )
+
+  chat_id = "turn-start-off-loop"
+  _seed_owner_and_creds()
+  _seed_chat(
+    chat_id, messages=[{"role": "user", "content": "hi", "ts": 1}],
+    pending=[], running="running", run_token="rt-turn-start-off-loop",
+  )
+  with SessionLocal() as db:
+    db.get(models.Chat, chat_id).agent_settings_json = None
+    db.commit()
+  picked = {"model": "claude-opus-4-8", "effort": "low"}
+
+  context = []
+
+  def record(module, name):
+    real = getattr(module, name)
+
+    def wrapper(db, *args, **kwargs):
+      context.append((name, _running_on_event_loop(), id(db)))
+      return real(db, *args, **kwargs)
+
+    monkeypatch.setattr(module, name, wrapper)
+
+  record(agent_coordination, "build_coordination_context_delivery")
+  record(delegations, "active_parent_context")
+  record(chat_mod, "_last_user_message_elapsed")
+  record(agent_activity_provider, "resolve_agent_activity_binding")
+  real_read_context = chat_mod._read_turn_context
+
+  def read_context_with_concurrent_pick(*args):
+    with SessionLocal() as db:
+      db.get(models.Chat, chat_id).agent_settings_json = picked
+      db.commit()
+    return real_read_context(*args)
+
+  monkeypatch.setattr(
+    chat_mod, "_read_turn_context", read_context_with_concurrent_pick,
+  )
+
+  # The declaration TTL lapses during a slow preflight: provider resolution
+  # must still never read declarations on the loop.
+  clock = _freeze_provider_clock(monkeypatch)
+  declaration_reads = []
+  real_declarations = providers._read_app_model_declarations
+
+  def read_declarations():
+    declaration_reads.append(_running_on_event_loop())
+    return real_declarations()
+
+  monkeypatch.setattr(
+    providers, "_read_app_model_declarations", read_declarations,
+  )
+  real_policy = delegations.policy_for_chat
+
+  def slow_policy(*args, **kwargs):
+    clock[0] += 5.0
+    return real_policy(*args, **kwargs)
+
+  monkeypatch.setattr(delegations, "policy_for_chat", slow_policy)
+
+  _patch_claude_runner(monkeypatch)
+  chat_mod.mark_starting(chat_id)
+  _run_real_chat(
+    chat_id, run_token="rt-turn-start-off-loop",
+    run_gen=chat_mod.current_run_generation(chat_id),
+  )
+
+  assert declaration_reads == [False]
+  assert {name for name, _, _ in context} == {
+    "build_coordination_context_delivery",
+    "active_parent_context",
+    "_last_user_message_elapsed",
+    "resolve_agent_activity_binding",
+  }
+  assert {on_loop for _, on_loop, _ in context} == {False}
+  assert len({session for _, _, session in context}) == 1
+  with SessionLocal() as db:
+    assert db.get(models.Chat, chat_id).agent_settings_json == picked
+
+
+def test_turn_context_uses_liveness_captured_on_the_loop(db, monkeypatch):
+  # The runner registry belongs to the loop; the worker gets a snapshot.
+  from app import agent_coordination
+  import app.chat as chat_mod
+  from app.runner_registry import registry
+  from tests.test_agent_coordination import _network_fixture
+
+  chats, _ = _network_fixture(db)
+  alive = frozenset(registry.all_alive_chat_ids())
+  expected = agent_coordination.build_coordination_context_delivery(
+    db, chats["scout"].id, "scout-run",
+  )
+
+  def forbidden(_chat_id):
+    raise AssertionError("worker read the loop-owned runner registry")
+
+  monkeypatch.setattr(registry, "is_alive", forbidden)
+  reads = asyncio.run(asyncio.to_thread(
+    chat_mod._read_turn_context, chats["scout"].id, "scout-run", alive,
+  ))
+
+  assert reads.coordination == expected
+  assert chats["builder"].id in reads.coordination.text
+
+
+def test_slow_app_provider_load_is_fresh_from_its_completion(monkeypatch):
+  # Stamping the throttle when a load started let a load slower than the
+  # window send the next synchronous get_provider back to the database.
+  from app import providers
+
+  clock = _freeze_provider_clock(monkeypatch)
+  reads = []
+
+  def slow_read():
+    reads.append(_running_on_event_loop())
+    clock[0] += 5.0
+    return []
+
+  monkeypatch.setattr(providers, "_read_app_model_declarations", slow_read)
+
+  asyncio.run(providers.refresh_app_model_providers("/data"))
+  providers.sync_app_model_providers("/data")
+  providers.get_provider("claude")
+
+  assert reads == [False]
+
+
+def test_concurrent_app_provider_refreshes_await_one_load(monkeypatch):
+  # A second refresh used to return at once, before the first load applied.
+  import threading
+  from app import providers
+
+  release = threading.Event()
+  reads = []
+  applied = []
+  real_apply = providers._apply_app_model_declarations
+
+  def blocking_read():
+    reads.append(1)
+    release.wait(5)
+    return []
+
+  def apply(declarations):
+    applied.append(declarations)
+    real_apply(declarations)
+
+  monkeypatch.setattr(providers, "_read_app_model_declarations", blocking_read)
+  monkeypatch.setattr(providers, "_apply_app_model_declarations", apply)
+
+  async def scenario():
+    async def refresh():
+      await providers.refresh_app_model_providers("/data")
+      return len(applied)
+
+    first = asyncio.ensure_future(refresh())
+    await asyncio.sleep(0)
+    second = asyncio.ensure_future(refresh())
+    await asyncio.sleep(0.05)
+    assert not second.done()
+    release.set()
+    return await asyncio.gather(first, second)
+
+  assert asyncio.run(scenario()) == [1, 1]
+  assert reads == [1]
+
+
+def test_parent_settle_finds_owed_results_off_the_loop(monkeypatch):
+  seen = []
+
+  def sources(parent_chat_id):
+    seen.append(("sources", _running_on_event_loop()))
+    return ["source-run"]
+
+  async def deliver(parent_chat_id, source_work_id):
+    seen.append(("deliver", source_work_id, _running_on_event_loop()))
+    return False
+
+  monkeypatch.setattr(delegations, "_undelivered_result_sources", sources)
+  monkeypatch.setattr(delegations, "_deliver_parent_wake", deliver)
+
+  asyncio.run(delegations.deliver_results_after_parent_settled("parent-chat"))
+
+  assert seen == [("sources", False), ("deliver", "source-run", True)]
+
+
+@pytest.mark.parametrize("change", ["parent_settles", "drain_begins", None])
+def test_result_steer_plans_off_the_loop_and_rechecks_liveness_after(
+  monkeypatch, change,
+):
+  # The plan reads durable state in a worker; the runner and drain checks
+  # run on the loop after it, so a change during planning submits nothing.
+  import app.chat as chat_mod
+  import app.chat_steering as chat_steering
+  import app.chat_writer as chat_writer
+
+  state = {"running": True, "draining": False}
+  seen = []
+
+  def plan_steer(parent_chat_id, source_work_id):
+    seen.append(("plan", _running_on_event_loop()))
+    if change == "parent_settles":
+      state["running"] = False
+    elif change == "drain_begins":
+      state["draining"] = True
+    return "claude", {"role": "user", "content": "results", "cid": "cid"}
+
+  def submit(command):
+    seen.append(("submit", _running_on_event_loop()))
+    raise AssertionError("stop after the loop-side checks")
+
+  monkeypatch.setattr(delegations, "_plan_result_steer", plan_steer)
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _id: state["running"])
+  monkeypatch.setattr(chat_mod, "is_draining", lambda: state["draining"])
+  monkeypatch.setattr(
+    chat_steering, "has_live_steerable_turn", lambda _id, _provider: True,
+  )
+  monkeypatch.setattr(
+    chat_writer, "get_writer", lambda: type("W", (), {"submit": staticmethod(submit)}),
+  )
+
+  if change is None:
+    with pytest.raises(AssertionError, match="stop after"):
+      asyncio.run(delegations.steer_results_into_running_parent("parent", "src"))
+    assert seen == [("plan", False), ("submit", True)]
+  else:
+    assert asyncio.run(
+      delegations.steer_results_into_running_parent("parent", "src"),
+    ) is False
+    assert seen == [("plan", False)]
+
+
+def test_parent_wake_plan_never_reads_the_runner_registry(chat, db, monkeypatch):
+  # _plan_parent_wake runs in a worker; the registry belongs to the loop,
+  # which re-checks is_chat_running itself after planning.
+  import app.chat as chat_mod
+  from app import models
+
+  def forbidden(_chat_id):
+    raise AssertionError("worker read the loop-owned runner registry")
+
+  monkeypatch.setattr(chat_mod, "is_chat_running", forbidden)
+  physical = models.ChatRun(
+    id="carrier-run", root_run_id="carrier-run", chat_id=chat.id,
+    status="running", provider="claude", provider_execution_admitted=False,
+  )
+  db.add(physical)
+  db.commit()
+  monkeypatch.setattr(
+    delegations, "_committed_parent_wake",
+    lambda _db, _chat, _message: (physical, [], ()),
+  )
+  monkeypatch.setattr(
+    delegations, "safe_parent_wake_startup_writer_orphan",
+    lambda _db, _chat, _physical: True,
+  )
+
+  assert delegations._committed_parent_wake_is_unowned(db, chat, {}) is True
+
+
+def test_activity_start_checks_its_blockers_off_the_loop(monkeypatch):
+  import app.chat as chat_mod
+  import app.chat_start as chat_start
+
+  seen = []
+
+  def blocker(db, chat_id, **_kwargs):
+    seen.append(_running_on_event_loop())
+    return "owner_input"
+
+  monkeypatch.setattr(chat_mod, "programmatic_start_blocker", blocker)
+  monkeypatch.setattr(chat_mod, "is_draining", lambda: False)
+
+  assert asyncio.run(chat_start.start_programmatic_activity_continuation(
+    chat_id="parent-chat", root_run_id="root", run_token="not-started",
+    source_work_id="source", activity_id="activity",
+  )) is False
+  assert seen == [False]
+
+
+def test_activity_start_rechecks_drain_after_its_off_loop_read(monkeypatch):
+  # A drain that begins during the worker read owns its runs; the start
+  # must stop before touching the database on the loop.
+  import app.chat as chat_mod
+  import app.chat_start as chat_start
+  import app.database as database
+
+  draining = {"value": False}
+  sessions = []
+
+  def precheck(chat_id, run_token):
+    draining["value"] = True
+    return True, False
+
+  monkeypatch.setattr(chat_mod, "is_draining", lambda: draining["value"])
+  monkeypatch.setattr(chat_start, "_activity_start_precheck", precheck)
+  monkeypatch.setattr(
+    database, "SessionLocal", lambda *a, **kw: sessions.append(1),
+  )
+
+  assert asyncio.run(chat_start.start_programmatic_activity_continuation(
+    chat_id="parent-chat", root_run_id="root", run_token="existing-run",
+    source_work_id="source", activity_id="activity",
+  )) is False
+  assert sessions == []

@@ -5,6 +5,7 @@ from app.chat_writer import create_chat
 import asyncio
 from datetime import UTC, datetime, timedelta
 import hashlib
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -112,7 +113,13 @@ def _command_wait(db, **kwargs):
 
 def _a_turn_carrying_it_succeeds(db, chat_id, wait_id):
   """What a successful provider call records for the Wait result it carried."""
-  assert chat_waits_mod.stage_wait_results_delivered(db, chat_id, (wait_id,)) == 1
+  wait = db.get(models.ChatWait, wait_id)
+  run_id = "receipt-" + wait_id
+  db.add(models.ChatRun(id=run_id, chat_id=chat_id, goal_id=wait.goal_id,
+    status="completed", provider_execution_admitted=True,
+    admitted_wait_results_json=[wait_id]))
+  db.flush()
+  assert chat_waits_mod.stage_wait_results_delivered(db, chat_id, (wait_id,), run_id=run_id) == 1
   db.commit()
   db.expire_all()
 
@@ -630,7 +637,14 @@ def test_met_wait_resumes_only_after_late_update_edits_are_back(
   db.commit()
   starts = _capture_starts(monkeypatch, running=False)
   pending = [True]
-  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: pending[0])
+  hold_reads = set()
+
+  def late_edits_pending():
+    # The hold check reads update state (and may run git): never on the loop.
+    hold_reads.add(threading.current_thread() is threading.main_thread())
+    return pending[0]
+
+  monkeypatch.setattr(platform_update, "late_edits_pending", late_edits_pending)
 
   assert asyncio.run(sweep_due_waits()) == 0
   assert starts == []
@@ -641,6 +655,7 @@ def test_met_wait_resumes_only_after_late_update_edits_are_back(
   pending[0] = False
   assert asyncio.run(sweep_due_waits()) == 1
   assert len(starts) == 1 and starts[0]["chat_id"] == chat_id
+  assert hold_reads == {False}
 
 
 def test_unmet_command_wait_reschedules(client, owner_token, db, monkeypatch):
@@ -1102,7 +1117,7 @@ def test_owner_turn_adopts_committed_wait_wake_after_schedule_failure(
   db.expire_all()
   assert db.get(models.ChatWait, row.id).resume_delivered_at is None
   text, carried = chat_waits_mod.owed_wait_results(
-    db, chat_id, "Owner work takes priority",
+    db, chat_id, "Owner work takes priority", run_id=owner_run_id,
   )
   assert carried == (row.id,) and "owner wins scheduling race" in text
   _a_turn_carrying_it_succeeds(db, chat_id, row.id)
@@ -1163,7 +1178,7 @@ def test_owner_turn_adopts_wait_wake_closed_by_stop(
   # the owner's turn carries the result instead.
   assert asyncio.run(chat_waits_mod._deliver_resume(row.id)) is False
   assert chat_waits_mod.owed_wait_results(
-    db, chat_id, "Use the finished wait result",
+    db, chat_id, "Use the finished wait result", run_id=owner_run_id,
   )[1] == (row.id,)
   _a_turn_carrying_it_succeeds(db, chat_id, row.id)
   get_writer().submit(FinishRun(
@@ -1466,7 +1481,7 @@ def test_legacy_wait_orphan_preservation_requires_exact_empty_carrier(
   db.flush()
   physical = SimpleNamespace(
     id=resume_run_id, root_run_id=resume_run_id, chat_id=chat_id,
-    status="running", initiated_by_app_id=None,
+    status="running", initiated_by_app_id=None, goal_id=None,
     provider_execution_admitted=False,
   )
 
@@ -2394,8 +2409,9 @@ def test_wait_snapshot_cannot_follow_rebound_run_to_new_goal(
   assert asyncio.run(chat_waits_mod._deliver_resume(row.id)) is False
   assert starts == []
   db.expire_all()
-  assert db.get(models.ChatWait, row.id).resume_delivered_at is not None
-  text, ids = chat_waits_mod.owed_wait_results(db, chat_id, "")
+  assert db.get(models.ChatWait, row.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, row.id).result_disposition == "retired_by_goal_outcome"
+  text, ids = chat_waits_mod.owed_wait_results(db, chat_id, "", run_id=None)
   assert text == "" and ids == ()
 
 
@@ -2425,11 +2441,19 @@ def test_wait_fired_during_owner_stopped_goal_stays_owed_until_continue(
   db.expire_all()
   assert db.get(models.ChatWait, row.id).resume_delivered_at is None
   assert db.get(models.ChatWait, row.id).goal_id == "held-wait-goal"
-  assert chat_waits_mod.owed_wait_results(db, chat_id, "")[1] == ()
+  assert chat_waits_mod.owed_wait_results(db, chat_id, "", run_id=None)[1] == ()
 
   db.get(models.ChatGoal, row.goal_id).status = "open"
   db.commit()
-  assert chat_waits_mod.owed_wait_results(db, chat_id, "")[1] == (row.id,)
+  # Reopening the Goal is not chat-wide delivery authority: the unrelated
+  # turn (or a Goal-less one) must not consume its durable result.
+  assert chat_waits_mod.owed_wait_results(db, chat_id, "", run_id=None)[1] == ()
+  assert chat_waits_mod.owed_wait_results(db, chat_id, "", run_id=run.id)[1] == ()
+  receiver = models.ChatRun(id="held-wait-owner-continue", chat_id=chat_id,
+    goal_id=row.goal_id, status="running")
+  db.add(receiver)
+  db.commit()
+  assert chat_waits_mod.owed_wait_results(db, chat_id, "", run_id=receiver.id)[1] == (row.id,)
 
 
 def test_unowned_wait_never_counts_toward_creators_later_goal(db, chat):

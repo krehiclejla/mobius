@@ -878,8 +878,8 @@ async def providers_status(
   is_owner_caller = principal.app_id is None and principal.scope == "owner"
   from app.providers import PROVIDERS, provider_selectable
   data_dir = get_settings().data_dir
-  from app.providers import sync_app_model_providers
-  sync_app_model_providers(data_dir)
+  from app.providers import refresh_app_model_providers
+  await refresh_app_model_providers(data_dir)
   out = {}
   for pid, provider in PROVIDERS.items():
     enabled = provider_selectable(data_dir, pid)

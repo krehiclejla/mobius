@@ -1,4 +1,5 @@
 import { useCallback } from 'react'
+import { requestChatQuestionReveal } from '../../lib/chatQuestionReveal.js'
 
 export function findAppForOpenTarget(list, target) {
   if (target == null) return null
@@ -51,6 +52,9 @@ export default function useAppIntentNavigation({
     if (app) {
       void openAppWithIntent(app, intent)
     } else if (chat) {
+      if (url.searchParams.get('focus') === 'question') {
+        requestChatQuestionReveal(chat, url.searchParams.get('question'))
+      }
       navToRef.current('chat', { chatId: chat })
     }
   }, [openAppWithIntent])

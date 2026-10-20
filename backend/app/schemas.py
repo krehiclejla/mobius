@@ -453,6 +453,9 @@ class AppPreviewOut(BaseModel):
   capability_digest: str
   installed_contract: dict | None = None
   capability_diff: dict
+  # What a fresh install would download; None when any declared file's size is
+  # unknown, and for update previews, which arrive as a Git transfer instead.
+  download_bytes: int | None = None
 
 
 class ReconciliationReceiptOut(BaseModel):

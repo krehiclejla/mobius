@@ -1,5 +1,6 @@
 /* Pure presentation helpers for settled Waiting transcript markers. */
 
+import { goalDependencyOutcomeLabel } from './goalProgress.js'
 import { waitConditionLabel } from './waitingPresentation.js'
 
 function formatDuration(seconds) {
@@ -20,13 +21,25 @@ const OUTCOMES = {
   cancelled: { kicker: 'Wait stopped', tone: 'stopped', spoken: 'Stopped wait' },
 }
 
-/** Only a delivered result can explain what started an answer. Undelivered
- * results and deliberate stops stay beside the answer that owned the wait. */
+/** New receipts distinguish a waking delivery from a Goal outcome. Older
+ * summaries lack that distinction, so retain their historical placement. */
 export function waitWokeItsAnswer(summary) {
+  if (summary?.target_kind) return summary.result_disposition === 'delivered' && !!summary.received_run_id
+  if (summary?.result_disposition === 'retired_by_goal_outcome'
+    || summary?.result_disposition === 'withdrawn') return false
+  if (summary?.result_disposition === 'delivered'
+    || summary?.result_disposition === 'scheduled') return true
+  // legacy_consumed and absent dispositions cannot identify a receiving run.
   return summary?.status !== 'cancelled' && !summary?.delivery_pending
 }
 
 export function waitHistoryViewModel(summary) {
+  if (summary?.target_kind) {
+    const kicker = goalDependencyOutcomeLabel(summary)
+    return { condition: summary.condition, kicker, tone: 'dependency',
+      ariaLabel: `Waiting ended: ${summary.condition}. ${kicker}`,
+      metadata: summary.delivery_pending ? 'Result saved · follow-up pending' : null }
+  }
   const condition = waitConditionLabel(summary?.description)
   const settledOutcome = OUTCOMES[summary?.status]
   const outcome = summary?.delivery_pending && settledOutcome ? {

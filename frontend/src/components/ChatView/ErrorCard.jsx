@@ -40,6 +40,7 @@ export function errorCardViewModel(block) {
         'This Goal paused repeatedly without a visible owner for the next action.',
       )
     )
+  const settlementRecovery = block.code === 'goal_settlement_unfinished'
   const benign = !!block.pause || goalHandoff
   return {
     credits,
@@ -48,9 +49,10 @@ export function errorCardViewModel(block) {
     modelCapacityExhausted,
     resourceWait,
     goalHandoff,
+    settlementRecovery,
     benign,
     className: `chat__text--error${benign ? ' chat__text--parked' : ''}`,
-    label: credits ? 'Credits needed' : goalHandoff ? 'Goal paused' : modelCapacityExhausted ? 'Model still busy' : modelCapacity ? 'Model busy' : parked ? 'Rate limit' : (resourceWait ? 'Waiting' : (block.pause ? 'Paused' : 'Error')),
+    label: settlementRecovery ? 'Work interrupted' : credits ? 'Credits needed' : goalHandoff ? 'Goal paused' : modelCapacityExhausted ? 'Model still busy' : modelCapacity ? 'Model busy' : parked ? 'Rate limit' : (resourceWait ? 'Waiting' : (block.pause ? 'Paused' : 'Error')),
     checkLabel: formatResetTime(checkAt),
     resetLabel: parked ? formatResetTime(resetAt) : null,
   }
@@ -165,6 +167,8 @@ export default function ErrorCard({
                 ? creditsCopy(block.pause?.provider)
                 : vm.modelCapacityExhausted
                 ? 'Five automatic retries were used. Choose another model, then Resume to continue your saved work.'
+                : vm.settlementRecovery
+                ? 'Your progress is saved. This Goal is unfinished. Resume to continue.'
                 : vm.goalHandoff
                 ? 'The agent stopped before arranging the next step. Your progress is saved. Resume to continue this Goal.'
                 : block.pause?.kind === 'restart'

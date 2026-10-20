@@ -438,6 +438,10 @@ def fresh_db():
   from app.config import get_settings as _get_settings
   providers_mod.sync_app_model_providers(_get_settings().data_dir, force=True)
   providers_mod._app_provider_sync_at = 0.0
+  # The refresh lock binds to the first loop that contends it; each test
+  # runs its own loop.
+  import asyncio as _asyncio
+  providers_mod._app_provider_refresh_lock = _asyncio.Lock()
 
   yield
   from app import chat_writer as _cw

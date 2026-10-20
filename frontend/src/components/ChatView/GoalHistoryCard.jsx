@@ -5,7 +5,7 @@ import GoalPlanDetails from './GoalPlanDetails.jsx'
 import LifecycleIcon, { LifecycleOutcome } from './LifecycleIcon.jsx'
 import { goalHistoryViewModel } from './goalHistory.js'
 
-export default function GoalHistoryCard({ summary }) {
+export default function GoalHistoryCard({ summary, onInternalNav }) {
   const view = goalHistoryViewModel(summary)
   if (!view) return null
   const heading = <>
@@ -30,7 +30,7 @@ export default function GoalHistoryCard({ summary }) {
           {heading}
           <ChevronRight className="chat__panel-chevron" width={14} height={14} aria-hidden="true" />
         </summary>
-        <GoalPlanDetails plan={summary.plan} />
+        <GoalPlanDetails plan={summary.plan} dependencyHistory={summary.dependency_history} onInternalNav={onInternalNav} />
       </details> : heading}
     </aside>
   )

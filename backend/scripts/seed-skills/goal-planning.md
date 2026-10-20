@@ -98,6 +98,21 @@ refresh context, select the next task, or ask the owner to discover Unpause.
 - **External work:** a durable Wait (read `waiting.md`) or a wake-enabled helper
   owns automatic continuation only when its actual condition/result can wake
   this chat. Never promise a wake for an unarmed condition or manual hold.
+- **Another chat's decision:** finish independent work, then use
+  `wait_for_decision(chat_id: "SOURCE_CHAT", question_id: "EXACT_CARD")` on its
+  already-saved Q&A or approval. This is a real handoff for your exact open
+  Goal, not polling owner action. Never duplicate the card, poll its transcript,
+  or ask its agent to interrupt you. Results are facts, not transferred approval;
+  held Goals keep them without reopening. Restart and sealed-input cards are
+  not followable. Helpers report the dependency upward.
+- **Another chat's claimed work:** if `claim_agent_work` or an approval attempt
+  returns `held_by_peer`, follow that exact claim only when the response confirms
+  this Goal's dependency was created. Then the owning chat's completion or
+  release can resume this Goal; do not poll or ask its agent for an interrupt.
+  A claim follows one shared action, not the other chat's entire Goal. If no
+  dependency was created, report the blocker rather than promising an automatic
+  continuation. A missing or failed source needs manual recovery, not a claim
+  that healthy work is under way.
 - **Deferred work:** an answered **Not now** defers that step, not every other
   authorized task. Record its reason, then continue independent work without
   retrying the declined action. When nothing useful can proceed, call

@@ -515,7 +515,7 @@ async def test_the_next_turn_carries_added_side_questions_once(monkeypatch, chat
   async def fake_record_run_metrics(**_kwargs):
     return None
 
-  monkeypatch.setattr(chat_mod, "get_provider", lambda _id: _Provider())
+  monkeypatch.setattr(chat_mod, "registered_provider", lambda _id: _Provider())
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   monkeypatch.setattr(chat_mod, "_record_run_metrics", fake_record_run_metrics)
   monkeypatch.setattr(claude_sdk_runner, "run_claude_sdk_turn", fake_runner)

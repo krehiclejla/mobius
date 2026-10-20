@@ -676,10 +676,20 @@ jobs:
         with:
           node-version: 24
           cache: 'npm'
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
       - name: Install test deps
         # Browsers come from the next step, so no package needs its install script.
+        run: npm ci --ignore-scripts
+
+      - name: Install frontend deps for component specs
+        # Some specs mount real components through Vite from frontend/node_modules.
+        # Playwright loads every spec in every shard, so one unresolved import
+        # fails the whole suite before any test runs. The test container seeds
+        # from `git archive HEAD`, so this host-only tree never reaches it.
+        working-directory: frontend
         run: npm ci --ignore-scripts
 
       - name: Install Playwright browsers

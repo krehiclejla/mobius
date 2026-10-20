@@ -2,10 +2,21 @@
 """Propose stable agent runtime pins in a disposable checkout, never install them."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
 from urllib.request import urlopen
+
+CHROME_FEED = ("https://googlechromelabs.github.io/chrome-for-testing/"
+               "last-known-good-versions-with-downloads.json")
+CHROME_DOWNLOADS = "https://storage.googleapis.com/chrome-for-testing-public"
+CHROME_PIN = r"(?m)^(ARG CHROME_VERSION=)[^\s]+$"
+# Dockerfile sha256 argument -> Chrome for Testing download for linux64.
+CHROME_ARCHIVES = {
+    "CHROME_SHA256": "chrome",
+    "CHROME_HEADLESS_SHELL_SHA256": "chrome-headless-shell",
+}
 
 
 def read_url(url):
@@ -13,10 +24,44 @@ def read_url(url):
         return response.read().decode()
 
 
-def stable(version):
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+def sha256_of_url(url):
+    """Chrome for Testing publishes no checksums; hash the archive the build will fetch."""
+    digest = hashlib.sha256()
+    with urlopen(url, timeout=120) as response:
+        for chunk in iter(lambda: response.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stable(version, parts=3):
+    """Chrome for Testing versions have four numeric parts; the agent runtimes three."""
+    if not re.fullmatch(rf"\d+(?:\.\d+){{{parts - 1}}}", version):
         raise ValueError(f"Expected a stable release, got {version!r}")
     return tuple(map(int, version.split(".")))
+
+
+def propose_chrome(dockerfile, fetch, digest):
+    """Pin the current Stable with fresh archive hashes, or return the Dockerfile unchanged."""
+    channel = json.loads(fetch(CHROME_FEED))["channels"]["Stable"]
+    latest = channel["version"]
+    match = re.search(CHROME_PIN, dockerfile)
+    if not match:
+        raise ValueError("Missing Chrome for Testing pin")
+    current = match[0][len(match[1]):]
+    if stable(latest, parts=4) < stable(current, parts=4):
+        raise ValueError(f"Refusing Chrome for Testing downgrade: {current} -> {latest}")
+    if latest == current:
+        return dockerfile, []
+    dockerfile = replace_pin(dockerfile, CHROME_PIN, latest)
+    for argument, download in CHROME_ARCHIVES.items():
+        url = f"{CHROME_DOWNLOADS}/{latest}/linux64/{download}-linux64.zip"
+        listed = [entry["url"] for entry in channel["downloads"][download]
+                  if entry["platform"] == "linux64"]
+        if listed != [url]:
+            raise ValueError(f"Chrome for Testing feed does not list {url}")
+        dockerfile = replace_pin(
+            dockerfile, rf"(?m)^(ARG {argument}=)[0-9a-f]{{64}}$", digest(url))
+    return dockerfile, [f"Chrome for Testing: {current} → {latest}"]
 
 
 def replace_pin(text, pattern, value):
@@ -27,7 +72,7 @@ def replace_pin(text, pattern, value):
     return updated
 
 
-def propose(root, fetch=read_url):
+def propose(root, fetch=read_url, digest=sha256_of_url):
     dockerfile = (root / "Dockerfile").read_text()
     requirements = (root / "backend/requirements.txt").read_text()
     codex_pin = r"(?m)^(ARG CODEX_VERSION=)[^\s]+$"
@@ -58,6 +103,8 @@ def propose(root, fetch=read_url):
             raise ValueError(f"Refusing {name} downgrade: {current} -> {latest}")
         if latest != current:
             changes.append(f"{name}: {current} → {latest}")
+    dockerfile, chrome_changes = propose_chrome(dockerfile, fetch, digest)
+    changes += chrome_changes
     if not changes:
         return {}, []
 

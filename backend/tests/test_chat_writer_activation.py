@@ -311,12 +311,19 @@ def test_put_replace_transcript_broad_fences_stream_snapshot(client, auth, chat)
 # called `_complete_turn` directly could never have caught that, which is why
 # the original review missed it.
 def test_finalize_failure_via_run_chat_leaves_marker_for_reconciliation(
-  monkeypatch, tmp_path
+  monkeypatch, tmp_path, healthy_data_disk,
 ):
   """Through the real `run_chat` wrapper, a forced `Finalize` ack failure
   must leave the durable run marker SET after `run_chat` returns (so
   reconciliation would recover it) and perform NO continuation/promotion —
   no half-persisted, unexecuted turn."""
+  # This tests persistence failure, not host pressure. Admission binds its
+  # default reader at import time, so supply the normal-disk fixture explicitly.
+  from functools import partial
+  from app import resource_pressure
+  monkeypatch.setattr(chat_mod, "require_agent_turn_admission", partial(
+    chat_mod.require_agent_turn_admission, status_reader=resource_pressure.resource_status,
+  ))
   _seed_chat(
     "c-fin",
     messages=[{"role": "user", "content": "hi", "ts": 1}],
@@ -731,3 +738,51 @@ def test_append_steered_user_message_appends_when_no_assistant_yet():
   assert [m["content"] for m in chat["messages"]] == ["start", "steered"]
   assert "steered" not in chat["messages"][0]
   assert chat["messages"][1]["steered"] is True
+
+
+def test_recording_session_still_crosses_the_decision_graph_fence():
+  """Recording hooks must not bypass the production source-transition fence."""
+  from app.chat_writer import ChatWriterActor, Finalize
+  from tests.test_chat_writer import _RecordingSession
+
+  statements, snapshots = [], []
+  class RecordingSession(_RecordingSession):
+    def execute(self, statement, *args, **kwargs):
+      statements.append(str(statement))
+
+  actor = ChatWriterActor(session_factory=lambda: RecordingSession(snapshots))
+  actor.start()
+  try:
+    actor.submit(Finalize(chat_id="recording", run_token="run",
+      snapshot={"id": "run", "role": "assistant", "blocks": []})).result(5)
+  finally:
+    actor.stop(timeout=5)
+  assert len(snapshots) == 1
+  assert any(statement.startswith("UPDATE owner SET username=owner.username")
+    for statement in statements)
+
+
+def test_writer_fences_graph_mutations_and_dependency_result_admission(monkeypatch):
+  """A plain queue/park/title write must not contend on the owner graph row."""
+  from app import decision_cards
+  from app.chat_writer import (
+    ChatWriterActor, AppendPending, FinishRun, ParkRun, ReplaceTranscript,
+  )
+  from app.continuations import DEPENDENCY_RESULT_MESSAGE_KIND
+
+  actor = object.__new__(ChatWriterActor)
+  db = object()
+  fenced = []
+  monkeypatch.setattr(decision_cards, "fence_decisions", lambda session: fenced.append(session))
+  for name in ("_append_pending", "_finish_run", "_park_run", "_replace_transcript"):
+    monkeypatch.setattr(ChatWriterActor, name, lambda self, session, cmd: None)
+
+  for cmd in (AppendPending(), ParkRun(), ReplaceTranscript(title="renamed")):
+    actor._dispatch(db, cmd)
+  assert fenced == []
+
+  for cmd in (AppendPending(answers={"q": "yes"}),
+              AppendPending(user_msg={"kind": DEPENDENCY_RESULT_MESSAGE_KIND}), FinishRun(),
+              ReplaceTranscript(messages=[])):
+    actor._dispatch(db, cmd)
+  assert fenced == [db, db, db, db]

@@ -14,6 +14,7 @@ import {
   selectNavPopTarget,
   updateCurrentNavEntry,
 } from '../lib/navHistory.js'
+import { requestChatQuestionReveal } from '../lib/chatQuestionReveal.js'
 import { resolveInitialNav } from '../lib/resolveInitialNav.js'
 import {
   consumeReturnView,
@@ -94,6 +95,11 @@ const safeStoredChatId = readStoredChatId
 // the installed standalone PWA instead of a browser tab, because it's
 // inside the manifest scope (`/shell/`).
 export const deepLink = parseShellDeepLink(window.location)
+// Seed once per page load, not once per Shell/ChatView mount. An unconsumed
+// request stays available to the first eligible visible chat surface.
+if (deepLink?.view === 'chat' && deepLink.focusQuestion) {
+  requestChatQuestionReveal(deepLink.chatId, deepLink.questionId)
+}
 
 // Cold-restore of the active view/app (mirror of moebius_active_chat) so a
 // COLD relaunch of the shell PWA lands on the app the user was viewing

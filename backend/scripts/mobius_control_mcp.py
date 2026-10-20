@@ -41,6 +41,7 @@ UPDATE_GOAL_TOOL = "update_goal"
 READ_GOAL_TOOL = "read_goal"
 UPDATE_GOAL_TASKS_TOOL = "update_goal_tasks"
 DECLARE_WAIT_TOOL = "declare_wait"
+WAIT_FOR_DECISION_TOOL = "wait_for_decision"
 CANCEL_WAIT_TOOL = "cancel_wait"
 REQUEST_APPROVAL_TOOL = "request_approval"
 REQUEST_QUESTION_TOOL = "request_question"
@@ -91,6 +92,7 @@ OWNER_TOOLS = (
   UPDATE_GOAL_TOOL,
   READ_GOAL_TOOL,
   DECLARE_WAIT_TOOL,
+  WAIT_FOR_DECISION_TOOL,
   CANCEL_WAIT_TOOL,
   REQUEST_APPROVAL_TOOL,
   REQUEST_QUESTION_TOOL,
@@ -154,8 +156,8 @@ DECLARE_WAIT_DESCRIPTION = (
   "itself when an external condition is met or a timer fires, including "
   "across server restarts. Await ordinary commands and helpers in-turn; a "
   "delegated child returns a future condition to its parent instead. Never "
-  "use a wait for an approval or anything only the owner can do; show the "
-  "real question card. Something must actually be advancing the condition: "
+  "poll for an approval or owner action. Use wait_for_decision for another "
+  "chat's saved card, or save your own question card. Something must actually be advancing the condition: "
   "internal work needs an acknowledged durable executor first. Give exactly "
   "one of github_checks, command or delay_secs. Prefer github_checks for a "
   "published pull request at an exact head: it follows the checks GitHub "
@@ -694,6 +696,18 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     deadline_secs=_optional_int(arguments, "deadline_secs"),
     github_checks=arguments.get("github_checks"),
   )
+
+
+def _call_wait_for_decision(arguments: dict[str, Any]) -> dict:
+  if set(arguments) != {"chat_id", "question_id"} or any(
+    not isinstance(value, str) or not value.strip() or len(value) > 64
+    for value in arguments.values()
+  ):
+    raise ValueError("wait_for_decision needs exact chat_id and question_id strings")
+  try:
+    return _WAITS.wait_for_decision(**arguments)
+  except SystemExit as exc:
+    raise RuntimeError(str(exc)) from exc
 
 
 def _call_cancel_wait(arguments: dict[str, Any]) -> dict:
@@ -1473,18 +1487,19 @@ _TOOL_DEFINITIONS = {
   REQUEST_APPROVAL_TOOL: {
     "name": REQUEST_APPROVAL_TOOL,
     "description": (
-      "Ask the owner to approve a proposed Möbius action other than a platform "
-      "restart (use request_restart). This is an application decision, not a "
+      "Ask the owner to approve an action; for restart use request_restart. "
+      "This is an application decision, not a "
       "tool-permission escalation. Saves an answerable card; returns a "
       "receipt, NOT an answer or permission. "
       f"{SAVED_CARD_TERMINAL_INSTRUCTION} "
-      "The owner's answer "
-      "resumes the chat, with no timeout. Explain the action and its impact, "
+      "The answer resumes the chat without timeout. Explain its impact "
       "and include a decline/defer choice. work_key also claims the exact "
       "action, so do not call claim_agent_work first. If another chat already "
       "owns or completed that key, no card is saved, your turn continues, and "
-      "the result is that claim (held_by_peer or completed): do not duplicate "
-      "the action. Identical retries within a turn reuse the same card. Never "
+      "the result is held_by_peer or completed: do not duplicate. "
+      "A held_by_peer Goal follows only if the response confirms "
+      "its dependency was created; otherwise do not promise a wake. "
+      "Identical retries within a turn reuse the same card. Never "
       "request secrets here. Background agents leave approvals pending for a "
       "live chat instead."
     ),
@@ -1825,6 +1840,24 @@ _TOOL_DEFINITIONS = {
       "additionalProperties": False,
     },
   },
+  WAIT_FOR_DECISION_TOOL: {
+    "name": WAIT_FOR_DECISION_TOOL,
+    "description": (
+      "Wait on one exact saved Q&A or approval card in another readable chat. "
+      "Only an open top-level Goal can subscribe; helpers report upward. "
+      "Do independent work first, then end normally. No duplicate card, polling, "
+      "deadline or peer interrupt request is needed. Already-settled decisions "
+      "are recorded immediately. The exact Goal receives the outcome when eligible; "
+      "owner holds remain held. Answers are facts, never permission to execute "
+      "another chat's action. Restart and sealed secure-input cards are refused."
+    ),
+    "inputSchema": {
+      "type": "object", "properties": {
+        "chat_id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "question_id": {"type": "string", "minLength": 1, "maxLength": 64},
+      }, "required": ["chat_id", "question_id"], "additionalProperties": False,
+    },
+  },
   DECLARE_WAIT_TOOL: {
     "name": DECLARE_WAIT_TOOL,
     "description": DECLARE_WAIT_DESCRIPTION,
@@ -1957,8 +1990,11 @@ _TOOL_DEFINITIONS = {
     "description": (
       "Atomically claim convergent work that needs no owner approval "
       "(request_approval claims its own work_key). The first chat wins; a "
-      "later caller gets the owner and becomes a follower that is notified "
-      "when the work completes or is released, so it must not duplicate it. "
+      "later caller gets the owner; a Goal follows that exact acquisition only "
+      "when the response confirms a dependency was created. That Goal resumes "
+      "when eligible on completion or release, without polling or a peer interrupt. A helper "
+      "or Goal-less chat cannot own that automatic follow. Do not duplicate "
+      "claimed work. "
       "Transfer only for a specific strong reason, naming the observed owner "
       "in expected_owner_chat_id; transfer never grants owner authority. Use "
       "canonical lowercase keys such as "
@@ -1978,8 +2014,9 @@ _TOOL_DEFINITIONS = {
   FINISH_AGENT_WORK_TOOL: {
     "name": FINISH_AGENT_WORK_TOOL,
     "description": (
-      "Complete or release a claim this chat owns; followers wake with the "
-      "outcome. Usually unnecessary inside a Goal: update_goal complete with "
+      "Complete or release a claim this chat owns; exact follower Goals receive "
+      "the outcome when eligible (held Goals keep it without reopening). "
+      "Usually unnecessary inside a Goal: update_goal complete with "
       "finished_claims completes the claims the Goal performed and "
       "releases the rest (for example, a declined approval), and Stop, "
       "dismissal, or chat deletion releases them. Call it to settle earlier "
@@ -2011,6 +2048,7 @@ _TOOL_HANDLERS = {
   READ_GOAL_TOOL: _call_read_goal,
   UPDATE_GOAL_TASKS_TOOL: _call_update_goal_tasks,
   DECLARE_WAIT_TOOL: _call_declare_wait,
+  WAIT_FOR_DECISION_TOOL: _call_wait_for_decision,
   CANCEL_WAIT_TOOL: _call_cancel_wait,
   LIST_AGENT_PEERS_TOOL: _call_list_agent_peers,
   SEND_AGENT_MESSAGE_TOOL: _call_send_agent_message,

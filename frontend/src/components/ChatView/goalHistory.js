@@ -35,6 +35,6 @@ export function goalHistoryViewModel(summary) {
     ariaLabel: `${completed ? 'Completed goal' : cancelled ? 'Cancelled goal' : legacyFailure ? 'Goal needing attention' : 'Goal cannot complete'}: ${objective}`,
     reason,
     metadata: [progress, duration].filter(Boolean).join(' · '),
-    hasPlan: Array.isArray(summary?.plan?.tasks) && summary.plan.tasks.length > 0,
+    hasPlan: (Array.isArray(summary?.plan?.tasks) && summary.plan.tasks.length > 0) || !!summary?.dependency_history?.length,
   }
 }

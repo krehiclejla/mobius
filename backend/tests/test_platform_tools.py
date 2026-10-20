@@ -538,7 +538,8 @@ def test_control_protocol_advertises_every_run_bound_tool(monkeypatch):
     assert wait_schema["properties"][name]["maximum"] == maximum
   assert "server restarts" in tools[platform_tools.WAIT_TOOL_NAME]["description"]
   assert "silent exit 1" in tools[platform_tools.WAIT_TOOL_NAME]["description"]
-  assert "Never use a wait for an approval" in (
+  # Human decisions use saved cards, not command/timer approval polling.
+  assert "Never poll for an approval" in (
     tools[platform_tools.WAIT_TOOL_NAME]["description"]
   )
   assert "does not inherit turn-only API credentials" in (

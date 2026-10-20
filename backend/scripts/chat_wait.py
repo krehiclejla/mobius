@@ -89,3 +89,10 @@ def declare_wait(
 def cancel_wait(wait_id: str) -> dict:
   """Cancel one exact wait through the same chat-bound platform API."""
   return _call("POST", f"/api/chat-waits/{quote(wait_id)}/cancel")
+
+
+def wait_for_decision(chat_id: str, question_id: str) -> dict:
+  """Subscribe to an exact foreign saved card, never poll owner input."""
+  return _call("POST", "/api/chat-waits/decision", {
+    "chat_id": chat_id, "question_id": question_id,
+  })

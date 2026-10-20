@@ -199,6 +199,10 @@ fi
 # node_modules is host-only and excluded from the Docker build context.
 node_modules_root="$(cd "$ROOT/node_modules" && pwd -P)"
 ln -s "$node_modules_root" "$snapshot_dir/node_modules"
+# Playwright loads every spec, and component specs import Vite from here.
+if [[ -d "$ROOT/frontend/node_modules" ]]; then
+  ln -s "$(cd "$ROOT/frontend/node_modules" && pwd -P)" "$snapshot_dir/frontend/node_modules"
+fi
 
 echo "Building disposable test stack for ${head_sha:0:12} (project: $project)..."
 compose_used=1

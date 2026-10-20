@@ -304,7 +304,8 @@ def test_goal_responsibility_requires_truthful_outcome_or_real_handoff():
   assert "# Waiting visibly — durable monitors or explicit owner actions" in waiting
   assert "`--owner` is required for command waits" in waiting_normalized
   assert "exit **0 exactly when the condition is met**" in waiting_normalized
-  assert "A wait declared inside a Goal resumes under the same Goal" in waiting_normalized
+  assert "A wait declared inside a Goal is delivered only to that same Goal" in waiting_normalized
+  assert "an unrelated turn in the chat cannot consume its result" in waiting_normalized
 
 
 def test_core_question_fallback_shows_the_minimal_valid_shape():

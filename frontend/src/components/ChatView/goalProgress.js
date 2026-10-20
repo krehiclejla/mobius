@@ -68,6 +68,9 @@ export function normalizeGoalPresentation(goal) {
     status: goal.status,
     resumable: goal.resumable === true,
     plan: goal.plan || null,
+    ...(goal.needed_by?.length ? { needed_by: goal.needed_by } : {}),
+    ...(Array.isArray(goal.dependency_history) && goal.dependency_history.length ? { dependency_history: goal.dependency_history } : {}),
+    ...(Array.isArray(goal.dependencies) && goal.dependencies.length ? { dependencies: goal.dependencies } : {}),
     ...(goal.status === 'paused' && ['owner', 'agent', 'unknown', 'deferred'].includes(goal.pause_reason)
       ? { pause_reason: goal.pause_reason } : {}),
     ...(goal.status === 'paused' && goal.pause_reason === 'deferred' && typeof goal.hold_reason === 'string'
@@ -75,6 +78,34 @@ export function normalizeGoalPresentation(goal) {
     ...(goal.handoff?.kind ? { handoff: goal.handoff } : {}),
     ...(goal.result ? { result: goal.result } : {}),
   }
+}
+
+/** A dependency outcome is a saved fact, never permission or a Goal outcome. */
+export function goalDependencyOutcomeLabel(dependency) {
+  if ((dependency?.disposition || dependency?.result_disposition) === 'withdrawn') return 'You stopped following this'
+  const kind = dependency?.outcome?.kind
+  const answer = Object.values(dependency?.outcome?.answers || {}).filter(value => typeof value === 'string').join(' · ')
+  if (kind === 'answered' || kind === 'closed_without_reply') {
+    return answer ? `You chose ${answer}` : kind === 'answered' ? 'Answered' : 'Closed without a reply'
+  }
+  const label = {
+    cancelled: 'Stopped', superseded: 'Replaced', source_deleted: 'The chat was deleted',
+    completed: 'Work completed', released: 'Work handed back', owner_deleted: 'The chat was deleted',
+    owner_not_progressing: 'Work interrupted',
+  }[kind] || 'Waiting ended with this Goal'
+  const detail = dependency?.outcome?.outcome
+  return detail ? `${label} · ${detail}` : label
+}
+
+export function goalDependencyHref(dependency) {
+  if (!dependency?.source_chat_id || dependency.source_deleted) return null
+  const params = new URLSearchParams({ chat: dependency.source_chat_id })
+  if (dependency.target_kind === 'owner_card') {
+    if (!dependency.source_question_id) return null
+    params.set('focus', 'question')
+    params.set('question', dependency.source_question_id)
+  }
+  return `/shell/?${params}`
 }
 
 /** One status vocabulary for the Goal rail and its accessible announcement.

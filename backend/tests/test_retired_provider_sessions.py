@@ -71,7 +71,7 @@ async def _run_turn(
   async def fake_record_run_metrics(**_kwargs):
     return None
 
-  monkeypatch.setattr(chat_mod, "get_provider", lambda _id: _Provider(provider_name))
+  monkeypatch.setattr(chat_mod, "registered_provider", lambda _id: _Provider(provider_name))
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   monkeypatch.setattr(chat_mod, "_record_run_metrics", fake_record_run_metrics)
   refusals = []

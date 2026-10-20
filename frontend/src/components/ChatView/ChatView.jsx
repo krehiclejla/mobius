@@ -161,6 +161,7 @@ import {
 import {
   chatCacheEntryState,
   chatDetailCacheValue,
+  hasUnloadedNewerMessages,
   chatSnapshotMatchesRuntime,
   shouldRefetchTranscriptForRuntime,
   mergeRecentMessagesIntoLoadedWindow,
@@ -175,12 +176,9 @@ import {
   consumeChatSearchActivation,
   reconcileChatSearchActivation,
   subscribeChatSearchReveal,
+  retireMissingChatReveal,
 } from '../../lib/chatSearchReveal.js'
-import {
-  chatQuestionRevealFor,
-  consumeChatQuestionReveal,
-  subscribeChatQuestionReveal,
-} from '../../lib/chatQuestionReveal.js'
+import { useChatQuestionActivation, useChatQuestionReveal } from './hooks/useChatQuestionReveal.js'
 import {
   highlightSearchTerms,
 } from '../../lib/searchTermHighlight.js'
@@ -448,7 +446,6 @@ export default function ChatView({
   onDisplayReady = null,
   artifactsAppId = null,
   onOpenArtifact = null,
-  focusPendingQuestion = false,
 }) {
   const queryClient = useQueryClient()
   const provisionalNewChat = !!newChatSession && !newChatSession.materialized
@@ -482,11 +479,12 @@ export default function ChatView({
   const searchRevealConsumed = searchActivationRef.current.consumedId === searchReveal?.id
   const searchRevealCleanupRef = useRef(() => {})
   useEffect(() => () => searchRevealCleanupRef.current(), [])
-  const [, setQuestionRevealVersion] = useState(0)
-  useEffect(() => subscribeChatQuestionReveal(chatId, () => {
-    setQuestionRevealVersion(version => version + 1)
-  }), [chatId])
-  const questionReveal = chatQuestionRevealFor(chatId)
+  const questionActivation = useChatQuestionActivation({
+    chatId, hidden, searchRevealId: searchReveal?.id,
+  })
+  const decisionQuestionId = questionActivation.reveal?.questionId
+  const decisionRevealId = questionActivation.reveal?.id
+  const decisionAnchorKey = decisionQuestionId ? `question:${decisionQuestionId}` : null
   const inputRef = useRef(null)
   const handleInternalNav = useCallback((url) => {
     onInternalNav?.(url)
@@ -526,6 +524,10 @@ export default function ChatView({
     applyMessagesToView,
     commitMessages,
   } = useTranscriptState({ cacheKey: transcriptCacheKey, cached, queryClient })
+  const [hasUnloadedNewer, setHasUnloadedNewer] = useState(
+    () => hasUnloadedNewerMessages(cached),
+  )
+  const loadingLatestRef = useRef(false)
   const messageHistory = useMemo(
     () => composerHistoryFromMessages(messages),
     [messages],
@@ -535,11 +537,11 @@ export default function ChatView({
   // saved coordinate; an incomplete restoration window stays hidden until the
   // anchor-addressed read repairs or retires that coordinate.
   const initialSavedAnchorKey = savedReadingAnchorKey(chatId)
-  const initialActivationAnchorKey = searchReveal?.anchorKey || initialSavedAnchorKey
+  const initialActivationAnchorKey = decisionAnchorKey || searchReveal?.anchorKey || initialSavedAnchorKey
   const initialCacheEntryState = chatCacheEntryState(
     cached,
     initialActivationAnchorKey,
-    !searchReveal && savedReadingAnchorHasNestedPart(chatId),
+    !decisionAnchorKey && !searchReveal && savedReadingAnchorHasNestedPart(chatId),
   )
   const [loading, setLoading] = useState(
     provisionalNewChat ? false : initialCacheEntryState === 'missing',
@@ -1168,7 +1170,7 @@ export default function ChatView({
     hidden,
     loadNonce,
     provisionalNewChat,
-    searchAnchorKey: searchReveal?.anchorKey,
+    searchAnchorKey: decisionAnchorKey || searchReveal?.anchorKey,
     searchRevealId: searchReveal?.id,
     loadingOlderRef: loadingOlder,
     pageRef: olderPageRef,
@@ -2508,7 +2510,7 @@ export default function ChatView({
     setChatInfo(activationCache?.chatInfo ?? null)
     setContinuationWait(activationCache?.continuationWait || null)
     const savedAnchorKey = savedReadingAnchorKey(chatId)
-    const searchAnchorKey = searchReveal?.anchorKey || null
+    const searchAnchorKey = decisionAnchorKey || searchReveal?.anchorKey || null
     // A search selection is a deliberate one-shot navigation, so it wins over
     // the stored reader coordinate for this activation. It never remaps or
     // retires that saved position.
@@ -2712,7 +2714,10 @@ export default function ChatView({
             retireSavedReadingPosition(chatId)
             anchorRetired = true
           } else {
-            clearChatSearchReveal(chatId, searchReveal?.id)
+            retireMissingChatReveal(chatId, {
+              decisionRevealId: decisionAnchorKey ? decisionRevealId : null,
+              searchRevealId: searchReveal?.id,
+            })
           }
         } else {
           // Rolling servers may omit the coverage bit. A row that is present
@@ -2728,6 +2733,7 @@ export default function ChatView({
         return
       }
       const msgs = detailCache.messages
+      setHasUnloadedNewer(hasUnloadedNewerMessages(detailCache))
       await reconcileFailedSendOutbox({
         visibleMessages: msgs,
         pendingMessages: runtime.pending_messages || [],
@@ -2977,6 +2983,8 @@ export default function ChatView({
     provisionalNewChat,
     searchReveal?.anchorKey,
     searchReveal?.id,
+    decisionAnchorKey,
+    decisionRevealId,
     commitRuntimeSnapshot,
     inspectRuntimeSnapshot,
     onRuntimeSettledIdle,
@@ -4158,9 +4166,9 @@ export default function ChatView({
   })
 
   // Chat commands (slashCommands.mobiusChatCommand) run here and are never
-  // sent. Nothing typed is lost to a failure: /compact and /new leave the chat
-  // box only once their action has happened, and /btw moves its question into
-  // the side-question card, which offers Try again.
+  // sent. Nothing typed is lost to a failure: /compact leaves the chat box once
+  // the server starts compacting and /new once the new chat exists, and /btw
+  // moves its question into the side-question card, which offers Try again.
   function dispatchMobiusChatCommand(composed) {
     const command = mobiusChatCommand(composed)
     if (!command) return false
@@ -4293,6 +4301,20 @@ export default function ChatView({
     void doSend(input.trim(), { directSteer: true, ...composerSendFiles(fromHistory) })
       .finally(() => { submitSteerInFlightRef.current = false })
   }
+
+  const handleStopFollowing = useCallback(async (dependencyId) => {
+    const res = await apiFetch(`/chat-waits/dependencies/${encodeURIComponent(dependencyId)}/withdraw`, {
+      method: 'POST', timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+    })
+    if (!res.ok) {
+      let data = null
+      try { data = await res.json() } catch { /* use the fallback below */ }
+      throw new Error(typeof data?.detail === 'string' ? data.detail : 'Could not stop following. Try again.')
+    }
+    // No optimistic deletion: the committed result/history and remaining Goal
+    // ownership arrive together, including Resume when no handoff remains.
+    await fetchMessages({ force: true, authoritative: true })
+  }, [fetchMessages])
 
   // Goal clearing is lifecycle control, never chat content. The rail confirms
   // first, then this exact-id request dismisses completed work without
@@ -5801,17 +5823,13 @@ export default function ChatView({
     scrollRef, hasPendingResume, resumeCardEl,
   )
   const questionNudgeShown = hasPendingQuestion && pendingCardOffscreen
-  const questionRevealConsumedRef = useRef(null)
-  useLayoutEffect(() => {
-    const requestId = questionReveal?.id ?? (focusPendingQuestion ? 'deep-link' : null)
-    if (!requestId || questionRevealConsumedRef.current === requestId) return
-    if (!hasPendingQuestion || !pendingQuestionEl) return
-    questionRevealConsumedRef.current = requestId
-    revealPendingQuestion(pendingQuestionEl)
-    if (questionReveal?.id != null) consumeChatQuestionReveal(chatId, questionReveal.id)
-  }, [chatId, focusPendingQuestion, hasPendingQuestion, pendingQuestionEl, questionReveal, revealPendingQuestion])
+  useChatQuestionReveal({
+    activation: questionActivation, hidden, displayReady, rootRef: scrollRef,
+    pendingElement: hasPendingQuestion ? pendingQuestionEl : null,
+    revealElement: revealPendingQuestion, contentVersion: messages,
+  })
   const resumeNudgeShown = hasPendingResume && resumeCardOffscreen
-  const jumpToLatestVisible = jumpToLatestShown({
+  const jumpToLatestVisible = hasUnloadedNewer || jumpToLatestShown({
     // A send-owned PIN_USER_MSG is the expected latest-turn location, not a
     // reader escape. Its keyboard-close reachability floor can temporarily
     // extend the physical tail before the viewport grows, so suppress the
@@ -5821,6 +5839,34 @@ export default function ChatView({
     questionNudgeShown,
     resumeNudgeShown,
   })
+  const followLatestIncludingUnloaded = useCallback(async () => {
+    if (!hasUnloadedNewer) {
+      followLatest()
+      return
+    }
+    if (loadingLatestRef.current) return
+    loadingLatestRef.current = true
+    const generation = fetchGenRef.current
+    try {
+      const response = await apiFetch(`/chats/${chatId}?limit=20&compact=1`, {
+        timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+      })
+      if (!response.ok) return
+      const latest = chatDetailCacheValue(await response.json())
+      if (chatIdStaleRef.current || fetchGenRef.current !== generation
+          || !latest.restorationWindowComplete) return
+      queryClient.setQueryData(chatMessagesQueryKey(chatId), latest)
+      flushSync(() => {
+        applyMessagesToView(latest.messages, latest.offset)
+        setHasUnloadedNewer(false)
+      })
+      followLatest()
+    } catch {
+      // Keep the control available for retry; never label the old window latest.
+    } finally {
+      loadingLatestRef.current = false
+    }
+  }, [hasUnloadedNewer, followLatest, chatId, queryClient, applyMessagesToView])
   const offscreenControlsVisible = questionNudgeShown
     || resumeNudgeShown
     || jumpToLatestVisible
@@ -5999,9 +6045,14 @@ export default function ChatView({
         actionError: goalResumeState.error,
       } : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff
+      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff || goalPresentation?.dependencies?.length || goalPresentation?.dependency_history?.length || goalPresentation?.needed_by?.length
         ? { details: <GoalPlanDetails
             plan={goalPresentation?.plan}
+            dependencies={goalPresentation?.dependencies}
+            onStopFollowing={!embedded ? handleStopFollowing : undefined}
+            dependencyHistory={goalPresentation?.dependency_history}
+            neededBy={goalPresentation?.needed_by}
+            onInternalNav={internalNav}
             holdReason={continuationHandoff
               ? `${continuationHandoff.description} ${continuationHandoff.boundary}`
               : goalPresentation?.hold_reason}
@@ -6493,7 +6544,7 @@ export default function ChatView({
                       className="chat__jump-latest"
                       aria-label="Jump to the latest message"
                       title="Jump to latest"
-                      {...composerAdjacentActionProps(followLatest, {
+                      {...composerAdjacentActionProps(followLatestIncludingUnloaded, {
                         activateOnTouchEnd: true,
                       })}
                     >

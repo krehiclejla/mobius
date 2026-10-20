@@ -3,18 +3,18 @@ import {
   ArrowRotateCw,
   ChevronDown,
   DoubleChevronRight,
+  Paperclip,
   Pencil,
   X,
 } from '@openai/apps-sdk-ui/components/Icon'
 import { stripAugmentation } from './msgText.js'
 import { cidOf } from './messageIdentity.js'
 import { queuedHint } from './queuedHint.js'
+import { queuedFilesLabel, queuedPreview } from './queuedPreview.js'
 import {
   pointerSelectionChangedWithin,
   textSelectionSnapshot,
 } from '../../lib/selectableTextControl.js'
-
-const TRUNCATE_AT = 80
 
 /**
  * Queued-messages tray rendered above the chat input.
@@ -117,11 +117,9 @@ export default function QueuedMessages({
             const key = keyOf(msg)
             const text = stripAugmentation(msg.content || '')
             const isExpanded = expanded.has(key)
-            const needsTruncation = text.length > TRUNCATE_AT || text.includes('\n')
-            const firstLine = text.split('\n')[0]
-            const preview = firstLine.length > TRUNCATE_AT
-              ? firstLine.slice(0, TRUNCATE_AT) + '…'
-              : firstLine + (text.includes('\n') ? ' …' : '')
+            const { preview, needsTruncation } = queuedPreview(text)
+            const filesLabel = queuedFilesLabel(msg.attachments)
+            const filesOnly = filesLabel && !text
             const MessageSurface = needsTruncation ? 'button' : 'div'
             const inComposer = inComposerCid === key
             const rejected = msg.recoveryAvailable
@@ -163,12 +161,20 @@ export default function QueuedMessages({
                       aria-hidden="true"
                     />
                   )}
-                  <span className="queued__text">
-                    {isExpanded ? text : preview}
-                    {rejected && <span className="queued__rejection" role="status">
-                      Send rejected. Your message is kept here.
-                    </span>}
-                  </span>
+                  {(!filesOnly || rejected) && (
+                    <span className="queued__text">
+                      {isExpanded ? text : preview}
+                      {rejected && <span className="queued__rejection" role="status">
+                        Send rejected. Your message is kept here.
+                      </span>}
+                    </span>
+                  )}
+                  {filesLabel && (
+                    <span className={`queued__files${filesOnly ? ' queued__files--only' : ''}`}>
+                      <Paperclip width={14} height={14} aria-hidden="true" />
+                      <span className="queued__files-name">{filesLabel}</span>
+                    </span>
+                  )}
                 </MessageSurface>
                 {rejected && (
                   <button

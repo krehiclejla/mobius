@@ -53,7 +53,6 @@ function PaneChatView({
   onFirstMessage,
   onDisplayReady,
   onChatBoundaryError,
-  focusPendingQuestion = false,
   archived = false,
   setChatArchived,
 }) {
@@ -177,7 +176,6 @@ function PaneChatView({
         composerRequest={composerRequest}
         onComposerRequestHandled={onComposerRequestHandled}
         onDisplayReady={onDisplayReady ? handleDisplayReady : null}
-        focusPendingQuestion={focusPendingQuestion}
         archived={archived}
         onRestoreArchived={setChatArchived ? handleRestoreArchived : undefined}
       />

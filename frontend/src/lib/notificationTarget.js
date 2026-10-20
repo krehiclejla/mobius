@@ -73,7 +73,8 @@ export function parseNotificationTarget(target) {
       }
     }
     if (chat && ID_RE.test(chat)) {
-      return { view: 'chat', chatId: chat, focusQuestion: params.get('focus') === 'question' }
+      return { view: 'chat', chatId: chat, focusQuestion: params.get('focus') === 'question',
+        ...(params.get('focus') === 'question' && params.get('question') ? { questionId: params.get('question') } : {}) }
     }
     if (!app && !chat && params.has('settings')) {
       return { view: 'settings', section: settingsSectionOrNull(params.get('settings')) }

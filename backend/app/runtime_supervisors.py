@@ -390,6 +390,13 @@ class RuntimeSupervisors:
             raise
           except Exception as exc:
             self.log.error("chat-wait sweep failed: %s", exc, exc_info=True)
+          try:
+            from app.goal_dependencies import deliver_pending_dependencies
+            await deliver_pending_dependencies()
+          except asyncio.CancelledError:
+            raise
+          except Exception as exc:
+            self.log.error("dependency delivery sweep failed: %s", exc, exc_info=True)
       finally:
         system_broadcast.unsubscribe(events)
 
@@ -514,8 +521,27 @@ class RuntimeSupervisors:
         run_capacity_tick,
       )
       from app.config import get_settings
+      from app.file_cache import reclaim_accumulated_cache
 
       data_dir = get_settings().data_dir
+
+      async def release_accumulated_cache() -> None:
+        # Railway meters page cache as memory, and turn-end cleanup waits for
+        # the turn to end; release what long turns keep hot in the meantime.
+        try:
+          advice = await asyncio.to_thread(reclaim_accumulated_cache, data_dir)
+        except Exception:
+          self.log.debug("periodic file cache advice failed", exc_info=True)
+          return
+        if not advice or not advice["observed_drop_bytes"]:
+          # Silence is the signal that nothing reclaimable accumulated; a pass
+          # that keeps achieving nothing should not read as if it worked.
+          return
+        self.log.info(
+          "periodic file cache advice: container file cache %d -> %d bytes",
+          advice["file_cache_before_bytes"], advice["file_cache_after_bytes"],
+        )
+
       tick = 0
       while True:
         try:
@@ -563,6 +589,10 @@ class RuntimeSupervisors:
           raise
         except Exception as exc:
           self.log.error("capacity monitor failed: %s", exc, exc_info=True)
+        # Boot's own pass advises these same paths once the server is ready,
+        # so the first tick would only repeat it seconds later.
+        if tick:
+          await release_accumulated_cache()
         tick += 1
         await asyncio.sleep(CAPACITY_MONITOR_INTERVAL_SECS)
 

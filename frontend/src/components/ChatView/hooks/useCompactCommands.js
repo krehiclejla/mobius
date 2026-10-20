@@ -37,6 +37,25 @@ export default function useCompactCommands({
     return () => { lifecycle.active = false }
   }, [chatId])
 
+  // The "/compact" command the owner submitted and this pane may clear. It is
+  // consumed once, by whichever comes first: the server starting to compact or
+  // the finished compaction. Only the call that set it may consume it.
+  const submittedCommandRef = useRef(null)
+
+  const clearSubmittedCommand = useCallback(() => {
+    const submitted = submittedCommandRef.current
+    submittedCommandRef.current = null
+    if (!submitted?.lifecycle?.active || activeCompactChatRef.current !== submitted.chatId
+      || !isOwnerWorkspace()
+      || composerDraftRevision(submitted.chatId) !== submitted.revision
+      || inputValueRef.current !== submitted.text) return
+    setComposerInput('')
+  }, [inputValueRef, setComposerInput])
+
+  useEffect(() => {
+    if (serverCompactingKind === 'compact') clearSubmittedCommand()
+  }, [serverCompactingKind, clearSubmittedCommand])
+
   function claimAction(key) {
     if (pendingActionsRef.current.has(key)) return false
     pendingActionsRef.current.add(key)
@@ -107,9 +126,12 @@ export default function useCompactCommands({
   // compaction as its own "Context compacted" card. A card action passes no
   // submitted input, so the owner's unrelated draft is left untouched.
   //
-  // A submitted command stays in its chat's draft until a finished compaction
-  // is acknowledged, so rejection, transport failure, Pause, or leaving the
-  // chat never has to put it back: every pane of the chat already reads it.
+  // A submitted command stays in its chat's draft until the server reports it
+  // has started compacting, and the progress card shows what is happening
+  // from then on. A request the server refuses never starts compacting, so
+  // rejection, transport failure, or leaving the chat never has to put the
+  // command back: every pane of the chat already reads it. If that report
+  // never reaches this pane, the finished compaction clears it instead.
   // Only the submitting pane, still showing its chat in the owner workspace
   // it submitted from, clears it, and only while the draft revision and text
   // are unchanged; any later edit (text, an emptied draft, or uploads) is
@@ -127,12 +149,16 @@ export default function useCompactCommands({
     if (isProviderSwitchBlocking(chatId)) return
     const actionKey = `compact:${chatId}`
     if (!claimAction(actionKey)) return
-    const ownerDraft = submittedInput !== null && isOwnerWorkspace()
-      ? { text: inputValueRef.current, revision: composerDraftRevision(chatId) }
-      : null
     setSendFailure(null)
     const targetChatId = chatId
     const lifecycle = compactActionLifecycleRef.current
+    const submitted = submittedInput !== null && isOwnerWorkspace()
+      ? {
+        chatId: targetChatId, lifecycle,
+        text: inputValueRef.current, revision: composerDraftRevision(chatId),
+      }
+      : null
+    if (submitted) submittedCommandRef.current = submitted
     const stillVisible = () => lifecycle?.active && activeCompactChatRef.current === targetChatId
     cancelCompactProgress()
     try {
@@ -151,14 +177,13 @@ export default function useCompactCommands({
         // The compaction rewrote what the context holds: a cached /context
         // breakdown must not survive it, whichever pane shows this chat.
         onCompacted?.(targetChatId)
-        if (ownerDraft && stillVisible() && isOwnerWorkspace()
-          && composerDraftRevision(targetChatId) === ownerDraft.revision
-          && inputValueRef.current === ownerDraft.text) setComposerInput('')
+        if (submitted && submittedCommandRef.current === submitted) clearSubmittedCommand()
         if (stillVisible()) await fetchMessages({ force: true })
       }
     } catch (err) {
       if (stillVisible()) setSendFailure(sendFailureMessage(err, { online: getOnlineSnapshot() }))
     } finally {
+      if (submitted && submittedCommandRef.current === submitted) submittedCommandRef.current = null
       // Status readback is optional: it must never own the action latch.
       releaseAction(actionKey)
       if (lifecycle?.active) void refreshCompactProgress(targetChatId)

@@ -377,3 +377,226 @@ def test_a_failed_mid_level_helper_does_not_trap_its_coordinator(db, chat):
   update_goal_record(db, run, goal, goal.revision, complete=True)
   db.expire_all()
   assert goal.status == "completed"
+
+
+def _goal_result(db, chat, run, kind, *, resolved=True):
+  from app.chat_waits import declare_wait
+  if kind == "wait":
+    row = declare_wait(db, chat_id=chat.id, created_by_run_id=run.id,
+      description="Exact Goal result", kind="timer", delay_secs=60)
+    row.status = "met" if resolved else "armed"
+  else:
+    row = models.GoalDependency(id="dependency", waiting_chat_id=chat.id,
+      waiting_goal_id=run.goal_id, created_by_run_id=run.id,
+      target_kind="claim_acquisition", target_key="claim:acquisition",
+      target_claim_id="claim", target_acquisition_id="acquisition",
+      resolved_at=datetime.now(UTC) if resolved else None,
+      outcome_json={"kind": "completed", "outcome": "Verified"} if resolved else None)
+    db.add(row)
+  db.commit()
+  return row
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("admitted", [False, True])
+def test_completion_cannot_retire_a_result_missing_from_its_admitted_prompt(db, chat, kind, admitted):
+  from app.goal_plans import GoalPlanError
+  from app.chat_writer import AppendPending
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  # A selected-but-unadmitted snapshot is not evidence of provider receipt.
+  run.provider_execution_admitted = admitted
+  setattr(run, f"admitted_{kind}_results_json", [] if admitted else [row.id])
+  db.commit()
+  submit(AppendPending(chat_id=chat.id, user_msg={"role": "user", "content": "Result",
+    "cid": f"{kind}-result-{row.id}", "kind": f"{kind}_result", "source_work_id": run.id}))
+  db.expire_all()
+  before = deepcopy(goal.plan_json), goal.revision, deepcopy(db.get(models.Chat, chat.id).pending_messages)
+  with pytest.raises(GoalPlanError, match=f"{kind}:" + row.id):
+    update_goal_record(db, run, goal, goal.revision, complete=True,
+      tasks=[{"id": "verify", "result": "Not committed"}])
+  db.expire_all()
+  assert goal.status == "open" and row.result_disposition is None
+  assert (goal.plan_json, goal.revision, db.get(models.Chat, chat.id).pending_messages) == before
+  # The next exact-Goal turn carries it; completion need not wait for the
+  # end-of-turn provider-success acknowledgement to record an honest outcome.
+  receiver = models.ChatRun(id="receiving", chat_id=chat.id, root_run_id=run.id,
+    goal_id=goal.id, provider="codex", status="running", provider_execution_admitted=True)
+  setattr(receiver, f"admitted_{kind}_results_json", [row.id])
+  db.add(receiver); db.commit()
+  update_goal_record(db, receiver, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"
+  assert row.result_disposition == "retired_by_goal_outcome" and row.received_run_id is None
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("disposition", ["delivered", "withdrawn", "foreign_goal"])
+def test_completion_ignores_results_no_longer_owed_to_its_exact_goal(db, chat, kind, disposition):
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  if disposition == "foreign_goal":
+    other = models.ChatGoal(id="other", chat_id=chat.id, objective="Separate work")
+    db.add(other); db.flush()
+    setattr(row, "goal_id" if kind == "wait" else "waiting_goal_id", other.id)
+  else:
+    row.result_disposition = disposition
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.refresh(row)
+  assert row.result_disposition == (None if disposition == "foreign_goal" else disposition)
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("outcome", ["cancel", "cannot_complete"])
+def test_explicit_non_success_can_retire_an_unseen_result_without_claiming_receipt(db, chat, kind, outcome):
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  detail = "Owner called off this outcome" if outcome == "cancel" else {
+    "reason": "No feasible route", "efforts": "Verified constraints", "unmet_outcome": "Not shipped"}
+  update_goal_record(db, run, goal, goal.revision, **{outcome: detail})
+  db.refresh(row)
+  assert goal.status == ("cancelled" if outcome == "cancel" else outcome)
+  assert row.result_disposition == "retired_by_goal_outcome" and row.received_run_id is None
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_deferral_requires_resolving_or_withdrawing_the_exact_dependency(db, chat, resolved):
+  from app.goal_plans import GoalPlanError
+  from app.chat_writer import WithdrawGoalDependency
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, "dependency", resolved=resolved)
+  before = goal.revision
+  with pytest.raises(GoalPlanError, match="dependency:" + row.id):
+    update_goal_record(db, run, goal, goal.revision, defer=REASON)
+  db.expire_all()
+  assert goal.status == "open" and goal.revision == before and row.result_disposition is None
+  submit(WithdrawGoalDependency(chat_id=chat.id, dependency_id=row.id))
+  db.expire_all()
+  update_goal_record(db, run, goal, goal.revision, defer=REASON)
+  assert goal.status == "stopped" and row.result_disposition == "withdrawn"
+
+
+def test_completion_can_retire_an_unresolved_dependency(db, chat):
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, "dependency", resolved=False)
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.refresh(row)
+  assert row.result_disposition == "retired_by_goal_outcome"
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+def test_result_resolving_between_blocker_read_and_completion_cas_wins(db, chat, kind, monkeypatch):
+  from app import goals
+  from app.database import SessionLocal
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind, resolved=False)
+  original = goals._unseen_goal_result_queries
+  calls = 0
+  def resolve_before_cas(*args):
+    nonlocal calls
+    calls += 1
+    if calls == 2:
+      # A different source transaction wins after the friendly blocker read.
+      with SessionLocal() as source_db:
+        source = source_db.get(type(row), row.id)
+        if kind == "wait":
+          source.status = "met"
+        else:
+          source.resolved_at = datetime.now(UTC)
+          source.outcome_json = {"kind": "completed", "outcome": "Verified"}
+        source_db.commit()
+    return original(*args)
+  monkeypatch.setattr(goals, "_unseen_goal_result_queries", resolve_before_cas)
+  with pytest.raises(GoalPlanConflict, match="Goal changed"):
+    update_goal_record(db, run, goal, goal.revision, complete=True)
+  assert calls == 2
+  db.expire_all()
+  assert goal.status == "open" and goal.revision == 4
+  assert row.result_disposition is None
+  assert (row.status == "met") if kind == "wait" else row.resolved_at is not None
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+def test_deferral_receipts_admitted_results_only_after_success(db, chat, kind):
+  from app.chat_waits import owed_wait_results, stage_wait_results_delivered
+  from app.goal_dependencies import owed_dependency_results, stage_dependency_results_delivered
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  run.provider_execution_admitted = True
+  setattr(run, f"admitted_{kind}_results_json", [row.id])
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, defer=REASON)
+  db.refresh(row)
+  assert row.result_disposition is None  # Tools do not promise provider success.
+  owed = owed_wait_results if kind == "wait" else owed_dependency_results
+  receipt = stage_wait_results_delivered if kind == "wait" else stage_dependency_results_delivered
+  assert owed(db, chat.id, "", run_id=run.id) == ("", ())  # Never admit held work.
+  assert receipt(db, chat.id, (row.id,), run_id=run.id) == 1
+  db.commit(); db.refresh(row)
+  assert row.result_disposition == "delivered" and row.received_run_id == run.id
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("hold", ["owner_stop", "other_run", "legacy"])
+def test_success_receipt_cannot_bypass_a_different_hold(db, chat, kind, hold):
+  from app.chat_waits import stage_wait_results_delivered
+  from app.goal_dependencies import stage_dependency_results_delivered
+  from app.goals import _new_hold
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  run.provider_execution_admitted = True
+  setattr(run, f"admitted_{kind}_results_json", [row.id])
+  goal.status = "stopped"
+  goal.hold_json = None if hold == "legacy" else _new_hold(
+    cause="stop" if hold == "owner_stop" else "deferred",
+    actor="owner" if hold == "owner_stop" else "agent",
+    run_id=run.id if hold == "owner_stop" else "other-run", source_id="hold", reason=REASON)
+  db.commit()
+  receipt = stage_wait_results_delivered if kind == "wait" else stage_dependency_results_delivered
+  assert receipt(db, chat.id, (row.id,), run_id=run.id) == 0
+  db.refresh(row)
+  assert row.result_disposition is None
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("admitted", [False, True])
+def test_deferral_blocks_results_not_in_the_admitted_prompt(db, chat, kind, admitted):
+  from app.goal_plans import GoalPlanError
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  run.provider_execution_admitted = admitted
+  setattr(run, f"admitted_{kind}_results_json", [] if admitted else [row.id])
+  db.commit()
+  with pytest.raises(GoalPlanError, match=f"{kind}:" + row.id):
+    update_goal_record(db, run, goal, goal.revision, defer=REASON)
+  assert goal.status == "open" and row.result_disposition is None
+
+
+@pytest.mark.parametrize("action", ["stop", "dismiss"])
+def test_owner_end_survives_partial_claim_settlement_failure_and_retries(db, chat, monkeypatch, caplog, action):
+  import asyncio
+  from app import agent_work_claims, agent_coordination
+  from app.chat_writer import PrepareChatStop, ClearPresentedGoal
+  goal, run = seed(db, chat)
+  owner = models.Owner(username="claim-owner", hashed_password="unused")
+  db.add(owner); db.commit()
+  agent_work_claims.claim_work(db, owner_id=owner.id, chat_id=chat.id,
+    run_id=run.id, work_key="repair-stop", summary="Repair stop")
+  claim = db.query(models.AgentWorkClaim).one()
+  original = agent_work_claims.stage_settle_goal_claims
+  def fail_after_changes(*args, **kwargs):
+    original(*args, **kwargs)
+    raise RuntimeError("Injected partial claim settlement failure")
+  monkeypatch.setattr(agent_work_claims, "stage_settle_goal_claims", fail_after_changes)
+  command = (PrepareChatStop(chat_id=chat.id, actor="owner") if action == "stop" else
+    ClearPresentedGoal(chat_id=chat.id, expected_goal_id=goal.id))
+  submit(command)
+  db.expire_all()
+  assert goal.status == ("stopped" if action == "stop" else "dismissed")
+  assert claim.released_at is None and claim.completed_at is None
+  assert "settlement notice will retry" in caplog.text
+  monkeypatch.setattr(agent_work_claims, "stage_settle_goal_claims", original)
+  asyncio.run(agent_coordination.settle_claims_with_owner(chat.id))
+  db.expire_all()
+  assert claim.released_at is not None and claim.completed_at is None

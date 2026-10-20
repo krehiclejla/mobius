@@ -180,28 +180,28 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   # not rely on FK enforcement for lifecycle cleanup). Any legacy unfinished
   # claim reaching this seven-day boundary becomes reclaimable before its last
   # owner identity is removed.
-  now = now_naive_utc()
-  db.query(models.AgentWorkClaim).filter(
-    models.AgentWorkClaim.owner_chat_id.in_(chat_ids),
-    models.AgentWorkClaim.completed_at.is_(None),
-    models.AgentWorkClaim.released_at.is_(None),
-  ).update({
-    models.AgentWorkClaim.released_at: now,
-    models.AgentWorkClaim.updated_at: now,
-    models.AgentWorkClaim.outcome: (
-      "Owning chat was deleted before this action completed."
-    ),
-    models.AgentWorkClaim.revision: models.AgentWorkClaim.revision + 1,
-  }, synchronize_session=False)
+  from app.agent_work_claims import stage_release_claims_for_chat
+  from app.goal_dependencies import stage_retire_chat_dependencies
+  from app.decision_cards import stage_deleted_decision_rows
+  titles = dict(db.query(models.Chat.id, models.Chat.title).filter(models.Chat.id.in_(chat_ids)).all())
+  for chat_id in chat_ids:
+    stage_deleted_decision_rows(db, chat_id, titles.get(chat_id))
+    stage_release_claims_for_chat(db, chat_id)
+    stage_retire_chat_dependencies(db, chat_id)
+  db.query(models.SavedDecisionCard).filter(
+    models.SavedDecisionCard.chat_id.in_(chat_ids),
+  ).delete(synchronize_session=False)
+  db.query(models.GoalDependency).filter(
+    models.GoalDependency.waiting_chat_id.in_(chat_ids),
+  ).delete(synchronize_session=False)
   db.query(models.AgentWorkClaim).filter(
     models.AgentWorkClaim.owner_chat_id.in_(chat_ids),
   ).update({
     models.AgentWorkClaim.owner_chat_id: None,
   }, synchronize_session=False)
-  # Do not rely on SQLite FK enforcement for the follower side either.
-  db.query(models.AgentWorkInterest).filter(
-    models.AgentWorkInterest.chat_id.in_(chat_ids),
-  ).delete(synchronize_session=False)
+  # Legacy interest audit history has no guarantee beyond chat retention.
+  # The existing FK may cascade on purge; without FK enforcement inert rows
+  # may remain. No runtime consumer relies on either their presence or absence.
   # Transcript rows, search entries and damage copies go with each chat
   # through the `chats_deleted` trigger, in this same transaction.
   db.query(models.Chat).filter(

@@ -422,7 +422,7 @@ def test_losing_approval_request_follows_the_owner_without_a_card(
   assert "question_id" not in body
   assert "No approval card was saved and your turn continues" in body["next_action"]
   assert db.query(models.AgentWorkClaim).count() == 1
-  assert db.query(models.AgentWorkInterest).one().chat_id == other.id
+  assert db.query(models.GoalDependency).one().waiting_chat_id == other.id
   assert _row(other.id)[0] is None
 
   from app.agent_work_claims import finish_work

@@ -11258,6 +11258,232 @@ def test_install_preview_resolves_its_row_off_the_event_loop(
   assert on_loop == [False]
 
 
+# MANIFEST_NEWS minus its icon, job and seed files, so a test names every file.
+_MANIFEST_WITHOUT_FILES = {
+  key: value for key, value in MANIFEST_NEWS.items()
+  if key not in ("icon", "schedule", "storage_seeds")
+}
+
+
+def _intercepting_client(responses: dict, intercept):
+  """`_fake_async_client` whose requests first pass through `intercept`.
+
+  `intercept(method, url, headers)` returns a response context to answer that
+  request itself, or None to leave it to the canned `responses`.
+  """
+  make = _fake_async_client(responses)
+
+  def factory(*args, **kwargs):
+    client = make()
+    canned_stream = client.stream
+
+    def stream(method, url, **kw):
+      answer = intercept(method, url, dict(kw.get("headers") or {}))
+      return answer if answer is not None else canned_stream(method, url, **kw)
+
+    client.stream = stream
+    return client
+
+  return factory
+
+
+def _recording_client(responses: dict, requests: list):
+  """`_fake_async_client`, also recording each request's method, url and headers."""
+  def record(method, url, headers):
+    requests.append((method, url, headers))
+
+  return _intercepting_client(responses, record)
+
+
+class _StalledResponse:
+  """A response that never arrives; counts the lookups that get cancelled."""
+
+  def __init__(self, cancelled: list):
+    self._cancelled = cancelled
+
+  async def __aenter__(self):
+    try:
+      await asyncio.sleep(30)
+    except asyncio.CancelledError:
+      self._cancelled.append(1)
+      raise
+
+  async def __aexit__(self, *exc):
+    return False
+
+
+@pytest.fixture
+def empty_size_cache(monkeypatch):
+  """File sizes learned by one test must not answer another's lookups."""
+  monkeypatch.setattr(install, "_FILE_SIZE_CACHE", {})
+
+
+def test_install_preview_reports_download_size_without_fetching_app_code(
+  client, auth, bypass_url_validation, empty_size_cache,
+):
+  """The Store shows this before install, so only headers are read."""
+  base = "https://preview-size.test/repo/"
+  manifest = {
+    **_MANIFEST_WITHOUT_FILES, "id": "preview-size", "entry": "index.jsx",
+    "source_files": ["lib.js"], "static_assets": {"a.png": "static/a.png"},
+  }
+  sized = lambda size: (200, b"", {"Content-Length": str(size)})
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": sized(1000),
+    base + "lib.js": sized(200),
+    base + "static/a.png": sized(30),
+  }
+  requests: list = []
+  with patch("app.install.httpx.AsyncClient", side_effect=_recording_client(responses, requests)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["download_bytes"] == 1230
+  file_requests = [r for r in requests if not r[1].endswith("mobius.json")]
+  assert {method for method, _url, _h in file_requests} == {"HEAD"}
+  assert all(h["Accept-Encoding"] == "identity" for _m, _u, h in file_requests)
+
+
+def test_install_preview_omits_download_size_when_a_file_size_is_unknown(
+  client, auth, bypass_url_validation, empty_size_cache,
+):
+  """A missing size hides the number instead of showing a wrong one."""
+  base = "https://preview-size-unknown.test/repo/"
+  manifest = {
+    **_MANIFEST_WITHOUT_FILES, "id": "preview-size-unknown", "entry": "index.jsx",
+    "source_files": ["lib.js"],
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, b"", {"Content-Length": "1000"}),
+    # lib.js is absent: the fake answers 404.
+  }
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["download_bytes"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+  {"Content-Length": "40", "Content-Encoding": "gzip"},
+  {},
+])
+async def test_remote_file_size_never_reports_a_compressed_or_missing_length(
+  headers, bypass_url_validation, empty_size_cache,
+):
+  class _Client:
+    def stream(self, method, url, **kwargs):
+      return _StreamCtx(200, b"", headers=headers)
+
+  assert await install._remote_file_size(_Client(), "https://x.test/a.js") is None
+
+
+def test_install_preview_gives_up_on_stalled_size_lookups_instead_of_waiting(
+  client, auth, bypass_url_validation, empty_size_cache, monkeypatch,
+):
+  """Install waits on this preview, so optional sizes get a bounded wait."""
+  monkeypatch.setattr(install, "_SIZE_LOOKUP_DEADLINE", 0.2)
+  base = "https://preview-size-stalled.test/repo/"
+  manifest = {
+    **_MANIFEST_WITHOUT_FILES, "id": "preview-size-stalled", "entry": "index.jsx",
+    "source_files": ["lib.js"],
+  }
+  responses = {base + "mobius.json": (200, json.dumps(manifest).encode())}
+  cancelled: list = []
+  stall_heads = lambda method, url, headers: (
+    _StalledResponse(cancelled) if method == "HEAD" else None
+  )
+  started = time.monotonic()
+  with patch("app.install.httpx.AsyncClient", side_effect=_intercepting_client(responses, stall_heads)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["download_bytes"] is None
+  assert preview.json()["capability_digest"]
+  assert time.monotonic() - started < 10
+  assert len(cancelled) == 2
+
+
+def test_install_preview_sizes_files_while_reading_the_installed_contract(
+  client, auth, bypass_url_validation, empty_size_cache,
+):
+  """Hides the size lookup's latency behind the database read."""
+  import threading
+
+  base = "https://preview-size-overlap.test/repo/"
+  manifest = {**_MANIFEST_WITHOUT_FILES, "id": "preview-size-overlap"}
+  sizing_started = threading.Event()
+
+  async def sizing(_manifest, _raw_base):
+    sizing_started.set()
+    return 1234
+
+  def read_installed_contract(_manifest, _source):
+    # Awaited one after the other, the lookup would only start once this returns.
+    assert sizing_started.wait(timeout=5)
+    return None
+
+  with patch.object(install, "package_download_bytes", sizing), patch(
+    "app.routes.apps._installed_contract_for_preview", read_installed_contract,
+  ):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest": manifest, "raw_base": base,
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["download_bytes"] == 1234
+
+
+def test_install_preview_reuses_file_sizes_it_learned_moments_ago(
+  client, auth, bypass_url_validation, empty_size_cache, monkeypatch,
+):
+  """Reopening a listing must not spend the request budget installs share."""
+  base = "https://preview-size-cached.test/repo/"
+  manifest = {
+    **_MANIFEST_WITHOUT_FILES, "id": "preview-size-cached", "entry": "index.jsx",
+    "source_files": ["lib.js"],
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, b"", {"Content-Length": "1000"}),
+    base + "lib.js": (200, b"", {"Content-Length": "200"}),
+  }
+  requests: list = []
+
+  def preview_download_bytes():
+    with patch("app.install.httpx.AsyncClient", side_effect=_recording_client(responses, requests)):
+      preview = client.post("/api/apps/preview", headers=auth, json={
+        "manifest_url": base + "mobius.json",
+      })
+    assert preview.status_code == 200, preview.text
+    return preview.json()["download_bytes"]
+
+  heads = lambda: [r for r in requests if r[0] == "HEAD"]
+  assert preview_download_bytes() == 1200
+  assert len(heads()) == 2
+  assert preview_download_bytes() == 1200
+  assert len(heads()) == 2
+  monkeypatch.setattr(install, "_FILE_SIZE_TTL", 0.0)
+  assert preview_download_bytes() == 1200
+  assert len(heads()) == 4
+
+
+def test_file_size_cache_forgets_the_oldest_size_past_its_bound(
+  empty_size_cache, monkeypatch,
+):
+  monkeypatch.setattr(install, "_FILE_SIZE_CACHE_MAX", 2)
+  for name, size in (("a", 1), ("b", 2), ("a", 3), ("c", 4)):
+    install._remember_file_size(f"https://x.test/{name}", size)
+  assert {url.rsplit("/", 1)[1]: size for url, (_t, size) in install._FILE_SIZE_CACHE.items()} == {
+    "a": 3, "c": 4,
+  }
+
+
 def test_staged_clone_binds_identity_before_its_one_package_read(
   db, tmp_path, monkeypatch,
 ):

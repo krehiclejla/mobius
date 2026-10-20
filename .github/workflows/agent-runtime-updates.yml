@@ -59,9 +59,12 @@ jobs:
             backend/requirements.txt
             backend/requirements.lock
           body: |
-            Daily stable Claude/Codex runtime update proposal.
+            Daily stable Claude/Codex/Chrome runtime update proposal.
 
             - Claude's SDK supplies its bundled CLI; there is no second install.
+            - Chrome for Testing follows its Stable channel. It publishes no
+              checksums, so each archive's sha256 is computed from the same
+              download URL the image build verifies against.
             - Codex's npm CLI and Python SDK follow the same release. Its SDK
               CLI package shares the image's executable rather than duplicating it.
             - A Codex change fails `test_codex_tools_off.py` until the tools-off

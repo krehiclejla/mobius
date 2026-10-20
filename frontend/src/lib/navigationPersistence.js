@@ -43,7 +43,8 @@ export function parseShellDeepLink(location = globalThis.location) {
         const appId = /^\d+$/.test(app) ? Number.parseInt(app, 10) : null
         return { view: 'canvas', app, appId, intent }
       }
-      if (chat) return { view: 'chat', chatId: chat, intent, focusQuestion }
+      if (chat) return { view: 'chat', chatId: chat, intent, focusQuestion,
+        ...(focusQuestion && params.get('question') ? { questionId: params.get('question') } : {}) }
       if (project) return { view: 'project', projectId: project }
       if (projects === '1') return { view: 'projects' }
       if (params.has('settings')) {

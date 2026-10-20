@@ -98,6 +98,12 @@
     "0086_drop_chat_note_backup": "15897c2fe0885b337962f28abd0c6711a6ad1a2000440284d309ef5ecf36b49d",
     "0087_transcript_rows": "1eb049545de536d42713bfbaaffe282700fb3a1c131ff2811404ba31c7841fec",
     "0088_chat_compaction_drafts": "19c32b7c6cb3a5b7e3892b84c636ca3f1b8f6d292feda19befb821b72ace037e",
-    "0086_goal_execution_identity": "8cfac7d944e80b08f47d21d393401ac5211ed3560e196b4ef14d0efd04e1ea2e"
+    "0086_goal_execution_identity": "8cfac7d944e80b08f47d21d393401ac5211ed3560e196b4ef14d0efd04e1ea2e",
+    "0089_wait_result_receipts": "a2ab3b4fb8dde477ac70a239b0ff63719d0470ab3cbe84b3a3fbc85b2042ffe4",
+    "0090_goal_dependencies": "48515ad996c5ff79b49fcce765afd2bd312e1f5c94350b309924927e625ea5ab",
+    "0091_saved_decision_cards": "02419fbb4f6e0df6fd041aea007a70a0df31dee27e7d3d182d1dff96b6ad03dd",
+    "0092_transfer_notice_revision": "6f2b5103394e05671c13ff3e677a75d6746ea32043a2fd2d1fe1a4e4005261de",
+    "0093_pending_goal_dependency_indexes": "563d6aca72c6114e9e0a7c58d3e4d1a956843376d6d9b1ba7d38930882024882",
+    "0094_retire_legacy_claim_notice_carriers": "fb4916d1ac2f1d488b70f77013bed52155596f766b160ee53d6b7c3a1387c053"
   }
 }

@@ -364,11 +364,20 @@ def _approval_follower_result(claim: dict) -> dict:
   else:
     claim["next_action"] = (
       "No approval card was saved and your turn continues. "
-      f"{claim['owner_name']} owns this exact action and its approval; you now "
-      "follow it and will be notified when it completes or is released. Do "
+      f"{claim['owner_name']} owns this exact action and its approval. Do "
       "not request approval for or perform it yourself. Continue independent "
       "work and settle the overlapping plan task; your Goal stays yours."
     )
+    if claim.get("follow_status") in ("followed", "result_owed"):
+      claim["next_action"] += (
+        " Your open Goal follows this acquisition and will receive its result."
+      )
+    else:
+      claim["next_action"] += (
+        " No Goal follow was created ("
+        + str(claim.get("follow_status") or "no_open_top_level_goal")
+        + "); tell your coordinator if this work belongs to its Goal."
+      )
   return claim
 
 

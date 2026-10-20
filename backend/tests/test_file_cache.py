@@ -1,6 +1,8 @@
 import mmap
 import os
 
+import pytest
+
 from app import file_cache
 
 
@@ -207,3 +209,53 @@ def test_background_work_cleanup_covers_every_repository_pack_but_no_chat_profil
     )
   }
   assert all("agent-browser-profiles" not in str(path) for path in source_paths)
+
+
+@pytest.mark.parametrize("cached", [None, file_cache.ACCUMULATED_CACHE_FLOOR_BYTES - 1])
+def test_periodic_release_waits_for_the_floor(tmp_path, monkeypatch, cached):
+  """A quiet instance, or one without a readable cgroup, is left alone."""
+  calls = []
+  monkeypatch.setattr(file_cache, "_cached_file_bytes", lambda: cached)
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", calls.append)
+
+  assert file_cache.reclaim_accumulated_cache(tmp_path) is None
+  assert calls == []
+
+
+def _readings(*values):
+  """Successive cgroup readings, as a pass taken before and after sees them."""
+  readings = iter(values)
+  return lambda: next(readings)
+
+
+def test_periodic_release_frees_what_a_long_turn_keeps_hot(tmp_path, monkeypatch):
+  """Over the floor, the tick reuses the background-work cleanup unchanged and
+  reports what the container's file cache did, so the caller can log it."""
+  calls = []
+  floor = file_cache.ACCUMULATED_CACHE_FLOOR_BYTES
+  monkeypatch.setattr(
+    file_cache, "_cached_file_bytes", _readings(floor, floor - 50 * 1024 * 1024),
+  )
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", calls.append)
+
+  advice = file_cache.reclaim_accumulated_cache(tmp_path)
+
+  assert calls == [tmp_path]
+  assert advice["file_cache_before_bytes"] == floor
+  assert advice["file_cache_after_bytes"] == floor - 50 * 1024 * 1024
+  assert advice["observed_drop_bytes"] == 50 * 1024 * 1024
+
+
+def test_periodic_release_claims_no_drop_when_the_counter_only_grew(
+  tmp_path, monkeypatch,
+):
+  """A pass that races a busy turn can end with more cache than it started
+  with. Reporting that as a release would make a useless pass look productive,
+  so the drop floors at zero and the caller stays quiet."""
+  floor = file_cache.ACCUMULATED_CACHE_FLOOR_BYTES
+  monkeypatch.setattr(
+    file_cache, "_cached_file_bytes", _readings(floor, floor + 10 * 1024 * 1024),
+  )
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", lambda _path: None)
+
+  assert file_cache.reclaim_accumulated_cache(tmp_path)["observed_drop_bytes"] == 0

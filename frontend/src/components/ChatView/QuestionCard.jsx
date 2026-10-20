@@ -1,3 +1,5 @@
+import DependencyBacklinks from './DependencyBacklinks.jsx'
+import { ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { LocalAnswersContext } from './localAnswersContext.js'
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import './QuestionCard.css'
@@ -154,6 +156,8 @@ export default function QuestionCard({
   questions,
   questionId,
   answeredMap,
+  neededBy = [],
+  onInternalNav,
   platformAction,
   submittedOptions,
   attachments,
@@ -389,6 +393,8 @@ export default function QuestionCard({
     <div
       className={`qcard${grouped ? ' qcard--grouped' : ''}${answered ? ' qcard--answered' : ''}`}
       data-scroll-anchor-key={draftKey}
+      data-question-id={questionId}
+      tabIndex={-1}
       ref={answered ? null : pendingCardRef}
       aria-disabled={disabled && !answered ? true : undefined}
       aria-label={grouped ? `${questions.length} decisions` : undefined}
@@ -581,6 +587,10 @@ export default function QuestionCard({
         )
         })}
       </div>
+      {!!neededBy.length && <details className="qcard__related-work">
+        <summary>Related work<ChevronRight className="chat__panel-chevron" width={14} height={14} aria-hidden="true" /></summary>
+        <DependencyBacklinks chats={neededBy} onInternalNav={onInternalNav} />
+      </details>}
       {hasCardFiles && fileTray(cardLevel, 'Files for all answers')}
       {!platformAction && (answered || !disabled) && (
         <input ref={fileInputRef} type="file" multiple className="qcard__file-input"

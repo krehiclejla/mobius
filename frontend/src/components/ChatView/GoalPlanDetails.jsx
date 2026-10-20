@@ -1,7 +1,10 @@
 /* GoalPlanDetails renders the expanded dependency-aware todo list. */
+import DependencyBacklinks from './DependencyBacklinks.jsx'
+import DependencyLink from './DependencyLink.jsx'
+import StopFollowingAction from './StopFollowingAction.jsx'
 
-import { Check } from '@openai/apps-sdk-ui/components/Icon'
-import { goalTaskDisplayStatus } from './goalProgress'
+import { Check, Clock } from '@openai/apps-sdk-ui/components/Icon'
+import { goalTaskDisplayStatus, goalDependencyOutcomeLabel } from './goalProgress'
 import { goalHelpers } from './goalHelpers'
 import {
   HELPER_AWAITING_PARENT_LABEL, isHelperAwaitingParent, isWorkingHelperStatus,
@@ -48,6 +51,11 @@ function delegationMeta(node) {
   return state
 }
 
+const SOURCE_RECOVERY_BLOCKERS = new Set([
+  'source_missing', 'source_failed', 'source_held',
+  'owner_not_progressing', 'owner_deleted',
+])
+
 /* The exact saved question stays inspectable here, as a record addressed to
    the coordinating agent rather than an answer control for the owner. */
 function HelperQuestionRecord({ question }) {
@@ -84,10 +92,10 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
   )
 }
 
-export default function GoalPlanDetails({ plan, holdReason = null }) {
+export default function GoalPlanDetails({ plan, holdReason = null, dependencies = [], dependencyHistory = [], neededBy = [], onInternalNav, onStopFollowing }) {
   const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
-  if (!tasks.length && !plan?.delegations?.length && !reason) return null
+  if (!tasks.length && !plan?.delegations?.length && !reason && !dependencies.length && !dependencyHistory.length && !neededBy.length) return null
   const tasksById = new Map(tasks.map(task => [task.id, task]))
   const delegations = Array.isArray(plan?.delegations) ? plan.delegations : []
   // Execution is evidence for task status, never another checklist step.
@@ -122,7 +130,29 @@ export default function GoalPlanDetails({ plan, holdReason = null }) {
   }
   return (
     <div className="chat__goal-plan" role="region" aria-label="Goal details" tabIndex={0}>
+      <DependencyBacklinks chats={neededBy} onInternalNav={onInternalNav} />
       {reason && <p className="chat__goal-result">{reason}</p>}
+      {!!(dependencies.length + dependencyHistory.length) && <div role="list" aria-label="Work and decisions in other chats">
+        {[...dependencies, ...dependencyHistory].map(dependency => {
+          const settled = !!dependency.disposition
+          return <div role="listitem" key={dependency.id} className="chat__goal-task">
+            <Clock width={14} height={14} aria-hidden="true" />
+            <span className="chat__goal-task-copy">
+              <span className="chat__goal-task-title">{dependency.condition}</span>
+              <span className="chat__dependency-actions">
+                <DependencyLink dependency={dependency} onInternalNav={onInternalNav} />
+                {!settled && onStopFollowing && <StopFollowingAction dependency={dependency} onStopFollowing={onStopFollowing} />}
+              </span>
+              <span className="chat__goal-task-meta">{dependency.outcome || settled
+                ? goalDependencyOutcomeLabel(dependency)
+                : dependency.source_deleted ? 'The chat was deleted'
+                : SOURCE_RECOVERY_BLOCKERS.has(dependency.resume_blocker)
+                  ? `This work needs recovery in ${dependency.source_chat_title || 'the other chat'}`
+                  : dependency.automatic ? 'Continues automatically' : 'Saved until you continue this Goal'}</span>
+            </span>
+          </div>
+        })}
+      </div>}
       <div className="chat__goal-plan-tasks" role="list" aria-label="Full goal todo list">
         {(childrenByParent.get(null) || []).map(task => renderBranch(task))}
       </div>

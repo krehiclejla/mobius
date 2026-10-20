@@ -308,14 +308,15 @@ def compaction_brief_refresh(chat_id, run_id, *, delegated):
 async def settle_after_goal_completion(chat_id: str) -> None:
   """Finish what a committed terminal Goal outcome leaves for other owners.
 
-  Resume notices queued for Waits the completion took delivery of are
-  withdrawn, so they cannot start a turn for the finished Goal, and claim
-  followers wake with the settled outcome.
+  Retired Wait/dependency notices are withdrawn, so they cannot start a turn
+  for the finished Goal. Source claim results remain owed to exact followers.
   """
   from app.agent_coordination import settle_claims_with_owner
   from app.chat_waits import withdraw_delivered_resume_notices
 
+  from app.goal_dependencies import withdraw_disposed_dependency_notices
   await withdraw_delivered_resume_notices(chat_id)
+  await withdraw_disposed_dependency_notices(chat_id)
   await settle_claims_with_owner(chat_id)
 
 
@@ -359,6 +360,65 @@ def _helper_blockers(db, run, goal) -> list[str]:
       or (row.parent_chat_id == goal.chat_id and row.goal_id == goal.id)
     )
   ]
+
+
+def result_receiving_goals(db, chat_id, run_id, *, receipt=False):
+  """Admission requires an open Goal; success may receipt its own deferral.
+
+  A different run or owner Stop still keeps results owed. This predicate stays
+  in the receipt UPDATE so a concurrent hold cannot be bypassed by a stale read.
+  """
+  eligible = models.ChatGoal.status == "open"
+  if receipt:
+    hold = models.ChatGoal.hold_json
+    eligible |= ((models.ChatGoal.status == "stopped")
+      & (hold["cause"].as_string() == "deferred")
+      & (hold["actor"].as_string() == "agent")
+      & (hold["run_id"].as_string() == run_id))
+  return db.query(models.ChatGoal.id).filter(
+    models.ChatGoal.chat_id == chat_id, eligible,
+  )
+
+
+def _deferral_handoff_queries(db, run, goal):
+  from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
+  from app.goal_dependencies import outstanding_dependencies
+
+  admitted_waits = run.admitted_wait_results_json if run.provider_execution_admitted else ()
+  admitted_dependencies = run.admitted_dependency_results_json if run.provider_execution_admitted else ()
+  return (("wait:", _goal_waits(db, goal.chat_id, goal.id).filter(
+    (models.ChatWait.status == "armed") | (_FIRED_UNDELIVERED
+      & models.ChatWait.id.notin_(admitted_waits or ())),
+  )), ("dependency:", outstanding_dependencies(db).filter(
+    models.GoalDependency.waiting_chat_id == goal.chat_id,
+    models.GoalDependency.waiting_goal_id == goal.id,
+    models.GoalDependency.resolved_at.is_(None)
+      | models.GoalDependency.id.notin_(admitted_dependencies or ()),
+  )))
+
+
+def _unseen_goal_result_queries(db, run, goal):
+  """Do not finish past results that arrived after this turn's admission.
+
+  Provider success receipts happen after the agent's tools finish. Results
+  already carried by this admitted run may therefore retire with its explicit
+  outcome, but a newly resolved result must reach a receiving turn first.
+  """
+  from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
+  from app.goal_dependencies import outstanding_dependencies
+
+  admitted_waits = run.admitted_wait_results_json if run.provider_execution_admitted else ()
+  admitted_dependencies = run.admitted_dependency_results_json if run.provider_execution_admitted else ()
+  return (("wait:", _goal_waits(db, goal.chat_id, goal.id).filter(
+    _FIRED_UNDELIVERED,
+    models.ChatWait.kind != "platform_activation",
+    models.ChatWait.id.notin_(admitted_waits or ()),
+  )), ("dependency:", outstanding_dependencies(db).filter(
+    models.GoalDependency.waiting_chat_id == goal.chat_id,
+    models.GoalDependency.waiting_goal_id == goal.id,
+    models.GoalDependency.resolved_at.is_not(None),
+    models.GoalDependency.id.notin_(admitted_dependencies or ()),
+  )))
 
 
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
@@ -446,11 +506,9 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
   if defer_reason is not None:
     # A deliberate hold must not silently abandon a real handoff. Resolve its
     # owner first; this operation never cancels helpers, cards, or Waits.
-    from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
     blockers = _helper_blockers(db, run, goal)
-    blockers += ["wait:" + row.id for row in _goal_waits(db, goal.chat_id, goal.id).filter(
-      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-    ).all()]
+    blockers += [prefix + row.id
+      for prefix, query in _deferral_handoff_queries(db, run, goal) for row in query.all()]
     if db.query(models.Chat.pending_question_id).filter(models.Chat.id == goal.chat_id).scalar():
       blockers.append("owner_question")
     if blockers:
@@ -479,11 +537,15 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
         "failed", "blocked", "cancelled",
       } and not (task.get("note") or task.get("result"))]
     blockers += _helper_blockers(db, run, goal)
+    if status == "completed":
+      blockers += [prefix + row.id
+        for prefix, query in _unseen_goal_result_queries(db, run, goal) for row in query.all()]
     blockers = list(dict.fromkeys(blockers))
     if blockers:
       raise GoalPlanError(
         "Goal has unfinished tasks, unexplained settlements, active delegations, "
-        "or helper results it has not received yet (read one with list_agents): "
+        "or results it has not received yet (read helpers with list_agents; "
+        "Wait and dependency results arrive on the next exact-Goal turn): "
         + ", ".join(blockers),
         code="goal_completion_blocked", completion_blockers=blockers,
       )
@@ -495,8 +557,6 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
         "Not an open work claim of this Goal: " + ", ".join(sorted(unknown))
         + ". " + held_claims_hint(held)
       )
-    from app.chat_waits import stage_consume_fired_goal_waits
-    consumed_waits = stage_consume_fired_goal_waits(db, goal.chat_id, goal.id)
     values.update(status=status, result=outcome_text, next_action=None,
                   completed_at=datetime.now(UTC), completion_run_id=run.id)
   else:
@@ -504,13 +564,26 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       values["checkpoint"] = checkpoint
     if next_action is not None:
       values["next_action"] = next_action
+  # The completion CAS is the linearization point: a source that resolves
+  # after the friendly blocker read but before this write must still win.
+  # Retire only after the guarded terminal transition, never before its check.
+  result_guards = [~query.exists() for _, query in _unseen_goal_result_queries(db, run, goal)] \
+    if status == "completed" else []
+  if defer_reason is not None:
+    result_guards = [~query.exists() for _, query in _deferral_handoff_queries(db, run, goal)]
   changed = db.execute(update(models.ChatGoal).where(
+    *result_guards,
     models.ChatGoal.id == goal.id, models.ChatGoal.revision == expected_revision,
     models.ChatGoal.status == "open",
   ).values(**values))
   if changed.rowcount != 1:
     db.rollback()
     raise GoalPlanConflict("Goal changed; fetch it and retry")
+  if status is not None:
+    from app.chat_waits import stage_retire_fired_goal_waits
+    consumed_waits = stage_retire_fired_goal_waits(db, goal.chat_id, goal.id)
+    from app.goal_dependencies import stage_retire_goal_dependencies
+    stage_retire_goal_dependencies(db, goal.chat_id, goal.id)
   if status is not None or defer_reason is not None:
     # Completion settles the Goal's still-open exact-action claims in the same
     # commit: the ones it names as finished complete with the verified result,

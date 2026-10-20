@@ -28,6 +28,7 @@ import {
   OFFLINE_APPS_CACHE,
   STANDALONE_APPS_CACHE,
 } from '../frontend/src/sw-cache-policy.js'
+import { KATEX_ASSET_VERSION } from '../frontend/src/sw-precache-assets.js'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
 const HOSTILE_ORIGIN = process.env.MOBIUS_TEST_HOSTILE_ORIGIN || null
@@ -147,8 +148,8 @@ test.describe('Service worker — vite-plugin-pwa contract', () => {
       '/vendor/pdfjs/pdf.worker.mjs',
       '/vendor/katex/katex.min.css',
       '/vendor/katex/fonts/KaTeX_Main-Regular.woff2',
-      '/vendor/katex@0.18.9/katex.min.css',
-      '/vendor/katex@0.18.9/fonts/KaTeX_Main-Regular.woff2',
+      `/vendor/katex@${KATEX_ASSET_VERSION}/katex.min.css`,
+      `/vendor/katex@${KATEX_ASSET_VERSION}/fonts/KaTeX_Main-Regular.woff2`,
     ]
 
     await context.setOffline(true)

@@ -482,6 +482,34 @@ def presented_deferred_goals(db: Session, chat_ids) -> dict[str, dict]:
   return result
 
 
+def presented_dependency_goals(db: Session, chat_ids) -> dict[str, dict]:
+  """Drawer handoffs for retained exact Goals with outstanding dependencies.
+
+  Avoid hydrating plans and unrelated chats. Native precedence remains owned by
+  the shared Goal handoff projection, not a second drawer-only source checker.
+  """
+  ids = list(chat_ids)
+  if not ids:
+    return {}
+  from app.goal_dependencies import outstanding_dependencies
+  owned = outstanding_dependencies(db).with_entities(models.GoalDependency.waiting_goal_id)
+  rows = _presented_goal_attempts(db, ids).join(models.ChatGoal,
+    (models.ChatGoal.id == models.ChatRun.goal_id)
+    & (models.ChatGoal.chat_id == models.ChatRun.chat_id),
+  ).filter(models.ChatGoal.id.in_(owned), models.ChatGoal.status.in_(("open", "stopped"))).with_entities(
+    models.ChatRun, models.ChatGoal,
+  ).options(defer(models.ChatGoal.plan_json)).all()
+  from dataclasses import asdict
+  from app.chat_handoffs import goal_handoffs
+  result = {}
+  for physical, goal in rows:
+    native = goal_handoffs(db, goal)
+    result[physical.chat_id] = {"id": goal.id,
+      "dependencies": [asdict(item) for item in native.dependencies],
+      "handoff": _goal_handoff(db, physical, goal, native=native)}
+  return result
+
+
 def _delegation_tree(
   db: Session, physical: models.ChatRun, root: models.ChatGoal,
   *, all_attempts: bool = False,
@@ -727,10 +755,11 @@ def serialize_goal(
   db: Session,
   physical: models.ChatRun,
   root: models.ChatGoal,
+  *, include_foreign_context=True,
 ) -> dict[str, Any]:
   """Project durable Goal presentation independently of turn liveness."""
   plan = serialize_plan(db, physical, root)
-  return _goal_presentation(db, physical, root, plan)
+  return _goal_presentation(db, physical, root, plan, include_foreign_context=include_foreign_context)
 
 
 def _goal_presentation(
@@ -738,6 +767,7 @@ def _goal_presentation(
   physical: models.ChatRun,
   root: models.ChatGoal,
   plan: dict[str, Any] | None,
+  *, include_foreign_context=True,
 ) -> dict[str, Any]:
   """Project only the Goal's own lifecycle: active, paused, or terminal.
 
@@ -768,13 +798,26 @@ def _goal_presentation(
       presentation.update(pause_reason="deferred", hold_reason=hold["reason"])
     else:
       presentation["pause_reason"] = hold["actor"] if hold else "unknown"
-  presentation["handoff"] = _goal_handoff(db, physical, root)
+  from app.chat_handoffs import goal_handoffs
+  native = goal_handoffs(db, root, include_foreign_context=include_foreign_context)
+  presentation["handoff"] = _goal_handoff(db, physical, root, native=native)
+  from dataclasses import asdict
+  if native.dependencies:
+    presentation["dependencies"] = [asdict(item) for item in native.dependencies]
+  from app.goal_dependencies import goal_dependency_history
+  history = goal_dependency_history(db, root, include_foreign_context=include_foreign_context)
+  if history:
+    presentation["dependency_history"] = history
+  from app.goal_dependencies import source_dependency_backlinks
+  backlinks = source_dependency_backlinks(db, root.chat_id, goal_id=root.id).get(root.id) if include_foreign_context else None
+  if backlinks:
+    presentation["needed_by"] = backlinks
   presentation["plan"] = plan
   return presentation
 
 
-def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) -> dict:
-  from app.chat_handoffs import project_handoff
+def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal, *, native=None) -> dict:
+  from app.chat_handoffs import goal_handoffs, project_handoff
   none = {"kind": "none", "reason": None}
   if goal.status == "stopped":
     from app.goals import goal_hold
@@ -787,49 +830,39 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) 
     return {"kind": "recovery", "reason": "agent_pause" if actor == "agent" else "unknown_stop"}
   if goal.status != "open":
     return none
-  latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(
-    models.ChatRun.chat_id == goal.chat_id,
-  ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
-  owns_chat_attempt = latest is not None and latest.goal_id == goal.id
-  from app import questions
-  pending = questions.get(goal.chat_id)
-  pending_id = db.query(models.Chat.pending_question_id).filter(
-    models.Chat.id == goal.chat_id,
-  ).scalar()
-  # Saved-card admission prevents a successor until this marker is answered or
-  # cancelled. Its current physical attempt is therefore the exact owner;
-  # native in-turn questions additionally carry their explicit run identity.
-  owner_input = bool(owns_chat_attempt and (
-    pending_id or (pending is not None and pending.run_token == latest.id)
-  ))
-  if owner_input:
+  native = native if native is not None else goal_handoffs(db, goal)
+  if native.owner_input:
     return {"kind": "owner_input", "reason": "saved_card"}
-  if owns_chat_attempt and latest.status == "running":
+  if native.running:
     return {"kind": "working", "reason": None}
-  from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED, serialize_wait
-  waits = [serialize_wait(row, db=db) for row in _goal_waits(db, goal.chat_id, goal.id).filter(
-    (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-  ).all()]
-  if any(wait.get("resume_blocker") == "owner_input" for wait in waits):
+  if native.queued:
+    return {"kind": "automatic", "reason": "queued_continuation"}
+  if any(wait.resume_blocker == "owner_input" for wait in native.waits):
     return {"kind": "blocked", "reason": "other_work"}
-  from app.delegations import _self_resuming_helper_rows
-  roots = {goal.id}
-  helper_count = sum(row.goal_id == goal.id or (
-    row.goal_id is None and row.parent_root_run_id in roots)
-    for row, _status in _self_resuming_helper_rows(db, {goal.chat_id}))
-  from app.chat import continuation_handoff_for_chat
-  park = continuation_handoff_for_chat(db, goal.chat_id) if owns_chat_attempt else none
-  handoff = project_handoff(owner_input=False, running=False, waits=waits,
-    helper_count=helper_count, park=park)
-  if handoff["kind"] == "none" and owns_chat_attempt and latest.status in {"failed", "interrupted"}:
+  handoff = project_handoff(owner_input=False, running=False,
+    waits=[{"delivery_pending": wait.delivery_pending,
+            "resume_blocker": wait.resume_blocker} for wait in native.waits],
+    helper_count=native.helper_count, park=native.park_presentation)
+  if handoff["kind"] != "none":
+    return handoff
+  # A foreign claim is a handoff only while its source can progress or its
+  # result is owed automatically. A lost/failed source needs explicit recovery.
+  if any(not dep.automatic for dep in native.dependencies):
+    return {"kind": "recovery", "reason": "dependency_source"}
+  if any(
+    dep.automatic and (dep.outcome is None or dep.delivery_pending)
+    for dep in native.dependencies
+  ):
+    return {"kind": "automatic", "reason": "dependency"}
+  if native.failed_attempt:
     return {"kind": "recovery", "reason": "execution"}
   return handoff
 
 
-def presented_goal(db: Session, chat_id: str) -> dict[str, Any] | None:
+def presented_goal(db: Session, chat_id: str, *, include_foreign_context=True) -> dict[str, Any] | None:
   """Serialize the Goal presentation retained by this chat, if any."""
   rows = presented_goal_rows(db, chat_id)
-  return serialize_goal(db, *rows) if rows is not None else None
+  return serialize_goal(db, *rows, include_foreign_context=include_foreign_context) if rows is not None else None
 
 
 def paused_goal_run(db: Session, chat_id: str) -> models.ChatRun | None:
@@ -904,6 +937,7 @@ def terminal_goal_summaries_by_message_index(
   *,
   message_start: int = 0,
   message_end: int | None = None,
+  include_foreign_context=True,
 ) -> dict[int, list[dict[str, Any]]]:
   """Project terminal Goals at their outcome receipt, or legacy final answer.
 
@@ -1045,7 +1079,7 @@ def terminal_goal_summaries_by_message_index(
         or (message_end is not None and candidate_index >= message_end)):
       continue
     plan = serialize_plan(db, latest, root)
-    presentation = _goal_presentation(db, latest, root, plan)
+    presentation = _goal_presentation(db, latest, root, plan, include_foreign_context=include_foreign_context)
     projected.setdefault(candidate_index, []).append({
       **presentation,
       "started_at": started_at.isoformat(),

@@ -89,6 +89,9 @@ async function mount(page, { reject = false, acknowledgement = 'response', resta
       return route.fulfill({ json: {} }) // No fixture mutation reaches live data.
     }
     if (url.pathname === path || url.pathname === `${path}/runtime`) return route.fulfill({ json: detail() })
+    // The fixture chat exists only here, so the real backend would 404 the
+    // picker's limit read and fail the attachment before upload.
+    if (url.pathname === `${path}/upload-limits`) return route.fulfill({ json: { max_bytes: 50 * 1024 * 1024 } })
     if (url.pathname === `${path}/stream`) { streams++; return route.fulfill({ status: 204, body: '' }) }
     if (url.pathname === '/api/chats') return route.fulfill({ json: [detail()] })
     return route.continue()

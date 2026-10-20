@@ -107,6 +107,14 @@ def test_previous_release_database_upgrades_to_current_orm(tmp_path):
   assert [row["version"] for row in first_history] == [
     version for version, _migration in migrations._SCHEMA_MIGRATIONS
   ]
+  assert "0090_goal_dependencies" in {row["version"] for row in first_history}
+  assert "acquisition_id" in {c["name"] for c in inspect(eng).get_columns("agent_work_claims")}
+  assert "admitted_dependency_results_json" in {
+    c["name"] for c in inspect(eng).get_columns("chat_runs")
+  }
+  assert "goal_dependencies" in inspect(eng).get_table_names()
+  assert "0091_saved_decision_cards" in {row["version"] for row in first_history}
+  assert "saved_decision_cards" in inspect(eng).get_table_names()
 
 
 @pytest.mark.parametrize("start", ["fresh", "schema_0013"])
@@ -1864,6 +1872,12 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0087_transcript_rows",
     "0088_chat_compaction_drafts",
     "0086_goal_execution_identity",
+    "0089_wait_result_receipts",
+    "0090_goal_dependencies",
+    "0091_saved_decision_cards",
+    "0092_transfer_notice_revision",
+    "0093_pending_goal_dependency_indexes",
+    "0094_retire_legacy_claim_notice_carriers",
   ]
   assert second == first
 

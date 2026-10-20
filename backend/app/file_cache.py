@@ -84,9 +84,14 @@ def reclaim_file_cache(
   """Advise Linux to evict clean, dormant pages beneath ``paths``.
 
   General sweeps skip mapped files to avoid needlessly refaulting a live
-  process's code. Provider-exit cleanup may opt out: parallel agents share one
-  large executable, and Linux safely retains any mapped pages it cannot evict
-  while releasing unused portions left hot by the agent that just exited.
+  process's code. Tool cleanup opts out, because parallel agents share one
+  large executable: Linux keeps the pages a live process has faulted into its
+  page table and releases the rest of the same file. Callers that run while an
+  agent is still working — a provider exit with sibling agents alive, and the
+  periodic pass — therefore do release the parts of a running agent's bundle
+  it has not reached yet. Measured on one Railway instance: of a 253 MB agent
+  bundle fully in page cache, 122 MB was page-table mapped and kept, and the
+  released remainder refaults at roughly 7 GB/s, so the trade is cheap.
   """
   started = time.monotonic()
   before = _cached_file_bytes()
@@ -246,3 +251,40 @@ def reclaim_background_work_cache(data_dir: str | Path) -> None:
   """
   reclaim_file_cache(settled_tool_paths(), skip_mapped=False)
   reclaim_file_cache(repository_pack_paths(data_dir))
+
+
+# Below this much file cache the periodic pass has too little to release to be
+# worth running; in-use executable pages alone hold roughly half of it. This is
+# a billing floor, not a pressure response: Railway meters cached pages as
+# memory, so the pass has to run while the cgroup is still far from its limit.
+# Gating it on ``assess_memory_pressure`` instead would read "normal" exactly
+# when the saving is available, and quietly remove it.
+ACCUMULATED_CACHE_FLOOR_BYTES = 256 * 1024 * 1024
+
+
+def reclaim_accumulated_cache(data_dir: str | Path) -> dict | None:
+  """Release tool and git-history pages that a long turn keeps hot.
+
+  The settled-turn, app-job and boot boundaries run only after work ends, so
+  one long turn, or several overlapping ones, leaves these pages billable for
+  hours. The capacity monitor's existing tick calls this; it does nothing
+  while the container's file cache is under the floor or unreadable.
+
+  Returns the container's file-cache reading on each side of the pass so the
+  caller can log what it achieved, or ``None`` when the floor declined to run
+  one. Like every reading here that pair is an observation, not attribution:
+  concurrent work moves the same counter, so a pass that races a busy turn can
+  show no drop at all.
+  """
+  cached = _cached_file_bytes()
+  if cached is None or cached < ACCUMULATED_CACHE_FLOOR_BYTES:
+    return None
+  reclaim_background_work_cache(data_dir)
+  remaining = _cached_file_bytes()
+  return {
+    "file_cache_before_bytes": cached,
+    "file_cache_after_bytes": remaining,
+    "observed_drop_bytes": (
+      max(cached - remaining, 0) if remaining is not None else 0
+    ),
+  }

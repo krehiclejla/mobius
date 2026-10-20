@@ -135,33 +135,33 @@ function UserMessageSegments({ segments, onInternalNav, mediaDimensions }) {
   ))
 }
 
-function GoalHistory({ msg }) {
+function GoalHistory({ msg, onInternalNav }) {
   if (msg.role !== 'assistant' || !Array.isArray(msg.goal_summaries)) return null
   return msg.goal_summaries.map(summary => (
-    <GoalHistoryCard key={summary.id} summary={summary} />
+    <GoalHistoryCard key={summary.id} summary={summary} onInternalNav={onInternalNav} />
   ))
 }
 
 // Whatever started this answer leads it and stays visible while it streams:
 // a recovery resume (projected from its run) or a wait that woke the chat.
-function AnswerCause({ msg }) {
+function AnswerCause({ msg, onInternalNav }) {
   if (msg.role !== 'assistant') return null
   const waits = (msg.wait_summaries || []).filter(waitWokeItsAnswer)
   if (!msg.continuation_reason && !waits.length) return null
   return (
     <div className="chat__answer-cause">
       {msg.continuation_reason && <ContinuationCard msg={msg} />}
-      {waits.map(summary => <WaitHistoryCard key={summary.id} summary={summary} />)}
+      {waits.map(summary => <WaitHistoryCard key={summary.id} summary={summary} onInternalNav={onInternalNav} />)}
     </div>
   )
 }
 
 // A deliberately stopped wait is an outcome of the answer that owned it.
-function StoppedWaits({ msg }) {
+function StoppedWaits({ msg, onInternalNav }) {
   if (msg.role !== 'assistant' || !Array.isArray(msg.wait_summaries)) return null
   return msg.wait_summaries
     .filter(summary => !waitWokeItsAnswer(summary))
-    .map(summary => <WaitHistoryCard key={summary.id} summary={summary} />)
+    .map(summary => <WaitHistoryCard key={summary.id} summary={summary} onInternalNav={onInternalNav} />)
 }
 
 function MsgContentInner({
@@ -343,7 +343,7 @@ function MsgContentInner({
     // nodes — text, question, error, and provider context compaction.
     const renderBlock = (block, i) => {
       if (block.type === 'goal_history') {
-        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} />
+        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} onInternalNav={onInternalNav} />
       }
       if (block.type === 'activity' && Array.isArray(block.entries)) {
         // Cold, very long turns can reach this renderer with their adjacent
@@ -506,6 +506,8 @@ function MsgContentInner({
               questions={block.questions || []}
               questionId={block.question_id}
               answeredMap={answers}
+              neededBy={block.needed_by}
+              onInternalNav={onInternalNav}
               platformAction={block.platform_action}
               submittedOptions={block.selected_options}
               attachments={block.attachments}
@@ -650,7 +652,7 @@ function MsgContentInner({
 
     return (
       <MarkdownCopySurface msg={msg} markdownByIndex={markdownByIndex}>
-        <AnswerCause msg={msg} />
+        <AnswerCause msg={msg} onInternalNav={onInternalNav} />
         {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
         {nodes.flatMap((node, nodeIdx) => {
           const before = nodeIdx === beforeQuestionNode ? [fileAttachments] : []
@@ -692,8 +694,8 @@ function MsgContentInner({
         })}
         {/* The final attachment owns each deliverable, before any terminal question. */}
         {beforeQuestionNode < 0 && fileAttachments}
-        {!isStreaming && <GoalHistory msg={msg} />}
-        {!isStreaming && <StoppedWaits msg={msg} />}
+        {!isStreaming && <GoalHistory msg={msg} onInternalNav={onInternalNav} />}
+        {!isStreaming && <StoppedWaits msg={msg} onInternalNav={onInternalNav} />}
       </MarkdownCopySurface>
     )
   }
@@ -703,7 +705,7 @@ function MsgContentInner({
 
   return (
     <MarkdownCopySurface msg={msg}>
-      <AnswerCause msg={msg} />
+      <AnswerCause msg={msg} onInternalNav={onInternalNav} />
       {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
       {text ? (
         <div
@@ -741,8 +743,8 @@ function MsgContentInner({
               : text}
         </div>
       ) : null}
-      {!isStreaming && <GoalHistory msg={msg} />}
-      {!isStreaming && <StoppedWaits msg={msg} />}
+      {!isStreaming && <GoalHistory msg={msg} onInternalNav={onInternalNav} />}
+      {!isStreaming && <StoppedWaits msg={msg} onInternalNav={onInternalNav} />}
     </MarkdownCopySurface>
   )
 }

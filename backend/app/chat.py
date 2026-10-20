@@ -8,7 +8,6 @@ clients can subscribe.  Provider env / auth wiring lives in
 """
 
 import asyncio
-import gc
 import hashlib
 import json
 import math
@@ -21,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Text, cast, literal_column, or_, text
 from sqlalchemy.orm import Session, load_only
@@ -118,6 +118,7 @@ from app.chat_writer import (
   await_ack as _await_ack,
   cid_of,
   get_writer,
+  _SelectedResultUnavailable,
   next_message_ts as _next_message_ts,
   recover_start_continuation,
   update_last_assistant_message as _update_last_assistant_message,
@@ -132,11 +133,12 @@ from app.events import (
 )
 from app.providers import (
   DEFAULT_PROVIDER,
+  BaseProvider,
   authenticated_provider_ids,
   effective_agent_settings,
-  get_provider,
   get_skill_path,
   provider_runtime_kind,
+  registered_provider,
 )
 from app.runner_registry import registry
 from app.session_links import resume_retired
@@ -516,6 +518,7 @@ def programmatic_start_blocker(
       models.ChatWait.kind == ACTIVATION_WAIT_KIND,
       models.ChatWait.status.in_(("met", "expired", "failed")),
       models.ChatWait.resume_delivered_at.is_(None),
+      models.ChatWait.result_disposition.is_(None),
     ).first()
     if activation_wait is None:
       return "restart"
@@ -885,8 +888,10 @@ def reconcile_startup_chats(
           safe_helper_answer_startup_writer_orphan,
           safe_parent_wake_startup_writer_orphan,
         )
+        from app.goal_dependencies import safe_dependency_startup_orphan
         if (
-          safe_parent_wake_startup_writer_orphan(
+          safe_dependency_startup_orphan(db, chat, running_runs[0])
+          or safe_parent_wake_startup_writer_orphan(
             db, chat, running_runs[0],
           )
           or safe_helper_answer_startup_writer_orphan(db, chat, running_runs[0])
@@ -1377,8 +1382,10 @@ async def sweep_wedged_runs(db: Session) -> list[str]:
               safe_parent_wake_startup_writer_orphan,
             )
             from app.chat_waits import safe_startup_writer_orphan
+            from app.goal_dependencies import safe_dependency_startup_orphan
             if (
-              safe_startup_writer_orphan(db, chat, physical)
+              safe_dependency_startup_orphan(db, chat, physical)
+              or safe_startup_writer_orphan(db, chat, physical)
               or safe_parent_wake_startup_writer_orphan(db, chat, physical)
               or safe_helper_answer_startup_writer_orphan(db, chat, physical)
               or safe_auto_resume_startup_orphan(db, chat, physical)
@@ -2948,6 +2955,8 @@ async def _admit_provider_execution(
   *,
   has_peer_context_delivery: bool = False,
   activity_results: tuple[tuple[str, str], ...] = (),
+  wait_results: tuple[str, ...] = (),
+  dependency_results: tuple[str, ...] = (),
 ) -> bool:
   """Cross provider entry only while this exact turn still owns execution.
 
@@ -2963,11 +2972,63 @@ async def _admit_provider_execution(
       run_token=run_token,
       has_peer_context_delivery=has_peer_context_delivery,
       activity_results=activity_results,
+      wait_results=wait_results,
+      dependency_results=dependency_results,
     )))
   except Exception:
     if not _run_generation_superseded(chat_id, run_gen):
       raise
   return not _run_generation_superseded(chat_id, run_gen)
+
+
+def _selected_result_context(db, chat_id: str, run_token: str, raw_message: str):
+  """Rebuild only the result-bearing prompt segment for this exact run."""
+  from app.goal_dependencies import owed_dependency_results
+  from app.chat_waits import build_active_waits_context, owed_wait_results
+
+  dependency_text, dependency_ids = owed_dependency_results(
+    db, chat_id, raw_message, run_id=run_token,
+  )
+  wait_text, wait_ids = owed_wait_results(
+    db, chat_id, raw_message, run_id=run_token,
+  )
+  active_text = build_active_waits_context(db, chat_id)
+  return "\n\n".join(part for part in (active_text, wait_text, dependency_text) if part), wait_ids, dependency_ids
+
+
+async def _admit_with_selected_results(
+  db, chat_id: str, run_token: str, run_gen: int | None,
+  *, raw_message: str, user_message: str, context_marker: str | None,
+  selected_context: str, wait_results: tuple[str, ...],
+  dependency_results: tuple[str, ...], has_peer_context_delivery: bool,
+  activity_results: tuple[tuple[str, str], ...],
+):
+  """Retry stale selections, never a stale direct continuation or Stop."""
+  for attempt in range(3):
+    try:
+      admitted = await _admit_provider_execution(
+        chat_id, run_token, run_gen,
+        has_peer_context_delivery=has_peer_context_delivery,
+        activity_results=activity_results, wait_results=wait_results,
+        dependency_results=dependency_results,
+      )
+      if not admitted:
+        return False, user_message, (), ()
+      rendered = user_message.replace(
+        context_marker, f"{selected_context}\n\n" if selected_context else "", 1,
+      ) if context_marker else user_message
+      return True, rendered, wait_results, dependency_results
+    except _SelectedResultUnavailable:
+      if context_marker is None or attempt == 2 or _run_generation_superseded(chat_id, run_gen):
+        raise
+      # The writer rejected the old bytes atomically. Expire the request's
+      # read snapshot before choosing fresh, exact-Goal receivable results.
+      db.expire_all()
+      selected_context, wait_results, dependency_results = _selected_result_context(
+        db, chat_id, run_token, raw_message,
+      )
+      db.close()
+  raise AssertionError("unreachable result admission retry")
 
 
 def _log_superseded_run(chat_id: str, phase: str) -> None:
@@ -5120,15 +5181,12 @@ async def run_chat(
     if runtime_settled and disposition in _MEMORY_RECLAIM_DISPOSITIONS:
       # Release settled tool/source pages and allocator arenas. Source sweeps
       # protect live mappings and exclude owner data; tool advice may release
-      # unused pages of shared executables.
+      # unused pages of shared executables. Both run in a worker. There is
+      # no explicit collection: a full one holds the GIL (about 1.4 s of
+      # frozen loop per settled turn) and automatic GC already runs.
       try:
-        from app.allocator import trim_glibc
-        from app.file_cache import reclaim_settled_cache
-
-        gc.collect()
-        trim_glibc()
         await asyncio.to_thread(
-          reclaim_settled_cache, get_settings().data_dir, chat_id,
+          _reclaim_settled_memory, get_settings().data_dir, chat_id,
         )
       except Exception:
         _get_logger().debug(
@@ -5138,6 +5196,19 @@ async def run_chat(
         )
     if browser_cancelled is not None:
       raise browser_cancelled
+
+
+def _reclaim_settled_memory(data_dir, chat_id: str) -> None:
+  """Return allocator arenas, then evict settled tool/source pages.
+
+  Runs in a worker thread: neither step touches loop-owned state.
+  """
+  from app.allocator import trim_glibc
+  from app.file_cache import reclaim_settled_cache
+
+  trim_glibc()
+  reclaim_settled_cache(data_dir, chat_id)
+
 
 # The durable, settled, non-resuming terminals where a delegation child's
 # result is final and its ChatRun terminal status has committed (FinishRun ran
@@ -5169,6 +5240,7 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
+  dependency_results: tuple[str, ...] = (),
   side_question_cids: tuple[str, ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
@@ -5191,8 +5263,14 @@ async def _acknowledge_provider_success(
         delivered_through.message_id if delivered_through is not None else None
       ),
       wait_results=wait_results,
+      dependency_results=dependency_results,
       side_question_cids=side_question_cids,
     )))
+    if dependency_results:
+      from app.goal_dependencies import withdraw_disposed_dependency_notices
+      from app.goal_plans import publish_goal_changed
+      publish_goal_changed(chat_id)
+      await withdraw_disposed_dependency_notices(chat_id)
     if wait_results:
       from app.chat_waits import (
         _broadcast_changed,
@@ -5398,7 +5476,9 @@ def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
     }
   # Claude fixes a helper's model on the host's helper definitions, so its
   # hosts are also per model; a Codex thread chooses its model per turn.
-  model = run_policy.model if provider_runtime_kind(get_provider(provider_id)) == "claude_sdk" else None
+  # The turn refreshed the registry at its start; this lookup reads no storage.
+  claude = provider_runtime_kind(registered_provider(provider_id)) == "claude_sdk"
+  model = run_policy.model if claude else None
   return helper_hosts.HostKey(
     parent_chat_id=row[0],
     provider_id=provider_id,
@@ -5437,14 +5517,36 @@ async def _run_chat_impl(
     _log_superseded_run(chat_id, "entry")
     return chat_queue.TerminalDisposition.STALE_NO_ACTION
 
-  from app.database import SessionLocal
-  db = SessionLocal()
-  try:
-    with tracing.span("agent.turn", {
-      "mobius.chat_id": chat_id,
-      "mobius.provider": provider_id,
-      "mobius.resumed_session": bool(session_id),
-    }) as turn_span:
+  # The per-turn run token is allocated by the scheduler (the route /
+  # continuation / stale-pending drain) and passed in, so the SAME token
+  # that keys the turn's writer-actor commands is the one the sink +
+  # runner use for streaming/terminal writes. A None token (legacy/test
+  # caller bypassing the actor) gets a last-resort allocation so the sink
+  # always has a non-None key.
+  if run_token is None:
+    run_token = alloc_run_token()
+
+  with tracing.span("agent.turn", {
+    "mobius.chat_id": chat_id,
+    "mobius.provider": provider_id,
+    "mobius.resumed_session": bool(session_id),
+  }) as turn_span:
+    # Turn-start reads that froze the loop on a busy disk, in one worker
+    # session. They run before the preflight session loads the chat row and
+    # settings, so that snapshot spans no await a model pick could slip into.
+    turn_reads = await asyncio.to_thread(
+      _read_turn_context, chat_id, run_token,
+      frozenset(registry.all_alive_chat_ids()),
+    )
+    # Refresh app-declared model providers off the loop, then resolve this
+    # turn's provider from the registry without touching storage.
+    from app.providers import refresh_app_model_providers
+    await refresh_app_model_providers(get_settings().data_dir)
+    provider = registered_provider(provider_id)
+
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
       disposition = await _run_chat_impl_with_db(
         messages=messages,
         chat_id=chat_id,
@@ -5456,15 +5558,17 @@ async def _run_chat_impl(
         viewport=viewport,
         run_token=run_token,
         db=db,
+        turn_reads=turn_reads,
+        provider=provider,
       )
       tracing.annotate(turn_span, {"mobius.disposition": str(disposition)})
       return disposition
-  finally:
-    # Several setup paths can raise before reaching their explicit terminal
-    # cleanup.  A single outer owner guarantees the request's checkout is
-    # returned even for those unexpected failures.  close() is idempotent,
-    # so the terminal helpers may still release it as soon as they finish.
-    db.close()
+    finally:
+      # Several setup paths can raise before reaching their explicit terminal
+      # cleanup.  A single outer owner guarantees the request's checkout is
+      # returned even for those unexpected failures.  close() is idempotent,
+      # so the terminal helpers may still release it as soon as they finish.
+      db.close()
 
 
 def _should_inject_peer_context(
@@ -5473,6 +5577,49 @@ def _should_inject_peer_context(
 ) -> bool:
   """Inject peer context only for a physical chat run."""
   return bool(chat_id and run_token)
+
+
+if TYPE_CHECKING:
+  from app.agent_activity_provider import AgentActivityBinding
+  from app.agent_coordination import CoordinationContextDelivery
+
+
+@dataclass(frozen=True)
+class _TurnContextReads:
+  """Plain-data turn-start context read in a worker thread."""
+  coordination: "CoordinationContextDelivery | None"
+  helper_context: str
+  last_user_elapsed: str | None
+  activity_binding: "AgentActivityBinding"
+
+
+def _read_turn_context(
+  chat_id: str, run_token: str, alive_chat_ids: frozenset[str],
+) -> _TurnContextReads:
+  """Peer context, helper status, recency and the app activity binding.
+
+  Runs in a worker with its own short session. ``alive_chat_ids`` is the
+  runner registry captured on the loop, which the worker never reads.
+  """
+  from app.agent_activity_provider import resolve_agent_activity_binding
+  from app.agent_coordination import build_coordination_context_delivery
+  from app.database import SessionLocal
+  from app.delegations import active_parent_context
+
+  with SessionLocal() as db:
+    return _TurnContextReads(
+      coordination=(
+        build_coordination_context_delivery(
+          db, chat_id, run_token, alive_chat_ids=alive_chat_ids,
+        )
+        if _should_inject_peer_context(chat_id, run_token) else None
+      ),
+      helper_context=(
+        active_parent_context(db, chat_id, run_token) if chat_id else ""
+      ),
+      last_user_elapsed=_last_user_message_elapsed(db, chat_id),
+      activity_binding=resolve_agent_activity_binding(db),
+    )
 
 
 def _should_enable_coordination_tools(
@@ -5539,6 +5686,8 @@ async def _run_chat_impl_with_db(
   run_token: str | None = None,
   *,
   db: Session,
+  turn_reads: _TurnContextReads,
+  provider: BaseProvider,
 ) -> chat_queue.TerminalDisposition:
   """Run a turn with a session whose lifetime is owned by the wrapper."""
   log = _get_logger()
@@ -5547,16 +5696,6 @@ async def _run_chat_impl_with_db(
   user_message = raw_user_message
   historical_goal_mode = _chat_has_goal_intent(messages)
 
-  # The per-turn run token is allocated by the scheduler (the route /
-  # continuation / stale-pending drain) and passed in, so the SAME token
-  # that keys the turn's writer-actor commands is the one the sink +
-  # runner use for streaming/terminal writes. A None token (legacy/test
-  # caller bypassing the actor) gets a last-resort allocation so the sink
-  # always has a non-None key.
-  if run_token is None:
-    run_token = alloc_run_token()
-
-  provider = get_provider(provider_id)
   # Sync before reading the chat row: the read-to-snapshot-commit span below
   # must stay await-free so a concurrent picker PATCH cannot be overwritten.
   codex_native_skills_ready = False
@@ -5714,11 +5853,8 @@ async def _run_chat_impl_with_db(
   # Every durable child has its own chat address.
   coordination_context = ""
   coordination_message_through = None
-  if _should_inject_peer_context(chat_id, run_token):
-    from app.agent_coordination import build_coordination_context_delivery
-    coordination_delivery = build_coordination_context_delivery(
-      db, chat_id, run_token, chat=chat_row,
-    )
+  coordination_delivery = turn_reads.coordination
+  if coordination_delivery is not None:
     coordination_context = coordination_delivery.text
     coordination_message_through = coordination_delivery.delivered_through
     if coordination_context:
@@ -5784,27 +5920,23 @@ async def _run_chat_impl_with_db(
   # ordinary parent turn so a resumed agent waits on the existing child rather
   # than launching a duplicate. Delegated children attach to their own
   # descendants through their delegated assignment instead of inheriting this block.
-  if chat_id and run_token:
-    from app.delegations import active_parent_context
-    delegation_context = active_parent_context(db, chat_id, run_token)
-    if delegation_context:
-      user_message = f"{delegation_context}\n\n{user_message}"
+  if turn_reads.helper_context:
+    user_message = f"{turn_reads.helper_context}\n\n{user_message}"
 
   # Waiting is not a lock: owner messages do not cancel an armed condition.
   # Only the top-level chat owns durable waits; delegated children return any
   # future condition to this parent instead. A result that lands after this
   # snapshot queues behind the live turn rather than mutating its request.
   wait_results: tuple[str, ...] = ()
+  dependency_results: tuple[str, ...] = ()
+  result_context_marker = None
+  selected_result_context = ""
   if run_policy is None and chat_id:
-    from app.chat_waits import build_active_waits_context, owed_wait_results
-    owed_waits_text, wait_results = owed_wait_results(
-      db, chat_id, raw_user_message,
+    selected_result_context, wait_results, dependency_results = _selected_result_context(
+      db, chat_id, run_token, raw_user_message,
     )
-    if owed_waits_text:
-      user_message = f"{owed_waits_text}\n\n{user_message}"
-    waits_context = build_active_waits_context(db, chat_id)
-    if waits_context:
-      user_message = f"{waits_context}\n\n{user_message}"
+    result_context_marker = f"<result-context-{uuid.uuid4().hex}>"
+    user_message = f"{result_context_marker}{user_message}"
 
   # Side questions the owner added to the chat ("/btw", then Add to chat)
   # reach the agent once: on this turn, recorded delivered only when the
@@ -5843,9 +5975,7 @@ async def _run_chat_impl_with_db(
   # clock + a sense of recency (how long since the user last wrote). Prepended
   # last so it leads the message the agent sees; only the agent's copy is
   # touched here, never the persisted/displayed user text.
-  time_context = _build_time_context(
-    timezone, _last_user_message_elapsed(db, chat_id),
-  )
+  time_context = _build_time_context(timezone, turn_reads.last_user_elapsed)
   user_message = f"{time_context}\n\n{user_message}"
 
   bc = get_broadcast(chat_id)
@@ -5996,7 +6126,7 @@ async def _run_chat_impl_with_db(
   # Invariant: keep this block await-free through the commit below. A
   # picker PATCH from another coroutine can only interleave at await
   # points; if one is added here, a concurrent PATCH could clobber the
-  # user's pick.
+  # user's pick. Turn-start worker reads finish before chat_row is loaded.
   if run_policy is None and chat_row is not None and chat_overrides is None:
     snapshot = {}
     for k in ("model", "effort", "effort_by_provider"):
@@ -6062,14 +6192,11 @@ async def _run_chat_impl_with_db(
     db.close()
     return disposition
 
-  # Bind manifest-declared app activities while `db` is still live. This MUST happen
-  # before the db.close() below: resolving it lazily at a sink site would check
-  # out a fresh connection during the turn, which is precisely the pool
-  # exhaustion that close is there to prevent. It is also the semantically
-  # right moment — the recognizer is bound at the instant the agent is told
-  # the provider's path.
-  from app.agent_activity_provider import resolve_agent_activity_binding
-  agent_activity_binding = resolve_agent_activity_binding(db)
+  # Manifest-declared app activities were bound at turn start, in the
+  # worker: resolving them lazily at a sink site would check out a connection
+  # during the turn, which is precisely the pool exhaustion the db.close()
+  # below is there to prevent.
+  agent_activity_binding = turn_reads.activity_binding
 
   # Snapshot owner-managed MCP connections while this request session is still
   # live. Provider turns can wait for hours, so neither runner may query the
@@ -6259,13 +6386,16 @@ async def _run_chat_impl_with_db(
     try:
       from app.codex_sdk_runner import run_codex_sdk_turn
 
-      if not await _admit_provider_execution(
-        chat_id,
-        run_token or "",
-        run_gen,
+      admitted, user_message, wait_results, dependency_results = await _admit_with_selected_results(
+        db, chat_id, run_token or "", run_gen,
+        raw_message=raw_user_message, user_message=user_message,
+        context_marker=result_context_marker,
+        selected_context=selected_result_context,
+        wait_results=wait_results, dependency_results=dependency_results,
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
-      ):
+      )
+      if not admitted:
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
           provider_id=provider_id, cost_usd=0, close_browser=False,
@@ -6308,6 +6438,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          dependency_results=dependency_results,
           side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
@@ -6452,13 +6583,16 @@ async def _run_chat_impl_with_db(
     try:
       from app.providers import skills_enabled as _skills_enabled
 
-      if not await _admit_provider_execution(
-        chat_id,
-        run_token or "",
-        run_gen,
+      admitted, user_message, wait_results, dependency_results = await _admit_with_selected_results(
+        db, chat_id, run_token or "", run_gen,
+        raw_message=raw_user_message, user_message=user_message,
+        context_marker=result_context_marker,
+        selected_context=selected_result_context,
+        wait_results=wait_results, dependency_results=dependency_results,
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
-      ):
+      )
+      if not admitted:
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
           provider_id=provider_id, cost_usd=0, close_browser=False,
@@ -6504,6 +6638,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          dependency_results=dependency_results,
           side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")

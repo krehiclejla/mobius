@@ -1281,7 +1281,14 @@ def mobius_account_changed() -> None:
     mobius.forget_account_reads()
 
 _app_provider_ids: set[str] = set()
+# When the last app-provider load finished (monotonic). Async refreshes share
+# one lock, so a concurrent refresh waits for the load already in flight.
 _app_provider_sync_at = 0.0
+_app_provider_refresh_lock = asyncio.Lock()
+
+
+def _app_providers_fresh() -> bool:
+  return time.monotonic() - _app_provider_sync_at < 1.0
 
 
 def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
@@ -1291,11 +1298,25 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
   read throttle avoids adding one app query to every model/agent decision while
   still making install, update and uninstall visible without a server restart.
   """
-  global _app_provider_sync_at
-  now = time.monotonic()
-  if not force and now - _app_provider_sync_at < 1.0:
-    return
-  _app_provider_sync_at = now
+  if force or not _app_providers_fresh():
+    _apply_app_model_declarations(_read_app_model_declarations())
+
+
+async def refresh_app_model_providers(data_dir: str) -> None:
+  """``sync_app_model_providers`` for async callers, with the read off-loop.
+
+  The declaration query froze the event loop for seconds on a saturated disk.
+  It runs in a worker with its own session and the registry is updated back
+  on the loop.
+  """
+  async with _app_provider_refresh_lock:
+    if not _app_providers_fresh():
+      declarations = await asyncio.to_thread(_read_app_model_declarations)  # unsettled: read-only (app declarations)
+      _apply_app_model_declarations(declarations)
+
+
+def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:
+  """Accepted app model declarations as plain data; safe in a worker."""
   try:
     from app import models
     from app.database import SessionLocal
@@ -1305,7 +1326,7 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
       rows = db.query(models.App.id, models.App.capability_contract).filter(
         models.App.deleted_at.is_(None)
       ).all()
-      declarations = [
+      return [
         (app_id, contract["model_provider"])
         for app_id, contract in rows
         if isinstance(contract, dict)
@@ -1313,6 +1334,16 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
       ]
   except Exception as exc:
     _model_registry_log.warning("app model registry read failed: %s", exc)
+    return None
+
+
+def _apply_app_model_declarations(
+  declarations: list[tuple[Any, dict]] | None,
+) -> None:
+  """Apply one completed load; a failed read keeps the current registry."""
+  global _app_provider_sync_at
+  _app_provider_sync_at = time.monotonic()
+  if declarations is None:
     return
   next_ids: set[str] = set()
   native_match = next(((app_id, declaration) for app_id, declaration in declarations
@@ -1528,6 +1559,14 @@ def get_provider(
     from app.config import get_settings
     data_dir = get_settings().data_dir
   sync_app_model_providers(data_dir)
+  return registered_provider(provider_id)
+
+
+def registered_provider(provider_id: str | None = None) -> BaseProvider:
+  """``get_provider`` from the registry as it stands; never reads storage.
+
+  An async caller refreshes with ``refresh_app_model_providers`` first.
+  """
   selected = provider_id or DEFAULT_PROVIDER
   if selected not in PROVIDERS:
     raise ValueError(f"Provider {selected!r} is not installed.")

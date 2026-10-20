@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Text, case, cast, func
+from sqlalchemy import JSON, Text, case, cast, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -77,7 +77,7 @@ from app.chat_titles import (
 )
 from app.database import get_db
 from app.delegations import background_helper_chat_ids, serialize_background_helpers
-from app.goal_plans import presented_goal, presented_deferred_goals
+from app.goal_plans import presented_goal, presented_deferred_goals, presented_dependency_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
 from app.owner_input import OwnerInputKind
@@ -536,6 +536,9 @@ def _chat_message_matches_key(
   if not isinstance(message, dict):
     return False
   target = str(key)
+  if target.startswith("question:"):
+    return any(isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") == target[9:]
+               for block in message.get("blocks") or [])
   message_id = message.get("id")
   if message_id is not None and str(message_id) == target:
     return True
@@ -549,6 +552,49 @@ def _chat_message_matches_key(
   return f"{role}-{index}" == target
 
 
+def _question_anchor_index(messages, anchor_key):
+  """Locate the nested card without hydrating every historical message.
+
+  Converted transcripts search nested JSON in storage and return one scalar
+  coordinate. Legacy bodies are already resident; live overlays stay dominant.
+  """
+  from app.chat_transcript import MaterializedHistory
+  if not isinstance(messages, MaterializedHistory) or messages.history.legacy is not None:
+    return next((index for index, message in enumerate(messages)
+      if _chat_message_matches_key(message, index, anchor_key)), None)
+  if messages.live is not None and _chat_message_matches_key(messages.live, 0, anchor_key):
+    return messages.live_index if messages.live_index >= 0 else len(messages.history)
+  db = messages.history.db
+  row = models.ChatMessage
+  question_id = anchor_key[len("question:"):]
+  if db.bind.dialect.name == "sqlite":
+    blocks = func.json_each(case(
+      (func.json_type(row.body, "$.blocks") == "array", func.json_extract(row.body, "$.blocks")),
+      else_="[]",
+    )).table_valued("value", "type")
+    body = case((blocks.c.type == "object", blocks.c.value), else_="{}")
+    match = select(1).select_from(blocks).where(
+      func.json_extract(body, "$.type") == "question",
+      func.json_extract(body, "$.question_id") == question_id,
+    ).exists()
+  else:
+    saved_blocks = cast(row.body, JSON)["blocks"]
+    blocks = func.json_array_elements(case(
+      (func.json_typeof(saved_blocks) == "array", saved_blocks),
+      else_=func.json_build_array(),
+    )).table_valued("value")
+    match = select(1).select_from(blocks).where(
+      blocks.c.value.op("->>")("type") == "question",
+      blocks.c.value.op("->>")("question_id") == question_id,
+    ).exists()
+  query = db.query(row.seq).filter(row.chat_id == messages.chat.id,
+    row.seq < len(messages.history), match)
+  if messages.live is not None and messages.live_index >= 0:
+    query = query.filter(row.seq != messages.live_index)
+  found = query.order_by(row.seq).first()
+  return found[0] if found is not None else None
+
+
 def _chat_detail_window(
   messages: list,
   *,
@@ -560,21 +606,22 @@ def _chat_detail_window(
   """Select one authoritative detail window and report anchor coverage."""
   total = len(messages)
   if anchor_key is not None:
-    anchor_index = next((
+    is_question = anchor_key.startswith("question:")
+    anchor_index = (_question_anchor_index(messages, anchor_key) if is_question else next((
       index for index, message in enumerate(metadata if metadata is not None else messages)
       if _chat_message_matches_key(message, index, anchor_key)
-    ), None)
+    ), None))
     if anchor_index is not None:
-      # Exact restoration is one atomic snapshot: keep one predecessor above
-      # the saved row, then carry the current tail. Without that small amount
+      # Keep one predecessor above the saved row. Without that small amount
       # of real scroll range, a row that becomes first in the cold window can
       # only sit at the list's 8px top padding; a saved positive viewport
       # offset is clamped even though the requested row was found. The reader
       # then returns to the right message at the wrong vertical position.
-      # A page ceiling here would still silently discard the exact address the
-      # caller asked us to preserve.
+      # A bounded following range is enough to expose the requested row without
+      # hydrating every later turn in a long-running chat.
       start = max(0, anchor_index - 1)
-      return messages[start:], start, True
+      end = min(total, anchor_index + limit) if is_question else total
+      return messages[start:end], start, True
     start = max(0, total - limit)
     return messages[start:], start, False
   if before is not None:
@@ -646,6 +693,7 @@ def _chat_detail_response(
   from app.goal_plans import terminal_goal_summaries_by_message_index
   summaries_by_index = terminal_goal_summaries_by_message_index(
     db, chat.id, coordinates, message_start=start, message_end=start + len(page),
+    include_foreign_context=expose_session,
   )
   # Insert read-side lifecycle blocks before activity compaction. The completion
   # call then ends its stretch, and later prose/tools cannot drag the card down.
@@ -726,6 +774,24 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
+  from app.goal_dependencies import (source_dependency_backlinks,
+    terminal_dependency_summaries_by_message_index)
+  question_ids = {block.get("question_id") for message in page
+    for block in (message.get("blocks") or []) if isinstance(block, dict) and block.get("type") == "question"}
+  backlinks = source_dependency_backlinks(db, chat.id, question_ids=question_ids) if expose_session else {}
+  dependency_summaries = terminal_dependency_summaries_by_message_index(
+    db, chat.id, coordinates, message_start=start, message_end=start + len(page),
+    include_foreign_context=expose_session)
+  if backlinks or dependency_summaries:
+    page = [{**message,
+      **({"blocks": [{**block, "needed_by": backlinks[block["question_id"]]}
+        if isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") in backlinks
+        else block for block in message["blocks"]]} if backlinks and isinstance(message.get("blocks"), list)
+        and any(isinstance(block, dict) and block.get("type") == "question"
+          and block.get("question_id") in backlinks for block in message["blocks"]) else {}),
+      **({"wait_summaries": [*message.get("wait_summaries", []), *dependency_summaries[start + index]]}
+        if start + index in dependency_summaries else {}),
+    } for index, message in enumerate(page)]
   from app.continuations import recovery_reasons_by_message_index
   recovery_reasons = recovery_reasons_by_message_index(
     db, chat.id, coordinates, message_start=start, message_end=start + len(page),
@@ -763,7 +829,7 @@ def _chat_detail_response(
   active_goal_objective = (
     running_goal_objective(db, chat.id) if running else None
   )
-  goal = presented_goal(db, chat.id)
+  goal = presented_goal(db, chat.id, include_foreign_context=expose_session)
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   response = {
     "id": chat.id,
@@ -941,6 +1007,7 @@ def list_chats(
       "shell_chat_list_first_response",
       chat_count=len(chats),
     )
+  dependency_goals = presented_dependency_goals(db, (chat.id for chat in chats))
   deferred_goals = presented_deferred_goals(db, (chat.id for chat in chats))
   result = []
   for chat in chats:
@@ -957,7 +1024,7 @@ def list_chats(
       waits=waits,
       helper_count=1 if chat.id in helper_chat_ids else 0,
       park=park,
-      goal=deferred_goals.get(chat.id),
+      goal=deferred_goals.get(chat.id) or dependency_goals.get(chat.id),
     )
     result.append(_owner_chat_summary(
       chat,
@@ -1794,10 +1861,11 @@ def get_chat(
   of the first message in this page) and `total` (total message count).
 
   `anchor` is a durable rendered-row key used when restoring an older reading
-  position. If found, the response contains that row through the current tail
-  from one authoritative snapshot and reports `requested_anchor_found=true`;
-  `limit` is intentionally ignored. If it is absent, the ordinary latest page
-  is returned with `requested_anchor_found=false`.
+  position. If found, the response includes a predecessor when available and reports
+  `requested_anchor_found=true`. A `question:` anchor returns at most `limit`
+  messages starting at the matched row; other anchors extend through the tail,
+  ignoring `limit`. Both use one authoritative snapshot. If no row matches the
+  anchor, the ordinary latest page returns `requested_anchor_found=false`.
   """
   if principal.scope == "app":
     raise HTTPException(status_code=403, detail="App token is not valid here.")
@@ -1844,6 +1912,7 @@ def get_chat_runtime(
     chat_id,
     principal,
     load_fields=(
+      models.Chat.deleted_at,
       models.Chat.pending_messages,
       models.Chat.pending_question_id,
       models.Chat.active_assistant_message_id,
@@ -1863,7 +1932,7 @@ def get_chat_runtime(
     "recovery_run_id": _recovery_run_id(db, chat.id),
     "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": running_goal_objective(db, chat.id),
-    "goal": presented_goal(db, chat.id),
+    "goal": presented_goal(db, chat.id, include_foreign_context=principal.scope != "chat_embed"),
     "pending_messages": list(chat.pending_messages or []),
     "pending_question_id": _open_question_id_for(chat),
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
@@ -2545,14 +2614,12 @@ async def delete_chat(
           # a reorder held this boundary and waited to commit.
           from app.chat_waits import stage_cancel_waits_for_chat
           from app.agent_work_claims import stage_release_claims_for_chat
+          from app.decision_cards import stage_delete_decisions
+          stage_delete_decisions(db, chat)
           stage_cancel_waits_for_chat(db, chat_id)
           released_claims = stage_release_claims_for_chat(db, chat_id)
-          # A deleted follower no longer owns a Goal that should receive exact-
-          # action notices. Retire its interests with the tombstone so one stale
-          # recipient cannot poison fanout to healthy followers.
-          db.query(models.AgentWorkInterest).filter(
-            models.AgentWorkInterest.chat_id == chat_id,
-          ).delete(synchronize_session=False)
+          from app.goal_dependencies import stage_retire_chat_dependencies
+          stage_retire_chat_dependencies(db, chat_id)
           chat.deleted_at = now_naive_utc()
           recovery_notification_id = stage_recovery_notification(
             db,
@@ -2604,18 +2671,16 @@ async def delete_chat(
           chat_id,
         )
   # Destructive cleanup has settled before releasing transition ownership.
-  # The tombstone and releases are already durable. Notify/wake followers as a
-  # best-effort delivery layer; failure cannot roll back an owner-requested
+  # The tombstone and releases are already durable. Nudge exact-Goal delivery as a
+  # best-effort layer; failure cannot roll back an owner-requested
   # deletion, and the released claim itself remains reclaimable by exact key.
   if released_claims:
-    from app.agent_coordination import notify_settled_claims
+    from app.goal_dependencies import deliver_pending_dependencies
     try:
-      await notify_settled_claims(
-        db, owner_id=owner.id, sender_chat_id=chat_id, settled=released_claims,
-      )
+      await deliver_pending_dependencies()
     except Exception:
       log.exception(
-        "Chat %s was deleted but claim followers were not notified", chat_id,
+        "Chat %s was deleted but claim dependencies were not nudged", chat_id,
       )
   # The current chat has just entered its recovery window and therefore cannot
   # be selected when this existing lifecycle boundary reclaims older tombstones.

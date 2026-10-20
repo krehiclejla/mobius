@@ -4,6 +4,7 @@ from app.chat_writer import create_chat
 
 import asyncio
 import hashlib
+import threading
 
 import pytest
 
@@ -1028,9 +1029,20 @@ def test_hidden_source_work_terminal_persists_one_owner_notification(
     provider="codex",
   ))
   db.commit()
+  # The owner notification reads loop-owned presence, so the source status
+  # is published on the loop after the settle's worker records it.
+  publishers = []
+  real_status = delegations._publish_source_work_status
+
+  def publish_status(**fields):
+    publishers.append(threading.current_thread() is threading.main_thread())
+    real_status(**fields)
+
+  monkeypatch.setattr(delegations, "_publish_source_work_status", publish_status)
 
   asyncio.run(delegations.wake_parent_after_child_settled(row.child_chat_id))
   asyncio.run(delegations.wake_parent_after_child_settled(row.child_chat_id))
+  assert publishers == [True, True]
 
   db.expire_all()
   row = db.query(models.Delegation).one()

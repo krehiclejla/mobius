@@ -1,3 +1,4 @@
+import DrawerStatusMarker from './DrawerStatusMarker.jsx'
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -2313,62 +2314,8 @@ const DrawerRow = memo(function DrawerRow({
         {/* Status dot. Sits before the text so the user's eye
             picks it up alongside the label rather than at the row's
             edge (where the pin lives). aria-label exposes the state. */}
-        {ownerRequired ? (
-          <span
-            className="drawer__attention-diamond drawer__owner-input-dot"
-            role="img"
-            aria-label="Your input is needed"
-            title="Your input is needed"
-          />
-        ) : streaming ? (
-          <span
-            className="drawer__streaming-dot"
-            aria-label="Currently streaming"
-            title="Currently streaming"
-          />
-        ) : waiting ? (
-          <span
-            className="drawer__waiting-icon"
-            role="img"
-            aria-label="Waiting to resume"
-            title="Waiting to resume"
-          >
-            <Pause width={8} height={8} aria-hidden="true" />
-          </span>
-        ) : onHold ? (
-          <span className="drawer__waiting-icon" role="img" aria-label="On hold — continue when ready"
-            title={item.handoff?.hold_reason || 'On hold — continue when ready'}>
-            <Pause width={8} height={8} aria-hidden="true" />
-          </span>
-        ) : recovery ? (
-          <span
-            className="drawer__recovery-icon"
-            role="img"
-            aria-label={recoveryLabel}
-            title={recoveryLabel}
-          ><Pause width={8} height={8} aria-hidden="true" /></span>
-        ) : failed ? (
-          <span
-            className="drawer__failure-dot"
-            role="img"
-            aria-label="Latest run failed"
-            title="Latest run failed"
-          />
-        ) : building ? (
-          <span
-            className="drawer__streaming-dot"
-            role="img"
-            aria-label="Building"
-            title="Building…"
-          />
-        ) : attentionDot ? (
-          <span
-            className="drawer__attention-dot"
-            role="img"
-            aria-label="New activity"
-            title="New activity"
-          />
-        ) : null}
+        <DrawerStatusMarker {...{ ownerRequired, streaming, waiting, onHold, recovery,
+          recoveryLabel, failed, building, attentionDot }} holdReason={item.handoff?.hold_reason} />
         <span className={`drawer__item-text${badgeLabel ? ' drawer__item-text--unread' : ''}`}>{label}</span>
         {badgeLabel && (
           // The app's own unread count (see appBadge.js).

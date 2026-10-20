@@ -3,13 +3,9 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
-const vite = await createServer({
-  appType: 'custom', logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: ErrorCard, errorCardViewModel } = await vite.ssrLoadModule('/src/components/ChatView/ErrorCard.jsx')
 after(() => vite.close())
 
@@ -23,13 +19,16 @@ const settlementBlock = {
     + 'continue. Resume to recover this execution; the Goal has not been declared impossible.',
 }
 
-test('goal settlement stop renders the calm Goal paused card, not a red error', () => {
+test('goal settlement stop renders the calm Work interrupted card, not a red error', () => {
   const vm = errorCardViewModel(settlementBlock)
   assert.equal(vm.goalHandoff, true)
   assert.equal(vm.benign, true)
-  assert.equal(vm.label, 'Goal paused')
+  assert.equal(vm.label, 'Work interrupted')
+  assert.equal(vm.settlementRecovery, true)
   const html = renderToStaticMarkup(createElement(ErrorCard, { block: settlementBlock }))
   assert.match(html, /Your progress is saved/)
+  assert.match(html, /This Goal is unfinished. Resume to continue/)
+  assert.equal((html.match(/chat__recovery-title /g) || []).length, 1)
   assert.doesNotMatch(html, /role="alert"|settlement|execution/)
 })
 

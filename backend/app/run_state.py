@@ -62,6 +62,7 @@ def goal_identity_for_run_start(db, chat_id, message):
     continuation_reason, is_continuation_message,
     DELEGATION_RESULT_MESSAGE_KIND, PEER_MESSAGE_WAKE_KIND,
     PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND, WAIT_RESULT_MESSAGE_KIND,
+    DEPENDENCY_RESULT_MESSAGE_KIND,
   )
   message = message or {}
   content = str(message.get("content") or "")
@@ -85,6 +86,10 @@ def goal_identity_for_run_start(db, chat_id, message):
     if goal is not None and goal.chat_id == chat_id and goal.status == "open":
       return goal.objective, goal.id
     return None, None
+  elif kind == DEPENDENCY_RESULT_MESSAGE_KIND:
+    from app.goal_dependencies import dependency_result_row
+    row = dependency_result_row(db, chat_id, message)
+    return open_goal_identity_for_chat(db, chat_id, row.waiting_goal_id if row is not None else None)
   elif kind == PEER_MESSAGE_WAKE_KIND:
     # New peer carriers retain the exact Goal, including an explicit NULL.
     # Uncorrelated old carriers cannot prove ownership after source rebinding.
@@ -138,10 +143,18 @@ def queued_continuation_root(
     return None
   from app.continuations import (
     DELEGATION_RESULT_MESSAGE_KIND,
-    WAIT_RESULT_MESSAGE_KIND,
+    WAIT_RESULT_MESSAGE_KIND, DEPENDENCY_RESULT_MESSAGE_KIND,
     helper_answer_question_id,
     product_result_run_token,
   )
+
+  if message.get("kind") == DEPENDENCY_RESULT_MESSAGE_KIND:
+    from app.goal_dependencies import dependency_result_row
+    row = dependency_result_row(db, chat_id, message)
+    source = db.get(models.ChatRun, row.created_by_run_id) if row is not None and row.created_by_run_id else None
+    if source is not None and source.chat_id == chat_id:
+      return source.root_run_id or source.id
+    return product_result_run_token(chat_id, message)
 
   if message.get("kind") == WAIT_RESULT_MESSAGE_KIND:
     wait = _wait_result_row(db, chat_id, message)

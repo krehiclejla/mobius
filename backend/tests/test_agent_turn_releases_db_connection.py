@@ -92,6 +92,16 @@ async def test_agent_turn_closes_preflight_session_before_provider_wait(
       self.close_calls += 1
       self.real.close()
 
+    def __enter__(self):
+      # Turn-start reads in worker threads open their own short ``with``
+      # sessions; only the turn's own session is opened without one.
+      turn_sessions.remove(self)
+      return self
+
+    def __exit__(self, *exc):
+      self.close()
+      return False
+
     def __getattr__(self, name):
       return getattr(self.real, name)
 
@@ -209,7 +219,7 @@ async def test_agent_turn_returns_connection_while_provider_is_running(
     return chat_queue.TerminalDisposition.EMPTY_TERMINAL_CLEARED
 
   monkeypatch.setattr(
-    chat_mod, "get_provider", lambda _provider_id: _Provider(provider_name),
+    chat_mod, "registered_provider", lambda _provider_id: _Provider(provider_name),
   )
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   # Isolate the connection-ownership assertion from the post-provider
@@ -274,7 +284,7 @@ async def test_superseded_runner_cannot_overwrite_successor_session(
     return None
 
   monkeypatch.setattr(
-    chat_mod, "get_provider", lambda _provider_id: _Provider(provider_name),
+    chat_mod, "registered_provider", lambda _provider_id: _Provider(provider_name),
   )
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   monkeypatch.setattr(chat_mod, "_record_run_metrics", fake_record_run_metrics)
@@ -371,7 +381,7 @@ async def test_provider_exception_requests_owned_browser_cleanup(
     return chat_queue.TerminalDisposition.EMPTY_TERMINAL_CLEARED
 
   monkeypatch.setattr(
-    chat_mod, "get_provider", lambda _provider_id: _Provider(provider_name),
+    chat_mod, "registered_provider", lambda _provider_id: _Provider(provider_name),
   )
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   if provider_id == "codex":

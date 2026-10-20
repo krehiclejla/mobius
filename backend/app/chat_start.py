@@ -368,6 +368,21 @@ async def start_programmatic_chat_continuation(
     raise
 
 
+def _activity_start_precheck(chat_id: str, run_token: str) -> tuple[bool, bool]:
+  """Whether the activity run exists, and whether a fresh start is blocked."""
+  from app.chat import programmatic_start_blocker
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    exists = db.query(models.ChatRun.id).filter(
+      models.ChatRun.id == run_token,
+      models.ChatRun.chat_id == chat_id,
+    ).first() is not None
+    return exists, (
+      False if exists else bool(programmatic_start_blocker(db, chat_id))
+    )
+
+
 async def start_programmatic_activity_continuation(
   *, chat_id: str, root_run_id: str, run_token: str,
   source_work_id: str, activity_id: str,
@@ -386,7 +401,6 @@ async def start_programmatic_activity_continuation(
     is_chat_running,
     is_draining,
     mark_starting,
-    programmatic_start_blocker,
   )
   from app.chat_writer import (
     FinishRun,
@@ -410,13 +424,19 @@ async def start_programmatic_activity_continuation(
           if is_draining():
             return False
           orphaned = None
+          # The common fresh start needs only these durable reads; do them
+          # in a worker. The locks held above order them against any start.
+          exists, blocked = await asyncio.to_thread(  # unsettled: read-only (run existence and start blockers)
+            _activity_start_precheck, chat_id, run_token,
+          )
+          # A drain may have begun during that read; its runs stay its own.
+          if is_draining() or (not exists and blocked):
+            return False
           with SessionLocal() as db:
             existing = db.query(models.ChatRun).filter(
               models.ChatRun.id == run_token,
               models.ChatRun.chat_id == chat_id,
-            ).first()
-            if existing is None and programmatic_start_blocker(db, chat_id):
-              return False
+            ).first() if exists else None
             if existing is not None:
               if (
                 (existing.root_run_id or existing.id) != root_run_id

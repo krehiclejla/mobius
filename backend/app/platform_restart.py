@@ -227,6 +227,7 @@ def activation_barrier_wait_id(db: Session, chat_id: str) -> str | None:
     models.ChatWait.status.in_(("armed", "met", "expired", "failed")),
     models.ChatWait.action_approved_at.isnot(None),
     models.ChatWait.resume_delivered_at.is_(None),
+    models.ChatWait.result_disposition.is_(None),
   ).first()
   return row[0] if row is not None else None
 
@@ -298,6 +299,7 @@ def restart_observation_key(db: Session, chat_id: str) -> str:
     models.ChatWait.status == "met",
     models.ChatWait.met_at.isnot(None),
     models.ChatWait.resume_delivered_at.is_(None),
+    models.ChatWait.result_disposition.is_(None),
   ).order_by(models.ChatWait.id).all()
   return json.dumps([
     [[row.id, row.met_at.isoformat()] for row in rows],
@@ -338,7 +340,7 @@ def project_restart_observations(
 
   hold = (
     _restart_continuation_hold()
-    if any(row.status == "met" and row.resume_delivered_at is None
+    if any(row.status == "met" and row.resume_delivered_at is None and row.result_disposition is None
            for row in waits.values()) else "pending"
   )
 
@@ -351,7 +353,7 @@ def project_restart_observations(
       continue
     continuation = (
       "delivered" if row.resume_delivered_at is not None
-      else "cancelled" if row.status == "cancelled"
+      else "cancelled" if row.status == "cancelled" or row.result_disposition == "retired_by_goal_outcome"
       else hold
     )
     observations[id(card)] = {
