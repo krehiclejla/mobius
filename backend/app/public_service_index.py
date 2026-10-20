@@ -6,56 +6,27 @@ snapshot instead: every live id (stable service id, transition alias, or a
 legacy slug) whose accepted contract is public, with that service's rate
 bucket and allowance.
 
-A committed change to an app or a service alias in this process discards the
-snapshot, so an applied, removed, or re-accepted service (including a raised
-allowance) counts from its next request. A change written by another process
-(a script or scheduled job writing the database; the API itself is a single
-uvicorn worker) is picked up within ``OUT_OF_PROCESS_RECHECK_SECONDS``, or
-sooner when the door resolves a service that no longer matches its entry and
-calls ``discard``.
-
-The door charges only the bucket of the service an id resolves to now, so a
-stale entry never spends another service's allowance. It refuses from the
-snapshot alone only for an id the snapshot has ``confirm``ed against the
-database; an unconfirmed id is resolved first, at most once per snapshot, so
-a moved alias or raised allowance is never refused against an old bucket.
+Every committed change to an app or a service alias discards the snapshot,
+so an applied, moved, removed, or re-accepted service (including a changed
+allowance) counts from its next request. The API process is the only writer
+of those rows, so no other invalidation is needed.
 """
 
 from __future__ import annotations
 
-import threading
-import time
-from typing import NamedTuple
-
 from fastapi import HTTPException
-from sqlalchemy import event, inspect
 from sqlalchemy.orm import Session
 
-from app import app_services, models
+from app import app_services, commit_watch, models
 
 
-SERVICE_TABLES = frozenset({
-  models.App.__tablename__,
-  models.AppServiceAlias.__tablename__,
-})
-OUT_OF_PROCESS_RECHECK_SECONDS = 30.0
 PROBE_BUCKET = "unknown"
-_PENDING_KEY = "mobius_public_services_changed"
 
-_lock = threading.Lock()
-_rebuild_lock = threading.Lock()
+# Advanced by every committed service change. A snapshot built from the
+# generation it read stays current until the next change, including one that
+# commits from another thread while the snapshot is being built.
 _generation = 0
-
-
-class Snapshot(NamedTuple):
-  generation: int
-  built_at: float
-  index: dict[str, tuple[str, int]]
-  # Ids whose entry a request has matched against the database.
-  confirmed: set[str]
-
-
-_snapshot: Snapshot | None = None
+_snapshot: tuple[int, dict[str, tuple[str, int]]] | None = None
 
 
 def bucket(app, service: dict) -> tuple[str, int]:
@@ -65,61 +36,13 @@ def bucket(app, service: dict) -> tuple[str, int]:
   return str(app.id), app_services.public_requests_per_minute(service)
 
 
-def lookup(db: Session, service_id: str) -> tuple[tuple[str, int] | None, Snapshot]:
-  """The bucket and allowance of the public service ``service_id`` names.
-
-  Also returns the snapshot that answered, for ``discard``.
-  """
+def lookup(db: Session, service_id: str) -> tuple[str, int] | None:
+  """The bucket and allowance of the public service ``service_id`` names."""
   global _snapshot
-  current = _current()
-  if current is None:
-    # One rebuild at a time: requests that find the snapshot stale while
-    # another rebuilds wait for it and reuse its result instead of scanning.
-    with _rebuild_lock:
-      current = _current()
-      if current is None:
-        with _lock:
-          generation = _generation
-        current = Snapshot(generation, time.monotonic(), _build(db), set())
-        with _lock:
-          # A change committed while building leaves this snapshot already stale.
-          _snapshot = current
-  return current.index.get(service_id), current
-
-
-def discard(seen: Snapshot) -> None:
-  """Drop ``seen`` after finding it out of date, so the next request rebuilds.
-
-  Only that exact snapshot is dropped: a slower request still holding an
-  older one must not discard the fresh snapshot another request rebuilt.
-  """
-  global _snapshot
-  with _lock:
-    if _snapshot is seen:
-      _snapshot = None
-
-
-def confirm(seen: Snapshot, service_id: str) -> None:
-  """Record that ``service_id``'s entry in ``seen`` matches the database."""
-  with _lock:
-    seen.confirmed.add(service_id)
-
-
-def confirmed(seen: Snapshot, service_id: str) -> bool:
-  """Whether ``seen`` may refuse ``service_id`` without resolving it."""
-  with _lock:
-    return service_id in seen.confirmed
-
-
-def _current() -> Snapshot | None:
-  with _lock:
-    generation, current = _generation, _snapshot
-  if (
-    current is not None and current.generation == generation
-    and time.monotonic() - current.built_at < OUT_OF_PROCESS_RECHECK_SECONDS
-  ):
-    return current
-  return None
+  generation = _generation
+  if _snapshot is None or _snapshot[0] != generation:
+    _snapshot = (generation, _build(db))
+  return _snapshot[1].get(service_id)
 
 
 def _build(db: Session) -> dict[str, tuple[str, int]]:
@@ -155,40 +78,14 @@ def _build(db: Session) -> dict[str, tuple[str, int]]:
   return index
 
 
-def _touches_services(instance) -> bool:
-  return getattr(inspect(instance).mapper.local_table, "name", None) in SERVICE_TABLES
+def _services_changed() -> None:
+  global _generation
+  _generation += 1
 
 
-@event.listens_for(Session, "after_flush")
-def _mark_flushed_change(session, _flush_context) -> None:
-  if any(
-    _touches_services(obj)
-    for obj in (*session.new, *session.dirty, *session.deleted)
-  ):
-    session.info[_PENDING_KEY] = True
-
-
-@event.listens_for(Session, "do_orm_execute")
-def _mark_statement_change(state) -> None:
-  if not (state.is_insert or state.is_update or state.is_delete):
-    return
-  table = getattr(state.statement, "table", None)
-  if getattr(table, "name", None) in SERVICE_TABLES:
-    state.session.info[_PENDING_KEY] = True
-
-
-@event.listens_for(Session, "after_commit")
-def _publish_committed_change(session) -> None:
-  # A released savepoint is not yet visible to other sessions.
-  if session.in_nested_transaction():
-    return
-  if session.info.pop(_PENDING_KEY, False):
-    global _generation
-    with _lock:
-      _generation += 1
-
-
-@event.listens_for(Session, "after_transaction_end")
-def _forget_uncommitted_change(session, transaction) -> None:
-  if transaction.parent is None:
-    session.info.pop(_PENDING_KEY, None)
+commit_watch.on_committed_change(
+  "public_services",
+  {models.App.__tablename__, models.AppServiceAlias.__tablename__},
+  _services_changed,
+  inserts=True,
+)

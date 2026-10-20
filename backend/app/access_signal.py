@@ -22,12 +22,9 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from sqlalchemy import event, inspect
-from sqlalchemy.orm import Session
-
 from collections.abc import AsyncIterator, Callable
 
-from app import models
+from app import commit_watch, models
 from app.browser_access import BrowserAccessGrant, BrowserAccessSession
 
 # Every table an access check passed to ``until_revoked`` reads must be listed
@@ -39,7 +36,6 @@ ACCESS_TABLES = frozenset({
   BrowserAccessSession.__tablename__,
   models.IdentityAccountLink.__tablename__,
 })
-_PENDING_KEY = "mobius_access_changed"
 
 # Bound on how long a change written by another process can go unseen.
 OUT_OF_PROCESS_RECHECK_SECONDS = 30.0
@@ -152,43 +148,6 @@ async def until_revoked(
     await iterator.aclose()
 
 
-def _touches_access(instance) -> bool:
-  table = getattr(inspect(instance).mapper.local_table, "name", None)
-  return table in ACCESS_TABLES
-
-
-@event.listens_for(Session, "after_flush")
-def _mark_flushed_access_change(session, _flush_context) -> None:
-  changed = any(_touches_access(obj) for obj in session.deleted) or any(
-    _touches_access(obj) and session.is_modified(obj, include_collections=False)
-    for obj in session.dirty
-  )
-  if changed:
-    session.info[_PENDING_KEY] = True
-
-
-@event.listens_for(Session, "do_orm_execute")
-def _mark_statement_access_change(state) -> None:
-  if not (state.is_update or state.is_delete):
-    return
-  table = getattr(state.statement, "table", None)
-  if getattr(table, "name", None) in ACCESS_TABLES:
-    state.session.info[_PENDING_KEY] = True
-
-
-@event.listens_for(Session, "after_commit")
-def _publish_committed_access_change(session) -> None:
-  # SQLAlchemy also fires this when a savepoint is released; the change is not
-  # visible to other sessions until the outermost transaction commits.
-  if session.in_nested_transaction():
-    return
-  if session.info.pop(_PENDING_KEY, False):
-    notify_access_changed()
-
-
-@event.listens_for(Session, "after_transaction_end")
-def _forget_uncommitted_access_change(session, transaction) -> None:
-  # Only the outermost transaction ends the unit of work; a rolled-back
-  # savepoint must not drop a change its committed parent still carries.
-  if transaction.parent is None:
-    session.info.pop(_PENDING_KEY, None)
+commit_watch.on_committed_change(
+  "access", ACCESS_TABLES, notify_access_changed, inserts=False,
+)

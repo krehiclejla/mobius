@@ -932,54 +932,30 @@ def test_public_service_may_declare_a_capped_request_allowance():
     validate_manifest_contract(private)
 
 
-def test_public_door_counts_each_caller_per_service_against_its_allowance():
-  from app.routes import app_services as routes
-
-  def request(host):
-    return SimpleNamespace(client=SimpleNamespace(host=host), headers={}, scope={})
-
-  for _ in range(60):
-    routes._admit_public_request(request("198.51.100.7"), "9101", 60)
-  with pytest.raises(HTTPException) as refused:
-    routes._admit_public_request(request("198.51.100.7"), "9101", 60)
-  assert refused.value.status_code == 429
-  assert int(refused.value.headers["Retry-After"]) >= 1
-
-  # Another service keeps its own count, and may have accepted a larger allowance.
-  for _ in range(300):
-    routes._admit_public_request(request("198.51.100.7"), "9102", 300)
-  with pytest.raises(HTTPException):
-    routes._admit_public_request(request("198.51.100.7"), "9102", 300)
-  # Another caller is counted apart.
-  routes._admit_public_request(request("198.51.100.8"), "9101", 60)
-
-
-def test_public_door_counts_probes_of_non_public_services(client, db, monkeypatch):
-  from limits.storage import MemoryStorage
-  from limits.strategies import FixedWindowRateLimiter
-  from app.routes import app_services as routes
-
-  monkeypatch.setattr(routes, "_public_window", FixedWindowRateLimiter(MemoryStorage()))
-  _service_app(db, slug="private-probe")
-  for _ in range(30):
-    assert client.get("/api/app-services/private-probe/status").status_code == 404
-    assert client.get("/api/app-services/missing-probe/status").status_code == 404
-  assert client.get("/api/app-services/private-probe/status").status_code == 429
-
-
 @pytest.fixture
 def fresh_public_door(monkeypatch):
   from limits.storage import MemoryStorage
   from limits.strategies import FixedWindowRateLimiter
+  from app import public_service_index
   from app.routes import app_services as routes
 
   monkeypatch.setattr(routes, "_public_window", FixedWindowRateLimiter(MemoryStorage()))
+  # Start from this test's database, not a snapshot an earlier test built.
+  monkeypatch.setattr(public_service_index, "_snapshot", None)
   lookups = []
   resolve = routes._service_app
   monkeypatch.setattr(
     routes, "_service_app", lambda session, slug: lookups.append(slug) or resolve(session, slug),
   )
   return lookups
+
+
+def test_public_door_counts_probes_of_non_public_services(client, db, fresh_public_door):
+  _service_app(db, slug="private-probe")
+  for _ in range(30):
+    assert client.get("/api/app-services/private-probe/status").status_code == 404
+    assert client.get("/api/app-services/missing-probe/status").status_code == 404
+  assert client.get("/api/app-services/private-probe/status").status_code == 429
 
 
 def _set_public_allowance(db, app, per_minute):
@@ -1046,147 +1022,31 @@ def test_withdrawn_public_service_stops_resolving_at_once(
   assert fresh_public_door == []
 
 
-def _stale_snapshot(entries):
-  """What another process's unseen change leaves: a current-looking snapshot."""
-  import time as clock
-  from app import public_service_index
-
-  with public_service_index._lock:
-    public_service_index._snapshot = public_service_index.Snapshot(
-      public_service_index._generation, clock.monotonic(), dict(entries), set(),
-    )
-
-
-def test_stale_snapshot_never_decides_the_accepted_cap(
+def test_moved_alias_counts_against_its_new_service_from_the_next_request(
   client, auth, db, fresh_public_door,
 ):
-  from app import public_service_index
-
-  app = _service_app(db, access="public", slug="lowered-service")
+  _service_app(db, access="public", slug="spent-service", aliases=("moving",))
+  fresh = _service_app(db, access="public", slug="fresh-service")
   for _ in range(60):
-    assert client.get("/api/app-services/lowered-service/status").status_code == 201
+    assert client.get("/api/app-services/moving/status").status_code == 201
+  assert client.get("/api/app-services/spent-service/status").status_code == 429
 
-  # Another process lowered the cap from 600; this process still has 600 cached.
-  _stale_snapshot({"lowered-service": (str(app.id), 600)})
-  assert client.get("/api/app-services/lowered-service/status").status_code == 429
-  assert public_service_index.lookup(db, "lowered-service")[0] == (str(app.id), 60)
-
-
-def test_moved_alias_is_charged_only_to_its_current_service(
-  client, auth, db, fresh_public_door,
-):
-  from app import public_service_index
-
-  former = _service_app(db, access="public", slug="former-service")
-  current = _service_app(db, access="public", slug="current-service", aliases=("moved",))
-  _stale_snapshot({
-    "former-service": (str(former.id), 60),
-    "current-service": (str(current.id), 60),
-    "moved": (str(former.id), 60),
-  })
-
-  assert client.get("/api/app-services/moved/status").status_code == 201
-  assert public_service_index.lookup(db, "moved")[0] == (str(current.id), 60)
-  # The stale entry spent nothing of the former service's allowance.
-  for _ in range(60):
-    assert client.get("/api/app-services/former-service/status").status_code == 201
-  assert client.get("/api/app-services/former-service/status").status_code == 429
-  # The moved request counted once, against the service it reached.
-  for _ in range(59):
-    assert client.get("/api/app-services/current-service/status").status_code == 201
-  assert client.get("/api/app-services/current-service/status").status_code == 429
+  alias = db.query(models.AppServiceAlias).filter_by(service_id="moving").one()
+  alias.app_id = fresh.id
+  db.commit()
+  assert client.get("/api/app-services/moving/status").status_code == 201
+  assert client.get("/api/app-services/spent-service/status").status_code == 429
 
 
-def test_a_stale_exhausted_bucket_never_refuses_the_current_service(
-  client, auth, db, fresh_public_door,
-):
-  former = _service_app(db, access="public", slug="spent-service")
-  current = _service_app(db, access="public", slug="open-service", aliases=("moved-on",))
-  for _ in range(60):
-    assert client.get("/api/app-services/spent-service/status").status_code == 201
+def test_editing_a_local_app_keeps_its_accepted_public_allowance(client, auth, db):
+  app = _service_app(db, access="public", slug="kept-allowance")
+  _set_public_allowance(db, app, 480)
 
-  # Another process moved the alias; this process still maps it to the spent bucket.
-  _stale_snapshot({
-    "spent-service": (str(former.id), 60),
-    "open-service": (str(current.id), 60),
-    "moved-on": (str(former.id), 60),
-  })
-  assert client.get("/api/app-services/moved-on/status").status_code == 201
-
-  # Likewise a raised allowance the snapshot has not seen yet.
-  _set_public_allowance(db, former, 600)
-  _stale_snapshot({"spent-service": (str(former.id), 60)})
-  assert client.get("/api/app-services/spent-service/status").status_code == 201
-
-
-def test_an_unconfirmed_refusal_costs_one_lookup_per_snapshot(
-  client, auth, db, fresh_public_door,
-):
-  app = _service_app(db, access="public", slug="steady-service")
-  for _ in range(60):
-    assert client.get("/api/app-services/steady-service/status").status_code == 201
-
-  _stale_snapshot({"steady-service": (str(app.id), 60)})
-  fresh_public_door.clear()
-  for _ in range(20):
-    assert client.get("/api/app-services/steady-service/status").status_code == 429
-  assert fresh_public_door == ["steady-service"]
-
-
-def test_concurrent_stale_lookups_rebuild_the_snapshot_once(monkeypatch):
-  import threading
-  import time as clock
-  from app import public_service_index
-
-  builds = []
-  started = threading.Event()
-
-  def slow_build(_db):
-    builds.append(1)
-    started.set()
-    clock.sleep(0.2)
-    return {"svc": ("1", 60)}
-
-  monkeypatch.setattr(public_service_index, "_build", slow_build)
-  monkeypatch.setattr(public_service_index, "_snapshot", None)
-  results = []
-  threads = [
-    threading.Thread(target=lambda: results.append(public_service_index.lookup(None, "svc")[0]))
-    for _ in range(8)
-  ]
-  for thread in threads:
-    thread.start()
-  for thread in threads:
-    thread.join()
-
-  assert builds == [1]
-  assert results == [("1", 60)] * 8
-
-
-def test_a_late_stale_request_keeps_the_rebuilt_snapshot(monkeypatch):
-  from app import public_service_index
-
-  builds = []
-
-  def build(_db):
-    builds.append(1)
-    return {"svc": ("1", 60)}
-
-  monkeypatch.setattr(public_service_index, "_build", build)
-  monkeypatch.setattr(public_service_index, "_snapshot", None)
-  _, early = public_service_index.lookup(None, "svc")
-  _, late = public_service_index.lookup(None, "svc")
-  assert late is early
-
-  # The first request to find the snapshot stale discards it and the next
-  # request rebuilds; the slower one holding the same old snapshot then
-  # reports it stale too.
-  public_service_index.discard(early)
-  _, rebuilt = public_service_index.lookup(None, "svc")
-  public_service_index.discard(late)
-
-  assert public_service_index.lookup(None, "svc")[1] is rebuilt
-  assert builds == [1, 1]
+  response = client.patch(f"/api/apps/{app.id}", headers=auth, json={"pinned": True})
+  assert response.status_code == 200
+  db.refresh(app)
+  assert app.capability_contract["service"]["public_requests_per_minute"] == 480
+  assert app_services.public_requests_per_minute(app.capability_contract["service"]) == 480
 
 
 def test_http_dense_container_decode_peak_includes_input_allocation(

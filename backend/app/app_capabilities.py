@@ -730,6 +730,8 @@ def contract_from_app_state(
       }
       if accepted_service.get("aliases"):
         service["aliases"] = list(accepted_service["aliases"])
+      if "public_requests_per_minute" in accepted_service:
+        service["public_requests_per_minute"] = accepted_service["public_requests_per_minute"]
       # Re-deriving transfer limits through manifest form could repair a
       # grant the runtime refuses (re-enabling a disabled service) or drop a
       # reviewed route ceiling (widening that route to the whole grant). Keep
