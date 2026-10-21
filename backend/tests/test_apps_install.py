@@ -9105,6 +9105,41 @@ def _update_check(
 
 
 
+def test_repeat_update_checks_reuse_one_fetch_until_the_recorded_upstream_moves(
+  client, auth, bypass_url_validation,
+):
+  """Store opens re-check every app; only discovery reuses a recent fetch.
+
+  A changed recorded upstream (install, update, reinstall) fetches afresh,
+  and the candidate preview the owner acts on always fetches.
+  """
+  base = "https://uc-reuse.test/repo/"
+  manifest_v1 = {**MANIFEST_NEWS, "id": "uc-reuse"}
+  installed = _install_v1(client, auth, base, manifest_v1, JSX_MULTI)
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  repo = Path(get_settings().data_dir) / "apps" / "uc-reuse"
+  manifest_v2 = {**manifest_v1, "version": "2.0.0"}
+  upstream_v2 = JSX_MULTI.replace("ORIGINAL TITLE", "UPSTREAM TITLE")
+
+  with _git_update_source(_git_candidate(manifest_v2, upstream_v2)) as fetch:
+    for _ in range(2):
+      res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+      assert res.status_code == 200, res.text
+      assert res.json()["update_available"] is True
+    assert fetch.await_count == 1
+
+    client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+    assert fetch.await_count == 2
+
+    app_git.record_upstream(
+      repo, {"index.jsx": upstream_v2.encode()}, base + "mobius.json", "2.0.0",
+    )
+    res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+    assert res.status_code == 200, res.text
+    assert fetch.await_count == 3
+
+
 def test_known_origin_check_never_falls_back_to_http(tmp_path):
   """An origin outage cannot silently change the source being reviewed."""
   from app.routes.apps import _fetch_update_commit

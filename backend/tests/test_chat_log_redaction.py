@@ -117,7 +117,7 @@ def test_redact_messages_caps_length_and_takes_newest_slice():
   assert len(capped[0]["text"]) <= 101  # 100 + ellipsis
 
 
-def test_count_visible_matches_redacted_message_survivors():
+def test_list_preview_count_matches_redacted_message_survivors():
   msgs = [
     {"role": "user", "content": "hi"},
     {"role": "user", "content": "secret", "hidden": True},
@@ -126,5 +126,21 @@ def test_count_visible_matches_redacted_message_survivors():
     {"role": "assistant", "content": "ok", "blocks": [
       {"type": "text", "content": "ok"}]},
   ]
-  assert r.count_visible_messages(msgs) == 2
+  assert r.list_preview(msgs).message_count == 2
   assert len(r.redact_messages(msgs)) == 2
+
+
+def test_list_preview_excerpt_is_the_first_survivor_and_walks_the_transcript_once():
+  walked = []
+
+  class OneShotTranscript:
+    def __iter__(self):
+      walked.append(True)
+      yield {"role": "user", "content": "first", "hidden": True}
+      yield {"role": "user", "content": "x" * 400}
+      yield {"role": "assistant", "content": "later"}
+
+  preview = r.list_preview(OneShotTranscript(), char_cap=10)
+  assert preview == r.ListPreview(2, "x" * 10 + "…")
+  assert walked == [True]
+  assert r.list_preview([]) == r.ListPreview(0, "")

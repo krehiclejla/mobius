@@ -490,3 +490,36 @@ def test_chat_logs_keyset_pages_without_offset_drift(
   assert second.status_code == 200, second.text
   assert [item["id"] for item in second.json()["items"]] == ["oldest"]
   assert second.json()["next_before"] is None
+
+
+def test_chat_logs_list_counts_live_replies_without_a_lazy_load_per_chat(
+  client, owner_token, db, monkeypatch,
+):
+  from sqlalchemy import event
+
+  from app.database import engine
+
+  for index in range(3):
+    chat = _seed_chat(db, chat_id=f"live{index}")
+    chat.live_assistant = {
+      "role": "assistant", "content": "streaming",
+      "blocks": [{"type": "text", "content": "streaming"}],
+    }
+    db.commit()
+  statements = []
+
+  def record(_conn, _cursor, statement, *_args):
+    statements.append(statement)
+
+  event.listen(engine, "before_cursor_execute", record)
+  try:
+    r = client.get(
+      "/api/chat-logs", headers={"Authorization": f"Bearer {owner_token}"},
+    )
+  finally:
+    event.remove(engine, "before_cursor_execute", record)
+  assert r.status_code == 200, r.text
+  # Two stored visible messages plus each chat's in-flight reply.
+  assert [item["message_count"] for item in r.json()["items"]] == [3, 3, 3]
+  live_reads = [s for s in statements if "FROM chat_live_assistants" in s]
+  assert len(live_reads) == 1, live_reads

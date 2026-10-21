@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -1288,6 +1289,40 @@ async def _fetch_update_commit(repo: Path, manifest_url: str) -> str:
   return await install.fetch_app_commit(repo, ref, expected_origin=origin)
 
 
+# Update discovery's reuse window. The Store checks every installed app on
+# each open and focus, one Git fetch per app; within this window a repeat
+# check reuses the upstream commit it just fetched. Only discovery reuses it:
+# update preview and install always fetch, so acting on an update is never
+# stale, and a newly pushed release shows up at most this late.
+_DISCOVERY_FETCH_REUSE_SECONDS = 300.0
+_discovered_commits: dict[tuple[str, str, str], tuple[float, str]] = {}
+
+
+async def _discover_update_commit(repo: Path, manifest_url: str) -> str:
+  """The upstream candidate for update-check, fetched at most once per window.
+
+  The key includes the recorded ``upstream`` commit, so an install, update
+  or reinstall of the app fetches afresh. Everything after the fetch (pending
+  receipts, identity, digests) is still read locally on every check.
+  """
+  baseline = await asyncio.to_thread(
+    app_git.head_sha, repo, app_git.UPSTREAM_BRANCH,
+  )
+  key = (str(repo), manifest_url, baseline)
+  now = time.monotonic()
+  reusable = _discovered_commits.get(key)
+  if reusable is not None and now - reusable[0] < _DISCOVERY_FETCH_REUSE_SECONDS:
+    return reusable[1]
+  commit = await _fetch_update_commit(repo, manifest_url)
+  for stale in [
+    k for k, (fetched_at, _) in _discovered_commits.items()
+    if now - fetched_at >= _DISCOVERY_FETCH_REUSE_SECONDS
+  ]:
+    del _discovered_commits[stale]
+  _discovered_commits[key] = (now, commit)
+  return commit
+
+
 def _hidden_merge_upstream(repo: Path) -> str | None:
   """The upstream commit whose merge base a shallow boundary hides, if any.
 
@@ -1563,7 +1598,7 @@ async def update_check(
     installed_manifest_url, manifest_url,
   )
   try:
-    commit = await _fetch_update_commit(repo, fetch_manifest_url)
+    commit = await _discover_update_commit(repo, fetch_manifest_url)
   except git_transfers.OriginMismatch:
     return _unknown(dict(_REPOSITORY_MOVED))
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):

@@ -133,6 +133,15 @@ def _test_secret_key_in_environment():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_update_discovery():
+  """Update-check reuses a recent upstream fetch per repo, source and recorded
+  upstream. Tests reuse app paths and produce identical commits, so each one
+  starts without an earlier test's discovery."""
+  from app.routes import apps as apps_routes
+  apps_routes._discovered_commits.clear()
+
+
+@pytest.fixture(autouse=True)
 def real_end_orphaned_hosts(monkeypatch):
   """Keep the app lifespan's boot sweep from ending processes outside the test.
 

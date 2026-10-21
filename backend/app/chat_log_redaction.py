@@ -39,6 +39,7 @@ caps + pagination bound how much survives per response.
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 from app.continuations import (
   SIDE_QUESTION_LABEL,
@@ -204,28 +205,31 @@ def redact_messages(messages, *, newest: int = MAX_MESSAGES_PER_CHAT,
   return out
 
 
-def excerpt_for_chat(messages: list, *, char_cap: int = EXCERPT_CHARS) -> str:
-  """A short, redacted teaser for the list view.
+class ListPreview(NamedTuple):
+  """The list view's per-chat summary fields."""
 
-  Uses the FIRST surviving user/assistant text (chronological) so the
-  excerpt reads like the start of the conversation, scrubbed + truncated.
-  Empty string when nothing survives redaction.
+  message_count: int
+  excerpt: str
+
+
+def list_preview(messages, *, char_cap: int = EXCERPT_CHARS) -> ListPreview:
+  """Visible-message count and excerpt from ONE pass over a transcript.
+
+  ``message_count`` counts the same whitelist `redact_messages` keeps, so it
+  matches what a detail fetch would return (modulo the newest cap). The
+  excerpt is the FIRST surviving text (chronological), so it reads like the
+  start of the conversation, scrubbed and truncated; empty when nothing
+  survives. One pass matters: the list pages through every chat, and each
+  extra walk re-reads and re-decodes a whole transcript.
   """
+  count = 0
+  excerpt = None
   for msg in messages or []:
     red = redact_message(msg)
     if red is None:
       continue
-    text = red["text"]
-    return text[:char_cap] + "…" if len(text) > char_cap else text
-  return ""
-
-
-def count_visible_messages(messages: list) -> int:
-  """How many messages survive redaction — the message_count surfaced in
-  the list view. Counts the same whitelist `redact_messages` keeps so the
-  number matches what a detail fetch would return (modulo the newest cap)."""
-  n = 0
-  for msg in messages or []:
-    if redact_message(msg) is not None:
-      n += 1
-  return n
+    count += 1
+    if excerpt is None:
+      text = red["text"]
+      excerpt = text[:char_cap] + "…" if len(text) > char_cap else text
+  return ListPreview(count, excerpt or "")

@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app import activity, chat_log_redaction as redact, models, transcript_rows
 from app.chat_transcript import materialized_messages
@@ -117,7 +117,9 @@ def list_chat_logs(
   if before_recency is not None and before_recency.tzinfo is not None:
     before_recency = before_recency.astimezone(UTC).replace(tzinfo=None)
 
-  base = db.query(models.Chat)
+  # Every listed chat reads its live reply overlay; load them in one query
+  # rather than one lazy load per chat.
+  base = db.query(models.Chat).options(selectinload(models.Chat.live_snapshot))
   if include_deleted:
     cutoff = now_naive_utc() - SOFT_DELETE_TTL
     base = base.filter(or_(
@@ -141,7 +143,7 @@ def list_chat_logs(
 
   items = []
   for c in rows:
-    msgs = materialized_messages(c)
+    preview = redact.list_preview(materialized_messages(c))
     items.append({
       "id": c.id,
       # Title is derived from the first user message → scrub it like
@@ -154,8 +156,8 @@ def list_chat_logs(
         else c.activity_at or c.updated_at
       ),
       "deleted_at": _iso(c.deleted_at),
-      "message_count": redact.count_visible_messages(msgs),
-      "excerpt": redact.excerpt_for_chat(msgs),
+      "message_count": preview.message_count,
+      "excerpt": preview.excerpt,
     })
 
   if principal.app_id is not None:
