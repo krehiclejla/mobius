@@ -66,6 +66,9 @@ services:
       # Self-hosters: set GITHUB_OAUTH_CLIENT_ID in .env to use your own
       # OAuth app, or to "" to disable the device flow (PAT still works).
       - GITHUB_OAUTH_CLIENT_ID=${GITHUB_OAUTH_CLIENT_ID:-Ov23liMpOLS6qp5YV8Vk}
+      # Proxies trusted to name the real visitor in X-Forwarded-For; see
+      # .env.example. uvicorn's own default trusts only loopback.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       - DATABASE_URL=sqlite:////data/db/ultimate.db
       - DATA_DIR=/data
       # The in-product agent has full root by default. Set this to 0 as an

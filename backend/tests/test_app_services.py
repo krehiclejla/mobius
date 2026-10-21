@@ -940,11 +940,11 @@ def test_public_service_may_declare_a_capped_request_allowance():
 @pytest.fixture
 def fresh_public_door(monkeypatch):
   from limits.storage import MemoryStorage
-  from limits.strategies import FixedWindowRateLimiter
+  from limits.strategies import SlidingWindowCounterRateLimiter
   from app import public_service_index
   from app.routes import app_services as routes
 
-  monkeypatch.setattr(routes, "_public_window", FixedWindowRateLimiter(MemoryStorage()))
+  monkeypatch.setattr(routes, "_public_window", SlidingWindowCounterRateLimiter(MemoryStorage()))
   # Start from this test's database, not a snapshot an earlier test built.
   monkeypatch.setattr(public_service_index, "_snapshot", None)
   lookups = []
@@ -961,6 +961,49 @@ def test_public_door_counts_probes_of_non_public_services(client, db, fresh_publ
     assert client.get("/api/app-services/private-probe/status").status_code == 404
     assert client.get("/api/app-services/missing-probe/status").status_code == 404
   assert client.get("/api/app-services/private-probe/status").status_code == 429
+
+
+def _visitor_request(address):
+  from starlette.requests import Request
+  return Request({"type": "http", "client": (address, 40000), "headers": []})
+
+
+def _admitted(address, per_minute=60):
+  from fastapi import HTTPException
+  from app.routes import app_services as routes
+  try:
+    routes._admit_public_request(_visitor_request(address), "7", per_minute)
+  except HTTPException as refused:
+    assert refused.status_code == 429
+    return False
+  return True
+
+
+def test_one_visitor_cannot_spend_another_visitors_allowance(fresh_public_door):
+  assert all(_admitted("203.0.113.1") for _ in range(60))
+  assert not _admitted("203.0.113.1")
+  assert all(_admitted("203.0.113.2") for _ in range(60))
+  assert not _admitted("203.0.113.2")
+
+
+def test_public_service_accepts_at_most_ten_visitors_allowances(fresh_public_door):
+  for visitor in range(10):
+    assert all(_admitted(f"198.51.100.{visitor}", 120) for _ in range(120))
+  assert not _admitted("198.51.100.200", 120)
+
+
+def test_refused_request_spends_neither_allowance(fresh_public_door):
+  for visitor in range(10):
+    assert all(_admitted(f"192.0.2.{visitor}") for _ in range(60))
+  for _ in range(5):
+    assert not _admitted("192.0.2.1")
+    assert not _admitted("192.0.2.99")
+  from app.routes import app_services as routes
+  from limits import RateLimitItemPerMinute
+  stats = routes._public_window.get_window_stats(
+    RateLimitItemPerMinute(60), "visitor", "7", "192.0.2.99",
+  )
+  assert stats.remaining == 60
 
 
 def _set_public_allowance(db, app, per_minute):

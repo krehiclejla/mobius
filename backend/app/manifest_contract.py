@@ -48,11 +48,14 @@ PROJECT_ARTIFACT_TYPES_COUNT_MAX = 12
 PROJECT_ARTIFACT_EXTENSIONS_COUNT_MAX = 16
 AGENT_ACTIVITIES_COUNT_MAX = 16
 SERVICE_REQUEST_MAX_BYTES = 8 * 1024 * 1024
-# Anonymous requests a minute one caller may make to one public app service.
+# Anonymous requests a minute one visitor may make to one public app service.
 # A public service may declare more, up to the cap, when its product needs a
 # faster cadence (a live multiplayer room); the owner accepts it on apply.
 PUBLIC_SERVICE_REQUESTS_PER_MINUTE = 60
 PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX = 600
+# The whole service takes at most this many visitors' allowances a minute, so
+# a crowd of visitors cannot run one public service hot.
+PUBLIC_SERVICE_VISITORS_AT_FULL_RATE = 10
 SERVICE_TRANSFER_MAX_BYTES = 60 * 1024 * 1024
 SERVICE_ALIASES_MAX = 4
 SERVICE_ROUTE_LIMITS_MAX = 16

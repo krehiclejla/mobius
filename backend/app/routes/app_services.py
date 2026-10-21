@@ -11,13 +11,14 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 from limits import RateLimitItemPerMinute
 from limits.storage import MemoryStorage
-from limits.strategies import FixedWindowRateLimiter
+from limits.strategies import SlidingWindowCounterRateLimiter
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app import app_services, models, public_service_index
 from app.database import get_db
 from app.deps import Principal, get_principal, reject_cross_site
+from app.manifest_contract import PUBLIC_SERVICE_VISITORS_AT_FULL_RATE
 from app.resource_access import live_app_or_404
 from app.storage_io import read_capped_body
 
@@ -26,23 +27,36 @@ router = APIRouter(tags=["app-services"])
 # Total body-read lifetime, separate from the unchanged 15-second execution timeout.
 SERVICE_BODY_TIMEOUT_SECONDS = 120
 _limiter = Limiter(key_func=get_remote_address, key_style="endpoint")
-# The anonymous door counts each caller per public service, against that
-# service's accepted allowance (60 a minute unless its manifest declares more).
+# The anonymous door holds each visitor of a public service to that service's
+# accepted allowance (60 a minute unless its manifest declares more), and the
+# service as a whole to PUBLIC_SERVICE_VISITORS_AT_FULL_RATE allowances, so
+# one visitor cannot spend every other visitor's share. A visitor is the
+# request's client address, which uvicorn takes from X-Forwarded-For only when
+# the peer is a proxy the operator listed in FORWARDED_ALLOW_IPS; behind an
+# unlisted proxy every visitor shares one allowance. The sliding window keeps a
+# burst across a minute boundary near the allowance instead of doubling it.
 # In-memory counters are exact because Mobius serves its API from a single
 # uvicorn worker; running several workers would need a shared store here.
-_public_window = FixedWindowRateLimiter(MemoryStorage())
+_public_window = SlidingWindowCounterRateLimiter(MemoryStorage())
 
 
 def _admit_public_request(request: Request, bucket: str, per_minute: int) -> None:
-  allowance = RateLimitItemPerMinute(per_minute)
-  caller = get_remote_address(request)
-  if not _public_window.hit(allowance, caller, bucket):
-    reset_at, _ = _public_window.get_window_stats(allowance, caller, bucket)
-    raise HTTPException(
-      429,
-      f"Rate limit exceeded: {allowance.amount} per 1 minute",
-      headers={"Retry-After": str(max(1, int(reset_at - time.time()) + 1))},
-    )
+  visitor = RateLimitItemPerMinute(per_minute)
+  service = RateLimitItemPerMinute(per_minute * PUBLIC_SERVICE_VISITORS_AT_FULL_RATE)
+  counters = (
+    (visitor, ("visitor", bucket, get_remote_address(request))),
+    (service, ("service", bucket)),
+  )
+  for allowance, key in counters:
+    if not _public_window.test(allowance, *key):
+      reset_at, _ = _public_window.get_window_stats(allowance, *key)
+      raise HTTPException(
+        429,
+        f"Rate limit exceeded: {allowance.amount} per 1 minute",
+        headers={"Retry-After": str(max(1, int(reset_at - time.time()) + 1))},
+      )
+  for allowance, key in counters:
+    _public_window.hit(allowance, *key)
 
 
 async def _response(status: int, body, headers: dict[str, str], media_type: str | None):

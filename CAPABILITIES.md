@@ -418,13 +418,16 @@ Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`
 by setting `access` to `apps`, or additionally expose anonymous calls at
 `/api/app-services/{service_id}/{path}` by setting it to `public`. Anonymous
-requests are counted per public service and per network caller, 60 a minute
-by default. Möbius does not trust forwarded client addresses, so behind a
-hosting proxy every visitor arrives as the same caller: size the allowance
-for all visitors of the service together, not for one. A public service whose
-product needs a faster cadence (a live multiplayer room) may declare
-`service.public_requests_per_minute`, from 60 to 600, which the owner accepts
-with the rest of its capability contract. `service.id`
+requests are counted per public service and per visitor, 60 a minute by
+default, and the service as a whole accepts at most ten visitors' allowances a
+minute. A visitor is the network client address. Möbius trusts a forwarded
+client address only from a proxy the operator lists in `FORWARDED_ALLOW_IPS`;
+behind an unlisted proxy every visitor arrives as the same caller and shares
+one allowance. A public service whose product needs a faster cadence may
+declare `service.public_requests_per_minute`, from 60 to 600 per visitor,
+which the owner accepts with the rest of its capability contract. Request
+polling suits turn-based or slow-changing state; it is not a real-time
+transport. `service.id`
 is the stable public contract and does not change when the app's display name,
 manifest `id`, repository, or installed slug changes. These are explicit
 install-time grants and do not widen the service app token's accepted
