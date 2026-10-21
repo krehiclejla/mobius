@@ -968,7 +968,7 @@ def _visitor_request(address):
   return Request({"type": "http", "client": (address, 40000), "headers": []})
 
 
-def _admitted(address, per_minute=60):
+def _admitted(address, per_minute):
   from fastapi import HTTPException
   from app.routes import app_services as routes
   try:
@@ -979,31 +979,36 @@ def _admitted(address, per_minute=60):
   return True
 
 
-def test_one_visitor_cannot_spend_another_visitors_allowance(fresh_public_door):
-  assert all(_admitted("203.0.113.1") for _ in range(60))
-  assert not _admitted("203.0.113.1")
-  assert all(_admitted("203.0.113.2") for _ in range(60))
-  assert not _admitted("203.0.113.2")
+def test_one_visitor_may_spend_only_a_quarter_of_the_allowance(fresh_public_door):
+  assert all(_admitted("203.0.113.1", 600) for _ in range(150))
+  assert not _admitted("203.0.113.1", 600)
+  assert all(_admitted("203.0.113.2", 600) for _ in range(150))
+  assert not _admitted("203.0.113.2", 600)
 
 
-def test_public_service_accepts_at_most_ten_visitors_allowances(fresh_public_door):
-  for visitor in range(10):
-    assert all(_admitted(f"198.51.100.{visitor}", 120) for _ in range(120))
-  assert not _admitted("198.51.100.200", 120)
+def test_visitor_share_never_falls_below_the_default(fresh_public_door):
+  assert all(_admitted("203.0.113.3", 120) for _ in range(60))
+  assert not _admitted("203.0.113.3", 120)
+
+
+def test_reviewed_allowance_is_the_whole_services_ceiling(fresh_public_door):
+  for visitor in range(4):
+    assert all(_admitted(f"198.51.100.{visitor}", 600) for _ in range(150))
+  assert not _admitted("198.51.100.200", 600)
 
 
 def test_refused_request_spends_neither_allowance(fresh_public_door):
-  for visitor in range(10):
-    assert all(_admitted(f"192.0.2.{visitor}") for _ in range(60))
+  for visitor in range(4):
+    assert all(_admitted(f"192.0.2.{visitor}", 600) for _ in range(150))
   for _ in range(5):
-    assert not _admitted("192.0.2.1")
-    assert not _admitted("192.0.2.99")
+    assert not _admitted("192.0.2.1", 600)
+    assert not _admitted("192.0.2.99", 600)
   from app.routes import app_services as routes
   from limits import RateLimitItemPerMinute
   stats = routes._public_window.get_window_stats(
-    RateLimitItemPerMinute(60), "visitor", "7", "192.0.2.99",
+    RateLimitItemPerMinute(150), "visitor", "7", "192.0.2.99",
   )
-  assert stats.remaining == 60
+  assert stats.remaining == 150
 
 
 def _set_public_allowance(db, app, per_minute):

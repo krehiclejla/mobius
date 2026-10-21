@@ -18,7 +18,7 @@ from slowapi.util import get_remote_address
 from app import app_services, models, public_service_index
 from app.database import get_db
 from app.deps import Principal, get_principal, reject_cross_site
-from app.manifest_contract import PUBLIC_SERVICE_VISITORS_AT_FULL_RATE
+from app.manifest_contract import PUBLIC_SERVICE_REQUESTS_PER_MINUTE, PUBLIC_SERVICE_VISITOR_SHARES
 from app.resource_access import live_app_or_404
 from app.storage_io import read_capped_body
 
@@ -27,22 +27,23 @@ router = APIRouter(tags=["app-services"])
 # Total body-read lifetime, separate from the unchanged 15-second execution timeout.
 SERVICE_BODY_TIMEOUT_SECONDS = 120
 _limiter = Limiter(key_func=get_remote_address, key_style="endpoint")
-# The anonymous door holds each visitor of a public service to that service's
-# accepted allowance (60 a minute unless its manifest declares more), and the
-# service as a whole to PUBLIC_SERVICE_VISITORS_AT_FULL_RATE allowances, so
+# The anonymous door holds each public service to its accepted allowance (60 a
+# minute unless its manifest declares more) across all its visitors, and each
+# visitor to a 1/PUBLIC_SERVICE_VISITOR_SHARES share of it (never under 60), so
 # one visitor cannot spend every other visitor's share. A visitor is the
-# request's client address, which uvicorn takes from X-Forwarded-For only when
-# the peer is a proxy the operator listed in FORWARDED_ALLOW_IPS; behind an
-# unlisted proxy every visitor shares one allowance. The sliding window keeps a
-# burst across a minute boundary near the allowance instead of doubling it.
+# request's client address; behind a proxy that address is the proxy's, so
+# every visitor shares one visitor share. The sliding window keeps a burst
+# across a minute boundary near the allowance instead of doubling it.
 # In-memory counters are exact because Mobius serves its API from a single
 # uvicorn worker; running several workers would need a shared store here.
 _public_window = SlidingWindowCounterRateLimiter(MemoryStorage())
 
 
 def _admit_public_request(request: Request, bucket: str, per_minute: int) -> None:
-  visitor = RateLimitItemPerMinute(per_minute)
-  service = RateLimitItemPerMinute(per_minute * PUBLIC_SERVICE_VISITORS_AT_FULL_RATE)
+  visitor = RateLimitItemPerMinute(
+    max(PUBLIC_SERVICE_REQUESTS_PER_MINUTE, per_minute // PUBLIC_SERVICE_VISITOR_SHARES),
+  )
+  service = RateLimitItemPerMinute(per_minute)
   counters = (
     (visitor, ("visitor", bucket, get_remote_address(request))),
     (service, ("service", bucket)),

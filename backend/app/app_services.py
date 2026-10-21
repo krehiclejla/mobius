@@ -900,7 +900,7 @@ def service_contract(app, *, access: str) -> dict:
 
 
 def public_requests_per_minute(service: dict) -> int:
-  """One anonymous visitor's per-minute allowance for this accepted public service.
+  """All anonymous visitors' per-minute allowance for this accepted public service.
 
   Like the transfer limits below, an accepted value the manifest contract
   could not have produced disables the service rather than being clamped.
