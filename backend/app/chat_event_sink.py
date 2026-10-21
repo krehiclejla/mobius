@@ -988,8 +988,16 @@ class ChatEventSink:
         )
       return final_name
 
-  async def _resolve_uncertain_generated_files(self) -> None:
-    """Merge every late file commit before a terminal snapshot can replace it."""
+  def generated_file_commit_unresolved(self) -> bool:
+    """Whether a timed-out file commit may still land; settling decides it."""
+    return bool(self._uncertain_generated_files)
+
+  async def settle_uncertain_generated_files(self) -> None:
+    """Merge every late file commit before a terminal snapshot can replace it.
+
+    Finalize always calls this; a runner may call it earlier to learn a
+    capture's outcome while the turn can still say so.
+    """
     for path, pending in list(self._uncertain_generated_files.items()):
       final_name = await _await_ack(get_writer().submit(
         ResolveGeneratedFilePublication(chat_id=self.chat_id, path=path),
@@ -1027,7 +1035,9 @@ class ChatEventSink:
 
   async def generated_file_capacity(self) -> int:
     """Return how many files can fit before performing any disk copies."""
-    if not self.chat_id:
+    # An unresolved commit may still consume a row, and a publication behind
+    # it would only leave another frozen copy. Report no room until it settles.
+    if not self.chat_id or self._uncertain_generated_files:
       return 0
     try:
       return int(await _await_ack(get_writer().submit(
@@ -1348,7 +1358,7 @@ class ChatEventSink:
     # FIFO writer. Resolve it before Finalize can replace its atomic live
     # snapshot with this sink's file-less in-memory state. If the writer is
     # still unavailable, let the terminal barrier fail closed instead.
-    await self._resolve_uncertain_generated_files()
+    await self.settle_uncertain_generated_files()
     await self._flush_lifecycle()
     # An app activity deferred to a background task whose task_done never reached us
     # (turn stopped, provider suppressed the terminal frame) must not persist

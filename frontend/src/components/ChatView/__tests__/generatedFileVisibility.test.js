@@ -4,7 +4,17 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
-const vite = await createSsrRenderServer()
+globalThis.location = { origin: 'http://localhost' }
+globalThis.window = { location: globalThis.location, innerHeight: 800 }
+
+const vite = await createSsrRenderServer({
+  noExternal: ['dompurify'],
+  plugins: [{
+    name: 'dompurify-ssr-stub', enforce: 'pre',
+    resolveId: id => id === 'dompurify' ? '\0dompurify-stub' : null,
+    load: id => id === '\0dompurify-stub' ? 'export default { sanitize: value => String(value) }' : null,
+  }],
+})
 const { default: MsgContent } = await vite.ssrLoadModule(
   '/src/components/ChatView/MsgContent.jsx',
 )
@@ -88,7 +98,7 @@ test('a post-answer generated file does not hide the recovery action', () => {
   assert.match(html, />report\.pdf</)
 })
 
-test('generated images retain the existing inline gallery treatment', () => {
+test('generated images use full in-chat image frames rather than upload thumbnails', () => {
   const imageMessage = {
     ...generatedMessage,
     blocks: [{ type: 'generated_files', files: [{
@@ -104,7 +114,9 @@ test('generated images retain the existing inline gallery treatment', () => {
 
   assert.doesNotMatch(html, /chat__attach-file/)
   assert.match(html, /chat__attach-images/)
-  assert.match(html, /chat__attach-thumb-frame/)
+  assert.match(html, /chat__generated-image/)
+  assert.match(html, /md-image-frame/)
+  assert.doesNotMatch(html, /chat__attach-thumb-frame/)
 })
 
 test('only browser-safe generated documents open as previews', () => {
@@ -282,3 +294,136 @@ for (const isStreaming of [true, false]) {
     assert.equal(html.includes('chat__attach-file'), !isStreaming)
   })
 }
+
+for (const isStreaming of [true, false]) {
+  test(`generated image shows directly while docs remain deferred (${isStreaming})`, () => {
+    const path = '/api/chats/chat-generated-file/generated-files/chart.png'
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: {role: 'assistant', blocks: [{type: 'generated_files', files: [
+        {name: 'chart.png', mime_type: 'image/png', previewable: true},
+        {name: 'notes.pdf', mime_type: 'application/pdf', previewable: true},
+      ]}], media_dimensions: {[path]: {width: 1536, height: 1024}}},
+      chatId: 'chat-generated-file', isStreaming,
+    }))
+    assert.match(html, /--md-image-ratio:1536 \/ 1024/)
+    assert.match(html, /chat__generated-image/)
+    assert.equal(html.includes('notes.pdf'), !isStreaming)
+  })
+}
+
+test('an embedded generated image is not also rendered as an attachment', () => {
+  const href = '/api/chats/chat-generated-file/generated-files/chart.png'
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: {role: 'assistant', blocks: [
+      {type: 'text', content: `![chart](${href}?preview=true)`},
+      {type: 'generated_files', files: [{name: 'chart.png', mime_type: 'image/png', previewable: true}]},
+    ]}, chatId: 'chat-generated-file', isStreaming: false,
+  }))
+  assert.equal((html.match(/class="md-image-frame"/g) || []).length, 1)
+  assert.doesNotMatch(html, /chat__generated-image/)
+})
+
+test('an image URL mentioned only in a code example does not hide the actual picture', () => {
+  const href = '/api/chats/chat-generated-file/generated-files/chart.png'
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: {role: 'assistant', blocks: [
+      {type: 'text', content: '`![chart](' + href + ')`'},
+      {type: 'generated_files', files: [{name: 'chart.png', mime_type: 'image/png', previewable: true}]},
+    ]}, chatId: 'chat-generated-file', isStreaming: false,
+  }))
+  assert.match(html, /chat__generated-image/)
+})
+
+for (const protocol of ['javascript:', 'data:', 'ftp:']) {
+  for (const isStreaming of [true, false]) {
+    test(`rejected ${protocol} Markdown cannot suppress a generated image (${isStreaming})`, () => {
+      const href = `${protocol}/api/chats/chat-generated-file/generated-files/chart.png`
+      const html = renderToStaticMarkup(createElement(MsgContent, {
+        msg: { role: 'assistant', blocks: [
+          { type: 'text', content: `![chart](${href})` },
+          { type: 'generated_files', files: [{ name: 'chart.png', mime_type: 'image/png', previewable: true }] },
+        ] }, chatId: 'chat-generated-file', isStreaming,
+      }))
+      assert.match(html, /chat__generated-image/)
+      assert.equal((html.match(/class="md-image-frame"/g) || []).length, 1)
+    })
+  }
+}
+
+test('reopened generated gallery images reserve every frame before authorization', () => {
+  const chatId = 'chat-generated-file'
+  const names = ['first.png', 'second.png', 'last.png']
+  const mediaDimensions = Object.fromEntries(names.map(name => [
+    `/api/chats/${chatId}/generated-files/${name}`, { width: 120, height: 300 },
+  ]))
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: {
+      role: 'assistant', media_dimensions: mediaDimensions,
+      blocks: [{ type: 'generated_files', files: names.map(name => ({
+        name, size: 900, mime_type: 'image/png', previewable: true,
+      })) }],
+    },
+    chatId, isLastMsg: false, isStreaming: false,
+  }))
+  assert.equal((html.match(/class="md-image-frame"/g) || []).length, names.length)
+  assert.equal((html.match(/--md-image-ratio:120 \/ 300/g) || []).length, names.length)
+})
+
+const imageStep = (id, prompt, extra = {}) => ({
+  type: 'tool', tool: 'ImageGen', tool_use_id: id, input: prompt,
+  status: 'done', output: 'Image generated.', output_exit_code: 0, ...extra,
+})
+const nativePicture = (name, step, extra = {}) => ({
+  name, size: 900, mime_type: 'image/png', previewable: true,
+  source_tool_use_id: step, width: 1536, height: 1024, ...extra,
+})
+
+for (const isStreaming of [true, false]) {
+  test(`each generated picture follows the step that made it (${isStreaming})`, () => {
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: { role: 'assistant', blocks: [
+        { type: 'text', content: 'First a fox.' },
+        imageStep('ig_1', 'A red fox in snow'),
+        { type: 'text', content: 'Now a heron.' },
+        imageStep('ig_2', 'A grey heron at dawn'),
+        { type: 'text', content: 'Both are done.' },
+        { type: 'generated_files', files: [
+          nativePicture('generated-image-1.png', 'ig_1'),
+          nativePicture('generated-image-2.png', 'ig_2'),
+        ] },
+      ] },
+      chatId: 'chat-generated-file', isStreaming, isActiveAnswer: isStreaming,
+    }))
+    // Before its media token resolves, a frame is named by its alt text.
+    const order = ['First a fox.', 'Open A red fox in snow preview', 'Now a heron.',
+      'Open A grey heron at dawn preview', 'Both are done.'].map(text => html.indexOf(text))
+    assert.ok(order.every(index => index >= 0), `missing in ${order}`)
+    assert.deepEqual([...order].sort((a, b) => a - b), order)
+    // The recorded capture size fixes each frame before any byte loads.
+    assert.equal((html.match(/--md-image-ratio:1536 \/ 1024/g) || []).length, 2)
+  })
+}
+
+test('a picture whose step is not on screen falls back after the answer', () => {
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: { role: 'assistant', blocks: [
+      { type: 'text', content: 'Here it is.' },
+      { type: 'generated_files', files: [nativePicture('generated-image-1.png', 'ig_gone')] },
+    ] },
+    chatId: 'chat-generated-file', isStreaming: false,
+  }))
+  assert.ok(html.indexOf('Here it is.') < html.indexOf('chat__generated-image'))
+  assert.match(html, /aria-label="Open Generated image preview"/)
+  assert.doesNotMatch(html, /generated-image-1\.png preview/)
+})
+
+test('a picture still pending at the step reads as pending, not as a failure', () => {
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: { role: 'assistant', blocks: [imageStep('ig_1', 'A red fox in snow', {
+      output: 'Image generated. Attaching it has not finished yet; Möbius tries again when this turn ends.',
+    })] },
+    chatId: 'chat-generated-file', isStreaming: true, isActiveAnswer: true,
+  }))
+  assert.match(html, /Generat(ed|ing) an image/)
+  assert.doesNotMatch(html, /chat__generated-image/)
+})

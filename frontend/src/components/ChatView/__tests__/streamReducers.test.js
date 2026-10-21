@@ -75,6 +75,22 @@ test('generated image fingerprints reach the live attachment entry', () => {
   assert.equal(items[0].files[0].sha256, digest)
 })
 
+test('a native picture keeps its producing step and capture size live', () => {
+  const items = attachGeneratedFile([], {
+    name: 'generated-image-1.png', size: 12, mime_type: 'image/png', previewable: true,
+    source_tool_use_id: 'ig_1', width: 1536, height: 1024,
+  })
+  assert.deepEqual(items[0].files[0], {
+    name: 'generated-image-1.png', size: 12, mime_type: 'image/png', previewable: true,
+    source_tool_use_id: 'ig_1', width: 1536, height: 1024,
+  })
+  // An unproven size never reaches the frame.
+  const unsized = attachGeneratedFile([], {
+    name: 'x.png', mime_type: 'image/png', width: 0, height: '9', source_tool_use_id: '',
+  })
+  assert.deepEqual(Object.keys(unsized[0].files[0]).sort(), ['mime_type', 'name', 'previewable', 'size'])
+})
+
 function questionEvent(id, text) {
   return {
     type: 'question',

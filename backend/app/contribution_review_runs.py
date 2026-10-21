@@ -195,8 +195,13 @@ def arm_merge(db, row, target, outcome, principal):
     chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
     summary=f"Review and merge {key(target)} at {target['head_sha'][:12]}.")
   if claim["state"] in {"held_by_peer", "completed"}:
+    follow_status = claim.get("follow_status", "no_goal_follow")
+    follows = follow_status in {"followed", "result_owed"}
     return {**outcome, "state": "needs_you", "review_chat_id": claim["owner_chat_id"],
-            "summary": "This exact merge already has an owning conversation. Open that conversation to follow its result."}
+            "goal_follow_status": follow_status,
+            "summary": ("This exact merge already has an owning conversation. Open that conversation. "
+                        + ("Your Goal follows this claim and will receive its result." if follows else
+                           f"No new Goal follow was created ({follow_status}); reconcile the result yourself."))}
   # Keep this write and save_outcome in one transaction. A second worker must
   # wait for the first receipt before checking other overlapping batches.
   fenced = db.execute(update(models.AgentWorkClaim).where(

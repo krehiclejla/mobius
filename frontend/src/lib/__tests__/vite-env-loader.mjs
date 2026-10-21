@@ -26,6 +26,8 @@ const REACT_SHIM = new URL(
 const REACT_SHIMMED_MODULES = [
   '/components/AppIcon.jsx',
   '/components/SettingsView/GithubConnection.jsx',
+  '/components/SettingsView/MobiusProviderAccess.jsx',
+  '/components/SettingsView/useSettingsFocus.js',
   '/components/Shell/useAppIntentNavigation.js',
   '/components/Shell/useShellUpdateController.js',
   '/components/Shell/useVisibleAppPresence.js',

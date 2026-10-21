@@ -434,6 +434,10 @@ def _distinctive_activity(block: dict, binding: RecallBinding) -> bool:
   # omitted from a compact chat read.
   if bounded_peer_message(block.get("peer_message")) is not None:
     return True
+  # A generated picture is shown right after the step that made it, so that
+  # step keeps its id and prompt instead of folding into "ran commands".
+  if block.get("tool") == "ImageGen":
+    return True
   if block.get("tool") != "Read":
     return False
   raw = block.get("input")

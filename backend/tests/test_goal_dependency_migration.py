@@ -7,11 +7,83 @@ import pytest
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models, schema_migrations
 from app.chat_writer import create_chat
 
+
+def test_fresh_dependency_table_keeps_columns_previous_releases_map(tmp_path):
+  # create_all runs before migrations. A table it creates must still carry
+  # every column a previous release maps, or rolling back reports a schema gap.
+  eng = create_engine(f"sqlite:///{tmp_path / 'fresh-dependencies.db'}")
+  models.Base.metadata.create_all(eng)
+  schema_migrations._add_goal_dependencies(eng)
+  assert 'task_id' in {col['name'] for col in inspect(eng).get_columns('goal_dependencies')}
+  assert schema_migrations.mapped_schema_gaps(eng) == []
+  eng.dispose()
+
+@pytest.mark.parametrize("start", ["fresh", "upgrade"])
+@pytest.mark.parametrize("live_state", ["pending", "result_owed", "owner_suppressed"])
+def test_live_claim_follow_unique_index_preserves_historical_receipts(tmp_path, start, live_state):
+  eng = create_engine(f"sqlite:///{tmp_path / 'unique-follows.db'}")
+  models.Base.metadata.create_all(eng)
+  if start == "upgrade":
+    with eng.begin() as conn:
+      conn.execute(text("DROP INDEX uq_goal_dependencies_live_claim_acquisition"))
+  def insert(conn, suffix, *, disposition=None, withdrawn=None):
+    conn.execute(text(
+      "INSERT INTO goal_dependencies (id, waiting_goal_id, waiting_chat_id, "
+      "target_kind, target_key, target_acquisition_id, result_disposition, "
+      "withdrawn_at, created_at) VALUES (:id, 'goal', 'chat', "
+      "'claim_acquisition', :key, 'acquisition', :disposition, :withdrawn, CURRENT_TIMESTAMP)"
+    ), {"id": suffix, "key": f"claim:acquisition:{suffix}",
+        "disposition": disposition, "withdrawn": withdrawn})
+
+  with eng.begin() as conn:
+    insert(conn, "delivered", disposition="delivered")
+    insert(conn, "withdrawn", withdrawn=datetime(2026, 10, 20))
+    insert(conn, "live")
+    if live_state != "pending":
+      column = "resolved_at" if live_state == "result_owed" else "owner_suppressed_at"
+      conn.execute(text(f"UPDATE goal_dependencies SET {column} = CURRENT_TIMESTAMP WHERE id = 'live'"))
+  schema_migrations._enforce_unique_live_claim_follows(eng)
+  schema_migrations._enforce_unique_live_claim_follows(eng)
+  indexes = {item["name"]: item for item in inspect(eng).get_indexes("goal_dependencies")}
+  assert indexes["uq_goal_dependencies_live_claim_acquisition"]["unique"]
+  with pytest.raises(IntegrityError):
+    with eng.begin() as conn:
+      insert(conn, "duplicate")
+  with eng.connect() as conn:
+    assert conn.execute(text("SELECT count(*) FROM goal_dependencies")).scalar_one() == 3
+  eng.dispose()
+
+
+
+def test_unique_live_follow_upgrade_withdraws_existing_duplicates(tmp_path):
+  # Before the index, duplicate live follows were possible; the upgrade must
+  # keep exactly one (an owed result first, then the newest) and never fail.
+  eng = create_engine(f"sqlite:///{tmp_path / 'duplicate-follows.db'}")
+  models.Base.metadata.create_all(eng)
+  with eng.begin() as conn:
+    conn.execute(text("DROP INDEX uq_goal_dependencies_live_claim_acquisition"))
+    for row_id, created, resolved in (("older-owed", "2026-10-17 01:00:00", "2026-10-17 02:00:00"),
+                                      ("newer-pending", "2026-10-18 01:00:00", None),
+                                      ("newest-pending", "2026-10-19 01:00:00", None)):
+      conn.execute(text(
+        "INSERT INTO goal_dependencies (id, waiting_goal_id, waiting_chat_id, target_kind, "
+        "target_key, target_acquisition_id, resolved_at, created_at) VALUES (:id, 'goal', "
+        "'chat', 'claim_acquisition', :key, 'acquisition', :resolved, :created)"
+      ), {"id": row_id, "key": f"claim:acquisition:{row_id}", "resolved": resolved, "created": created})
+  schema_migrations._enforce_unique_live_claim_follows(eng)
+  schema_migrations._enforce_unique_live_claim_follows(eng)
+  with eng.connect() as conn:
+    rows = dict(conn.execute(text(
+      "SELECT id, result_disposition FROM goal_dependencies ORDER BY id")).all())
+  assert rows == {"newer-pending": "withdrawn", "newest-pending": "withdrawn", "older-owed": None}
+  assert inspect(eng).get_indexes("goal_dependencies")
+  eng.dispose()
 
 def _seed_legacy_follow(eng, *, suffix, source_status="running", card=False,
                         resolved=False):

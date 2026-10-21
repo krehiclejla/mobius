@@ -5,6 +5,7 @@ import {
   coalesceThinkingEntries,
   toolGroupState,
   toolGroupSummary,
+  toolGroupPastSummary,
 } from '../groupBlocks.js'
 import {
   toolActivityLabel,
@@ -386,6 +387,30 @@ test('a distinctive tool (image view) breaks out into its own line', () => {
   assert.equal(nodes[1].group[0].item.input, img)
   assert.equal(nodes[2].group.length, 1)            // the plain read, its own run
   assert.equal(nodes[3].group.length, 1)            // the trailing image view, alone
+})
+
+test('an image generation step stands alone and reads as the activity', () => {
+  const gen = tool({ tool: 'ImageGen', input: 'A red fox in snow', status: 'done' })
+  const nodes = groupActivityRuns([e(tool({ tool: 'Bash' })), e(gen), e(tool({ tool: 'Bash' }))])
+  assert.equal(nodes.length, 3)
+  assert.equal(nodes[1].group[0].item, gen)
+  assert.ok(isDistinctiveActivityTool(gen))
+  // The prompt is the picture's alt text, not the row's label.
+  assert.equal(toolCallLabel(gen), 'Generated an image')
+  assert.equal(toolCallLabel({ ...gen, status: 'running' }), 'Generating an image')
+  assert.equal(toolActivityLabel('ImageGen'), 'Generating images')
+  // A pending attachment still exits 0: the picture was generated.
+  assert.equal(toolCallLabel({ ...gen, output: 'Attaching it has not finished yet' }), 'Generated an image')
+})
+
+test('a failed image generation step never claims it generated a picture', () => {
+  for (const output of ['Image generation failed.', 'The image was generated, but Möbius could not attach it.']) {
+    const failed = tool({ tool: 'ImageGen', status: 'done', output, output_exit_code: 1 })
+    assert.ok(isDistinctiveActivityTool(failed))
+    assert.equal(toolCallLabel(failed), 'Tried to generate an image')
+    assert.equal(toolGroupPastSummary([failed]), 'Tried to generate an image')
+    assert.equal(groupActivityRuns([e(failed)])[0].group.length, 1)
+  }
 })
 
 test('consecutive image views each get their own line — they do not accumulate', () => {

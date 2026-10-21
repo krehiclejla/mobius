@@ -20,6 +20,68 @@ def _running_on_event_loop() -> bool:
   return True
 
 
+def test_dependency_sweep_selects_off_loop_after_reconciliation(monkeypatch):
+  from concurrent.futures import Future
+  from app import goal_dependencies, chat_writer
+
+  seen = []
+
+  def pending():
+    seen.append(("pending", _running_on_event_loop()))
+    return True
+
+  def submit(command):
+    assert isinstance(command, chat_writer.ReconcileClaimSources)
+    seen.append(("reconcile", _running_on_event_loop()))
+    result = Future()
+    result.set_result(None)
+    return result
+
+  def select():
+    seen.append(("select", _running_on_event_loop()))
+    return ["dependency"], {"chat"}
+
+  async def deliver(row_id):
+    assert row_id == "dependency"
+    seen.append(("deliver", _running_on_event_loop()))
+    return True
+
+  async def cleanup(chat_id):
+    assert chat_id == "chat"
+    seen.append(("cleanup", _running_on_event_loop()))
+
+  monkeypatch.setattr(goal_dependencies, "_has_pending_claim_dependencies", pending)
+  monkeypatch.setattr(goal_dependencies, "_select_dependency_deliveries", select)
+  monkeypatch.setattr(goal_dependencies, "deliver_dependency", deliver)
+  monkeypatch.setattr(goal_dependencies, "withdraw_disposed_dependency_notices", cleanup)
+  monkeypatch.setattr(chat_writer, "get_writer",
+    lambda: type("Writer", (), {"submit": staticmethod(submit)}))
+
+  assert asyncio.run(goal_dependencies.deliver_pending_dependencies()) == 1
+  assert seen == [("pending", False), ("reconcile", True), ("select", False),
+    ("deliver", True), ("cleanup", True)]
+
+
+def test_stop_following_reads_in_a_worker_owned_session(db, chat, client, auth, monkeypatch):
+  from app import database
+  from tests.test_decision_dependencies import _setup, _follow
+
+  _setup(db, chat)
+  row = _follow(db, chat)
+  seen = []
+  real_session = database.SessionLocal
+
+  def session():
+    seen.append(_running_on_event_loop())
+    return real_session()
+
+  monkeypatch.setattr(database, "SessionLocal", session)
+  response = client.post(f"/api/chat-waits/dependencies/{row.id}/withdraw", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert seen and not any(seen)
+
+
 def test_parent_wake_reads_the_parent_off_the_event_loop(monkeypatch):
   seen = []
 

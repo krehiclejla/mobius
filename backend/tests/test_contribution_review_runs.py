@@ -527,6 +527,39 @@ def test_peer_owns_exact_merge_so_review_links_to_it_without_public_action(setup
   item = report(setup)["run"]["items"][0]
   assert item["state"] == "needs_you"
   assert item["review_chat_id"] == "peer-chat"
+  assert item["goal_follow_status"] == "no_open_top_level_goal"
+  assert "No new Goal follow was created" in item["summary"]
+
+
+@pytest.mark.parametrize("follow_status", ["followed", "result_owed"])
+def test_peer_claim_result_only_promises_goal_follow_when_registered(setup, monkeypatch, follow_status):
+  from app import agent_work_claims
+  db, row, principal = setup
+  monkeypatch.setattr(agent_work_claims, "claim_work", lambda *args, **kwargs: {
+    "state": "held_by_peer", "owner_chat_id": "peer-chat", "follow_status": follow_status,
+  })
+  result = domain.arm_merge(db, row, TARGET, {"head_sha": SHA}, principal)
+  assert result["goal_follow_status"] == follow_status
+  assert "Your Goal follows this claim" in result["summary"]
+
+
+@pytest.mark.parametrize("conflict", [
+  "The claim changed while following; inspect it before retrying.",
+  "Transfer would create a direct Goal dependency cycle.",
+])
+def test_claim_conflict_returns_409_without_merge_or_false_goal_follow(setup, monkeypatch, conflict):
+  from app import agent_work_claims
+  db, row, _ = setup
+  monkeypatch.setattr(agent_work_claims, "claim_work", lambda *args, **kwargs:
+    (_ for _ in ()).throw(ValueError(conflict)))
+  monkeypatch.setattr(domain, "perform_merge", lambda *args: pytest.fail("Claim conflict must not merge"))
+  with pytest.raises(HTTPException) as error:
+    report(setup)
+  assert error.value.status_code == 409
+  assert "No merge attempt was started" in error.value.detail
+  assert "no new Goal follow was created" in error.value.detail
+  db.refresh(row)
+  assert row.outcomes_json == {}
 
 
 @pytest.mark.parametrize("state", ["merging", "merge_unknown", "queued", "merged"])

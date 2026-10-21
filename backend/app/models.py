@@ -1688,12 +1688,19 @@ class GoalDependency(Base):
     UniqueConstraint("waiting_goal_id", "target_key", name="uq_goal_dependency_target"),
     Index("ix_goal_dependencies_owed", "waiting_goal_id", "resolved_at", "result_disposition"),
     Index("ix_goal_dependencies_source", "target_kind", "target_acquisition_id", "resolved_at"),
+    Index("uq_goal_dependencies_live_claim_acquisition", "waiting_goal_id",
+          "target_acquisition_id", unique=True,
+          sqlite_where=text("target_kind = 'claim_acquisition' AND result_disposition IS NULL AND withdrawn_at IS NULL"),
+          postgresql_where=text("target_kind = 'claim_acquisition' AND result_disposition IS NULL AND withdrawn_at IS NULL")),
   )
 
   id = Column(String(64), primary_key=True)
   waiting_goal_id = Column(String(64), nullable=False, index=True)
   waiting_chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
   created_by_run_id = Column(String(64), nullable=True)
+  # Unused, but still mapped: create_all runs before migrations, so dropping
+  # it would build new goal_dependencies tables without the column and a
+  # rolled-back previous release (which maps it) would report a schema gap.
   task_id = Column(String(64), nullable=True)
   target_kind = Column(String(32), nullable=False)
   target_key = Column(String(160), nullable=False)

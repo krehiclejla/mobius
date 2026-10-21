@@ -104,6 +104,7 @@
     "0091_saved_decision_cards": "02419fbb4f6e0df6fd041aea007a70a0df31dee27e7d3d182d1dff96b6ad03dd",
     "0092_transfer_notice_revision": "6f2b5103394e05671c13ff3e677a75d6746ea32043a2fd2d1fe1a4e4005261de",
     "0093_pending_goal_dependency_indexes": "563d6aca72c6114e9e0a7c58d3e4d1a956843376d6d9b1ba7d38930882024882",
-    "0094_retire_legacy_claim_notice_carriers": "fb4916d1ac2f1d488b70f77013bed52155596f766b160ee53d6b7c3a1387c053"
+    "0094_retire_legacy_claim_notice_carriers": "fb4916d1ac2f1d488b70f77013bed52155596f766b160ee53d6b7c3a1387c053",
+    "0095_unique_live_claim_follows": "004b84df6907864697cc530eca85f4f9f6b5d1b332f27ce6d647e54461e7c5ef"
   }
 }

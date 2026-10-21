@@ -524,3 +524,44 @@ def test_native_goal_resume_sdk_contract_is_pinned():
   assert {status.value for status in ThreadGoalStatus} == {
     "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
   }
+
+
+def test_native_image_generation_contract_is_imported_and_translated():
+  v = pytest.importorskip('openai_codex.generated.v2_all')
+  from app import codex_sdk_runner
+
+  sdk = codex_sdk_runner._sdk_imports()
+  assert sdk['ImageGenerationThreadItem'] is v.ImageGenerationThreadItem
+  assert set(v.ImageGenerationThreadItem.model_fields) >= {
+    'id', 'status', 'result', 'revised_prompt', 'saved_path', 'failure',
+  }
+  item = v.ImageGenerationThreadItem(
+    id='image-call', type='imageGeneration', status='completed',
+    result='private-base64-not-for-chat', savedPath='/private/image.png',
+  )
+  assert codex_sdk_runner._tool_start_event(item, sdk)['tool'] == 'ImageGen'
+  events = codex_sdk_runner._tool_completed_events(item, sdk)
+  assert events[0]['output_exit_code'] == 0
+  assert 'private' not in json.dumps(events)
+  assert events[-1] == {'type': 'tool_end'}
+
+
+def test_image_prompt_known_only_at_completion_becomes_the_bounded_step_input():
+  v = pytest.importorskip('openai_codex.generated.v2_all')
+  from app import codex_sdk_runner
+
+  sdk = codex_sdk_runner._sdk_imports()
+  started = v.ImageGenerationThreadItem(
+    id='image-call', type='imageGeneration', status='in_progress', result='',
+  )
+  assert codex_sdk_runner._tool_start_event(started, sdk)['input'] == ''
+  prompt = 'A red fox curled up in   fresh snow. ' * 12
+  completed = v.ImageGenerationThreadItem(
+    id='image-call', type='imageGeneration', status='completed', result='',
+    revisedPrompt=prompt,
+  )
+  backfill = codex_sdk_runner._tool_completed_events(completed, sdk)[0]
+  assert backfill['type'] == 'tool_input'
+  # Whitespace collapses and the alt text stays a description, not a page.
+  assert len(backfill['input']) == 200 and backfill['input'].endswith('…')
+  assert backfill['input'].startswith('A red fox curled up in fresh snow.')

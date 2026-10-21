@@ -521,12 +521,11 @@ export default function ChatView({
     messagesRef,
     offset,
     offsetRef,
+    hasUnloadedNewer,
+    setHasUnloadedNewer,
     applyMessagesToView,
     commitMessages,
   } = useTranscriptState({ cacheKey: transcriptCacheKey, cached, queryClient })
-  const [hasUnloadedNewer, setHasUnloadedNewer] = useState(
-    () => hasUnloadedNewerMessages(cached),
-  )
   const loadingLatestRef = useRef(false)
   const messageHistory = useMemo(
     () => composerHistoryFromMessages(messages),
@@ -1468,7 +1467,7 @@ export default function ChatView({
           recentOffset: data.offset || 0,
           preserveLocalSuffix: true,
         })
-        commitMessages(refreshed.messages, refreshed.offset)
+        commitMessages(refreshed.messages, refreshed.offset, { total: data.total })
         setTranscriptReconcileSeq(seq => seq + 1)
       } else if (!staleSnapshot) {
         const refreshed = mergeRecentMessagesIntoLoadedWindow({
@@ -1477,7 +1476,7 @@ export default function ChatView({
           recentMessages: msgs,
           recentOffset: data.offset || 0,
         })
-        commitMessages(refreshed.messages, refreshed.offset)
+        commitMessages(refreshed.messages, refreshed.offset, { total: data.total })
         setTranscriptReconcileSeq(seq => seq + 1)
       }
       if (data.running) {

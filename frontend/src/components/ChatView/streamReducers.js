@@ -597,8 +597,10 @@ export function attachToolOutput(prev, content, event = null) {
 
 /**
  * Applies a `generated_file` event to one provider-neutral turn block.
- * Deliverables render after the answer, so coupling them to a guessed tool
- * identity adds failure modes without changing the visible result.
+ * Deliverables render after the answer and are never tied to a guessed tool.
+ * A native picture is the exception the server states outright: it carries
+ * the step that produced it and its decoded size (events.py keeps the same
+ * fields), so it shows beside that step in a frame sized before it loads.
  */
 export function attachGeneratedFile(prev, event) {
   const name = event?.name
@@ -610,6 +612,13 @@ export function attachGeneratedFile(prev, event) {
     previewable: event.previewable === true,
   }
   if (typeof event.sha256 === 'string') entry.sha256 = event.sha256
+  if (typeof event.source_tool_use_id === 'string' && event.source_tool_use_id) {
+    entry.source_tool_use_id = event.source_tool_use_id
+  }
+  if ([event.width, event.height].every(side => Number.isInteger(side) && side > 0)) {
+    entry.width = event.width
+    entry.height = event.height
+  }
   const i = prev.findLastIndex(it => it.type === 'generated_files')
   if (i < 0) return [...prev, { type: 'generated_files', files: [entry] }]
   const block = prev[i]

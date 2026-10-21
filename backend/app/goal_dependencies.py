@@ -7,6 +7,7 @@ result grants takeover authority, and a held Goal is never reopened by delivery.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -473,28 +474,37 @@ async def withdraw_disposed_dependency_notices(chat_id):
   return len(stale)
 
 
-async def deliver_pending_dependencies():
-  """Existing supervisor reconciliation, never a polling agent or new runner."""
+def _has_pending_claim_dependencies():
+  """Read the reconciliation trigger in a worker-owned session."""
   from app.database import SessionLocal
-  from app.chat_writer import ReconcileClaimSources, await_ack, get_writer
-  # Only genuinely unresolved claim follows warrant the serialized source
-  # reconciliation. The partial index added at cutover makes this a seek.
-  try:
-    with SessionLocal() as db:
-      has_pending_claims = db.query(models.GoalDependency.id).filter(
-        models.GoalDependency.target_kind == "claim_acquisition",
-        pending_follow_predicate(),
-      ).first() is not None
-    if has_pending_claims:
-      await await_ack(get_writer().submit(ReconcileClaimSources()))
-  except Exception:
-    _LOG.warning("claim source reconciliation failed", exc_info=True)
+  with SessionLocal() as db:
+    return db.query(models.GoalDependency.id).filter(
+      models.GoalDependency.target_kind == "claim_acquisition",
+      pending_follow_predicate(),
+    ).first() is not None
+
+
+def _select_dependency_deliveries():
+  """Select owed results after source reconciliation, off the event loop."""
+  from app.database import SessionLocal
   with SessionLocal() as db:
     rows = outstanding_dependencies(db).filter(
       models.GoalDependency.resolved_at.is_not(None),
     ).with_entities(models.GoalDependency.id, models.GoalDependency.waiting_chat_id).all()
-    ids = [row.id for row in rows]
-    chats = {row.waiting_chat_id for row in rows}
+    return [row.id for row in rows], {row.waiting_chat_id for row in rows}
+
+
+async def deliver_pending_dependencies():
+  """Existing supervisor reconciliation, never a polling agent or new runner."""
+  from app.chat_writer import ReconcileClaimSources, await_ack, get_writer
+  # Only genuinely unresolved claim follows warrant the serialized source
+  # reconciliation. The partial index added at cutover makes this a seek.
+  try:
+    if await asyncio.to_thread(_has_pending_claim_dependencies):
+      await await_ack(get_writer().submit(ReconcileClaimSources()))
+  except Exception:
+    _LOG.warning("claim source reconciliation failed", exc_info=True)
+  ids, chats = await asyncio.to_thread(_select_dependency_deliveries)
   started = 0
   for row_id in ids:
     try:

@@ -8,6 +8,8 @@ surfaces (the chat UI's waiting card and its cancel affordance).
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
@@ -165,22 +167,28 @@ def wait_for_decision(
       "Its saved outcome is evidence, never authority.")}
 
 
+def _withdraw_dependency_chat(dependency_id: str, principal_chat_id: str | None):
+  from app.database import SessionLocal
+  with SessionLocal() as db:
+    row = db.get(models.GoalDependency, dependency_id)
+    if row is None:
+      raise HTTPException(status_code=404, detail="No such follow.")
+    if principal_chat_id is not None and principal_chat_id != row.waiting_chat_id:
+      raise HTTPException(status_code=403, detail="Not this chat's follow.")
+    get_active_chat_or_404(db, row.waiting_chat_id)
+    return row.waiting_chat_id
+
+
 @router.post("/dependencies/{dependency_id}/withdraw")
 async def withdraw_dependency(
   dependency_id: str,
   principal: Principal = Depends(get_principal),
-  db: Session = Depends(get_db),
 ):
   """Owner control bound to the waiting chat, never the foreign source."""
   _require_owner(principal)
-  row = db.get(models.GoalDependency, dependency_id)
-  if row is None:
-    raise HTTPException(status_code=404, detail="No such follow.")
-  if principal.chat_id is not None and principal.chat_id != row.waiting_chat_id:
-    raise HTTPException(status_code=403, detail="Not this chat's follow.")
-  chat_id = row.waiting_chat_id
-  get_active_chat_or_404(db, chat_id)
-  db.rollback()
+  chat_id = await asyncio.to_thread(
+    _withdraw_dependency_chat, dependency_id, principal.chat_id,
+  )
   from app.chat_writer import WithdrawGoalDependency, await_ack, get_writer
   result = await await_ack(get_writer().submit(WithdrawGoalDependency(
     chat_id=chat_id, dependency_id=dependency_id)))

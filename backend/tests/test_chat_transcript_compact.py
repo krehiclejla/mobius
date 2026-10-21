@@ -423,6 +423,37 @@ def test_image_reads_stay_distinctive_and_question_twins_are_not_rendered():
   )
 
 
+def test_image_generation_steps_stay_distinctive_for_their_pictures():
+  image_step = {
+    "type": "tool", "tool": "ImageGen", "tool_use_id": "ig_1", "status": "done",
+    "input": "A red fox in snow", "output": "Image generated.",
+  }
+  messages = [{
+    "role": "assistant",
+    "blocks": [
+      {"type": "tool", "tool": "Bash", "output": "one"},
+      {"type": "tool", "tool": "Bash", "output": "two"},
+      image_step,
+      {"type": "tool", "tool": "Bash", "output": "three"},
+      {"type": "tool", "tool": "Bash", "output": "four"},
+      {"type": "generated_files", "files": [{
+        "name": "generated-image-1.png", "source_tool_use_id": "ig_1",
+      }]},
+    ],
+  }]
+
+  blocks = compact_messages_for_detail(
+    messages, message_offset=0, binding=EMPTY_RECALL_BINDING,
+  )[0]["blocks"]
+
+  # The step keeps the id its picture is anchored to and the prompt its alt
+  # text comes from, between two folded runs.
+  assert [block["type"] for block in blocks] == [
+    "activity", "tool", "activity", "generated_files",
+  ]
+  assert blocks[1] == {**image_step, "raw_index": 2}
+
+
 def test_skill_reads_stay_distinctive_in_compact_history():
   skill_read = {
     "type": "tool",

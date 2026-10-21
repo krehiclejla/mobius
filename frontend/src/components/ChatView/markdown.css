@@ -579,3 +579,13 @@ ol.md-list ol.md-list ol.md-list { list-style: lower-roman; }
   .md-app-card { min-height: 12rem; }
   .md-app-card__visual { height: 7.5rem; min-height: 7.5rem; }
 }
+
+/* Native generated pictures share Markdown's full-size viewer, not upload thumbs.
+   They align with the prose column (.md-paragraph's inset) and sit as their
+   own reading block under the step that made them. */
+.chat__generated-image { display: block; width: 100%; padding-left: 8px; }
+.chat__attach-images:has(.chat__generated-image) { flex-direction: column; width: 100%; }
+.chat__tools + .chat__attachments:has(.chat__generated-image) {
+  margin-top: var(--activity-row-gap, 4px);
+}
+.chat__attachments:has(.chat__generated-image) + * { margin-top: 0.75rem; }

@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { renderHook } from './react-hook-shim.mjs'
 import useTranscriptState from '../useTranscriptState.js'
+import { chatDetailCacheValue, mergeRecentMessagesIntoLoadedWindow } from '../../../../lib/chatDetailCache.js'
 
 function queryClientWith(initial) {
   let value = initial
@@ -38,6 +39,35 @@ test('consecutive transcript commits compose through the synchronous owner ref',
   assert.equal(queryClient.value.updated_at, null)
   assert.equal(queryClient.value.restorationWindowComplete, true,
     'local and streamed commits preserve canonical first-paint provenance')
+})
+
+test('latest-page refresh retires unloaded-newer navigation after replacing a bounded question window', () => {
+  const historical = chatDetailCacheValue({
+    offset: 9, total: 500,
+    messages: [{ id: 'before' }, { id: 'question', blocks: [
+      { type: 'question', question_id: 'historical' },
+    ] }],
+  })
+  const queryClient = queryClientWith(historical)
+  const { result } = renderHook(useTranscriptState, {
+    cacheKey: ['chat-messages', 7], cached: historical, queryClient,
+  })
+  assert.equal(result.current.hasUnloadedNewer, true)
+
+  const recent = Array.from({ length: 20 }, (_, index) => ({ id: `recent-${index}` }))
+  const refreshed = mergeRecentMessagesIntoLoadedWindow({
+    loadedMessages: result.current.messagesRef.current,
+    loadedOffset: result.current.offsetRef.current,
+    recentMessages: recent,
+    recentOffset: 480,
+  })
+  assert.equal(refreshed.verified, false, 'the latest page replaces non-overlapping history')
+  result.current.commitMessages(refreshed.messages, refreshed.offset, { total: 500 })
+
+  assert.equal(result.current.offset, 480)
+  assert.equal(result.current.messages[0].id, 'recent-0')
+  assert.equal(result.current.hasUnloadedNewer, false,
+    'Jump to latest must not remain visible after the mounted window reaches the tail')
 })
 
 test('an authoritative view activation does not republish the query cache', () => {

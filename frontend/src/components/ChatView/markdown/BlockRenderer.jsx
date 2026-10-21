@@ -39,6 +39,14 @@ const mdOwnerText = configuredMarked({
 })
 
 
+export function markdownImageHrefs(text) {
+  const hrefs = []
+  md.walkTokens(tokenize(text), token => {
+    if (token.type === 'image') hrefs.push(token.href)
+  })
+  return hrefs
+}
+
 function tokenize(text, { writtenByOwner = false } = {}) {
   return (writtenByOwner ? mdOwnerText : md).lexer(text || '')
 }

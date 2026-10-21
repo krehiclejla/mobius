@@ -1709,6 +1709,58 @@ def _claim_and_notices(db):
   return claim, notices
 
 
+@pytest.mark.parametrize("release", [False, True])
+def test_finish_succeeds_when_background_dependency_selection_fails(
+  client, auth, db, monkeypatch, release,
+):
+  from app import goal_dependencies
+  _claim_owner_and_follower(db)
+  attempts = []
+
+  async def fail_delivery():
+    attempts.append(True)
+    raise RuntimeError("database unavailable during delivery selection")
+
+  monkeypatch.setattr(goal_dependencies, "deliver_pending_dependencies", fail_delivery)
+  response = client.post("/api/agent-coordination/work-claims/finish",
+    headers=_top_level_auth(db, "claim-owner", "claim-owner-run"),
+    json={"work_key": CLAIM_KEY, "outcome": "Saved result", "release": release})
+
+  assert response.status_code == 200, response.text
+  assert response.json()["dependency_delivery"] == "scheduled"
+  assert attempts == [True]
+  claim, _ = _claim_and_notices(db)
+  assert (claim.released_at if release else claim.completed_at) is not None
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == (
+    "released" if release else "completed")
+
+
+def test_finish_returns_before_running_the_dependency_sweep(monkeypatch):
+  import asyncio
+  from types import SimpleNamespace
+  from fastapi import BackgroundTasks
+  from app.routes import agent_coordination as route
+  from app import goal_dependencies
+
+  swept = []
+  async def deliver():
+    swept.append(True)
+  monkeypatch.setattr(goal_dependencies, "deliver_pending_dependencies", deliver)
+  monkeypatch.setattr(route, "finish_work", lambda *a, **kw: {"state": "completed"})
+
+  async def scenario():
+    tasks = BackgroundTasks()
+    result = await route.finish_current_work(
+      route.AgentWorkClaimFinish(work_key=CLAIM_KEY, outcome="Saved result"), tasks,
+      principal=SimpleNamespace(owner=SimpleNamespace(id="owner"), chat_id="chat"), db=None)
+    assert result == {"state": "completed", "dependency_delivery": "scheduled"}
+    assert swept == []
+    await tasks()
+    assert swept == [True]
+
+  asyncio.run(scenario())
+
+
 def test_goal_completion_stamps_exact_goal_dependency_without_peer_notice(
   client, auth, db, monkeypatch,
 ):

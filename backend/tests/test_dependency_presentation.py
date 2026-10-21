@@ -277,6 +277,40 @@ def test_question_anchor_search_does_not_hydrate_unrelated_history(db, chat, cli
   assert len(missing.json()['messages']) == 20
 
 
+@pytest.mark.parametrize('found_seq', [0, None])
+def test_question_anchor_builds_postgresql_nested_json_search_without_executing_it(
+    db, chat, monkeypatch, found_seq):
+  from sqlalchemy.dialects import postgresql
+  from sqlalchemy.orm import Query
+  from app import transcript_rows
+  from app.chat_transcript import materialized_messages
+  from app.routes.chats import _question_anchor_index
+
+  transcript_rows.append(db, chat, {'role': 'assistant', 'blocks': [
+    {'type': 'question', 'question_id': 'historical'},
+  ]})
+  db.commit()
+  messages = materialized_messages(chat)
+  assert messages.history.legacy is None
+  statements = []
+
+  def capture(query):
+    statements.append(query.limit(1).statement.compile(dialect=postgresql.dialect()))
+    return (found_seq,) if found_seq is not None else None
+
+  monkeypatch.setattr(Query, 'first', capture)
+  monkeypatch.setattr(db.bind.dialect, 'name', 'postgresql')
+  assert _question_anchor_index(messages, 'question:historical') == found_seq
+  assert len(statements) == 1
+  sql = str(statements[0])
+  assert 'json_array_elements' in sql
+  assert 'json_typeof' in sql and 'json_build_array' in sql
+  assert sql.count('->>') == 2
+  assert 'chat_messages.chat_id =' in sql and 'chat_messages.seq <' in sql
+  assert 'ORDER BY chat_messages.seq' in sql and 'LIMIT' in sql
+  assert {'question', 'historical'} <= set(statements[0].params.values())
+
+
 def test_dependency_receipt_paging_hydrates_only_exact_on_page_anchors(db, chat, monkeypatch):
   from app import goal_dependencies
   run = _run(db, chat, 'declare', 'goal')

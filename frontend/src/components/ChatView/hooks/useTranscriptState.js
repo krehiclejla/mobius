@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import { sameMessageList } from '../chatMessageList.js'
+import { hasUnloadedNewerMessages } from '../../../lib/chatDetailCache.js'
 
 /**
  * Owns the mounted transcript and its query-cache projection.
@@ -13,6 +14,9 @@ import { sameMessageList } from '../chatMessageList.js'
 export default function useTranscriptState({ cacheKey, cached, queryClient }) {
   const [messages, setMessages] = useState(() => cached?.messages ?? [])
   const [offset, setOffset] = useState(() => cached?.offset ?? 0)
+  const [hasUnloadedNewer, setHasUnloadedNewer] = useState(
+    () => hasUnloadedNewerMessages(cached),
+  )
   const messagesRef = useRef(messages)
   const offsetRef = useRef(offset)
 
@@ -42,6 +46,7 @@ export default function useTranscriptState({ cacheKey, cached, queryClient }) {
     const force = opts?.force === true
     const prev = messagesRef.current
     const next = typeof updater === 'function' ? updater(prev) : updater
+    const committedOffset = nextOffset !== undefined ? nextOffset : offsetRef.current
     queryClient.setQueryData(cacheKey, existing => ({
       ...(existing || {}),
       // Local and streamed composites are newer than the last complete detail
@@ -51,6 +56,11 @@ export default function useTranscriptState({ cacheKey, cached, queryClient }) {
       offset: nextOffset !== undefined ? nextOffset : (existing?.offset ?? 0),
     }))
     applyMessagesToView(next, nextOffset, force)
+    if (opts && Object.prototype.hasOwnProperty.call(opts, 'total')) {
+      setHasUnloadedNewer(hasUnloadedNewerMessages({
+        messages: next, offset: committedOffset, total: opts.total,
+      }))
+    }
   }, [applyMessagesToView, cacheKey, queryClient])
 
   return {
@@ -58,6 +68,8 @@ export default function useTranscriptState({ cacheKey, cached, queryClient }) {
     messagesRef,
     offset,
     offsetRef,
+    hasUnloadedNewer,
+    setHasUnloadedNewer,
     applyMessagesToView,
     commitMessages,
   }

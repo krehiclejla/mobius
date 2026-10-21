@@ -5535,3 +5535,425 @@ def test_own_stop_does_not_turn_stale_size_details_into_recovery(monkeypatch):
   assert result["error"] is None
   assert result["terminal_status"] == "interrupted"
   assert not result.get("context_window_exceeded")
+
+
+_IMAGE_RESULT = (
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4'
+  '////fwAJ+wP9KobjigAAAABJRU5ErkJggg=='
+)
+
+
+@pytest.mark.parametrize('result', [None, 'not-base64!', '', 'c2VjcmV0'])
+def test_generated_image_rejects_invalid_bytes_without_leaving_files(tmp_path, result):
+  from app import generated_files
+
+  with pytest.raises(ValueError):
+    codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', result)
+  assert generated_files._inbox_names(str(tmp_path), 'chat') == []
+
+
+@pytest.mark.parametrize('damage', [
+  'signature', 'truncated', 'checksum', 'pixels', 'zero', 'oversized', 'animated',
+])
+def test_generated_image_rejects_malformed_png_before_staging(tmp_path, monkeypatch, damage):
+  import base64
+  import io
+  import struct
+  import zlib
+  from PIL import Image
+  from app import generated_files
+
+  monkeypatch.setattr(Image, 'MAX_IMAGE_PIXELS', None)
+  content = base64.b64decode(_IMAGE_RESULT)
+  if damage == 'signature':
+    content = content[:8]
+  elif damage == 'truncated':
+    content = content[:-12]
+  elif damage == 'checksum':
+    content = content[:29] + b'\0\0\0\0' + content[33:]
+  elif damage == 'pixels':
+    # Keep chunk framing/checksums valid but make the pixel stream undecodable.
+    payload = b'not a zlib stream'
+    chunk = b'IDAT' + payload
+    content = content[:33] + struct.pack('>I', len(payload)) + chunk + struct.pack('>I', zlib.crc32(chunk)) + content[-12:]
+  elif damage == 'animated':
+    # Only the first frame would be decoded, so later frames stay unproven.
+    buffer = io.BytesIO()
+    Image.new('RGB', (2, 2)).save(
+      buffer, 'PNG', save_all=True, append_images=[Image.new('RGB', (2, 2), 'red')],
+    )
+    content = buffer.getvalue()
+  else:
+    width = 0 if damage == 'zero' else 32_000_001
+    header = content[12:16] + struct.pack('>II', width, 1) + content[24:29]
+    content = content[:12] + header + struct.pack('>I', zlib.crc32(header)) + content[33:]
+
+  with pytest.raises(ValueError):
+    codex_sdk_runner._stage_codex_generated_image(
+      str(tmp_path), 'chat', base64.b64encode(content).decode(),
+    )
+  assert generated_files._inbox_names(str(tmp_path), 'chat') == []
+
+
+def test_generated_image_obeys_existing_deliverable_size_limit(tmp_path, monkeypatch):
+  from app import generated_files
+
+  monkeypatch.setattr(generated_files, 'MAX_RECORDED_BYTES', 8)
+  with pytest.raises(ValueError, match='size limit'):
+    codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
+
+
+def test_generated_image_preserves_bytes_and_uses_unique_names(tmp_path):
+  import base64
+  from app import generated_files
+
+  staged = [codex_sdk_runner._stage_codex_generated_image(
+    str(tmp_path), 'chat', _IMAGE_RESULT,
+  ) for _ in range(2)]
+  names = [name for name, _size in staged]
+  # The size proven while decoding travels with the capture.
+  assert staged[0][1] == staged[1][1] == {'width': 1, 'height': 1}
+  inbox = generated_files.output_dir(str(tmp_path), 'chat')
+  assert names[0] != names[1]
+  assert all((inbox / name).read_bytes() == base64.b64decode(_IMAGE_RESULT) for name in names)
+  assert sorted(path.name for path in inbox.iterdir()) == sorted(names)
+
+
+class _ImagePublicationSink:
+  def __init__(self):
+    self.events = []
+
+  async def generated_file_capacity(self):
+    return 500
+
+  async def publish_generated_file(self, event):
+    self.events.append(event)
+    return event['name']
+
+  def generated_file_commit_unresolved(self):
+    return False
+
+
+def test_native_image_capture_does_not_publish_unfinished_inbox_files(tmp_path):
+  from app import generated_files
+
+  inbox = generated_files.output_dir(str(tmp_path), 'chat', create=True)
+  # The agent may still be writing its own deliverable when an image completes.
+  (inbox / 'report.pdf').write_bytes(b'%PDF-partial')
+  sink = _ImagePublicationSink()
+  staged = {}
+  assert asyncio.run(codex_sdk_runner._deliver_codex_generated_image(
+    sink, str(tmp_path), 'chat', _IMAGE_RESULT, tool_use_id='ig_1', staged=staged,
+  )) is codex_sdk_runner.ImageDelivery.SHOWN
+  assert [event['mime_type'] for event in sink.events] == ['image/png']
+  # The published picture names its step and size; nothing private leaks.
+  assert {key: sink.events[0][key] for key in ('source_tool_use_id', 'width', 'height')} == {
+    'source_tool_use_id': 'ig_1', 'width': 1, 'height': 1,
+  }
+  assert list(staged.values()) == [{'source_tool_use_id': 'ig_1', 'width': 1, 'height': 1}]
+  assert (inbox / 'report.pdf').read_bytes() == b'%PDF-partial'
+
+
+class _UnresolvedCommitSink:
+  """A sink whose only file commit timed out and may still land."""
+
+  def __init__(self, data_dir):
+    self.data_dir = data_dir
+    self.unresolved = True
+    self.events = []
+    self.commit_lands = True
+
+  async def generated_file_capacity(self):
+    return 0  # The real sink reports no room while a commit is unresolved.
+
+  def generated_file_commit_unresolved(self):
+    return self.unresolved
+
+  async def publish_generated_file(self, event):
+    raise AssertionError('no publication is admitted behind an unresolved commit')
+
+  async def settle_uncertain_generated_files(self):
+    from app import generated_files
+    if self.commit_lands:
+      for name in generated_files._inbox_names(self.data_dir, 'chat'):
+        generated_files.discard_inbox_file(self.data_dir, 'chat', name)  # consumed
+      self.unresolved = False
+
+  def publish(self, event):
+    self.events.append(event)
+
+
+@pytest.mark.parametrize('commit_lands', [True, False])
+def test_image_behind_a_timed_out_commit_stays_pending_until_that_commit_settles(
+  tmp_path, commit_lands,
+):
+  from app import generated_files
+
+  sink = _UnresolvedCommitSink(str(tmp_path))
+  sink.commit_lands = commit_lands
+  staged = {}
+  delivery = asyncio.run(codex_sdk_runner._deliver_codex_generated_image(
+    sink, str(tmp_path), 'chat', _IMAGE_RESULT, tool_use_id='ig_1', staged=staged,
+  ))
+  # A "full" reading behind a timed-out commit is not final: stage and wait.
+  assert delivery is codex_sdk_runner.ImageDelivery.PENDING
+  assert len(generated_files._inbox_names(str(tmp_path), 'chat')) == 1
+
+  asyncio.run(codex_sdk_runner._settle_pending_codex_images(
+    sink, str(tmp_path), 'chat', staged=staged, pending_steps={'ig_1'},
+  ))
+  if commit_lands:
+    assert sink.events == [{
+      'type': 'tool_output', 'tool_use_id': 'ig_1', 'content': 'Image generated.',
+      'output_complete': True, 'output_exit_code': 0,
+    }]
+  else:
+    # The writer is still unavailable: Finalize settles it, so no rewrite yet.
+    assert sink.events == []
+    assert len(generated_files._inbox_names(str(tmp_path), 'chat')) == 1
+
+
+def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_path, monkeypatch):
+  import base64
+  import os
+  import threading
+  from app import generated_files
+
+  entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+  original_fdopen = os.fdopen
+
+  class BlockedWrite:
+    def __init__(self, fd, *args, **kwargs):
+      self.stream = original_fdopen(fd, *args, **kwargs)
+
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *args):
+      return self.stream.__exit__(*args)
+
+    def write(self, content):
+      self.stream.write(content[:8])
+      self.stream.flush()
+      entered.set()
+      assert release.wait(5), 'capture was not released'
+      self.stream.write(content[8:])
+
+  def capture():
+    try:
+      return codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
+    finally:
+      finished.set()
+
+  async def cancel_and_publish():
+    sink = _ImagePublicationSink()
+    task = asyncio.create_task(asyncio.to_thread(capture))
+    try:
+      assert await asyncio.to_thread(entered.wait, 5)
+      task.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await task
+      # Match the runner's final inbox publication while its worker still writes.
+      assert await generated_files.publish_inbox_files(
+        sink, data_dir=str(tmp_path), chat_id='chat',
+      ) == set()
+      assert sink.events == []
+    finally:
+      release.set()
+      assert await asyncio.to_thread(finished.wait, 5)
+    # The completed capture is recovered whole by the next publication.
+    names = generated_files._inbox_names(str(tmp_path), 'chat')
+    assert len(names) == 1
+    assert (generated_files.output_dir(str(tmp_path), 'chat') / names[0]).read_bytes() == base64.b64decode(_IMAGE_RESULT)
+    assert await generated_files.publish_inbox_files(
+      sink, data_dir=str(tmp_path), chat_id='chat',
+    ) == set(names)
+    assert len(sink.events) == 1
+    assert generated_files._inbox_names(str(tmp_path), 'chat') == []
+
+  def blocked_fdopen(fd, *args, **kwargs):
+    if not entered.is_set():
+      return BlockedWrite(fd, *args, **kwargs)
+    return original_fdopen(fd, *args, **kwargs)
+
+  monkeypatch.setattr(os, 'fdopen', blocked_fdopen)
+  asyncio.run(cancel_and_publish())
+
+
+@pytest.mark.parametrize('status,result,expected_files,capacity,publication', [
+  ('completed', _IMAGE_RESULT, 1, 500, 'accepted'),
+  ('completed', 'invalid!', 0, 500, 'accepted'),
+  ('completed', 'iVBORw0KGgo=', 0, 500, 'accepted'),
+  ('completed', '', 0, 500, 'accepted'),
+  ('failed', _IMAGE_RESULT, 0, 500, 'accepted'),
+  ('completed', _IMAGE_RESULT, 0, 0, 'accepted'),
+  ('completed', _IMAGE_RESULT, 0, 499, 'capacity_race'),
+  ('completed', _IMAGE_RESULT, 0, 500, 'capacity_after_staging'),
+  ('completed', _IMAGE_RESULT, 0, 500, 'raises'),
+  ('completed', _IMAGE_RESULT, 1, 500, 'raises_once'),
+  ('completed', _IMAGE_RESULT, 0, 500, 'uncertain'),
+  ('completed', _IMAGE_RESULT, 1, 500, 'committed_uncertain'),
+])
+def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
+  client, db, auth, chat, monkeypatch, tmp_path, status, result, expected_files, capacity, publication,
+):
+  import base64
+  import json
+  v = pytest.importorskip('openai_codex.generated.v2_all')
+  from app import generated_files
+  from app.agent_activity import EMPTY_AGENT_ACTIVITY_BINDING
+  from app.broadcast import ChatBroadcast
+  from app.chat_event_sink import ChatEventSink
+  from app.config import get_settings
+
+  # savedPath is intentionally outside the generator tree and contains unrelated
+  # bytes: delivery must use the typed result, never open that supplied path.
+  private_path = tmp_path / 'not-an-image'
+  private_path.write_bytes(b'do not read this')
+  started = v.ImageGenerationThreadItem(
+    id='image-call', type='imageGeneration', status='in_progress', result='',
+  )
+  # The provider may name the revised prompt only on completion.
+  completed = v.ImageGenerationThreadItem(
+    id='image-call', type='imageGeneration', status=status, result=result,
+    savedPath=str(private_path), transparentBackground=True,
+    revisedPrompt='A red fox in snow',
+  )
+  notifications = [
+    SimpleNamespace(method='item/started', payload=v.ItemStartedNotification(
+      item=started, threadId='thread-1', turnId='turn-1', startedAtMs=1,
+    )),
+    SimpleNamespace(method='item/completed', payload=v.ItemCompletedNotification(
+      item=completed, threadId='thread-1', turnId='turn-1', completedAtMs=2,
+    )),
+    *_goal_completion_notifications(),
+  ]
+  notifications.insert(2, notifications[1])  # Replay even without a delivery receipt.
+  if capacity == 0:
+    for index in range(8):
+      another = v.ImageGenerationThreadItem(
+        id=f'image-call-{index}', type='imageGeneration', status='completed', result=result,
+      )
+      event = SimpleNamespace(method='item/completed', payload=v.ItemCompletedNotification(
+        item=another, threadId='thread-1', turnId='turn-1', completedAtMs=3 + index,
+      ))
+      notifications[3:3] = [
+        SimpleNamespace(method='item/started', payload=v.ItemStartedNotification(
+          item=another, threadId='thread-1', turnId='turn-1', startedAtMs=2 + index,
+        )), event, event,
+      ]
+  thread = _FakeThread('thread-1', _FakeTurnHandle(notifications))
+
+  class FakeAsyncCodex:
+    def __init__(self, config=None):
+      self.config = config
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      return None
+
+    async def thread_start(self, *_args, **_kwargs):
+      return thread
+
+  sdk = _fake_sdk(FakeAsyncCodex)
+  sdk.update({
+    'ImageGenerationThreadItem': v.ImageGenerationThreadItem,
+    'ItemStartedNotification': v.ItemStartedNotification,
+    'ItemCompletedNotification': v.ItemCompletedNotification,
+  })
+  monkeypatch.setattr(codex_sdk_runner, '_sdk_imports', lambda: sdk)
+  sink = ChatEventSink(
+    ChatBroadcast(chat.id), chat.id, run_token='rt-image',
+    agent_activity_binding=EMPTY_AGENT_ACTIVITY_BINDING,
+  )
+  if capacity in (0, 499):
+    db.add_all([models.GeneratedFile(
+      chat_id=chat.id, name=f'existing-{index}.png', path=f'existing-{index}',
+      size=1, mime_type='image/png',
+    ) for index in range(500 if capacity == 0 else 499)])
+    db.commit()
+  publish_generated_file = sink.publish_generated_file
+  if publication == 'capacity_after_staging':
+    capacity_reads = 0
+
+    async def capacity_lost_after_staging():
+      # The pre-staging check passes; every later read finds the chat full.
+      nonlocal capacity_reads
+      capacity_reads += 1
+      return 1 if capacity_reads == 1 else 0
+
+    monkeypatch.setattr(sink, 'generated_file_capacity', capacity_lost_after_staging)
+  if publication != 'accepted':
+    publication_attempts = 0
+
+    async def uncertain_publication(event):
+      nonlocal publication_attempts
+      publication_attempts += 1
+      assert publication != 'capacity_after_staging', 'a full chat admits no commit'
+      if publication == 'raises_once' and publication_attempts > 1:
+        return await publish_generated_file(event)
+      if publication in ('raises', 'raises_once'):
+        raise OSError('simulated post-stage settlement failure')
+      if publication == 'capacity_race':
+        db.add(models.GeneratedFile(
+          chat_id=chat.id, name='last-slot.png', path='last-slot',
+          size=1, mime_type='image/png',
+        ))
+        db.commit()
+        return await publish_generated_file(event)
+      if publication == 'committed_uncertain':
+        await publish_generated_file(event)
+        # Model late commit settlement after its acknowledgement was lost.
+        generated_files._settle_capture(
+          get_settings().data_dir, chat.id, event, accepted=True,
+        )
+      return generated_files.PUBLICATION_UNCERTAIN
+    monkeypatch.setattr(sink, 'publish_generated_file', uncertain_publication)
+  outcome = asyncio.run(codex_sdk_runner.run_codex_sdk_turn(
+    user_message='Create an image', session_id=None, base_env={}, cwd=str(tmp_path),
+    chat_id=chat.id, bc=sink, pending_questions={}, db=None,
+  ))
+  assert outcome['error'] is None
+  tools = [block for block in sink.assistant_blocks if block.get('tool') == 'ImageGen']
+  assert len(tools) == (9 if capacity == 0 else 1)
+  assert tools[0]['tool_use_id'] == 'image-call'
+  assert tools[0]['input'] == 'A red fox in snow'
+  # The step ends with the truth about its picture. A pending promise is
+  # always kept: the turn-end settlement rewrites it as shown or not attached.
+  if status == 'failed':
+    step = ('Image generation failed.', 1)
+  elif expected_files:
+    step = ('Image generated.', 0)
+  else:
+    step = ('The image was generated, but Möbius could not attach it.', 1)
+  assert all((tool['output'], tool['output_exit_code']) == step for tool in tools)
+  assert private_path.read_bytes() == b'do not read this'
+  rows = db.query(models.GeneratedFile).filter_by(chat_id=chat.id).all()
+  assert len(rows) == expected_files + (500 if capacity in (0, 499) else 0)
+  serialized = json.dumps(sink.assistant_blocks)
+  assert str(private_path) not in serialized
+  assert _IMAGE_RESULT not in serialized
+  # Nothing is left queued that this chat could never attach.
+  assert generated_files._inbox_names(get_settings().data_dir, chat.id) == []
+  if expected_files:
+    row = rows[0]
+    res = client.get(
+      f'/api/chats/{chat.id}/generated-files/{row.name}',
+      headers=auth, params={'preview': True},
+    )
+    assert res.status_code == 200
+    assert res.content == base64.b64decode(_IMAGE_RESULT)
+    assert res.headers['content-type'] == 'image/png'
+    # Reopening the chat must retain the attachment even with no final prose.
+    reopened = client.get(f'/api/chats/{chat.id}?limit=10', headers=auth).json()
+    attachment_blocks = [
+      b for m in reopened['messages'] for b in m.get('blocks', [])
+      if b.get('type') == 'generated_files'
+    ]
+    assert attachment_blocks[0]['files'][0]['name'] == row.name
+    # A late-resolved commit still lands beside its step, sized up front.
+    assert {key: attachment_blocks[0]['files'][0].get(key) for key in (
+      'source_tool_use_id', 'width', 'height',
+    )} == {'source_tool_use_id': 'image-call', 'width': 1, 'height': 1}

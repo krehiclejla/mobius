@@ -21,8 +21,9 @@ const requests = readFileSync(
   new URL('../../components/SettingsView/usePlatformUpdates.js', import.meta.url), 'utf8',
 )
 
-test('appearance keeps one icon switch without making the section clickable', () => {
-  assert.match(view, /settings__section--appearance/)
+test('appearance keeps one icon switch in the header without making the section clickable', () => {
+  assert.match(view, /<header className="settings__header">/)
+  assert.doesNotMatch(view, /settings__section--appearance/)
   assert.match(view, /className="settings__appearance-toggle"[\s\S]*role="switch"[\s\S]*onClick=\{toggleTheme\}/)
   assert.match(view, /settings__appearance-option/)
   assert.doesNotMatch(view, /settings__appearance-thumb/)
@@ -32,12 +33,9 @@ test('appearance keeps one icon switch without making the section clickable', ()
   assert.match(css, /\.settings__appearance-toggle\s*\{[^}]*grid-template-columns:\s*repeat\(2, 34px\);/s)
 })
 
-test('last model keeps its normal-weight standard highlight', () => {
-  assert.match(view, /provider-row__status-text settings__last-model/)
-  assert.match(view, /Choose which models appear\. New chats use your last pick\./)
-  assert.match(view, /Last model: <span className="settings__standard-highlight">/)
-  assert.match(css, /\.settings__last-model\s*\{[^}]*color:\s*var\(--muted\);[^}]*font-weight:\s*400;/s)
-  assert.match(css, /\.settings__standard-highlight\s*\{[^}]*color:\s*var\(--green\);[^}]*font-weight:\s*inherit;/s)
+test('provider priority does not override the last-picked new-chat model', () => {
+  assert.match(view, /New chats still use your last-picked chat model/)
+  assert.doesNotMatch(view, /settings__priority-summary|firstBackgroundLabel|lastModelLabel/)
 })
 
 test('version details distinguish served Möbius from its container identity', () => {
@@ -95,41 +93,45 @@ test('status failures project unknown rather than retaining an unchecked current
   assert.match(requests, /results\[0\]\.status === 'rejected'[\s\S]*platformStatusUnavailable\(current\)/)
 })
 
-test('background agents are always draggable without reorder chrome or a trailing caret', () => {
+test('provider rows keep six-dot background priority without reorder chrome', () => {
   assert.match(view, /settings-bg-row__effort-visual[\s\S]*settings-bg-row__effort-dot/)
   assert.match(view, /efforts=\{efforts\}[\s\S]*onEffortChange=\{onEffortChange\}/)
   assert.doesNotMatch(view, /settings-bg-row__effort-picker|<EffortStepper/)
   assert.doesNotMatch(view, /\{effortLabel\} effort<\/span>/)
-  assert.match(view, /reorderMode\s*\n/)
   assert.match(view, /<GripVertical size=\{18\} strokeWidth=\{2\}/)
   assert.doesNotMatch(view, /settings-agent-group__reorder|>Reorder<|model-trigger__caret/)
-  assert.match(view, /Background agents/)
-  assert.match(view, /Used for memory, reflection, and other automatic tasks\. Tried in order\./)
-  assert.match(css, /\.settings-bg-row\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;/s)
+  assert.match(view, /background-task priority/)
+  assert.match(css, /\.settings-bg-row\s*\{[^}]*border:\s*1px solid var\(--border\);[^}]*background:\s*var\(--surface\);/s)
   assert.match(css, /\.settings-bg-row__effort-visual\s*\{[^}]*min-width:\s*68px;/s)
   assert.doesNotMatch(view, /dropPosition|settings-bg-row--drop-before|settings-bg-row--drop-after/)
   assert.doesNotMatch(css, /settings-bg-row--drop-before|settings-bg-row--drop-after/)
 })
 
-test('provider-dependent settings stay unavailable until a provider is connected', () => {
-  assert.match(view, /disabled=\{!hasConfiguredProvider\}/)
-  assert.match(view, /No provider connected/)
-  assert.match(view, /Connect an AI provider to choose chat models\./)
-  assert.match(view, /settings-agent-group--disabled/)
-  assert.match(view, /Connect an AI provider to configure automatic tasks\./)
+test('provider usage is fetched only for the open provider page', () => {
+  assert.match(view, /&& selectedProvider === 'codex'/)
+  assert.match(view, /&& selectedProvider === 'claude'/)
+  assert.doesNotMatch(view, /PlanUsageToggle|expandedUsage/)
+})
+
+test('the Möbius account and Möbius sign-in hand off to Möbius · You', () => {
+  assert.match(view, /onOpenApp\?\.\('identity'\)/)
+  assert.match(view, /onOpenAccount=\{openMobiusYou\}/)
+  assert.doesNotMatch(view, /IdentityAccount|SettingsView\/identity\/|useIdentityQuery/)
+})
+
+test('provider-dependent model controls stay unavailable until connected', () => {
+  assert.match(view, /disabled=\{!configuredProviders\.has\(row\.provider\)\}/)
+  assert.match(view, /disabled=\{!configured\}/)
   assert.match(view, /configuredProviders=\{configuredProviders\}/)
 })
 
-test('Möbius subscription is app-owned and follows Codex and Claude', () => {
-  assert.match(view, /const mobiusAvailable = providerStatusQuery\.data\?\.mobius\?\.available === true/)
-  assert.match(
-    view,
-    /name="OpenAI Codex"[\s\S]*name="Claude Code"[\s\S]*\{mobiusAvailable && \([\s\S]*name="Möbius"/,
-  )
-  assert.match(view, /Sign in from Möbius · You to activate your trial\./)
-  assert.match(view, /actionLabel="Open Möbius · You"/)
-  assert.match(view, /onOpenApp\?\.\('identity'\)/)
-  assert.doesNotMatch(view, /Claim trial|connectMobius|startLogin\(\)/)
+test('Settings detail back button has a 44px touch target and keeps the shared 18px icon', () => {
+  assert.match(view, /className="settings__back"[\s\S]*<ArrowLeft width=\{18\} height=\{18\}/)
+  assert.match(css, /\.settings__back\s*\{[^}]*display:\s*grid;[^}]*place-items:\s*center;/s)
+  const backStyle = css.match(/\.settings__back\s*\{([^}]+)\}/s)[1]
+  assert.match(backStyle, /width:\s*44px;/)
+  assert.match(backStyle, /height:\s*44px;/)
+  assert.doesNotMatch(view, />←<\/button>/)
 })
 
 test('new provider connections use the curated unattended defaults', () => {
@@ -145,12 +147,6 @@ test('new provider connections use the curated unattended defaults', () => {
   assert.match(view, /if \(!saved\) return[\s\S]*setExpandedAuth\(null\)/)
   assert.doesNotMatch(view, /api\.settings\.save\(\{ provider \}\)/)
   assert.match(view, /effort: defaultEffort\(provider\)/)
-})
-
-test('Möbius subscription status uses the same consumed-credit copy as the brain', () => {
-  assert.match(view, /enabled: active && providerReady && mobiusAvailable && mobiusAuthenticated/)
-  assert.match(view, /providerAllowanceSummary\('mobius', mobiusAllowance\)/)
-  assert.doesNotMatch(view, /mobiusRemaining|spendable_units/)
 })
 
 test('appearance indicator waits for the same seeded theme repaint as the palette', () => {

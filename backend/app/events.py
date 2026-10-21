@@ -996,9 +996,9 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     return True
 
   if event_type == "generated_file":
-    # Deliverables belong to the completed assistant turn, not to a guessed
-    # provider tool. A dedicated block keeps the transcript contract identical
-    # across providers and lets the UI render one handoff after the final text.
+    # Deliverables belong to the assistant turn, never to a guessed provider
+    # tool. A dedicated block keeps the transcript contract identical across
+    # providers and lets the UI render one handoff after the final text.
     name = event.get("name")
     if not isinstance(name, str) or not name:
       return False
@@ -1010,6 +1010,15 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     }
     if isinstance(event.get("sha256"), str):
       entry["sha256"] = event["sha256"]
+    # A native picture's runner knows (not guesses) the step that produced
+    # it and its decoded size: the UI shows it beside that step in a frame
+    # sized before any byte loads.
+    source = event.get("source_tool_use_id")
+    if isinstance(source, str) and source:
+      entry["source_tool_use_id"] = source
+    width, height = event.get("width"), event.get("height")
+    if all(type(side) is int and side > 0 for side in (width, height)):
+      entry["width"], entry["height"] = width, height
     target = next((
       block for block in reversed(assistant_blocks)
       if block.get("type") == "generated_files"

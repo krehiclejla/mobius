@@ -679,8 +679,23 @@ async def _record_collab_child_links(
     log.debug("codex collab child-link recording failed", exc_info=True)
 
 
+# The step's input doubles as its picture's alt text; keep it a description.
+_IMAGE_PROMPT_LIMIT = 200
+
+
+def _image_prompt(item: Any) -> str:
+  """The provider's revised prompt, bounded for a step input and alt text."""
+  prompt = " ".join(str(getattr(item, "revised_prompt", None) or "").split())
+  if len(prompt) <= _IMAGE_PROMPT_LIMIT:
+    return prompt
+  return prompt[:_IMAGE_PROMPT_LIMIT - 1].rstrip() + "…"
+
+
 def _tool_start_event(item: Any, sdk: dict[str, Any]) -> dict[str, Any] | None:
   """Builds one Möbius `tool_start` event from a typed item."""
+  image_generation_cls = sdk.get("ImageGenerationThreadItem")
+  if image_generation_cls is not None and isinstance(item, image_generation_cls):
+    return {"type": "tool_start", "tool": "ImageGen", "input": _image_prompt(item)}
   image_view_cls = sdk.get("ImageViewThreadItem")
   if image_view_cls is not None and isinstance(item, image_view_cls):
     return {
@@ -762,6 +777,24 @@ def _tool_completed_events(
   streamed_command_output: str | None = None,
 ) -> list[dict[str, Any]]:
   """Builds Möbius tool-end events from a completed typed item."""
+  image_generation_cls = sdk.get("ImageGenerationThreadItem")
+  if image_generation_cls is not None and isinstance(item, image_generation_cls):
+    failed = item.status != "completed" or getattr(item, "failure", None) is not None
+    # The revised prompt may arrive only with the completed item; backfill it
+    # (the caller stamps tool_use_id) so the picture's alt text is real.
+    prompt = _image_prompt(item)
+    # The runner captures result bytes through managed deliverables. Never put
+    # base64 or the provider's private saved_path in a transcript/tool output.
+    return [
+      *([{"type": "tool_input", "input": prompt}] if prompt else []),
+      {
+        "type": "tool_output",
+        "content": "Image generation failed." if failed else "Image generated.",
+        "output_complete": True,
+        "output_exit_code": 1 if failed else 0,
+      },
+      {"type": "tool_end"},
+    ]
   image_view_cls = sdk.get("ImageViewThreadItem")
   if image_view_cls is not None and isinstance(item, image_view_cls):
     return [{"type": "tool_end"}]

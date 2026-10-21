@@ -157,7 +157,7 @@ def claim_work(
     row = models.AgentWorkClaim(
       id=str(uuid.uuid4()), owner_id=owner_id, work_key=key,
       summary=clean_summary, owner_chat_id=chat_id, owner_run_id=run_id,
-      owner_goal_id=goal_id, acquisition_id=str(uuid.uuid4()),
+      owner_goal_id=goal_id, acquisition_id=uuid.uuid4().hex,
     )
     db.add(row)
     try:
@@ -192,7 +192,7 @@ def claim_work(
       models.AgentWorkClaim.takeover_reason: None,
       models.AgentWorkClaim.released_at: None,
       models.AgentWorkClaim.outcome: None,
-      models.AgentWorkClaim.acquisition_id: str(uuid.uuid4()),
+      models.AgentWorkClaim.acquisition_id: uuid.uuid4().hex,
       models.AgentWorkClaim.claimed_at: now,
       models.AgentWorkClaim.updated_at: now,
       models.AgentWorkClaim.revision: next_revision,

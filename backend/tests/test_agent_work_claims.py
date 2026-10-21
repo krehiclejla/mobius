@@ -54,6 +54,8 @@ def test_first_claim_wins_and_loser_follows_without_duplicate_ownership(db):
   )
 
   assert won["state"] == "claimed"
+  assert len(won["acquisition_id"]) == 32
+  assert all(char in "0123456789abcdef" for char in won["acquisition_id"])
   assert lost["state"] == "held_by_peer"
   assert lost["owner_chat_id"] == first.id
   assert db.query(models.AgentWorkClaim).count() == 1
@@ -522,10 +524,17 @@ def test_work_keys_accept_pr_references_with_hash_and_plus():
     clean_work_key("Has Spaces")
 
 
-def test_follow_is_one_dependency_per_goal_and_acquisition(db):
+@pytest.mark.parametrize('legacy_acquisition', [None, '175124e1-4ee7-4181-9407-9a41ebd065e7'])
+def test_follow_is_one_dependency_per_goal_and_acquisition(db, legacy_acquisition):
   owner, first, second = _fixture(db)
   won = claim_work(db, owner_id=owner.id, chat_id=first.id,
                    run_id='claim-run-first', work_key=KEY, summary='Do work')
+  if legacy_acquisition:
+    db.get(models.AgentWorkClaim, won['id']).acquisition_id = legacy_acquisition
+    db.commit()
+    won = claim_work(db, owner_id=owner.id, chat_id=first.id,
+      run_id='claim-run-first', work_key=KEY, summary='Keep the existing acquisition')
+    assert won['acquisition_id'] == legacy_acquisition
   first_follow = claim_work(db, owner_id=owner.id, chat_id=second.id,
                             run_id='claim-run-second', work_key=KEY, summary='Follow')
   second_follow = claim_work(db, owner_id=owner.id, chat_id=second.id,
@@ -550,6 +559,7 @@ def test_release_stamps_old_acquisition_before_reclaim(db):
   reclaimed = claim_work(db, owner_id=owner.id, chat_id=second.id,
                          run_id='claim-run-second', work_key=KEY, summary='Retry')
   assert reclaimed['acquisition_id'] != won['acquisition_id']
+  assert len(reclaimed['acquisition_id']) == 32
   assert old.target_acquisition_id == won['acquisition_id']
   assert old.outcome_json['outcome'] == 'Not done'
 
@@ -1057,7 +1067,7 @@ def test_third_chat_can_take_over_from_stalled_successor(db):
     takeover_reason="Successor is not progressing")
   assert _claim_row(db).owner_chat_id == third.id
 
-def test_received_owner_not_progressing_can_follow_same_live_acquisition_again(db):
+def test_received_owner_not_progressing_does_not_refollow_stalled_acquisition(db):
   from app.goal_dependency_sources import stage_follow_claim
   owner, first, second = _owned_goal_claim(db)
   old = db.query(models.GoalDependency).one()
@@ -1069,6 +1079,16 @@ def test_received_owner_not_progressing_can_follow_same_live_acquisition_again(d
   assert stage_follow_claim(db, claim, chat_id=second.id,
     run_id="claim-run-second") == "result_owed"
   old.result_disposition = "delivered"
+  db.get(models.ChatRun, "claim-run-first").status = "failed"
+  db.commit()
+  before = db.query(models.GoalDependency).count()
+  blocked = claim_work(db, owner_id=owner.id, chat_id=second.id,
+    run_id="claim-run-second", work_key=KEY, summary="Inspect stalled owner")
+  assert blocked["follow_status"] == "owner_not_progressing"
+  assert "No new Goal follow was created" in blocked["next_action"]
+  assert db.query(models.GoalDependency).count() == before
+  # A new, progressing attempt may subscribe without rewriting the receipt.
+  db.get(models.ChatRun, "claim-run-first").status = "running"
   db.commit()
   assert stage_follow_claim(db, claim, chat_id=second.id,
     run_id="claim-run-second") == "followed"
@@ -1333,8 +1353,9 @@ def test_legacy_interest_model_has_no_runtime_consumers():
 
 
 @pytest.mark.parametrize("blocker", ["direct_cycle", "dependency_limit"])
-def test_refollow_after_stalled_source_still_enforces_cycle_and_64_cap(db, blocker):
+def test_refollow_after_stalled_source_still_enforces_cycle_and_64_cap(db, blocker, monkeypatch):
   from app.goal_dependency_sources import stage_follow_claim
+  from app import goal_dependency_sources
   owner, first, second = _owned_goal_claim(db)
   old = db.query(models.GoalDependency).one()
   old.resolved_at = now_naive_utc()
@@ -1355,6 +1376,9 @@ def test_refollow_after_stalled_source_still_enforces_cycle_and_64_cap(db, block
         target_claim_id=f"other-{index}", target_acquisition_id=f"other-{index}"))
     db.commit()
   before = db.query(models.GoalDependency).count()
+  # Isolate registration guards from source viability, which is checked first.
+  monkeypatch.setattr(goal_dependency_sources, "dependency_source_blocker",
+    lambda *_args, **_kwargs: None)
   assert stage_follow_claim(db, claim, chat_id=second.id, run_id="claim-run-second") == blocker
   assert db.query(models.GoalDependency).count() == before
   assert old.result_disposition == "delivered"

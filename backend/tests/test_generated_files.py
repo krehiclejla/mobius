@@ -488,6 +488,54 @@ def test_full_chat_does_not_recopy_queued_files_on_later_turns(
   assert freeze_calls == 0
 
 
+def test_known_attributes_describe_a_file_but_never_replace_its_capture(tmp_path):
+  from app.events import process_event
+
+  data_dir = str(tmp_path)
+  gf.add_inbox_file(data_dir, "chat", "image.png", b"finished image")
+  events = []
+
+  class Sink:
+    async def generated_file_capacity(self):
+      return 1
+
+    async def publish_generated_file(self, event):
+      events.append(event)
+      return event["name"]
+
+  attributes = {"image.png": {
+    "source_tool_use_id": "ig_1", "width": 3, "height": 2,
+    "name": "other.png", "path": "../escape", "type": "tool_start",
+  }}
+  assert asyncio.run(gf.publish_inbox_files(
+    Sink(), data_dir=data_dir, chat_id="chat", known_attributes=attributes,
+  )) == {"image.png"}
+  event = events[0]
+  assert (event["type"], event["name"]) == ("generated_file", "image.png")
+  assert event["path"] != "../escape"
+
+  blocks = []
+  assert process_event({k: v for k, v in event.items() if not k.startswith("_")}, blocks)
+  assert blocks[0]["files"][0] == {
+    "name": "image.png", "size": len(b"finished image"), "mime_type": "image/png",
+    "previewable": True, "sha256": event["sha256"],
+    "source_tool_use_id": "ig_1", "width": 3, "height": 2,
+  }
+
+
+@pytest.mark.parametrize("width,height", [(True, 2), (0, 2), (3, -1), (3.0, 2), ("3", 2), (3, None)])
+def test_generated_file_entry_drops_an_unproven_size(width, height):
+  from app.events import process_event
+
+  blocks = []
+  assert process_event({
+    "type": "generated_file", "name": "image.png", "mime_type": "image/png",
+    "previewable": True, "width": width, "height": height,
+  }, blocks)
+  assert "width" not in blocks[0]["files"][0]
+  assert "height" not in blocks[0]["files"][0]
+
+
 def test_publish_failure_keeps_inbox_and_frozen_copy(chat):
   class FailingSink:
     async def generated_file_capacity(self):
@@ -655,6 +703,16 @@ def test_generated_file_timeout_preserves_late_writer_commit(
       sink, data_dir=settings.data_dir, chat_id=chat.id,
     )
     assert (inbox / "report.pdf").read_bytes() == b"report"
+    # Let the late command commit, but keep its sink acknowledgement unresolved.
+    # Later publications (one per native image) must not freeze more copies.
+    writer.resume_for_test()
+    monkeypatch.setattr(chat_writer, "ACK_TIMEOUT_SECS", 2)
+    sink.generated_file_capacity = ChatEventSink.generated_file_capacity.__get__(sink)
+    for _ in range(3):
+      assert await gf.publish_inbox_files(
+        sink, data_dir=settings.data_dir, chat_id=chat.id,
+      ) == set()
+    assert len(list(gf.stored_dir(settings.data_dir, chat.id).iterdir())) == 1
     sink.publish({
       "type": "error", "message": "Stopped", "resumable": True,
     })
@@ -721,7 +779,7 @@ def test_generated_file_timeout_removes_frozen_copy_after_confirmed_rejection(
       return ack
 
   monkeypatch.setattr(chat_event_sink, "get_writer", lambda: Writer())
-  asyncio.run(sink._resolve_uncertain_generated_files())
+  asyncio.run(sink.settle_uncertain_generated_files())
 
   assert (inbox / "report.pdf").read_bytes() == b"report"
   assert list(gf.stored_dir(settings.data_dir, chat.id).iterdir()) == []
@@ -797,3 +855,18 @@ def test_non_ascii_filename_downloads_instead_of_500(client, db, auth, chat):
   assert res.status_code == 200
   assert res.content == b"%PDF-1.4 cjk"
   assert "filename*=utf-8''" in res.headers["content-disposition"]
+
+
+def test_discarding_a_staged_capture_touches_only_that_inbox_file(tmp_path):
+  data_dir = str(tmp_path)
+  gf.add_inbox_file(data_dir, "chat", "image.png", b"capture")
+  gf.add_inbox_file(data_dir, "chat", "report.pdf", b"agent file")
+  outside = tmp_path / "outside.png"
+  outside.write_bytes(b"keep")
+
+  assert gf.discard_inbox_file(data_dir, "chat", "image.png") is True
+  assert gf.discard_inbox_file(data_dir, "chat", "image.png") is False
+  assert gf.discard_inbox_file(data_dir, "chat", "../../../outside.png") is False
+  assert gf.discard_inbox_file(data_dir, "missing-chat", "image.png") is False
+  assert gf._inbox_names(data_dir, "chat") == ["report.pdf"]
+  assert outside.read_bytes() == b"keep"

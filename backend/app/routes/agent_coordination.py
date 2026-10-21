@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
@@ -146,9 +147,18 @@ async def claim_current_work(
   return result
 
 
+async def _deliver_finished_claim_dependencies():
+  from app.goal_dependencies import deliver_pending_dependencies
+  try:
+    await deliver_pending_dependencies()
+  except Exception:
+    logging.getLogger(__name__).exception("Finished claim dependencies were not nudged")
+
+
 @router.post("/work-claims/finish", dependencies=[Depends(reject_cross_site)])
 async def finish_current_work(
   body: AgentWorkClaimFinish,
+  background_tasks: BackgroundTasks,
   principal: Principal = Depends(get_agent_run_principal),
   db: Session = Depends(get_db),
 ):
@@ -165,11 +175,10 @@ async def finish_current_work(
     raise HTTPException(409, str(exc)) from exc
   # Source outcome was stamped in the finish transaction. The delivery pass
   # only reduces latency; it never makes the result durable.
-  from app.goal_dependencies import deliver_pending_dependencies
-  delivery = await deliver_pending_dependencies()
+  background_tasks.add_task(_deliver_finished_claim_dependencies)
   return {
     **finished,
-    "dependency_delivery": delivery,
+    "dependency_delivery": "scheduled",
   }
 
 

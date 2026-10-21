@@ -271,7 +271,12 @@ async def report_outcome(app_id: int, run_id: str, body: ReviewOutcome,
             _assert_execution_live(db, row, principal)
             # Persist before network I/O. A crash or lost response cannot
             # authorize replay. CAS also fences other server processes.
-            owned_elsewhere = reviews.arm_merge(db, row, target, outcome, principal)
+            try:
+              owned_elsewhere = reviews.arm_merge(db, row, target, outcome, principal)
+            except ValueError as exc:
+              db.rollback()
+              raise HTTPException(409,
+                f"Merge claim conflict: {exc} No merge attempt was started; no new Goal follow was created.") from exc
             if owned_elsewhere:
               if owned_elsewhere.get("review_selection_id") != row.id:
                 reviews.save_outcome(db, row, item_key, owned_elsewhere)
